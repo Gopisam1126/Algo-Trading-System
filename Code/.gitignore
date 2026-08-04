@@ -1,0 +1,67 @@
+# ===========================================================================
+# SECRETS — nothing in this block may ever be committed.
+# Enforced additionally by the gitleaks pre-commit hook.
+# ===========================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+config/secrets.*
+*.sops.yaml
+!*.sops.example.yaml
+age.key
+.age/
+
+# Broker / API credential dumps
+**/credentials*.json
+**/token*.json
+**/session*.json
+
+# ===========================================================================
+# Data — market data and trade records stay local
+# ===========================================================================
+data/historical/*
+data/archive/*
+!data/historical/.gitkeep
+!data/archive/.gitkeep
+*.parquet
+*.duckdb
+*.sqlite
+*.db
+
+# Backtest and validation artefacts
+backtest_results/
+validation_reports/
+
+# ===========================================================================
+# Python
+# ===========================================================================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+.coverage.*
+dist/
+build/
+
+# ===========================================================================
+# Ops
+# ===========================================================================
+*.log
+logs/
+docker-compose.override.yml
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+!.vscode/extensions.json

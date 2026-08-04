@@ -1,0 +1,22 @@
+# Normalize line endings so Windows/Linux checkouts don't produce spurious diffs.
+# Everything is LF in the repository; Git converts on checkout as needed.
+
+* text=auto eol=lf
+
+# Scripts that must stay LF even on Windows (they run inside Linux containers)
+*.sh        text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+*.py        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.toml      text eol=lf
+
+# Binary — never touch
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.pdf       binary
+*.parquet   binary
+*.zip       binary

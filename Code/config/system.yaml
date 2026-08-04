@@ -1,0 +1,181 @@
+# ===========================================================================
+# system.yaml — AI Algo Trading Platform (India Edition)
+#
+# This file is VERSION CONTROLLED and is the single source of tunable
+# behaviour.  It contains no secrets — only references to them.
+#
+# Three validation gates apply (src/algotrader/common/config.py):
+#   1. Type / range        — Pydantic field constraints
+#   2. Cross-field         — weights sum to 1.0, slots fit capital, etc.
+#   3. HARD BOUNDS in code — reject dangerous values regardless of this file
+#
+# Gate 3 means: config can tune the system, but can never disable safety.
+#
+# Changing this file requires a restart.  Risk limits are immutable during
+# an active session — a mid-session limit change is indistinguishable from
+# an attack.
+# ===========================================================================
+
+system:
+  mode: paper                     # paper | alert_only | approval | live
+  timezone: Asia/Kolkata
+  deployment_region: ap-south-1   # MUST be an India region (SEBI)
+  static_ip: ""                   # MUST be broker-whitelisted before live
+  log_level: INFO
+
+# ---------------------------------------------------------------------------
+broker:
+  primary: angelone               # angelone | zerodha | fyers | dhan | upstox
+  fallback: fyers
+  algo_id: ""                     # exchange-assigned; required for live mode
+  auth:
+    method: oauth_2fa
+    daily_reauth_time: "07:00"    # SEBI: sessions auto-logout before pre-open
+    credentials_source: env
+
+# ---------------------------------------------------------------------------
+universe:
+  base: nifty200                  # nifty50 | nifty100 | nifty200 | nifty500 | fno | custom
+  custom_symbols: []
+
+  hard_filters:                   # binary exclusions, applied before scoring
+    exclude_t2t: true             # cannot be disabled — intraday impossible in T2T
+    exclude_asm_gsm: true
+    exclude_fno_ban: true
+    exclude_earnings_today: true
+    min_circuit_band_pct: 10
+    min_price: 100
+    min_avg_volume_20d: 500000
+    min_market_cap_cr: 5000
+    min_avg_daily_range_pct: 1.5
+    max_spread_pct: 0.05
+
+  scoring_weights:                # must sum to exactly 1.0
+    trend_alignment: 0.25
+    relative_strength: 0.20
+    volatility_fitness: 0.15
+    volume_expansion: 0.15
+    level_proximity: 0.15
+    catalyst_news: 0.10
+
+  shortlist_size: 15              # passed to AI deep synthesis
+  final_watchlist_size: 8         # actively monitored during the session
+
+# ---------------------------------------------------------------------------
+risk:
+  capital: 500000                 # INR
+  position_slots: 5               # max concurrent stocks
+  capital_per_slot_pct: 20        # 5 x 20% = 100%
+
+  per_trade:
+    risk_pct: 1.0                 # -> Rs 5,000 risked per trade
+    sizing_method: atr_based
+    atr_multiplier_stop: 1.5
+    max_position_pct: 20
+    target_r_multiple: 2.0
+    trailing_stop_after_r: 1.0
+
+  portfolio:
+    max_daily_loss_pct: 3.0       # -> halts at -Rs 15,000
+    max_sector_exposure_pct: 40
+    max_correlated_positions: 2
+    max_net_directional_exposure_pct: 60
+    consecutive_loss_halt: 3
+
+  exit_buffer_minutes: 5          # exit before the broker's auto square-off
+  square_off_times:               # PER-STOCK — see calendar.py
+    cas_stocks: "15:10"           # CAS regime, live since 2026-08-03
+    non_cas_stocks: "15:20"
+    fno: "15:25"
+
+# ---------------------------------------------------------------------------
+execution:
+  interval_mode: adaptive         # derived from measured p95 latency
+  interval_floor: 5m
+  interval_ceiling: 15m
+  latency_headroom_multiplier: 2.0
+  recalibrate_interval_daily: true
+
+  max_orders_per_second: 5        # hard cap; SEBI threshold is 10
+  order_type: limit
+  limit_offset_pct: 0.05
+  order_timeout_sec: 30
+
+  no_trade_windows:
+    - ["09:15", "09:20"]          # opening noise
+    - ["15:00", "15:30"]          # no new entries near close
+
+# ---------------------------------------------------------------------------
+ai:
+  provider: anthropic
+
+  models:
+    deep_synthesis: claude-opus-5      # once daily, pre-market — depth over speed
+    session_reasoning: claude-sonnet-5 # in-session confirmations
+    news_triage: claude-haiku-4-5      # high-volume classification
+
+  confidence:
+    min_to_act: 0.65              # below this -> no trade at all
+    min_for_full_size: 0.80       # below this -> reduced size
+    treat_conflict_as_no_trade: true
+
+  cost_controls:
+    daily_token_budget: 2000000
+    alert_at_pct: 80
+    hard_stop_at_pct: 100
+
+  session_timeout_sec: 15
+  fallback_on_timeout: skip_trade # cannot be changed — the system fails closed
+
+# ---------------------------------------------------------------------------
+# Strategy engine — see STRATEGY_ENGINE.md
+strategy_engine:
+  enabled: true
+  max_active: 6
+  max_active_per_regime: 3
+  max_shadow: 10
+
+  validation:                     # the overfitting gauntlet
+    min_trades: 100
+    min_regimes: 2
+    max_pbo: 0.5                  # Probability of Backtest Overfitting
+    min_deflated_sharpe_confidence: 0.95
+    max_correlation_to_active: 0.8
+    parameter_sensitivity_pct: 20
+    holdout_months: 6             # never seen by the AI generator
+
+  promotion:
+    shadow_min_sessions: 20
+    paper_min_trades: 30
+    paper_min_expectancy_r: 0.15
+    require_human_approval: true  # cannot be disabled
+
+  ai_generation:
+    enabled: false                # Phase 2 — build the gauntlet FIRST
+    cadence: weekly               # 'continuous' is rejected by validation
+    max_proposals_per_cycle: 5
+    max_active_ai_strategies: 3
+    model: claude-opus-5
+    modes: [observation, journal]
+    require_hypothesis: true      # cannot be disabled
+    min_journal_trades: 50
+
+# ---------------------------------------------------------------------------
+autonomy:
+  level: L1                       # L0 observe | L1 alert | L2 approve | L3 supervised | L4 auto
+  max_position_value_pct: 20
+  min_ai_confidence: 0.70         # below this at L3 -> escalate (not reject)
+  min_timeframe_agreement: 2
+  max_india_vix: 22
+  require_symbol_traded_before: true
+  escalation_timeout_sec: 60      # on timeout -> skip the trade
+
+# ---------------------------------------------------------------------------
+notifications:
+  channels: [telegram]
+  recipients: []                  # MAX 1 — more triggers a validation error
+  premarket_briefing: true
+  trade_alerts: true
+  risk_breach_alerts: true
+  eod_report: true
+  require_approval_before_entry: true

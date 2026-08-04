@@ -1,0 +1,280 @@
+#!/usr/bin/env python
+"""Pre-flight check.
+
+Run this before every trading day and after any infrastructure change.  It
+verifies the things that are cheap to check and expensive to get wrong —
+particularly the SEBI compliance constraints, which are architectural
+requirements rather than paperwork.
+
+    python scripts/doctor.py
+
+Exit code 0 = ready, 1 = problems found.
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+
+# Windows consoles default to cp1252; force UTF-8 so output never mangles.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+OK, FAIL, WARN = f"{GREEN}[ OK ]{RESET}", f"{RED}[FAIL]{RESET}", f"{YELLOW}[WARN]{RESET}"
+
+
+@dataclass
+class Report:
+    failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def ok(self, msg: str, detail: str = "") -> None:
+        print(f"  {OK} {msg}" + (f" {DIM}{detail}{RESET}" if detail else ""))
+
+    def fail(self, msg: str, detail: str = "") -> None:
+        print(f"  {FAIL} {msg}" + (f" {DIM}{detail}{RESET}" if detail else ""))
+        self.failures.append(msg)
+
+    def warn(self, msg: str, detail: str = "") -> None:
+        print(f"  {WARN} {msg}" + (f" {DIM}{detail}{RESET}" if detail else ""))
+        self.warnings.append(msg)
+
+
+def section(title: str) -> None:
+    print(f"\n{title}")
+    print("-" * len(title))
+
+
+def check_python(r: Report) -> None:
+    section("Environment")
+    v = sys.version_info
+    if v >= (3, 12):
+        r.ok(f"Python {v.major}.{v.minor}.{v.micro}")
+    elif v >= (3, 11):
+        r.warn(f"Python {v.major}.{v.minor}.{v.micro}", "3.12+ recommended")
+    else:
+        r.fail(f"Python {v.major}.{v.minor} is too old", "3.11 minimum")
+
+
+def check_dependencies(r: Report) -> None:
+    required = {
+        "pydantic": "core validation",
+        "yaml": "config loading",
+        "redis": "message fabric",
+        "sqlalchemy": "persistence",
+        "structlog": "logging + redaction",
+        "anthropic": "AI layer",
+        "fastapi": "dashboard",
+    }
+    optional = {"talib": "indicator hot path", "uvloop": "faster event loop"}
+
+    for mod, why in required.items():
+        try:
+            __import__(mod)
+            r.ok(f"{mod}", why)
+        except ImportError:
+            r.fail(f"{mod} not installed", f"needed for {why} - run: make install")
+
+    for mod, why in optional.items():
+        try:
+            __import__(mod)
+            r.ok(f"{mod}", why)
+        except ImportError:
+            r.warn(f"{mod} not installed", why)
+
+
+def check_config(r: Report) -> None:
+    section("Configuration")
+    try:
+        from algotrader.common.config import load_config
+
+        cfg = load_config()
+    except FileNotFoundError as exc:
+        r.fail("config not found", str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001 — surface any validation error verbatim
+        r.fail("config failed validation", str(exc).split("\n")[0])
+        return
+
+    r.ok("config valid", f"hash={cfg.config_hash()}")
+    r.ok(f"mode = {cfg.system.mode.value}")
+    r.ok(f"autonomy = {cfg.autonomy.level.value}")
+
+    print(f"\n  {DIM}Derived risk figures:{RESET}")
+    print(f"    capital            Rs {cfg.risk.capital:>12,.0f}")
+    print(f"    slots              {cfg.risk.position_slots:>15}")
+    print(f"    capital per slot   Rs {cfg.risk.capital_per_slot:>12,.0f}")
+    print(f"    risk per trade     Rs {cfg.risk.risk_per_trade_rupees:>12,.0f}")
+    print(f"    daily loss limit   Rs {cfg.risk.daily_loss_limit_rupees:>12,.0f}")
+
+
+def check_compliance(r: Report) -> None:
+    """SEBI constraints — architectural requirements, not paperwork."""
+    section("SEBI compliance")
+    try:
+        from algotrader.common.config import load_config
+        from algotrader.common.enums import SystemMode
+
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        r.fail("cannot check compliance", "config did not load")
+        return
+
+    live = cfg.system.mode is SystemMode.LIVE
+
+    if cfg.execution.max_orders_per_second <= 5:
+        r.ok(f"order rate {cfg.execution.max_orders_per_second}/sec",
+             "SEBI threshold is 10")
+    else:
+        r.fail(f"order rate {cfg.execution.max_orders_per_second}/sec is too high")
+
+    india = {"ap-south-1", "ap-south-2", "centralindia", "southindia", "asia-south1"}
+    if cfg.system.deployment_region.lower() in india:
+        r.ok(f"region {cfg.system.deployment_region}", "India - required by SEBI")
+    else:
+        r.fail(f"region {cfg.system.deployment_region} is not in India")
+
+    if cfg.system.static_ip:
+        r.ok("static IP configured", cfg.system.static_ip)
+    elif live:
+        r.fail("static IP required for live mode")
+    else:
+        r.warn("static IP not set", "required before live trading")
+
+    if cfg.broker.algo_id:
+        r.ok("Algo-ID configured")
+    elif live:
+        r.fail("Algo-ID required for live mode")
+    else:
+        r.warn("Algo-ID not set", "required before live trading")
+
+    if len(cfg.notifications.recipients) <= 1:
+        r.ok("single notification recipient",
+             "broadcasting signals can trigger RA obligations")
+    else:
+        r.fail("multiple notification recipients configured")
+
+
+def check_egress_ip(r: Report) -> None:
+    """The IP the broker sees must match what is whitelisted."""
+    section("Network")
+    import os
+
+    expected = os.environ.get("EXPECTED_EGRESS_IP", "").strip()
+    if not expected:
+        r.warn("EXPECTED_EGRESS_IP not set", "cannot verify broker whitelist match")
+        return
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:  # noqa: S310
+            actual = resp.read().decode().strip()
+    except Exception as exc:  # noqa: BLE001
+        r.warn("could not determine egress IP", str(exc)[:60])
+        return
+
+    if actual == expected:
+        r.ok("egress IP matches whitelist", actual)
+    else:
+        r.fail("egress IP MISMATCH", f"expected {expected}, got {actual}")
+
+
+def check_strategies(r: Report) -> None:
+    section("Strategies")
+    try:
+        from algotrader.strategy import primitives  # noqa: F401
+        from algotrader.strategy.dsl import REGISTRY, load_strategy_yaml
+
+        r.ok(f"{len(REGISTRY.names())} primitives registered")
+    except Exception as exc:  # noqa: BLE001
+        r.fail("primitive registry failed to load", str(exc)[:80])
+        return
+
+    strategy_dir = Path(__file__).parents[1] / "config" / "strategies"
+    files = sorted(strategy_dir.glob("*.yaml")) if strategy_dir.exists() else []
+    if not files:
+        r.warn("no strategy files found", str(strategy_dir))
+        return
+
+    from algotrader.strategy.dsl import compile_strategy
+
+    for path in files:
+        try:
+            doc = load_strategy_yaml(path.read_text(encoding="utf-8"))
+            compile_strategy(doc)
+            r.ok(f"{path.name}", f"{doc.id} v{doc.version}")
+        except Exception as exc:  # noqa: BLE001
+            r.fail(f"{path.name} failed to compile", str(exc)[:80])
+
+
+def check_secrets(r: Report) -> None:
+    section("Secrets")
+    import os
+
+    from algotrader.common.config import load_config
+    from algotrader.common.enums import SystemMode
+
+    try:
+        live = load_config().system.mode is SystemMode.LIVE
+    except Exception:  # noqa: BLE001
+        live = False
+
+    required = ["ANTHROPIC_API_KEY"]
+    broker = ["ANGELONE_API_KEY", "ANGELONE_CLIENT_ID", "ANGELONE_TOTP_SECRET"]
+
+    for key in required:
+        (r.ok if os.environ.get(key) else (r.fail if live else r.warn))(
+            f"{key} {'set' if os.environ.get(key) else 'not set'}"
+        )
+    for key in broker:
+        if os.environ.get(key):
+            r.ok(f"{key} set")
+        elif live:
+            r.fail(f"{key} not set", "required for live trading")
+        else:
+            r.warn(f"{key} not set", "required before live trading")
+
+    if Path(".env").exists():
+        import stat
+
+        mode = Path(".env").stat().st_mode
+        if mode & (stat.S_IRGRP | stat.S_IROTH):
+            r.warn(".env is group/world readable", "chmod 600 .env")
+        else:
+            r.ok(".env permissions look sane")
+
+
+def main() -> int:
+    print("=" * 62)
+    print("  AI Algo Trading - pre-flight check")
+    print("=" * 62)
+
+    r = Report()
+    check_python(r)
+    check_dependencies(r)
+    check_config(r)
+    check_compliance(r)
+    check_secrets(r)
+    check_strategies(r)
+    check_egress_ip(r)
+
+    print("\n" + "=" * 62)
+    if r.failures:
+        print(f"  {RED}{len(r.failures)} failure(s){RESET}, {len(r.warnings)} warning(s)")
+        for f in r.failures:
+            print(f"    - {f}")
+        print("=" * 62)
+        return 1
+
+    print(f"  {GREEN}All checks passed{RESET}, {len(r.warnings)} warning(s)")
+    print("=" * 62)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

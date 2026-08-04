@@ -1,0 +1,110 @@
+# ===========================================================================
+# Seed strategy: Opening Range Breakout (classic)
+#
+# This is a REFERENCE EXAMPLE showing the strategy DSL.  It is data, not
+# code — the runtime walks this validated tree; nothing here is executed as
+# Python.  An AI-proposed strategy takes exactly this shape.
+#
+# Before this can trade live it must pass the full validation gauntlet
+# (STRATEGY_ENGINE.md §5) and then a human approval gate.  Shipping a
+# strategy file does not arm it.
+# ===========================================================================
+
+id: orb_classic
+name: "Opening Range Breakout — Classic"
+version: 1
+origin: BUILTIN_SEED
+created_at: 2026-08-04T00:00:00Z
+created_by: user
+
+# --- Frozen BEFORE any backtest runs.  A strategy that cannot be explained
+#     is data mining; this ordering makes that detectable. ---
+hypothesis:
+  mechanism: >
+    The first 15 minutes of the Indian session establish a reference range as
+    overnight order imbalance clears. A decisive break of that range on
+    expanding volume signals that one side has been absorbed and that
+    directional participation is entering rather than two-way liquidity
+    provision, which tends to produce continuation within the session.
+  why_it_should_persist: >
+    This reflects genuine intraday auction structure and the concentration of
+    institutional participation in the first hour, not a pricing error that
+    arbitrage would close. The edge is compensation for taking directional
+    risk early in the session.
+  expected_failure_mode: >
+    Fails on rangebound, low-conviction days where the range breaks in both
+    directions (whipsaw), and on gap days where the range is unusually wide
+    relative to the day's remaining potential.
+
+applicability:
+  regimes: [TRENDING, HIGH_VOL, RISK_ON]
+  timeframe: 5m
+  min_price: 100
+
+direction: LONG
+
+entry:
+  all_of:
+    - primitive: price_breaks_level
+      params:
+        level: opening_range_high
+        direction: above
+        buffer_pct: 0.05
+
+    - primitive: volume_ratio_above
+      params:
+        window: 20
+        threshold: 1.5
+
+    - primitive: timeframe_agreement_at_least
+      params:
+        count: 2
+        of: "1h,1d,1w"
+
+    - primitive: range_pct_between      # too tight = noise, too wide = unaffordable stop
+      params:
+        source: opening_range
+        min_pct: 0.5
+        max_pct: 2.5
+
+    - primitive: index_not_opposing      # don't fight the Nifty
+      params:
+        index: NIFTY
+        tolerance_pct: 0.3
+
+    - primitive: bars_until_squareoff_above
+      params:
+        bars: 12                         # enough runway for the trade to work
+
+  none_of:
+    - primitive: no_material_news        # inverted: skip if material news landed
+      params:
+        lookback_hours: 12
+
+exit:
+  # `stop` and `time` are REQUIRED by the schema — a strategy cannot express
+  # "no stop loss" or "hold past the deadline".
+  stop:
+    primitive: atr_stop
+    params:
+      multiplier: 1.5
+      period: 14
+
+  target:
+    primitive: r_multiple_target
+    params:
+      r: 2.0
+
+  trail:
+    primitive: trail_after_r
+    params:
+      activate_at_r: 1.0
+      atr_mult: 1.0
+
+  time:
+    primitive: squareoff_deadline        # per-stock: 15:10 CAS / 15:20 / 15:25 F&O
+
+constraints:
+  max_entries_per_day: 1
+  entry_window: ["09:30", "11:00"]
+  min_bars_since_open: 3
