@@ -7,7 +7,8 @@ executes risk-gated trades across multiple stocks concurrently.
 
 > **Status: Phase 0 — foundation scaffold.** The safety-critical primitives
 > (domain models, config validation, secrets, calendar, strategy DSL) are built
-> and tested. The services are not yet implemented. **Nothing trades yet.**
+> and tested — **112 tests passing**. The services are not yet implemented.
+> **Nothing trades yet.**
 
 ---
 
@@ -17,6 +18,7 @@ Read these before changing anything. They are in [`../Documents/`](../Documents/
 
 | # | Document | Covers |
 |---|---|---|
+| **0** | **`MASTER_REFERENCE.md`** | **START HERE — the complete system reference** |
 | 1 | `ARCHITECTURE_RESEARCH.md` | The *why* — research findings, AI layering, latency |
 | 2 | `INDIA_FEATURES_AND_CONFIG.md` | The *what* — NSE/BSE rules, SEBI, config schema |
 | 3 | `LOW_LEVEL_ARCHITECTURE.md` | The *how* — services, schemas, security, deployment |

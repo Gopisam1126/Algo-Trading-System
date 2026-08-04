@@ -1,5 +1,7 @@
 # India Market Edition — Feature Catalogue & System Configuration Specification
 
+> 📘 **New here? Start with [MASTER_REFERENCE.md](MASTER_REFERENCE.md)** — the single onboarding document covering the whole system.
+
 **Companion to:** [ARCHITECTURE_RESEARCH.md](ARCHITECTURE_RESEARCH.md) (read that first — it covers the general architecture, AI layering, and latency reasoning that this document assumes)
 **Followed by:** [LOW_LEVEL_ARCHITECTURE.md](LOW_LEVEL_ARCHITECTURE.md) — the technical implementation spec: services, schemas, tech stack, security architecture, deployment
 **Then:** [MVP_UI_AND_LEGAL.md](MVP_UI_AND_LEGAL.md) — MVP feature scope, autonomy model, UI/admin design, Indian legal & tax framework

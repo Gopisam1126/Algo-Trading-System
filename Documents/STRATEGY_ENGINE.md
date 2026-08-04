@@ -5,6 +5,8 @@
 **Status:** Design complete, pre-implementation
 **Version:** 1.0 — 2026-08-04
 
+> 📘 **New here? Start with [MASTER_REFERENCE.md](MASTER_REFERENCE.md)** — the single onboarding document covering the whole system.
+
 **Document set:**
 1. [ARCHITECTURE_RESEARCH.md](ARCHITECTURE_RESEARCH.md) — the *why*
 2. [INDIA_FEATURES_AND_CONFIG.md](INDIA_FEATURES_AND_CONFIG.md) — the *what* (market rules, config)

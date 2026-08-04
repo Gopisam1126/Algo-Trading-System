@@ -4,6 +4,8 @@
 **Purpose:** Single source of truth for the *why* behind every future architecture/implementation decision. Read this before writing code; update it when decisions change.
 
 > **⚠️ Revision note (2026-08-04, v1.1):** This document was originally written before the project scoped to **Indian markets (NSE/BSE)**. It recommended US brokers (Alpaca, Interactive Brokers), US data providers, and framed regulation around the US PDT rule — all of which were wrong for this project and contradicted the companion documents. Those sections have been corrected. The reasoning content (AI layering, latency analysis, multi-timeframe methodology, confluence) was market-agnostic and stands unchanged. See [VERIFICATION_REPORT.md](VERIFICATION_REPORT.md) for the full audit.
+> 📘 **New here? Start with [MASTER_REFERENCE.md](MASTER_REFERENCE.md)** — the single onboarding document covering the whole system.
+
 **Document set — read in this order:**
 1. **This document** — the *why*: research findings, AI strategy, latency reasoning, general architecture
 2. [INDIA_FEATURES_AND_CONFIG.md](INDIA_FEATURES_AND_CONFIG.md) — the *what*: NSE/BSE market rules, SEBI algo compliance, pre-market engine, stock scoring model, feature catalogue, configuration schema

@@ -6,8 +6,9 @@ A personal-use algorithmic trading system for Indian equities (NSE/BSE). It
 handles real money. Treat every change to `execution/`, `common/config.py`, or
 the strategy validation path as safety-critical.
 
-Design documents are in `../Documents/` — seven of them, numbered in reading
-order. `PRE_LIVE_CHECKLIST.md` is the gate before real capital. **Read the relevant one before changing behaviour it specifies.** They
+Design documents are in `../Documents/`. **`MASTER_REFERENCE.md` is the entry
+point** — read it first; it covers the whole system. The others go deeper on
+specific areas. `PRE_LIVE_CHECKLIST.md` is the gate before real capital. **Read the relevant one before changing behaviour it specifies.** They
 are not aspirational; they record decisions with reasoning, and the code is
 expected to match.
 

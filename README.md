@@ -8,7 +8,7 @@ and reasoning, and executes risk-gated trades across multiple stocks
 concurrently.
 
 > **Status: Phase 0 — foundation.** Safety-critical primitives are built and
-> tested (60 tests passing). Services are not yet implemented. **Nothing trades.**
+> tested (112 tests passing). Services are not yet implemented. **Nothing trades.**
 
 ---
 
@@ -26,12 +26,14 @@ reasoning, not aspirations — the code is expected to match.
 
 | # | Document | Covers |
 |---|---|---|
+| **0** | **[MASTER_REFERENCE.md](Documents/MASTER_REFERENCE.md)** | **START HERE — everything about the system in one document** |
 | 1 | [ARCHITECTURE_RESEARCH.md](Documents/ARCHITECTURE_RESEARCH.md) | The *why* — research, AI layering, latency analysis |
 | 2 | [INDIA_FEATURES_AND_CONFIG.md](Documents/INDIA_FEATURES_AND_CONFIG.md) | The *what* — NSE/BSE rules, SEBI compliance, config schema |
 | 3 | [LOW_LEVEL_ARCHITECTURE.md](Documents/LOW_LEVEL_ARCHITECTURE.md) | The *how* — services, schemas, security, deployment |
 | 4 | [MVP_UI_AND_LEGAL.md](Documents/MVP_UI_AND_LEGAL.md) | Scope, screens, autonomy model, legal & tax framework |
 | 5 | [STRATEGY_ENGINE.md](Documents/STRATEGY_ENGINE.md) | Strategy DSL, AI generation, overfitting defence |
 | 6 | [VERIFICATION_REPORT.md](Documents/VERIFICATION_REPORT.md) | Cross-document audit |
+| 7 | [PRE_LIVE_CHECKLIST.md](Documents/PRE_LIVE_CHECKLIST.md) | **The gate before real capital** |
 
 ---
 
