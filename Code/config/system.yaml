@@ -99,9 +99,13 @@ execution:
   latency_headroom_multiplier: 2.0
   recalibrate_interval_daily: true
 
-  max_orders_per_second: 3        # Zerodha Kite allows ~3/sec - the BINDING
-                                  # constraint. SEBI's threshold is 10; the
-                                  # broker's own limit is lower and wins.
+  max_orders_per_second: 3        # OUR conservative choice. Zerodha enforces
+                                  # 10 OPS account-wide (429 above it), same
+                                  # as SEBI's threshold. This system trades on
+                                  # multi-minute intervals across ~5 slots, so
+                                  # 3/sec is ample and leaves large headroom.
+  market_protection: -1           # REQUIRED on MARKET/SL-M from 1 Apr 2026.
+                                  # -1 = broker auto-protection. 0 is rejected.
   order_type: limit
   limit_offset_pct: 0.05
   order_timeout_sec: 30

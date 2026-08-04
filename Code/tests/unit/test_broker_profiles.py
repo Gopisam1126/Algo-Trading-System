@@ -28,12 +28,13 @@ class TestProfiles:
         with pytest.raises(ValueError, match="unknown broker"):
             get_profile("some_random_broker")
 
-    def test_zerodha_rate_is_the_tighter_constraint(self) -> None:
-        """Zerodha's own limit binds before SEBI's threshold does."""
-        assert ZERODHA.max_orders_per_second < MAX_ORDERS_PER_SECOND
+    def test_zerodha_matches_sebi_threshold(self) -> None:
+        """Zerodha enforces 10 OPS account-wide, matching SEBI's threshold."""
+        assert ZERODHA.max_orders_per_second == 10
 
     def test_effective_rate_takes_the_minimum(self) -> None:
-        assert ZERODHA.effective_order_rate(MAX_ORDERS_PER_SECOND) == 3
+        """Our own cap is tighter than the broker's, so ours binds."""
+        assert ZERODHA.effective_order_rate(MAX_ORDERS_PER_SECOND) == MAX_ORDERS_PER_SECOND
 
     def test_every_profile_has_a_positive_rate(self) -> None:
         for key, profile in PROFILES.items():
@@ -65,27 +66,20 @@ class TestZerodhaOperationalCharacteristics:
 
 
 class TestConfigEnforcesBrokerLimit:
-    def test_over_broker_limit_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="permits only"):
-            AppConfig.model_validate({
-                "broker": {"primary": "zerodha"},
-                "execution": {"max_orders_per_second": 5},
-            })
-
-    def test_at_broker_limit_is_accepted(self) -> None:
+    def test_within_broker_limit_is_accepted(self) -> None:
         cfg = AppConfig.model_validate({
             "broker": {"primary": "zerodha"},
             "execution": {"max_orders_per_second": 3},
         })
         assert cfg.execution.max_orders_per_second == 3
 
-    def test_same_rate_is_fine_on_a_higher_limit_broker(self) -> None:
-        """3/sec is legal on Angel One too — the check is per broker."""
-        cfg = AppConfig.model_validate({
-            "broker": {"primary": "angelone"},
-            "execution": {"max_orders_per_second": 5},
-        })
-        assert cfg.execution.max_orders_per_second == 5
+    def test_our_own_hard_cap_still_binds(self) -> None:
+        """Even where the broker allows 10, our code cap of 5 wins."""
+        with pytest.raises(ValidationError, match="exceeds the hard cap"):
+            AppConfig.model_validate({
+                "broker": {"primary": "zerodha"},
+                "execution": {"max_orders_per_second": 8},
+            })
 
     def test_unknown_broker_in_config_is_rejected(self) -> None:
         with pytest.raises(ValidationError, match="unknown broker"):

@@ -243,6 +243,11 @@ class ExecutionConfig(_Model):
     order_timeout_sec: int = Field(default=30, ge=1)
     no_trade_windows: list[tuple[time, time]] = Field(default_factory=list)
 
+    #: Market protection for MARKET/SL-M orders. -1 = broker auto-protection.
+    #: Zerodha rejects unprotected market orders from 1 Apr 2026, and 0 is
+    #: explicitly rejected, so this may not be zero.
+    market_protection: Decimal = Decimal("-1")
+
     @field_validator("max_orders_per_second")
     @classmethod
     def _sebi_safe(cls, v: int) -> int:
@@ -252,6 +257,18 @@ class ExecutionConfig(_Model):
                 f"{MAX_ORDERS_PER_SECOND}. SEBI's algo-registration threshold is "
                 f"10 orders/sec per segment; we stay at half that deliberately."
             )
+        return v
+
+    @field_validator("market_protection")
+    @classmethod
+    def _protection_not_zero(cls, v: Decimal) -> Decimal:
+        if v == 0:
+            raise ValueError(
+                "market_protection of 0 is rejected by the broker. Use -1 for "
+                "auto-protection or a positive percentage."
+            )
+        if v < 0 and v != Decimal("-1"):
+            raise ValueError("the only valid negative market_protection is -1 (auto)")
         return v
 
     @model_validator(mode="after")

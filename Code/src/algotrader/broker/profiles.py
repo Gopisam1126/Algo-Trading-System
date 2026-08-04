@@ -72,6 +72,19 @@ class BrokerProfile:
     #: Whether historical data is a separate paid add-on.
     historical_data_extra_cost: bool
 
+    #: True when the static-IP whitelist applies ONLY to order endpoints,
+    #: leaving quotes/WebSocket/orderbook reachable from any IP.  This is
+    #: architecturally useful: it means only the execution service needs to
+    #: originate from the whitelisted address.
+    static_ip_order_endpoints_only: bool = False
+
+    #: True when MARKET and SL-M orders require an explicit market-protection
+    #: parameter, without which the broker rejects them.
+    requires_market_protection: bool = False
+
+    #: Broker-imposed daily order cap, if any (0 = none published).
+    max_orders_per_day: int = 0
+
     notes: str = ""
     verified_on: str = "2026-08"
     caveats: list[str] = field(default_factory=list)
@@ -84,30 +97,51 @@ class BrokerProfile:
 ZERODHA = BrokerProfile(
     key="zerodha",
     display_name="Zerodha Kite Connect",
-    max_orders_per_second=3,
+    # Zerodha staff on the Kite Connect developer forum state 10 OPS enforced
+    # ACCOUNT-WIDE (not per app) with HTTP 429 on excess: of 15 attempted, 10
+    # place and 5 are blocked.  An older documented Kite limit of ~3/sec
+    # circulates in secondary sources; the forum figure is more recent and
+    # comes from Zerodha directly.  We still run well under it by choice.
+    max_orders_per_second=10,
     max_data_requests_per_minute=200,
     auth_flow=AuthFlow.REDIRECT_REQUEST_TOKEN,
     daily_token_expiry=True,
     requires_manual_daily_login=True,
-    monthly_cost_inr=500,
+    monthly_cost_inr=500,          # data APIs; order placement reported free
     historical_data_extra_cost=True,
+    static_ip_order_endpoints_only=True,
+    requires_market_protection=True,
+    max_orders_per_day=3000,
     notes=(
-        "Most mature Indian broker API — best documentation and ecosystem. "
-        "Two operational constraints matter: the order rate is roughly a third "
-        "of Angel One's, and the daily auth is a browser redirect flow rather "
-        "than a programmatic login."
+        "Most mature Indian broker API - best documentation and ecosystem. "
+        "Static IP applies to ORDER endpoints only; quotes, WebSocket, "
+        "orderbook and positions remain reachable from any IP, which maps "
+        "cleanly onto this system's read-only vs trading service split."
     ),
     caveats=[
+        "MARKET and SL-M orders REQUIRE a market_protection parameter from "
+        "1 Apr 2026; without it the broker rejects them. Accepts -1 for "
+        "auto-protection or a numeric percentage. Market protection converts "
+        "a market order to a limit order and remains subject to exchange LPP "
+        "ranges.",
+        "pykiteconnect 5.1.0 on PyPI does NOT expose market_protection in "
+        "place_order() (it is on the main branch only - see zerodha/"
+        "pykiteconnect issue #225). Verify the installed version supports it "
+        "before relying on market or SL-M orders.",
         "Access token expires daily; a fresh login is required every trading "
-        "morning before pre-open.",
-        "Auth is a redirect flow (login URL -> request_token -> exchange with "
-        "api_secret). It cannot be fully automated without driving a browser "
-        "or using undocumented endpoints — confirm what Zerodha permits before "
-        "relying on either.",
-        "Historical data appears to be a separate paid add-on beyond the base "
-        "API subscription — CONFIRM current pricing with Zerodha.",
-        "3 orders/sec is the binding constraint, well below SEBI's 10/sec "
-        "threshold. Config must not exceed it.",
+        "morning before pre-open. Auth is a browser redirect flow, so this "
+        "step is manual by design in this deployment.",
+        "Each static IP can be linked to only one account (community-reported "
+        "error). Family sharing is permitted; multiple Zerodha accounts can "
+        "sit under one developer profile.",
+        "Zerodha applies a ~3,000 orders/day account cap for most users, "
+        "extendable on request - unlikely to bind for this system.",
+        "Historical data is a separate paid add-on beyond the base API "
+        "subscription - CONFIRM current pricing with Zerodha.",
+        "Self-developed algos under 10 OPS receive a GENERIC exchange algo ID "
+        "rather than a unique one. Sources disagree on whether the developer "
+        "attaches it via the order `tag` field or the broker injects it - "
+        "CONFIRM with Zerodha before going live.",
     ],
 )
 

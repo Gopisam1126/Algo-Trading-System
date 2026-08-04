@@ -228,12 +228,45 @@ class OrderRequest(_Frozen):
     intent: OrderIntent
     algo_id: str | None = None      # SEBI-mandated, attached by the gateway
 
+    #: Market protection for MARKET and SL-M orders.
+    #:
+    #: Zerodha rejects unprotected market orders from 1 Apr 2026. ``-1``
+    #: requests broker-default auto-protection; a positive value is a
+    #: percentage band. Market protection converts the market order into a
+    #: limit order and is still subject to exchange LPP ranges.
+    #:
+    #: Note this is NOT the same as our own stop-loss: it bounds slippage on
+    #: the fill, it does not bound the position's risk.
+    market_protection: Decimal | None = None
+
     @model_validator(mode="after")
     def _price_required_for_type(self) -> OrderRequest:
         if self.order_type in (OrderType.LIMIT, OrderType.SL) and self.limit_price is None:
             raise ValueError(f"{self.order_type} requires a limit price")
         if self.order_type in (OrderType.SL, OrderType.SLM) and self.trigger_price is None:
             raise ValueError(f"{self.order_type} requires a trigger price")
+        return self
+
+    @model_validator(mode="after")
+    def _market_orders_need_protection(self) -> OrderRequest:
+        """MARKET and SL-M orders must carry market protection.
+
+        Without it the broker rejects the order. Catching it here means the
+        failure surfaces in a unit test rather than as a rejected exit at
+        15:09 with a position still open.
+        """
+        if self.order_type in (OrderType.MARKET, OrderType.SLM):
+            if self.market_protection is None:
+                raise ValueError(
+                    f"{self.order_type.value} orders require market_protection "
+                    f"(-1 for broker auto-protection, or a percentage). "
+                    f"Unprotected market orders are rejected by the broker."
+                )
+            if self.market_protection != Decimal("-1") and self.market_protection <= 0:
+                raise ValueError(
+                    "market_protection must be -1 (auto) or a positive percentage; "
+                    "0 is explicitly rejected by the broker"
+                )
         return self
 
 

@@ -31,7 +31,11 @@ dependencies = [
     "TA-Lib>=0.4.32",          # requires the C library — see README
 
     # --- Broker ---
-    "kiteconnect>=5.0",        # Zerodha Kite Connect (primary)
+    # WARNING: pykiteconnect 5.1.0 on PyPI does NOT expose market_protection
+    # in place_order() (main branch only - zerodha/pykiteconnect#225).
+    # MARKET and SL-M orders are REJECTED without it from 1 Apr 2026.
+    # Verify support before live trading; install from git if needed.
+    "kiteconnect>=5.1",        # Zerodha Kite Connect (primary)
 
     # --- AI ---
     "anthropic>=0.40",
