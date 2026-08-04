@@ -49,13 +49,14 @@ These are not preferences. Violating any of them either breaks the law, breaks t
 | # | Constraint | Source | Enforcement point |
 |---|---|---|---|
 | C1 | Deployment must run on an **Indian server** with a **static, broker-whitelisted IP** | SEBI framework | Infrastructure (§13) |
-| C2 | Order rate must stay **below 10 orders/second**; system caps at 5 | SEBI threshold | `OrderGateway` token bucket (§5.7) |
+| C2 | Order rate must stay **below 10 orders/second**; system runs at 3 | SEBI threshold **and** Zerodha's account-wide limit (both 10) | `OrderGateway` token bucket (§5.7); per-broker ceilings in `broker/profiles.py` |
 | C3 | Broker session must **re-authenticate daily before pre-open** | SEBI auto-logout | `AuthManager` scheduled job (§5.1) |
 | C4 | The **LLM must never compute position size, stop price, or place an order** | Companion §6.2 | Type system: AI layer returns `Recommendation`, not `Order` (§6.4) |
 | C5 | Every intraday position must be closed on **our own schedule**, before the broker's per-stock auto square-off | NSE CAS regime | `PositionManager` deadline timer (§5.8) |
 | C6 | No secret may exist in source, config files, logs, or LLM prompts | Security | `SecretsProvider` + log redaction filter (§10) |
 | C7 | Every order must be **idempotent** and traceable to the decision that produced it | Auditability | `client_order_id` = deterministic hash (§8.2) |
 | C8 | The system must **fail closed** — any component failure stops new entries, never opens new risk | Safety | `HealthGate` in `RiskEngine` (§5.7) |
+| C9 | **MARKET and SL-M orders must carry `market_protection`** | Zerodha, from 1 Apr 2026 | `OrderRequest` model validator — an unprotected market order will not construct |
 
 ### 1.2 Design principles
 

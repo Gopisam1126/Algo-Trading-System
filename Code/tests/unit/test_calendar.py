@@ -131,3 +131,45 @@ class TestTimezoneDiscipline:
         offset = datetime(2026, 8, 4, tzinfo=ZoneInfo("Asia/Kolkata")).utcoffset()
         assert offset is not None
         assert offset.total_seconds() == 5.5 * 3600
+
+
+# ---------------------------------------------------------------------------
+# Regression: OHLC coherence
+#
+# A field_validator on `high` only sees fields declared before it, so checks
+# against `low` and `close` were silently no-ops and `close > high` reached
+# the indicator engine as a corrupt bar. Fixed by moving to a model_validator.
+# ---------------------------------------------------------------------------
+
+
+class TestBarOHLCCoherence:
+    @staticmethod
+    def _bar(o: str, h: str, low: str, c: str):
+        from decimal import Decimal
+
+        from algotrader.common.enums import Timeframe
+        from algotrader.common.models.market import Bar
+
+        return Bar(
+            symbol="TEST", timeframe=Timeframe.M5, open_ts=datetime.now(UTC),
+            open=Decimal(o), high=Decimal(h), low=Decimal(low), close=Decimal(c),
+            volume=100,
+        )
+
+    @pytest.mark.parametrize(
+        "name,o,h,low,c",
+        [
+            ("close above high", "100", "105", "98", "110"),
+            ("close below low", "100", "105", "98", "95"),
+            ("open above high", "100", "99.5", "98", "99"),
+            ("open below low", "100", "105", "101", "102"),
+            ("high below low", "100", "97", "99", "98"),
+        ],
+    )
+    def test_incoherent_bars_rejected(self, name, o, h, low, c) -> None:
+        with pytest.raises(Exception):
+            self._bar(o, h, low, c)
+
+    def test_coherent_bar_accepted(self) -> None:
+        bar = self._bar("100", "105", "98", "102")
+        assert bar.high >= bar.close >= bar.low

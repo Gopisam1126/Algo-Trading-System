@@ -23,11 +23,27 @@ import structlog
 from algotrader.common.secrets import REDACTED, SecretString
 
 #: Patterns that look like credentials regardless of where they came from.
+#:
+#: These are a BACKSTOP, not the primary defence.  Exact-match scrubbing of
+#: values loaded from the secrets provider (``known_values``) plus the
+#: sensitive-key-name list below do the real work; regexes only catch
+#: credentials that arrive from somewhere we did not load them, such as a
+#: third-party SDK echoing a response body.
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}", re.I),        # Anthropic keys
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-.]+"),  # JWTs
-    re.compile(r"\b[0-9]{6}\b(?=\s*(?:totp|otp))", re.I),      # TOTP codes
-    re.compile(r"(?i)\b(api[_-]?key|secret|password|token|totp)\b\s*[:=]\s*\S+"),
+    # Anthropic API keys
+    re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{10,}", re.I),
+    # JWTs — match the three-part header.payload.signature structure rather
+    # than assuming a minimum header length. A short-header token was
+    # previously slipping through.
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]*"),
+    # Bearer tokens in headers
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9_\-.=]{8,}"),
+    # Base32 TOTP seeds (typically 16-32 chars, A-Z and 2-7)
+    re.compile(r"\b[A-Z2-7]{16,64}={0,6}\b(?=\s*(?:totp|seed|secret))", re.I),
+    # Six-digit OTP adjacent to a totp/otp label
+    re.compile(r"\b[0-9]{6}\b(?=\s*(?:totp|otp))", re.I),
+    # Any credential-shaped assignment
+    re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token|totp|access_token)\b\s*[:=]\s*\S+"),
 ]
 
 #: Field names whose values are always redacted, whatever they contain.

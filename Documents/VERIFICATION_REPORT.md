@@ -148,4 +148,87 @@ Honest accounting of what remains uncertain:
 
 ---
 
+---
+
+## 9. Second audit — 2026-08-04 (post-Zerodha, post-scaffold)
+
+A second full pass covering the code scaffold, which did not exist at the first
+audit. Static scan, behavioural probing, container posture, and document
+cross-check. **Two live bugs found and fixed** — both in code that reads
+correctly but did not behave as written.
+
+### B1 — CRITICAL: OHLC bar validation was partially inert
+
+`Bar._high_is_highest` and `_low_is_lowest` were Pydantic **field** validators.
+A field validator only sees fields declared *before* it, so when `high` was
+validated, `low` and `close` did not yet exist — those comparisons silently did
+nothing.
+
+**Consequence:** a bar with `close > high` or `close < low` validated
+successfully and would have reached the indicator engine. That is precisely the
+corrupt-bar class the validation existed to prevent, and it would have
+propagated into every downstream EMA and ATR with no error raised.
+
+**Fix:** replaced with a `model_validator(mode="after")`, which sees all fields.
+Five-case regression test added. Audited every other validator in the codebase —
+all remaining cross-field logic already uses `model_validator`, so this was the
+only instance.
+
+### B2 — Log redaction: short JWTs leaked
+
+The JWT pattern required 20+ characters after `eyJ`. Real tokens with short
+headers (e.g. `eyJhbGciOiJIUzI1NiJ9`, 17 chars after the prefix) did not match
+and would have been logged in full.
+
+**Fix:** match the three-part `header.payload.signature` structure instead of
+assuming a header length. Also added Bearer-token and base32 TOTP-seed patterns.
+Twelve redaction paths now tested, plus false-positive guards confirming
+ordinary trading text survives intact.
+
+### Verified clean
+
+| Area | Result |
+|---|---|
+| `eval` / `exec` / `__import__` / `shell=True` / `os.system` in source | None |
+| YAML loading | `safe_load` everywhere; `!!python/object`, `!!python/name`, `!!python/module` all blocked |
+| `float` in money or price paths | None — `Decimal` throughout, exact arithmetic verified |
+| Naive `datetime` construction | None |
+| SecretString leak paths | 10 tested (str, repr, f-string, format, %-format, join, exception, list, dict, pickle) — all redacted |
+| Config hard bounds | Order rate, risk %, market protection, T2T filter, human approval all reject as designed |
+| `Recommendation` sizing surface | No quantity/size/capital/stop fields; `extra="forbid"` blocks injection |
+| Square-off deadlines | Ours precedes broker's for every stock class |
+| Container posture | Non-root, capabilities dropped, no privileged/host-network, `core` network `internal: true`, images pinned by tag, all ports bound to 127.0.0.1 |
+| `.gitignore` coverage | `.env` ignored at any depth; secrets, keys, market data all excluded |
+| Repository secret scan | Clean — no keys, no `.env`, no private keys |
+
+### Document drift corrected
+
+The Zerodha switch left five stale claims across the specifications:
+
+1. Zerodha listed at "~3 orders/sec" — actually **10 OPS account-wide** per Zerodha staff.
+2. Angel One still named as the primary recommendation.
+3. Config examples showing `primary: angelone` and `max_orders_per_second: 5`.
+4. **Market protection undocumented** — a code-breaking requirement absent from every doc.
+5. **Static IP scope undocumented** — it applies to order endpoints only, which is
+   architecturally useful and was not recorded.
+
+All corrected. A new §3.3 in INDIA_FEATURES_AND_CONFIG.md holds the verified
+Zerodha constraint table, and a new constraint **C9** (market protection) was
+added to LOW_LEVEL_ARCHITECTURE.md §1.1.
+
+**Test count: 60 → 112.**
+
+### Still unresolved
+
+- **Algo-ID attachment mechanics.** Sources disagree on whether the developer
+  supplies it via the order `tag` field or the broker injects it. One line of
+  code either way, but it must be confirmed with Zerodha before live.
+- **`pykiteconnect` 5.1.0 lacks `market_protection`.** A plain
+  `pip install kiteconnect` yields a version that cannot place compliant market
+  orders. Verify the installed version before live trading.
+- **NSE holiday list is an empty placeholder.** Until populated, every weekday
+  is treated as a trading day.
+
+---
+
 *End of report.*

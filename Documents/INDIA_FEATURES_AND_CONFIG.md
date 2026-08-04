@@ -96,15 +96,36 @@ These feed the "Market Condition Context" object (companion doc §7):
 | Broker | Order rate limit | Data cost | Notes |
 |---|---|---|---|
 | **Angel One SmartAPI** | ~10 orders/sec | Free | Frequently cited as the strongest free option — reliable WebSocket streaming, practical rate limits. Strong default candidate. |
-| **Zerodha Kite Connect** | ~3 orders/sec, ~200 data req/min | ~₹500/mo per API key | Most mature ecosystem and documentation. **Daily access-token expiry — needs fresh login every trading day** (which the SEBI auto-logout rule mandates anyway, so it's less of a drawback now than it used to be). Lower order-rate limit is fine for this system's design. |
+| **Zerodha Kite Connect** ⭐ | **10 orders/sec** account-wide (429 above), ~200 data req/min | ~₹500/mo (data APIs; order placement reported free) | **SELECTED — see §3.3 for verified constraints.** Most mature ecosystem and documentation. Daily token expiry via a browser-redirect flow. |
 | **Fyers API** | — | Free | Free API, free minute-level historical data for ~1–2 years via API — genuinely useful for backtesting. Native TradingView integration. |
 | **DhanHQ** | — | ₹0 orders / ₹499 for real-time + historical data | Native TradingView integration. |
 | **Upstox API v2** | — | Free | Execution-focused; reported order round-trips in the 40–80 ms range. |
 | Alice Blue / Shoonya | — | Free | Additional free-API options. |
 
-**Recommendation:** Start with **Angel One SmartAPI** (free, 10 OPS headroom, reliable WebSocket) or **Fyers** (free + free minute-level history, which removes a real cost barrier for the backtesting/pre-market historical analysis this system depends on). Consider running **Zerodha Kite Connect** in parallel as a data/execution fallback if reliability matters — WebSocket stability at market open and on expiry days is a known pain point across Indian broker APIs, and having a second connection is cheap insurance.
+**Decision: Zerodha Kite Connect (primary) + Fyers (data fallback).** Chosen for ecosystem maturity and documentation quality. Fyers remains in the design as a secondary data feed — its free minute-level history removes a real cost barrier for pre-market analysis, and a second WebSocket is cheap insurance against the open/expiry-day instability common to Indian broker APIs.
+
+> **Corrected.** An earlier revision put Zerodha at ~3 orders/sec from a secondary source. Zerodha staff state **10 OPS enforced account-wide** on the Kite Connect developer forum. See §3.3.
 
 ⚠️ **Verify each broker's current SEBI-framework compliance status and API terms directly** — the April 2026 deadline reshaped what brokers permit, and blog comparisons go stale fast.
+
+### 3.3 ⚠️ Zerodha Kite Connect — verified operational constraints
+
+Confirmed against Zerodha's own Kite Connect developer forum (staff replies) and
+Z-Connect, August 2026. The machine-readable copy lives in
+`Code/src/algotrader/broker/profiles.py` and is the authoritative version.
+
+| Constraint | Detail | Design impact |
+|---|---|---|
+| **Order rate** | **10 OPS enforced account-wide** (not per app); HTTP 429 above it. Of 15 attempted, 10 place and 5 are blocked. | We run at 3/sec by choice, not necessity. |
+| **Market protection** ⚠️ | **MARKET and SL-M orders REQUIRE a `market_protection` parameter from 1 Apr 2026.** Without it the broker rejects them; `0` is also rejected. `-1` requests broker auto-protection. It converts a market order into a limit order and remains subject to exchange LPP ranges. | **Highest-risk item.** The square-off exit is a market order — an unprotected one means the position does not close and the broker force-closes it at whatever price is there. Enforced in `OrderRequest`. |
+| **pykiteconnect gap** ⚠️ | Version 5.1.0 on PyPI does **not** expose `market_protection` in `place_order()`; it is on the main branch only (zerodha/pykiteconnect#225). | A plain `pip install kiteconnect` yields a version that cannot place compliant market orders. **Verify before live.** |
+| **Static IP scope** ✅ | Applies to **order endpoints only**. Quotes, WebSocket, orderbook and positions stay reachable from any IP. | Maps cleanly onto the read-only vs trading service split — only `execution-svc` must originate from the whitelisted address. |
+| **IP registration** | `developers.kite.trade` → profile → "IP Whitelist". IPv4 and IPv6 both accepted. Orders from an unregistered IP are rejected. | One-time setup, verified at startup by `doctor.py`. |
+| **IP binding** | Each static IP binds to **one account**. Family sharing is permitted; multiple Zerodha accounts can sit under one developer profile. | Relevant only when extending to family accounts. |
+| **Daily auth** | Browser redirect: login URL → `request_token` → exchange with `api_secret` → `access_token`, expiring daily. | **Manual daily login accepted** for this deployment. Sets a floor of one human touchpoint each trading morning. |
+| **Algo-ID** | Self-developed algos under 10 OPS receive a **generic** exchange ID, not a unique registered one. | ⚠️ Sources disagree on whether the developer attaches it via the order `tag` field or the broker injects it — **confirm with Zerodha before live**. |
+| **Daily order cap** | ~3,000 orders/day for most accounts, extendable on request. | Far above this system's usage. |
+| **Cost** | ~₹500/month for data APIs; order placement reported free. Historical data appears to be a separate add-on. | Confirm current pricing directly. |
 
 ### 3.2 Historical data for the pre-market engine
 The pre-market analysis engine (§4) needs multi-year, multi-timeframe historical data for the full universe:
@@ -302,7 +323,7 @@ system:
 
 # ------------------------------------------------------------
 broker:
-  primary: angelone              # angelone | zerodha | fyers | dhan | upstox
+  primary: zerodha               # angelone | zerodha | fyers | dhan | upstox
   fallback: fyers                # optional secondary for data redundancy
   algo_id: ""                    # exchange-assigned; confirm with broker
   auth:
@@ -514,7 +535,9 @@ execution:
   latency_headroom_multiplier: 2.0
   recalibrate_interval_daily: true
 
-  max_orders_per_second: 5               # SEBI threshold is 10 — stay well under
+  max_orders_per_second: 3               # our conservative choice; Zerodha and
+                                         # SEBI both permit 10
+  market_protection: -1                  # REQUIRED on MARKET/SL-M — see §3.3
   order_type: limit                      # limit orders reduce slippage vs market
   limit_offset_pct: 0.05
   order_timeout_sec: 30

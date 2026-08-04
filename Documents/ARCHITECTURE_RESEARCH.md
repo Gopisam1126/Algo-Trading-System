@@ -103,12 +103,14 @@ In India, market data and execution come bundled through the **broker's API**; t
 |---|---|---|---|
 | **Angel One SmartAPI** | ~10 orders/sec | Free | Reliable WebSocket, practical rate limits. Strong default. |
 | **Fyers API** | — | Free | Free minute-level history (~1–2 years) — removes a real cost barrier for the pre-market historical analysis this system depends on. |
-| **Zerodha Kite Connect** | ~3 orders/sec | ~₹500/mo per key | Most mature ecosystem; daily token expiry (which SEBI mandates anyway). |
+| **Zerodha Kite Connect** ⭐ | **10 orders/sec** account-wide (429 above) | ~₹500/mo (data APIs; order placement reported free) | **SELECTED.** Most mature ecosystem and documentation. Browser-redirect daily auth; static IP applies to order endpoints only. |
 | **DhanHQ** | — | ₹0 orders / ₹499 data | Native TradingView integration. |
 | **Upstox API v2** | — | Free | Execution-focused; 40–80 ms order round-trips reported. |
 | **NSE Bhavcopy** | n/a | Free | Daily EOD; the basis of the long-run local archive. |
 
-**Recommendation:** **Angel One SmartAPI** primary (free, 10 OPS headroom, reliable WebSocket), with **Fyers** as a secondary for data redundancy and free intraday history. WebSocket stability at the open and on expiry days is a known weak point across Indian broker APIs, so a second connection is cheap insurance.
+**Decision (v1.2): Zerodha Kite Connect is the primary broker**, with **Fyers** as secondary for data redundancy and free intraday history. WebSocket stability at the open and on expiry days is a known weak point across Indian broker APIs, so a second connection is cheap insurance.
+
+> **Corrected in v1.2.** An earlier revision recorded Zerodha at ~3 orders/sec from a secondary source and recommended Angel One partly on that basis. Zerodha staff state on the Kite Connect developer forum that **10 OPS is enforced account-wide** with HTTP 429 above it — matching SEBI's threshold rather than being a third of it. Verified operational detail is maintained in code at `Code/src/algotrader/broker/profiles.py`, which is the authoritative copy.
 
 ### 3.2 REST vs. WebSocket
 - **WebSocket is mandatory for the fast loop.** Polling via REST introduces avoidable per-request latency and rate-limit pressure; WebSocket pushes trades/quotes/bar-updates as they occur. Every credible 2026 source treats WebSocket streaming as baseline, not optional, for anything faster than end-of-day.

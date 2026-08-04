@@ -20,7 +20,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from algotrader.common.enums import Exchange, Timeframe
 
@@ -110,25 +110,24 @@ class Bar(_Frozen):
 
     _utc = field_validator("open_ts")(_require_utc)
 
-    @field_validator("high")
-    @classmethod
-    def _high_is_highest(cls, v: Decimal, info: object) -> Decimal:
-        data = getattr(info, "data", {})
-        for field in ("open", "low", "close"):
-            other = data.get(field)
-            if other is not None and v < other:
-                raise ValueError(f"high {v} is below {field} {other}")
-        return v
+    @model_validator(mode="after")
+    def _ohlc_is_coherent(self) -> Bar:
+        """Enforce high >= {open, low, close} and low <= {open, close}.
 
-    @field_validator("low")
-    @classmethod
-    def _low_is_lowest(cls, v: Decimal, info: object) -> Decimal:
-        data = getattr(info, "data", {})
-        for field in ("open", "close"):
-            other = data.get(field)
-            if other is not None and v > other:
-                raise ValueError(f"low {v} is above {field} {other}")
-        return v
+        This MUST be a model validator, not a field validator.  A
+        ``field_validator`` on ``high`` only sees fields declared before it
+        (open), so checks against ``low`` and ``close`` silently do nothing —
+        which is exactly how ``close > high`` used to slip through and reach
+        the indicator engine as a corrupt bar.
+        """
+        if self.high < self.low:
+            raise ValueError(f"high {self.high} is below low {self.low}")
+        for name, value in (("open", self.open), ("close", self.close)):
+            if value > self.high:
+                raise ValueError(f"{name} {value} is above high {self.high}")
+            if value < self.low:
+                raise ValueError(f"{name} {value} is below low {self.low}")
+        return self
 
     @property
     def range(self) -> Decimal:
