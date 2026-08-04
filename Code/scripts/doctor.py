@@ -127,11 +127,31 @@ def check_compliance(r: Report) -> None:
 
     live = cfg.system.mode is SystemMode.LIVE
 
-    if cfg.execution.max_orders_per_second <= 5:
-        r.ok(f"order rate {cfg.execution.max_orders_per_second}/sec",
-             "SEBI threshold is 10")
+    # The binding constraint is min(SEBI cap, broker API limit).
+    try:
+        from algotrader.broker.profiles import get_profile
+
+        profile = get_profile(cfg.broker.primary)
+    except ValueError as exc:
+        r.fail("unknown broker in config", str(exc)[:80])
+        return
+
+    rate = cfg.execution.max_orders_per_second
+    if rate <= profile.max_orders_per_second:
+        r.ok(f"order rate {rate}/sec",
+             f"{profile.display_name} allows {profile.max_orders_per_second}, SEBI 10")
     else:
-        r.fail(f"order rate {cfg.execution.max_orders_per_second}/sec is too high")
+        r.fail(f"order rate {rate}/sec exceeds broker limit",
+               f"{profile.display_name} allows only {profile.max_orders_per_second}")
+
+    # Zerodha-style redirect auth cannot complete unattended. That is an
+    # operational constraint on autonomy, not a bug — surface it so it is a
+    # known trade-off rather than a 07:00 surprise.
+    if profile.requires_manual_daily_login:
+        r.warn(f"{profile.display_name} needs a manual daily login",
+               "redirect auth flow - unattended operation needs this solved")
+    else:
+        r.ok(f"{profile.display_name} supports programmatic daily login")
 
     india = {"ap-south-1", "ap-south-2", "centralindia", "southindia", "asia-south1"}
     if cfg.system.deployment_region.lower() in india:

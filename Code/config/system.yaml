@@ -25,11 +25,14 @@ system:
 
 # ---------------------------------------------------------------------------
 broker:
-  primary: angelone               # angelone | zerodha | fyers | dhan | upstox
-  fallback: fyers
+  primary: zerodha                # angelone | zerodha | fyers | dhan | upstox
+  fallback: fyers                 # free minute-level history; data redundancy
   algo_id: ""                     # exchange-assigned; required for live mode
   auth:
-    method: oauth_2fa
+    # Zerodha uses a REDIRECT flow (login URL -> request_token -> access_token),
+    # not a programmatic login. The token expires daily and must be renewed
+    # before pre-open. See broker/profiles.py for the operational caveats.
+    method: redirect_request_token
     daily_reauth_time: "07:00"    # SEBI: sessions auto-logout before pre-open
     credentials_source: env
 
@@ -96,7 +99,9 @@ execution:
   latency_headroom_multiplier: 2.0
   recalibrate_interval_daily: true
 
-  max_orders_per_second: 5        # hard cap; SEBI threshold is 10
+  max_orders_per_second: 3        # Zerodha Kite allows ~3/sec - the BINDING
+                                  # constraint. SEBI's threshold is 10; the
+                                  # broker's own limit is lower and wins.
   order_type: limit
   limit_offset_pct: 0.05
   order_timeout_sec: 30

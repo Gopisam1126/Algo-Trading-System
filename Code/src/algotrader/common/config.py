@@ -444,6 +444,33 @@ class AppConfig(_Model):
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
 
     @model_validator(mode="after")
+    def _order_rate_within_broker_limit(self) -> Self:
+        """The binding constraint is min(SEBI cap, broker API limit).
+
+        SEBI's threshold is 10 orders/sec and we cap at 5 — but a broker may
+        allow far less.  Zerodha Kite Connect permits roughly 3/sec, so a
+        config carried over from a different broker is actively wrong and
+        would get throttled by the broker rather than caught by us.
+        """
+        from algotrader.broker.profiles import get_profile
+
+        try:
+            profile = get_profile(self.broker.primary)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from None
+
+        if self.execution.max_orders_per_second > profile.max_orders_per_second:
+            raise ValueError(
+                f"execution.max_orders_per_second is "
+                f"{self.execution.max_orders_per_second}, but "
+                f"{profile.display_name} permits only "
+                f"{profile.max_orders_per_second}/sec. Exceeding the broker's "
+                f"own API limit gets you throttled regardless of what SEBI "
+                f"allows. Lower it to {profile.max_orders_per_second} or below."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _live_mode_requires_compliance(self) -> Self:
         if self.system.mode is SystemMode.LIVE:
             if not self.system.static_ip:

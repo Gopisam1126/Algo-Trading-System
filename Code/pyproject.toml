@@ -30,6 +30,9 @@ dependencies = [
     "pandas>=2.2",
     "TA-Lib>=0.4.32",          # requires the C library — see README
 
+    # --- Broker ---
+    "kiteconnect>=5.0",        # Zerodha Kite Connect (primary)
+
     # --- AI ---
     "anthropic>=0.40",
 
