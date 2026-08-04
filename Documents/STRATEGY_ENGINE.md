@@ -12,6 +12,7 @@
 4. [MVP_UI_AND_LEGAL.md](MVP_UI_AND_LEGAL.md) — scope, screens, law
 5. **This document** — the strategy lifecycle: authoring, AI generation, validation, promotion, retirement
 6. [VERIFICATION_REPORT.md](VERIFICATION_REPORT.md) — cross-document audit
+7. [PRE_LIVE_CHECKLIST.md](PRE_LIVE_CHECKLIST.md) — the consolidated gate before real capital
 
 ---
 

@@ -204,6 +204,83 @@ def check_egress_ip(r: Report) -> None:
         r.fail("egress IP MISMATCH", f"expected {expected}, got {actual}")
 
 
+def check_market_calendar(r: Report) -> None:
+    """An incomplete holiday list is a SILENT failure.
+
+    The system would treat a market holiday as a normal trading day, run the
+    pre-market pipeline against data that never arrives, and potentially
+    compute indicators across a phantom session. Nothing errors — it just
+    quietly does the wrong thing. Hence an explicit check.
+    """
+    section("Market calendar")
+
+    from algotrader.common.calendar import DEFAULT_HOLIDAY_FILE, load_holidays_with_status
+
+    path = Path(__file__).parents[1] / DEFAULT_HOLIDAY_FILE
+    status = load_holidays_with_status(str(path) if path.exists() else None)
+
+    if status.is_trustworthy:
+        r.ok(f"holiday list verified ({status.count} dates)", status.source)
+    elif status.count == 0:
+        r.fail(
+            "NO holiday list loaded",
+            "every weekday will be treated as a trading day",
+        )
+    else:
+        r.warn(
+            f"holiday list INCOMPLETE ({status.count} dates)",
+            "fixed-date only; lunar festivals missing - populate from the NSE circular",
+        )
+
+    # Sanity: a known fixed holiday must actually be excluded.
+    from datetime import date as _date
+
+    from algotrader.common.calendar import MarketCalendar
+
+    cal = MarketCalendar(status.dates)
+    republic_day = _date(2026, 1, 26)
+    if status.count:
+        if cal.is_trading_day(republic_day):
+            r.fail("Republic Day treated as a trading day", "holiday list is not applied")
+        else:
+            r.ok("holiday exclusion works", "26 Jan 2026 correctly excluded")
+
+
+def check_broker_sdk(r: Report) -> None:
+    """Verify the installed Kite SDK can actually place compliant orders.
+
+    pykiteconnect 5.1.0 on PyPI omits `market_protection` from place_order().
+    MARKET and SL-M orders are rejected without it from 1 Apr 2026, so a plain
+    `pip install kiteconnect` yields an SDK that cannot square off a position.
+    """
+    section("Broker SDK")
+
+    try:
+        import kiteconnect
+    except ImportError:
+        r.warn("kiteconnect not installed", "required before any broker work")
+        return
+
+    version = getattr(kiteconnect, "__version__", "unknown")
+
+    try:
+        import inspect
+
+        params = inspect.signature(kiteconnect.KiteConnect.place_order).parameters
+    except Exception as exc:  # noqa: BLE001
+        r.warn(f"kiteconnect {version} - could not inspect place_order", str(exc)[:60])
+        return
+
+    if "market_protection" in params:
+        r.ok(f"kiteconnect {version} supports market_protection")
+    else:
+        r.fail(
+            f"kiteconnect {version} LACKS market_protection",
+            "MARKET/SL-M orders will be rejected - install from git main "
+            "(zerodha/pykiteconnect#225)",
+        )
+
+
 def check_strategies(r: Report) -> None:
     section("Strategies")
     try:
@@ -280,6 +357,8 @@ def main() -> int:
     check_config(r)
     check_compliance(r)
     check_secrets(r)
+    check_broker_sdk(r)
+    check_market_calendar(r)
     check_strategies(r)
     check_egress_ip(r)
 

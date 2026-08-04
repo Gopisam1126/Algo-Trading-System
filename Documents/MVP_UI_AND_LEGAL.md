@@ -12,6 +12,7 @@
 4. **This document** — the *scope, the screens, and the law*
 5. [STRATEGY_ENGINE.md](STRATEGY_ENGINE.md) — strategy DSL, registry lifecycle, AI generation, validation gauntlet
 6. [VERIFICATION_REPORT.md](VERIFICATION_REPORT.md) — cross-document audit
+7. [PRE_LIVE_CHECKLIST.md](PRE_LIVE_CHECKLIST.md) — the consolidated gate before real capital
 
 ---
 

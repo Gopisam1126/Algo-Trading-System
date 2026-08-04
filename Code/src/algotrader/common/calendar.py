@@ -198,28 +198,91 @@ class MarketCalendar:
         )
 
 
-def load_holidays(path: str | None = None) -> frozenset[date]:
-    """Load the NSE holiday list from a YAML file.
+DEFAULT_HOLIDAY_FILE = "config/nse_holidays.yaml"
 
-    Expected shape::
 
-        holidays:
-          - 2026-01-26   # Republic Day
-          - 2026-03-06   # Holi
+class HolidayCalendarStatus:
+    """Where the holiday list came from and whether it can be trusted.
 
-    Falls back to the (empty) built-in list if no path is given — which means
-    the system will treat every weekday as a trading day.  Supply the real
-    list before live trading.
+    Returned alongside the dates so callers — notably ``doctor.py`` — can warn
+    when the calendar is incomplete.  An incomplete list is a *silent* failure:
+    the system treats a market holiday as a normal trading day and runs a
+    pre-market cycle against data that will never arrive.
+    """
+
+    __slots__ = ("dates", "verified", "source", "path", "count")
+
+    def __init__(
+        self,
+        dates: frozenset[date],
+        *,
+        verified: bool,
+        source: str,
+        path: str | None,
+    ) -> None:
+        self.dates = dates
+        self.verified = verified
+        self.source = source
+        self.path = path
+        self.count = len(dates)
+
+    @property
+    def is_trustworthy(self) -> bool:
+        """True only when the file declares itself checked against NSE."""
+        return self.verified and self.count > 0
+
+    def __repr__(self) -> str:
+        state = "verified" if self.is_trustworthy else "INCOMPLETE"
+        return f"HolidayCalendarStatus({self.count} dates, {state}, {self.source!r})"
+
+
+def load_holidays_with_status(path: str | None = None) -> HolidayCalendarStatus:
+    """Load the NSE holiday list, reporting whether it can be trusted.
+
+    The file declares ``meta.verified_against_nse_circular``.  Until that is
+    set to true, the list is treated as incomplete and callers should surface
+    a warning rather than silently proceeding.
     """
     if path is None:
-        return _FALLBACK_HOLIDAYS_2026
+        return HolidayCalendarStatus(
+            _FALLBACK_HOLIDAYS_2026,
+            verified=False,
+            source="built-in fallback (empty)",
+            path=None,
+        )
 
     import yaml
 
-    with open(path, encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh) or {}
-    entries = raw.get("holidays", [])
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        return HolidayCalendarStatus(
+            _FALLBACK_HOLIDAYS_2026,
+            verified=False,
+            source=f"file not found: {path}",
+            path=path,
+        )
+
     parsed: set[date] = set()
-    for entry in entries:
+    for entry in raw.get("holidays") or []:
         parsed.add(entry if isinstance(entry, date) else date.fromisoformat(str(entry)))
-    return frozenset(parsed)
+
+    meta = raw.get("meta") or {}
+    return HolidayCalendarStatus(
+        frozenset(parsed),
+        verified=bool(meta.get("verified_against_nse_circular", False)),
+        source=str(meta.get("source", path)),
+        path=path,
+    )
+
+
+def load_holidays(path: str | None = None) -> frozenset[date]:
+    """Load the NSE holiday list from a YAML file.
+
+    Convenience wrapper over :func:`load_holidays_with_status` for callers
+    that only need the dates.  **Prefer the status-returning version** where
+    the completeness of the calendar matters — which is anywhere near a
+    trading decision.
+    """
+    return load_holidays_with_status(path).dates

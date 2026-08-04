@@ -6,8 +6,8 @@ A personal-use algorithmic trading system for Indian equities (NSE/BSE). It
 handles real money. Treat every change to `execution/`, `common/config.py`, or
 the strategy validation path as safety-critical.
 
-Design documents are in `../Documents/` — six of them, numbered in reading
-order. **Read the relevant one before changing behaviour it specifies.** They
+Design documents are in `../Documents/` — seven of them, numbered in reading
+order. `PRE_LIVE_CHECKLIST.md` is the gate before real capital. **Read the relevant one before changing behaviour it specifies.** They
 are not aspirational; they record decisions with reasoning, and the code is
 expected to match.
 
@@ -55,6 +55,34 @@ found a design conflict rather than an obstacle.
 - Strategies are pure functions over a `MultiTimeframeSnapshot` — no I/O, no
   randomness. This is what makes them backtestable by replay.
 
+## Verifying your own work
+
+**Static review does not catch behaviour.** Two real bugs shipped past a clean
+code read in this repo:
+
+- `Bar` used a Pydantic *field* validator for OHLC coherence. A field validator
+  cannot see fields declared after it, so the `close > high` check was inert.
+  A corrupt bar validated successfully and would have reached the indicator
+  engine with no error raised.
+- The log redactor's JWT pattern required a longer header than real tokens
+  have, so short JWTs were logged in full.
+
+Both read correctly. Both took under a minute to find by *running* them —
+constructing a deliberately invalid bar, feeding a real token through the
+redactor.
+
+So when you add or change a safety-relevant claim, write the probe that would
+catch it being false:
+
+| Claim | Probe |
+|---|---|
+| "this validator rejects X" | Construct X; assert it raises |
+| "secrets are redacted" | Pass a real-shaped secret; grep the output |
+| "config rejects bad values" | Set the bad value; assert it fails |
+| "the deadline is respected" | Compare against the real broker deadline |
+
+Prefer a failing test over a comment asserting correctness.
+
 ## Before you commit
 
 ```bash
@@ -100,8 +128,13 @@ Never commit a `.env`, a credential, or anything under `data/`.
 ## Current state
 
 Phase 0 complete: domain models, config with hard bounds, secrets, logging with
-redaction, NSE calendar, broker protocol, strategy DSL with 27 primitives, and
-60 passing tests. Services are stubs. Nothing trades.
+redaction, NSE calendar, broker protocol (Zerodha Kite Connect primary), strategy
+DSL with 27 primitives, and 112 passing tests. Services are stubs. Nothing trades.
+
+Three items are open and tracked in `../Documents/PRE_LIVE_CHECKLIST.md`:
+Algo-ID attachment mechanic unconfirmed, `kiteconnect` on PyPI lacks
+`market_protection`, and the NSE holiday list is incomplete. `make doctor`
+checks the latter two at runtime.
 
 Next up is Phase 1 — broker authentication with daily re-login, WebSocket
 ingestion, tick cleaning, and bar construction. `INDIA_FEATURES_AND_CONFIG.md §3`

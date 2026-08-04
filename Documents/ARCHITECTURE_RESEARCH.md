@@ -11,6 +11,7 @@
 4. [MVP_UI_AND_LEGAL.md](MVP_UI_AND_LEGAL.md) — the *scope, screens, and law*: MVP feature list, autonomy model, news scoring engine, UI/admin design, Indian legal & tax framework, build plan
 5. [STRATEGY_ENGINE.md](STRATEGY_ENGINE.md) — the strategy lifecycle: DSL, user-authored & AI-generated strategies, the validation gauntlet, overfitting defence
 6. [VERIFICATION_REPORT.md](VERIFICATION_REPORT.md) — cross-document audit, findings, and corrections applied
+7. [PRE_LIVE_CHECKLIST.md](PRE_LIVE_CHECKLIST.md) — the consolidated gate before real capital
 **Last updated:** 2026-08-04
 **Author context:** Compiled from web research (Aug 2026) + first-principles reasoning, based on the user's original brief (see "Original Brief" below).
 

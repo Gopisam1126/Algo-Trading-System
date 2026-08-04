@@ -23,6 +23,7 @@ Read these before changing anything. They are in [`../Documents/`](../Documents/
 | 4 | `MVP_UI_AND_LEGAL.md` | Scope, screens, autonomy model, legal & tax |
 | 5 | `STRATEGY_ENGINE.md` | Strategy DSL, AI generation, overfitting defence |
 | 6 | `VERIFICATION_REPORT.md` | Cross-document audit |
+| 7 | `PRE_LIVE_CHECKLIST.md` | **The gate before real capital** |
 
 ---
 

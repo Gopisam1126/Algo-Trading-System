@@ -13,6 +13,7 @@
 4. [MVP_UI_AND_LEGAL.md](MVP_UI_AND_LEGAL.md) — the *scope, screens, and law*: MVP features, autonomy model, UI/admin design, Indian legal & tax framework
 5. [STRATEGY_ENGINE.md](STRATEGY_ENGINE.md) — strategy DSL, registry lifecycle, AI generation, validation gauntlet
 6. [VERIFICATION_REPORT.md](VERIFICATION_REPORT.md) — cross-document audit
+7. [PRE_LIVE_CHECKLIST.md](PRE_LIVE_CHECKLIST.md) — the consolidated gate before real capital
 
 ---
 
@@ -1235,6 +1236,26 @@ All logs are JSON (`structlog`), always carrying `correlation_id`, `service`, `s
 | **Replay** | Full pipeline over recorded historical ticks | Custom harness | Regression on every change |
 | **Chaos** | Injected failures | Custom | Pre-live gate |
 | **Paper** | Live market, no capital | Real broker sandbox | Multi-week before live |
+
+### 12.1a Why execution beats review (learned the hard way)
+
+The second audit ran a static scan for dangerous patterns — `eval`, `exec`,
+`float` in money paths, naive datetimes, broad exception swallowing. **It found
+nothing.** Two live bugs were nonetheless present, and both were found by
+*executing* the claims instead:
+
+| Bug | Why review missed it |
+|---|---|
+| OHLC validation inert | A Pydantic *field* validator cannot see fields declared after it, so the `close > high` check silently did nothing. The code reads as if it works. |
+| Log redactor leaked short JWTs | The pattern required a longer header than real tokens carry. The regex reads as if it matches. |
+
+Both took under a minute to find by constructing a deliberately invalid bar and
+feeding a real token through the redactor.
+
+**The rule this establishes:** every safety claim in this document should have a
+test that fails when the claim is false — not a comment asserting it is true.
+Where a claim is about behaviour under bad input, the test must *supply* the bad
+input rather than assert on the shape of the code.
 
 ### 12.2 Property-based invariants (the highest-value tests here)
 
