@@ -66,8 +66,19 @@ dev = [
     "pytest-cov>=5.0",
     "hypothesis>=6.112",
     "testcontainers[postgres,redis]>=4.8",
-    "ruff>=0.7",
-    "mypy>=1.12",
+    # Linters and type checkers are PINNED EXACTLY, not floored.
+    #
+    # These tools change their output between releases: a new ruff adds rules,
+    # a new mypy narrows types differently. With `ruff>=0.7` a developer and CI
+    # installed different versions and disagreed about whether the code was
+    # clean — CI failed on two I001 findings that the local 0.16.1 did not
+    # report at all. The CI workflow claims "if CI and local disagree, one of
+    # them is lying"; an unpinned linter builds that lie in by construction.
+    #
+    # Bump these deliberately, as their own change, so the diff shows which
+    # findings are new rules rather than new defects.
+    "ruff==0.16.2",
+    "mypy==2.3.0",
     "pip-audit>=2.7",
     "types-pyyaml",
     "types-python-dateutil",
