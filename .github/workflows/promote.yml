@@ -1,0 +1,133 @@
+name: Promote
+
+# Moves a verified commit along DEV -> QA -> PROD.
+#
+# Promotion is a MERGE of the whole tree, never a copy of selected files.
+# That is deliberate: if QA held a different set of files from DEV, QA would be
+# validating a tree that never existed on DEV, and every later merge would
+# conflict. "Only ship what is necessary" is enforced on the ARTIFACT — the
+# container image built in ci.yml contains only src/ and config/ — not by
+# promoting a partial source tree.
+#
+# This workflow refuses to promote a commit whose CI is not green. That check
+# is the entire point; without it, promotion is just a merge button.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: Source branch
+        required: true
+        type: choice
+        options: [DEV, QA]
+        default: DEV
+      to:
+        description: Target branch
+        required: true
+        type: choice
+        options: [QA, PROD]
+        default: QA
+      reason:
+        description: Why is this being promoted? (recorded in the merge commit)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: ${{ inputs.from }} -> ${{ inputs.to }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Reject an invalid promotion path
+        # DEV -> PROD would skip validation entirely. QA -> QA is a no-op that
+        # probably means someone picked the wrong dropdown.
+        run: |
+          set -euo pipefail
+          FROM="${{ inputs.from }}"; TO="${{ inputs.to }}"
+          if [ "$FROM" = "DEV" ] && [ "$TO" = "QA" ]; then exit 0; fi
+          if [ "$FROM" = "QA" ] && [ "$TO" = "PROD" ]; then exit 0; fi
+          echo "::error::$FROM -> $TO is not a valid promotion. Allowed: DEV->QA, QA->PROD."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the commit being promoted
+        id: src
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse "origin/${{ inputs.from }}")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Promoting $SHA from ${{ inputs.from }}"
+          git log -1 --format='  %h  %s' "$SHA"
+
+      - name: Require green CI on that exact commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = '${{ steps.src.outputs.sha }}';
+            const runs = await github.rest.actions.listWorkflowRunsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head_sha: sha,
+            });
+            const ci = runs.data.workflow_runs.filter(r => r.name === 'CI');
+            if (ci.length === 0) {
+              core.setFailed(`No CI run found for ${sha}. Push it and let CI finish first.`);
+              return;
+            }
+            const latest = ci.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+            if (latest.conclusion !== 'success') {
+              core.setFailed(
+                `CI for ${sha} concluded '${latest.conclusion}'. ` +
+                `A commit that has not passed CI is not promotable. ${latest.html_url}`
+              );
+              return;
+            }
+            core.info(`CI green for ${sha}: ${latest.html_url}`);
+
+      - name: Block PROD until the pre-live checklist is signed off
+        if: inputs.to == 'PROD'
+        # PROD means real capital. The checklist is not paperwork — it covers
+        # the static IP whitelist, the Algo-ID, daily re-auth and a paper
+        # trading record. This step is a deliberate speed bump, and it is meant
+        # to be removed only by someone who has actually read the file.
+        run: |
+          echo "::error::PROD promotion is gated on Documents/PRE_LIVE_CHECKLIST.md."
+          echo "Every item must be signed off, and paper trading must have a track"
+          echo "record across more than one market regime. Remove this step only"
+          echo "when that is genuinely true."
+          exit 1
+
+      - name: Merge
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout "${{ inputs.to }}"
+          git merge --no-ff "${{ steps.src.outputs.sha }}" -m \
+            "Promote ${{ inputs.from }} -> ${{ inputs.to }}: ${{ inputs.reason }}
+
+          Source commit: ${{ steps.src.outputs.sha }}
+          CI: verified green before merge.
+          Promoted by: ${{ github.actor }}"
+
+      - name: Push
+        run: git push origin "${{ inputs.to }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Promoted ${{ inputs.from }} → ${{ inputs.to }}"
+            echo ""
+            echo "- **Commit:** \`${{ steps.src.outputs.sha }}\`"
+            echo "- **Reason:** ${{ inputs.reason }}"
+            echo "- **By:** ${{ github.actor }}"
+            echo "- **CI:** verified green before the merge"
+          } >> "$GITHUB_STEP_SUMMARY"

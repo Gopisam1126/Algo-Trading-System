@@ -3,23 +3,28 @@
 # read-only application directory — see LOW_LEVEL_ARCHITECTURE.md §10.5.
 # ===========================================================================
 
-# --- Stage 1: build TA-Lib's C library and Python wheels -------------------
-FROM python:3.12-slim-bookworm AS builder
+# --- Stage 1: build the application venv -----------------------------------
+#
+# 3.11 matches the version CI tests. Ship what is tested: an image on 3.12 while
+# the suite runs on 3.11 means the artifact is not the thing that was verified.
+# Bumping this requires bumping the CI matrix first.
+FROM python:3.11-slim-bookworm AS builder
 
-ARG TALIB_VERSION=0.4.0
-
+# NOTE: TA-Lib is NOT built from source here any more.
+#
+# This stage used to download ta-lib 0.4.0 and compile it. **That build no
+# longer works** — 0.4.0's `gen_code.c` predates modern GCC's stricter C rules
+# and fails with "Error 1" partway through `make`, so the image could not be
+# built at all. It was not slow; it was broken, and nothing was checking.
+#
+# It is also unnecessary. TA-Lib has published manylinux wheels since 0.6
+# (verified against PyPI: 0.7.1 ships 12 of them), and a manylinux wheel must
+# vendor its own shared objects to qualify as one — so pip alone now yields a
+# self-contained install. That removes a compiler toolchain, a download from
+# SourceForge, and several minutes from every build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential wget ca-certificates \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# TA-Lib ships as a C library; the Python package is a binding over it.
-RUN wget -q "https://downloads.sourceforge.net/project/ta-lib/ta-lib/${TALIB_VERSION}/ta-lib-${TALIB_VERSION}-src.tar.gz" \
-    && tar -xzf "ta-lib-${TALIB_VERSION}-src.tar.gz" \
-    && cd ta-lib \
-    && ./configure --prefix=/usr \
-    && make -j"$(nproc)" \
-    && make install \
-    && cd .. && rm -rf ta-lib*
 
 WORKDIR /build
 COPY pyproject.toml README.md ./
@@ -29,7 +34,7 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir .
 
 # --- Stage 2: runtime ------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.11-slim-bookworm AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 curl \
@@ -37,8 +42,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && groupadd --system --gid 1001 algotrader \
     && useradd --system --uid 1001 --gid algotrader --create-home algotrader
 
-# TA-Lib shared objects from the build stage
-COPY --from=builder /usr/lib/libta_lib* /usr/lib/
+# The venv only. TA-Lib's shared objects are vendored INSIDE the manylinux
+# wheel, so there is no system libta_lib to copy across any more.
 COPY --from=builder /opt/venv /opt/venv
 
 ENV PATH="/opt/venv/bin:$PATH" \
