@@ -1,0 +1,39 @@
+# What reaches the Docker build context.
+#
+# The Dockerfile already COPYs only `src` and `config` into the runtime image,
+# so this file is not what keeps the IMAGE small — it keeps the CONTEXT small,
+# and that matters for two reasons:
+#
+# 1. **Secrets.** Everything here is uploaded to the Docker daemon before the
+#    build starts. Without this file, a developer's `.env` — Kite API secret,
+#    Anthropic key, Postgres password — is sent into the build context on every
+#    build. It would not appear in the final image today, but it is one careless
+#    `COPY . .` away from being baked into a layer, and layers are forever.
+#
+# 2. **Speed.** `.venv` alone is ~700 MB and `data/` grows without bound. Both
+#    would be uploaded on every single build for no purpose.
+#
+# Deny-by-default is deliberate. Listing what to exclude means the next thing
+# somebody adds is included by accident; listing what to include means the next
+# thing is excluded by default and has to be added on purpose.
+
+# --- exclude everything ---
+*
+
+# --- then re-admit only what the build genuinely needs ---
+!src/
+!config/
+!pyproject.toml
+!README.md
+
+# --- and strip build noise back out of those ---
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Never, under any circumstances:
+#   .env, .venv, data/, tests/, .git — all already excluded by `*` above and
+#   deliberately not re-admitted. The CI `image` job asserts their absence in
+#   the built image rather than trusting this file.

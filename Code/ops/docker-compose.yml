@@ -1,0 +1,188 @@
+# ===========================================================================
+# Docker Compose — nine services on one India-region host.
+#
+# Two security properties are load-bearing here (LOW_LEVEL_ARCHITECTURE.md
+# §10.3, §13.2):
+#
+#   1. The `core` network is `internal: true` — services on it have NO
+#      internet access at all.  A compromised service cannot phone home.
+#   2. Only `execution-svc` receives trading credentials.  Compromising
+#      `signal-engine` (the largest attack surface, since it processes AI
+#      responses) still cannot place an order.
+#
+# The dashboard binds to 127.0.0.1 only.  Reach it over WireGuard or an SSH
+# tunnel — a dashboard not reachable from the internet cannot be attacked
+# from the internet, and that single decision removes most of the surface.
+# ===========================================================================
+
+name: algotrader
+
+x-common: &common
+  restart: unless-stopped
+  env_file: [../.env]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  logging:
+    driver: json-file
+    options: {max-size: "50m", max-file: "5"}
+
+x-app: &app
+  <<: *common
+  build:
+    context: ..
+    dockerfile: ops/Dockerfile
+  # These two OVERRIDE config/system.yaml's `database:` and `redis:` sections
+  # for containers only, and they must.  system.yaml says `localhost` because
+  # that is correct when you run the app on the host; inside this network the
+  # datastores are reachable as `timescaledb` and `redis`, and `localhost`
+  # would resolve to the app container itself.
+  #
+  # `environment` beats `env_file`, so these also win over anything in ../.env.
+  # The credential still comes from POSTGRES_PASSWORD — it is interpolated
+  # here, not duplicated.
+  environment:
+    DATABASE_URL: >-
+      postgresql+psycopg://${POSTGRES_USER:-algotrader}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@timescaledb:5432/${POSTGRES_DB:-algotrader}
+    REDIS_URL: redis://redis:6379/0
+  volumes:
+    - ../config:/app/config:ro          # config is read-only to the app
+    - app-data:/app/data
+  depends_on:
+    redis: {condition: service_healthy}
+    timescaledb: {condition: service_healthy}
+
+services:
+  # ---------------------------------------------------------------- data ---
+  redis:
+    <<: *common
+    image: redis:7.4-alpine
+    command: >
+      redis-server --appendonly yes --appendfsync everysec
+      --maxmemory 2gb --maxmemory-policy noeviction
+    volumes: [redis-data:/data]
+    networks: [core]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  timescaledb:
+    <<: *common
+    image: timescale/timescaledb:2.17.2-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-algotrader}
+      POSTGRES_USER: ${POSTGRES_USER:-algotrader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes: [tsdb-data:/var/lib/postgresql/data]
+    networks: [core]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotrader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------- control ---
+  orchestrator:
+    <<: *app
+    command: python -m algotrader.orchestrator
+    networks: [core]
+
+  api-server:
+    <<: *app
+    command: python -m algotrader.api
+    networks: [core]
+    ports: ["127.0.0.1:8080:8080"]       # localhost ONLY — never 0.0.0.0
+
+  notifier:
+    <<: *app
+    command: python -m algotrader.notifier
+    networks: [core, notify-egress]
+
+  # -------------------------------------------------------------- market ---
+  market-ingest:
+    <<: *app
+    command: python -m algotrader.ingest
+    networks: [core, broker-egress]
+    environment:
+      ALGOTRADER_ROLE: market-ingest
+      BROKER_READ_ONLY: "true"           # read-only adapter; cannot trade
+
+  ti-engine:
+    <<: *app
+    command: python -m algotrader.indicators
+    networks: [core]                      # no internet access whatsoever
+
+  signal-engine:
+    <<: *app
+    command: python -m algotrader.signals
+    networks: [core, ai-egress]
+    environment:
+      BROKER_READ_ONLY: "true"
+
+  macro-svc:
+    <<: *app
+    command: python -m algotrader.macro
+    networks: [core, ai-egress, data-egress]
+
+  # ------------------------------------------------------------ execution ---
+  # The ONLY service holding trading credentials.
+  execution-svc:
+    <<: *app
+    command: python -m algotrader.execution
+    networks: [core, broker-egress]
+    environment:
+      ALGOTRADER_ROLE: execution
+      BROKER_READ_ONLY: "false"
+
+  # ------------------------------------------------------------ scheduled ---
+  premarket-job:
+    <<: *app
+    command: python -m algotrader.premarket
+    networks: [core, ai-egress, data-egress, broker-egress]
+    deploy:
+      resources:
+        limits: {cpus: "3.0", memory: 6G}   # heaviest compute of the day
+
+  strategy-svc:
+    <<: *app
+    command: python -m algotrader.strategy.service
+    networks: [core, ai-egress]
+    deploy:
+      resources:
+        limits: {cpus: "3.0", memory: 4G}   # validation gauntlet, off critical path
+
+  # ----------------------------------------------------------- monitoring ---
+  prometheus:
+    <<: *common
+    image: prom/prometheus:v3.0.1
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prom-data:/prometheus
+    networks: [core]
+    ports: ["127.0.0.1:9090:9090"]
+
+  grafana:
+    <<: *common
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes: [grafana-data:/var/lib/grafana]
+    networks: [core]
+    ports: ["127.0.0.1:3000:3000"]
+
+networks:
+  core:
+    internal: true          # NO internet access — the key containment control
+  broker-egress:            # egress-filter to broker hosts at the firewall
+  ai-egress:                # egress-filter to api.anthropic.com
+  data-egress:              # egress-filter to news / market-data providers
+  notify-egress:            # egress-filter to Telegram / SMTP
+
+volumes:
+  redis-data:
+  tsdb-data:
+  prom-data:
+  grafana-data:
+  app-data:

@@ -1,0 +1,75 @@
+# ===========================================================================
+# Repository-root ignore rules.
+#
+# Code/.gitignore holds the detailed application rules. This file is the
+# belt-and-braces layer: a leaked broker credential in git history is a
+# total-loss event, so the .env patterns are repeated here to cover every
+# directory, not just Code/.
+# ===========================================================================
+
+# --- SECRETS: never commit, anywhere in the tree ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+**/secrets.*
+*.sops.yaml
+!*.sops.example.yaml
+age.key
+.age/
+**/credentials*.json
+**/token*.json
+**/session*.json
+
+# --- Market data & trade records: stay local ---
+**/data/historical/*
+**/data/archive/*
+!**/data/historical/.gitkeep
+!**/data/archive/.gitkeep
+*.parquet
+*.duckdb
+*.sqlite
+*.db
+backtest_results/
+validation_reports/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+.coverage.*
+dist/
+build/
+
+# --- Node (Code/Test.js placeholder) ---
+node_modules/
+package-lock.json
+
+# --- Ops ---
+*.log
+logs/
+docker-compose.override.yml
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+!.vscode/extensions.json
+
+# --- OneDrive sync artefacts ---
+*.tmp
+~$*

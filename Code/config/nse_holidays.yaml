@@ -1,0 +1,51 @@
+# ===========================================================================
+# NSE trading holidays
+#
+# ⚠️  THIS FILE IS INCOMPLETE.  It contains only the FIXED-DATE holidays that
+#     can be stated with confidence.  India's market calendar is dominated by
+#     lunar-calendar festivals whose dates shift each year and which NSE
+#     publishes by circular.
+#
+#     Populate the remaining dates from NSE's official trading-holiday
+#     circular before live trading:
+#     https://www.nseindia.com/resources/exchange-communication-holidays
+#
+#     Why this matters: an incomplete list means the system treats a market
+#     holiday as a normal trading day.  It will attempt a pre-market run,
+#     find no data, and either fail loudly (best case) or compute indicators
+#     across a phantom session (worse).  `doctor.py` warns while this file is
+#     incomplete.
+#
+#     Weekends are handled in code and do NOT need listing here.
+# ===========================================================================
+
+meta:
+  # Set to true once the full NSE circular has been transcribed and checked.
+  verified_against_nse_circular: false
+  source: "PLACEHOLDER - fixed-date holidays only"
+  last_updated: "2026-08-04"
+
+holidays:
+  # --- Fixed-date national holidays (high confidence) ---
+  - 2026-01-26   # Republic Day
+  - 2026-05-01   # Maharashtra Day
+  - 2026-10-02   # Gandhi Jayanti
+  - 2026-12-25   # Christmas
+
+  # --- Computable from the ecclesiastical calendar ---
+  - 2026-04-03   # Good Friday (Easter Sunday 2026 falls on 05 Apr)
+
+  # --- STILL MISSING: lunar-calendar festivals ---
+  # These shift annually and MUST come from the NSE circular. Typically:
+  #   Holi · Ram Navami · Mahavir Jayanti · Id-ul-Fitr (Ramzan Id) ·
+  #   Bakri Id · Muharram · Ganesh Chaturthi · Dussehra ·
+  #   Diwali Laxmi Pujan (special muhurat session) · Diwali Balipratipada ·
+  #   Guru Nanak Jayanti
+  #
+  # Note also that Diwali Muhurat trading is a SPECIAL SESSION on a day that
+  # is otherwise a holiday - decide explicitly whether to trade it. The
+  # system's default is to treat it as a holiday and stand down.
+
+# Days that are holidays but carry a special trading session.
+# Listed separately so they are a deliberate decision, not an accident.
+special_sessions: []
