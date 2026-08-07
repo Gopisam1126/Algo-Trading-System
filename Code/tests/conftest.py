@@ -35,8 +35,21 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import yaml
 
+from algotrader.common.db.eventloop import configure_event_loop_policy
+
 if TYPE_CHECKING:  # pragma: no cover
     from redis import Redis
+
+# MUST run at import time, before pytest-asyncio creates any event loop.
+#
+# On Windows the default is a ProactorEventLoop, which async psycopg refuses
+# with `InterfaceError` at the first query. `create_engine_from_url` also calls
+# this — but by then pytest-asyncio has already built the loop, and setting the
+# policy afterwards has no effect on a loop that already exists. This is the
+# same defect that broke `make migrate`, resurfacing in a different entry point:
+# **the policy must be set before the loop, and every async entry point owns
+# that responsibility separately.** No-op off Windows.
+configure_event_loop_policy()
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = CODE_ROOT / "ops" / "docker-compose.yml"
