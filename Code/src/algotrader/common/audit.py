@@ -80,6 +80,29 @@ class AuditError(RuntimeError):
     """Raised when the audit layer is used incorrectly."""
 
 
+def _reject_non_string_keys(value: Any, path: str = "payload") -> None:
+    """Refuse payloads whose keys are not strings, at any depth.
+
+    ``json.dumps`` coerces non-string keys, so ``{1: "a"}`` and ``{"1": "a"}``
+    serialise identically — two different payloads with one hash. Worse,
+    ``{1: "a", "1": "b"}`` emits a duplicate key. Both are canonicalisation
+    defects in a structure whose entire purpose is to be canonical, so they are
+    rejected at the boundary rather than papered over.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise AuditError(
+                    f"{path} contains a non-string key {key!r} ({type(key).__name__}). "
+                    f"JSON coerces it to a string, so {{1: 'a'}} and {{'1': 'a'}} would "
+                    f"hash identically — an ambiguity the audit chain must not have."
+                )
+            _reject_non_string_keys(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _reject_non_string_keys(item, f"{path}[{index}]")
+
+
 def canonical_json(payload: dict[str, Any]) -> str:
     """Deterministic JSON — the same input always produces the same bytes.
 
@@ -87,10 +110,41 @@ def canonical_json(payload: dict[str, Any]) -> str:
     dict ordering is insertion-ordered, so the same logical payload built by two
     code paths would serialise differently and hash differently, and the chain
     would fail verification for no reason at all. ``default=str`` keeps
-    ``Decimal``, ``datetime`` and ``UUID`` hashable without silently converting
-    money to float.
+    ``Decimal``, ``datetime`` and ``UUID`` serialisable without silently
+    converting money to float.
+
+    Non-string keys are refused — see :func:`_reject_non_string_keys`.
     """
+    _reject_non_string_keys(payload)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _length_prefixed(*fields: str) -> str:
+    """Join fields so their boundaries are unambiguous.
+
+    **This is a security control, not formatting.**
+
+    The original construction was ``"|".join(fields)``. Because ``|`` was not
+    escaped and the fields are variable length, a field containing ``|`` could
+    shift a boundary and two *different* rows would hash identically::
+
+        stage="SIGNAL"        outcome="ALLOW|X"   ->  "SIGNAL|ALLOW|X"
+        stage="SIGNAL|ALLOW"  outcome="X"         ->  "SIGNAL|ALLOW|X"
+
+    Both produced the same digest, which defeats the whole point of the chain:
+    an attacker able to influence any field could substitute one record for
+    another without breaking it. This is the classic concatenation-ambiguity
+    defect — the same class as CVE-2012-2459's Merkle-tree ambiguity — and the
+    standard remedy is length-prefixing, which makes the encoding injective:
+    ``len(field)`` cannot be confused with the field's own content because it is
+    read first and fixes exactly how many characters follow.
+
+    ``AUDITv2`` is a domain-separation tag. It also makes the format change
+    explicit: digests produced by the old construction will not verify under
+    this one, which is correct — they were computed with a broken encoding.
+    """
+    parts = [f"{len(field)}:{field}" for field in fields]
+    return "AUDITv2|" + "".join(parts)
 
 
 def compute_row_hash(
@@ -114,16 +168,14 @@ def compute_row_hash(
     if ts.tzinfo is None:
         raise AuditError("ts must be timezone-aware — a naive timestamp hashes ambiguously")
 
-    material = "|".join(
-        (
-            prev_hash,
-            str(seq),
-            ts.astimezone(dt.UTC).isoformat(),
-            str(correlation_id),
-            stage,
-            outcome,
-            canonical_json(payload),
-        )
+    material = _length_prefixed(
+        prev_hash,
+        str(seq),
+        ts.astimezone(dt.UTC).isoformat(),
+        str(correlation_id),
+        stage,
+        outcome,
+        canonical_json(payload),
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 

@@ -503,9 +503,20 @@ class DecisionLog(Base):
     convention. See the role-grants migration. An application-level promise can
     be broken by a bug; a missing grant cannot.
 
-    The hash chain itself (``prev_hash``/``row_hash``) is written by E01-S05,
-    deferred to Sprint 2. The columns exist now so that the chain can be added
-    without a table rewrite.
+    **``symbol_id`` carries no foreign key, deliberately.** An FK to
+    ``instruments`` reintroduces exactly the coupling the independent session
+    exists to remove: PostgreSQL takes a shared lock on the referenced row to
+    validate the constraint, so an audit write referencing a symbol whose row is
+    still uncommitted **blocks until that business transaction commits**. During
+    the daily instrument sync — one transaction upserting thousands of rows —
+    every concurrent audit write for those symbols would stall, and at
+    ``statement_timeout`` the entry would fall through to the disk buffer. The
+    audit trail would degrade because of an unrelated bulk write.
+
+    Referential integrity is the wrong trade here. A dangling ``symbol_id`` in a
+    log is harmless and the log must also outlive delisted instruments; an audit
+    entry that cannot be written is not recoverable. This was found by QA probe
+    (QA-SEC-05), not by reading the schema.
     """
 
     __tablename__ = "decision_log"
@@ -526,7 +537,11 @@ class DecisionLog(Base):
 
     correlation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     stage: Mapped[str] = mapped_column(String(28), nullable=False)
-    symbol_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("instruments.id"))
+    #: DELIBERATELY NOT A FOREIGN KEY. See the class docstring — an FK here
+    #: makes the audit writer block on any uncommitted transaction that touched
+    #: the referenced instrument row, which defeats the independent-session
+    #: design. Confirmed by probe, not assumed.
+    symbol_id: Mapped[int | None] = mapped_column(Integer)
     outcome: Mapped[str] = mapped_column(String(12), nullable=False)
     reason_code: Mapped[str | None] = mapped_column(String(48))
     payload: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)

@@ -23,9 +23,65 @@ lifecycle, which is what makes bulk operations and debugging tractable:
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Final
 
 from algotrader.common.enums import Timeframe
+
+
+class UnsafeKeyError(ValueError):
+    """Raised when a key component would corrupt the keyspace."""
+
+
+#: What may appear in a key component. NSE tickers are uppercase alphanumerics
+#: with ``-`` and ``&`` (M&M, BAJAJ-AUTO); service names add lowercase and ``_``.
+#: Everything else is refused.
+#:
+#: **Used with ``fullmatch``, and deliberately unanchored.** The first version
+#: was ``re.compile(r"^...$").match(...)``, which is a bypass: in Python ``$``
+#: also matches immediately *before* a trailing newline, so ``"svc\n"`` passed
+#: validation and a newline reached the keyspace. ``fullmatch`` has no such
+#: exception — it requires the entire string, newline included, to match.
+#: (``\Z`` would work too; ``fullmatch`` is harder to get wrong later.)
+_SAFE_COMPONENT: Final = re.compile(r"[A-Za-z0-9_\-&.]{1,64}")
+
+#: How much of a rejected value to echo back. An unbounded echo turns a hostile
+#: 200 KB ticker into 200 KB of log, which is a denial-of-service on the log
+#: pipeline and a log-injection vector in its own right.
+_ECHO_LIMIT: Final = 64
+
+
+def _safe(component: str, what: str) -> str:
+    """Validate a value before it becomes part of a key.
+
+    **This is a security control.** Instrument symbols arrive from the broker's
+    daily dump — external data this system does not author — and flow straight
+    into Redis key names. Without validation:
+
+    - ``:`` shifts field boundaries. ``indicator_state("A:5m:x", "5m")`` yields
+      ``state:indicator:A:5m:x:5m``, which is indistinguishable from a key for
+      some other symbol/timeframe pair. Two logical states then share one slot,
+      and one silently overwrites the other.
+    - ``*`` and ``?`` are glob metacharacters. A symbol of ``*`` produces
+      ``state:quote:*``, which matches every quote key the moment anything
+      uses it in a ``SCAN``/``KEYS`` pattern.
+    - ``\\n`` and ``\\x00`` are accepted by Redis but break the moment the same
+      value reaches PostgreSQL, which rejects null bytes in text.
+
+    None of these raise on their own. They corrupt state quietly, which is the
+    worst failure mode for a component holding positions and a kill switch.
+    """
+    if not _SAFE_COMPONENT.fullmatch(component):
+        shown = component[:_ECHO_LIMIT]
+        suffix = f"... ({len(component)} chars)" if len(component) > _ECHO_LIMIT else ""
+        raise UnsafeKeyError(
+            f"{what} {shown!r}{suffix} is not safe to use in a Redis key. Allowed: "
+            f"letters, digits, and _ - & . (1-64 chars). A ':' would shift key "
+            f"boundaries and collide with another key; '*' or '?' would act as "
+            f"glob wildcards in any SCAN."
+        )
+    return component
+
 
 # --- namespaces -------------------------------------------------------------
 
@@ -59,22 +115,22 @@ def _day(day: dt.date | str) -> str:
 
 def indicator_state(symbol: str, timeframe: Timeframe | str) -> str:
     """HASH — the incremental indicator engine's state for one symbol/timeframe."""
-    return f"{STATE}:indicator:{symbol}:{_tf(timeframe)}"
+    return f"{STATE}:indicator:{_safe(symbol, 'symbol')}:{_tf(timeframe)}"
 
 
 def current_bar(symbol: str, timeframe: Timeframe | str) -> str:
     """HASH — the bar currently being built. Not yet persisted; not yet final."""
-    return f"{STATE}:bar:current:{symbol}:{_tf(timeframe)}"
+    return f"{STATE}:bar:current:{_safe(symbol, 'symbol')}:{_tf(timeframe)}"
 
 
 def quote(symbol: str) -> str:
     """HASH — latest quote. 60 s TTL: an expired quote IS the staleness signal."""
-    return f"{STATE}:quote:{symbol}"
+    return f"{STATE}:quote:{_safe(symbol, 'symbol')}"
 
 
 def position_state(symbol: str) -> str:
     """HASH — live position. No TTL; deleted on close."""
-    return f"{STATE}:position:{symbol}"
+    return f"{STATE}:position:{_safe(symbol, 'symbol')}"
 
 
 def slots() -> str:
@@ -90,7 +146,7 @@ def plan(trade_date: dt.date | str) -> str:
 
 
 def plan_candidate(trade_date: dt.date | str, symbol: str) -> str:
-    return f"{PLAN}:candidate:{_day(trade_date)}:{symbol}"
+    return f"{PLAN}:candidate:{_day(trade_date)}:{_safe(symbol, 'symbol')}"
 
 
 # --- context ----------------------------------------------------------------
@@ -130,18 +186,20 @@ def health(service: str) -> str:
     The expiry IS the liveness mechanism: no separate heartbeat-timeout logic
     exists or is needed. If the key is gone, the service is down.
     """
-    return f"{CONTROL}:health:{service}"
+    return f"{CONTROL}:health:{_safe(service, 'service name')}"
 
 
 # --- locks ------------------------------------------------------------------
 
 
 def slot_lock(slot_index: int) -> str:
+    if not isinstance(slot_index, int) or isinstance(slot_index, bool) or slot_index < 0:
+        raise UnsafeKeyError(f"slot_index must be a non-negative int, got {slot_index!r}")
     return f"{LOCK}:slot:{slot_index}"
 
 
 def symbol_lock(symbol: str) -> str:
-    return f"{LOCK}:symbol:{symbol}"
+    return f"{LOCK}:symbol:{_safe(symbol, 'symbol')}"
 
 
 # --- rate limiting / timers -------------------------------------------------
@@ -186,7 +244,7 @@ def stream_audit() -> str:
 
 def stream_dlq(stream_name: str) -> str:
     """Dead letter for a stream. Takes the FULL stream key, not a bare name."""
-    short = stream_name.removeprefix(f"{STREAM}:")
+    short = stream_name.removeprefix(f"{STREAM}:").removeprefix("dlq:")
     return f"{STREAM}:dlq:{short}"
 
 
