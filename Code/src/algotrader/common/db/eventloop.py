@@ -33,13 +33,17 @@ def configure_event_loop_policy() -> None:
     Idempotent and safe to call more than once. Must be called before the
     event loop is created.
     """
-    if sys.platform != "win32":
-        return
-
-    # WindowsSelectorEventLoopPolicy is the supported loop for psycopg async.
-    # The trade-off is that the selector loop does not support subprocesses on
-    # Windows; nothing in the data path needs them.
-    current = asyncio.get_event_loop_policy()
-    if isinstance(current, asyncio.WindowsSelectorEventLoopPolicy):
-        return
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Written as a positive `== "win32"` check rather than an early
+    # `!= "win32": return`. mypy understands `sys.platform` comparisons and
+    # narrows on them, so under `--platform linux` everything after the early
+    # return is provably dead and `warn_unreachable` fails the build. The
+    # positive form is the idiom mypy expects: the block is simply not analysed
+    # off Windows, and `WindowsSelectorEventLoopPolicy` — which does not exist
+    # on Linux — is never referenced there.
+    if sys.platform == "win32":
+        # WindowsSelectorEventLoopPolicy is the supported loop for psycopg
+        # async. The trade-off is that the selector loop does not support
+        # subprocesses on Windows; nothing in the data path needs them.
+        current = asyncio.get_event_loop_policy()
+        if not isinstance(current, asyncio.WindowsSelectorEventLoopPolicy):
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

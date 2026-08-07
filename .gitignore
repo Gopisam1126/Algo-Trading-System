@@ -16,7 +16,26 @@
 *.p12
 *.pfx
 secrets/
-**/secrets.*
+# Secret DATA files — deliberately enumerated by extension rather than written
+# as `**/secrets.*`.
+#
+# That glob was the original rule, and it silently excluded
+# `src/algotrader/common/secrets.py` — the module implementing SecretString,
+# i.e. safety invariant #3. The file was never committed, so the package could
+# not be imported from a clean clone and the repository had never actually
+# built anywhere except the machine it was written on. Nothing caught it for
+# the entire project, because every test run happened where the file existed.
+# CI found it on its first run.
+#
+# Never re-broaden this to `secrets.*`. Source code is not a secret; secret
+# VALUES are, and they live in the formats below.
+**/secrets.yaml
+**/secrets.yml
+**/secrets.json
+**/secrets.toml
+**/secrets.env
+**/secrets.txt
+**/secrets.ini
 *.sops.yaml
 !*.sops.example.yaml
 age.key
