@@ -28,6 +28,10 @@ dependencies = [
     # --- Market analysis ---
     "numpy>=2.1",
     "pandas>=2.2",
+    # Parquet archive (E01-S06). Large (~100 MB) but it is the standard
+    # implementation, preserves types across a round trip, and the archive
+    # job runs in the same deployment as everything else.
+    "pyarrow>=18.0",
     "TA-Lib>=0.4.32",          # requires the C library — see README
 
     # --- Broker ---
@@ -130,7 +134,7 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["talib.*", "pandas_ta.*", "lightgbm.*"]
+module = ["talib.*", "pandas_ta.*", "lightgbm.*", "pyarrow.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
