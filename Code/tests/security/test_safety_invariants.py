@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import ClassVar
 
 import pytest
 from pydantic import ValidationError
@@ -38,9 +39,18 @@ class TestAICannotSizePositions:
     size could be expressed.
     """
 
-    FORBIDDEN = {
-        "quantity", "qty", "size", "position_size", "capital_at_risk",
-        "stop_price", "notional", "amount", "rupees", "lots", "value",
+    FORBIDDEN: ClassVar[set[str]] = {
+        "quantity",
+        "qty",
+        "size",
+        "position_size",
+        "capital_at_risk",
+        "stop_price",
+        "notional",
+        "amount",
+        "rupees",
+        "lots",
+        "value",
     }
 
     def test_recommendation_has_no_sizing_fields(self) -> None:
@@ -67,7 +77,7 @@ class TestAICannotSizePositions:
                 ai_verdict="CONFIRM",
                 ai_rationale="test",
                 emitted_at=datetime.now(UTC),
-                quantity=500,          # <- must be rejected
+                quantity=500,  # <- must be rejected
             )
 
 
@@ -135,7 +145,7 @@ class TestConfigCannotDisableSafety:
             StrategyPromotionConfig(require_human_approval=False)
 
     def test_scoring_weights_must_sum_to_one(self) -> None:
-        with pytest.raises(ValidationError, match="must sum to 1.0"):
+        with pytest.raises(ValidationError, match=r"must sum to 1\.0"):
             ScoringWeights(trend_alignment=Decimal("0.9"))
 
     def test_deployment_must_be_india_region(self) -> None:
@@ -161,15 +171,13 @@ class TestLiveModeRequiresCompliance:
     def test_live_mode_requires_static_ip(self) -> None:
         with pytest.raises(ValidationError, match="static_ip"):
             AppConfig.model_validate(
-                {"system": {"mode": "live", "static_ip": ""},
-                 "broker": {"algo_id": "ALGO123"}}
+                {"system": {"mode": "live", "static_ip": ""}, "broker": {"algo_id": "ALGO123"}}
             )
 
     def test_live_mode_requires_algo_id(self) -> None:
         with pytest.raises(ValidationError, match="algo_id"):
             AppConfig.model_validate(
-                {"system": {"mode": "live", "static_ip": "1.2.3.4"},
-                 "broker": {"algo_id": ""}}
+                {"system": {"mode": "live", "static_ip": "1.2.3.4"}, "broker": {"algo_id": ""}}
             )
 
     def test_paper_mode_does_not_require_them(self) -> None:

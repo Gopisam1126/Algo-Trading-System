@@ -161,7 +161,7 @@ class InstrumentDailyStatus(_Frozen):
     is_asm: bool = False
     is_gsm: bool = False
     is_fno_ban: bool = False
-    is_cas_stock: bool = False           # drives the square-off deadline
+    is_cas_stock: bool = False  # drives the square-off deadline
     circuit_band_pct: Decimal | None = None
     upper_circuit: Price | None = None
     lower_circuit: Price | None = None

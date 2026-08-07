@@ -41,7 +41,9 @@ class AuthFlow(StrEnum):
     #: returned to a redirect URI -> exchanged with the API secret for an
     #: access token.  Cannot be fully automated without either driving a
     #: browser or hitting undocumented endpoints.
-    REDIRECT_REQUEST_TOKEN = "redirect_request_token"
+    # Suppression justified: this is the NAME of an auth flow, not a
+    # credential. bandit matches the "token" substring in the identifier.
+    REDIRECT_REQUEST_TOKEN = "redirect_request_token"  # noqa: S105
 
 
 @dataclass(frozen=True)
@@ -107,7 +109,7 @@ ZERODHA = BrokerProfile(
     auth_flow=AuthFlow.REDIRECT_REQUEST_TOKEN,
     daily_token_expiry=True,
     requires_manual_daily_login=True,
-    monthly_cost_inr=500,          # data APIs; order placement reported free
+    monthly_cost_inr=500,  # data APIs; order placement reported free
     historical_data_extra_cost=True,
     static_ip_order_endpoints_only=True,
     requires_market_protection=True,
@@ -156,8 +158,10 @@ ANGELONE = BrokerProfile(
     monthly_cost_inr=0,
     historical_data_extra_cost=False,
     notes="Free, programmatic TOTP login, highest order-rate headroom.",
-    caveats=["WebSocket stability at the open and on expiry days is a "
-             "commonly reported weak point — plan for reconnection."],
+    caveats=[
+        "WebSocket stability at the open and on expiry days is a "
+        "commonly reported weak point — plan for reconnection."
+    ],
 )
 
 FYERS = BrokerProfile(
@@ -171,7 +175,7 @@ FYERS = BrokerProfile(
     monthly_cost_inr=0,
     historical_data_extra_cost=False,
     notes="Free API with free minute-level history (~1-2 years) — useful as a "
-          "data fallback even when trading elsewhere.",
+    "data fallback even when trading elsewhere.",
 )
 
 UPSTOX = BrokerProfile(
@@ -199,9 +203,7 @@ DHAN = BrokerProfile(
 )
 
 
-PROFILES: dict[str, BrokerProfile] = {
-    p.key: p for p in (ZERODHA, ANGELONE, FYERS, UPSTOX, DHAN)
-}
+PROFILES: dict[str, BrokerProfile] = {p.key: p for p in (ZERODHA, ANGELONE, FYERS, UPSTOX, DHAN)}
 
 
 def get_profile(key: str) -> BrokerProfile:

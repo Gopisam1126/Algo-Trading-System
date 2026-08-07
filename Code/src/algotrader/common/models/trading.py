@@ -123,8 +123,8 @@ class Recommendation(_Frozen):
     strategy_id: str
     direction: Direction
 
-    trigger_price: Price       # from the deterministic strategy, not the AI
-    suggested_stop: Price      # from ATR/structure, not the AI
+    trigger_price: Price  # from the deterministic strategy, not the AI
+    suggested_stop: Price  # from ATR/structure, not the AI
 
     timeframe_agreement: int = Field(ge=0, le=3)
     ai_confidence: Confidence
@@ -137,8 +137,14 @@ class Recommendation(_Frozen):
     _utc = field_validator("emitted_at")(_require_utc)
 
     @classmethod
-    def build(cls, trigger: Trigger, review: AIReview, score: dict[str, float] | None = None,
-              *, now: datetime) -> Recommendation:
+    def build(
+        cls,
+        trigger: Trigger,
+        review: AIReview,
+        score: dict[str, float] | None = None,
+        *,
+        now: datetime,
+    ) -> Recommendation:
         return cls(
             correlation_id=trigger.correlation_id,
             symbol=trigger.symbol,
@@ -226,7 +232,7 @@ class OrderRequest(_Frozen):
     limit_price: Price | None = None
     trigger_price: Price | None = None
     intent: OrderIntent
-    algo_id: str | None = None      # SEBI-mandated, attached by the gateway
+    algo_id: str | None = None  # SEBI-mandated, attached by the gateway
 
     #: Market protection for MARKET and SL-M orders.
     #:
@@ -315,10 +321,10 @@ class Position(_Frozen):
     direction: Direction
     quantity: int = Field(gt=0)
     entry_price: Price
-    stop_price: Price                       # never None — invariant
+    stop_price: Price  # never None — invariant
     target_price: Price | None = None
     opened_at: datetime
-    squareoff_deadline: datetime            # per-stock; see calendar.py
+    squareoff_deadline: datetime  # per-stock; see calendar.py
     status: PositionStatus = PositionStatus.OPEN
 
     closed_at: datetime | None = None

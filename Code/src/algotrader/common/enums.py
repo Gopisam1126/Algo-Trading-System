@@ -46,14 +46,14 @@ class Direction(StrEnum):
 class OrderType(StrEnum):
     LIMIT = "LIMIT"
     MARKET = "MARKET"
-    SL = "SL"       # stop-loss limit
-    SLM = "SLM"     # stop-loss market
+    SL = "SL"  # stop-loss limit
+    SLM = "SLM"  # stop-loss market
 
 
 class Product(StrEnum):
-    MIS = "MIS"     # intraday, auto square-off applies
-    CNC = "CNC"     # delivery
-    NRML = "NRML"   # F&O carry-forward
+    MIS = "MIS"  # intraday, auto square-off applies
+    CNC = "CNC"  # delivery
+    NRML = "NRML"  # F&O carry-forward
 
 
 class OrderIntent(StrEnum):
@@ -97,7 +97,7 @@ class ExitReason(StrEnum):
     STOP = "STOP"
     TARGET = "TARGET"
     TRAILING_STOP = "TRAILING_STOP"
-    TIME = "TIME"                    # square-off deadline
+    TIME = "TIME"  # square-off deadline
     THESIS_INVALIDATED = "THESIS_INVALIDATED"
     KILLSWITCH = "KILLSWITCH"
     MANUAL = "MANUAL"
@@ -112,7 +112,7 @@ class SessionState(StrEnum):
     WATCHING = "WATCHING"
     TRADING = "TRADING"
     CLOSING_ONLY = "CLOSING_ONLY"
-    HALTED = "HALTED"                # terminal for the day; human-only exit
+    HALTED = "HALTED"  # terminal for the day; human-only exit
 
 
 class SystemMode(StrEnum):
@@ -128,7 +128,7 @@ class AutonomyLevel(StrEnum):
     L0_OBSERVE = "L0"
     L1_ALERT = "L1"
     L2_APPROVE = "L2"
-    L3_SUPERVISED = "L3"    # the design target
+    L3_SUPERVISED = "L3"  # the design target
     L4_FULL_AUTO = "L4"
 
 

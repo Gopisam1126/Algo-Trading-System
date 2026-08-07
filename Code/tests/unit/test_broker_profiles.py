@@ -67,19 +67,23 @@ class TestZerodhaOperationalCharacteristics:
 
 class TestConfigEnforcesBrokerLimit:
     def test_within_broker_limit_is_accepted(self) -> None:
-        cfg = AppConfig.model_validate({
-            "broker": {"primary": "zerodha"},
-            "execution": {"max_orders_per_second": 3},
-        })
+        cfg = AppConfig.model_validate(
+            {
+                "broker": {"primary": "zerodha"},
+                "execution": {"max_orders_per_second": 3},
+            }
+        )
         assert cfg.execution.max_orders_per_second == 3
 
     def test_our_own_hard_cap_still_binds(self) -> None:
         """Even where the broker allows 10, our code cap of 5 wins."""
         with pytest.raises(ValidationError, match="exceeds the hard cap"):
-            AppConfig.model_validate({
-                "broker": {"primary": "zerodha"},
-                "execution": {"max_orders_per_second": 8},
-            })
+            AppConfig.model_validate(
+                {
+                    "broker": {"primary": "zerodha"},
+                    "execution": {"max_orders_per_second": 8},
+                }
+            )
 
     def test_unknown_broker_in_config_is_rejected(self) -> None:
         with pytest.raises(ValidationError, match="unknown broker"):

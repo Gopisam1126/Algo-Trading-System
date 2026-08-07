@@ -28,23 +28,23 @@ from algotrader.common.models.trading import (
 )
 
 __all__ = [
+    # trading
+    "AIReview",
     # market
     "Bar",
+    "Confidence",
     "IndicatorSnapshot",
     "Instrument",
     "InstrumentDailyStatus",
     "MultiTimeframeSnapshot",
     "NonNegPrice",
-    "Price",
-    "Tick",
-    # trading
-    "AIReview",
-    "Confidence",
     "Order",
     "OrderRequest",
     "Position",
+    "Price",
     "Recommendation",
     "RiskDecision",
     "SizingResult",
+    "Tick",
     "Trigger",
 ]

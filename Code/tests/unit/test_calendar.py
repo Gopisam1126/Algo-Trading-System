@@ -12,6 +12,7 @@ from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import ValidationError
 
 from algotrader.common.calendar import (
     IST,
@@ -33,10 +34,10 @@ def ist_at(y: int, m: int, d: int, hh: int, mm: int) -> datetime:
 
 class TestTradingDays:
     def test_weekday_is_trading_day(self, cal: MarketCalendar) -> None:
-        assert cal.is_trading_day(date(2026, 8, 4))       # Tuesday
+        assert cal.is_trading_day(date(2026, 8, 4))  # Tuesday
 
     def test_saturday_is_not(self, cal: MarketCalendar) -> None:
-        assert not cal.is_trading_day(date(2026, 8, 8))   # Saturday
+        assert not cal.is_trading_day(date(2026, 8, 8))  # Saturday
 
     def test_holiday_is_not(self, cal: MarketCalendar) -> None:
         assert not cal.is_trading_day(date(2026, 8, 15))
@@ -63,7 +64,7 @@ class TestSessionState:
 
     def test_naive_datetime_rejected(self, cal: MarketCalendar) -> None:
         with pytest.raises(ValueError, match="timezone-aware"):
-            cal.is_market_open(datetime(2026, 8, 4, 11, 0))  # noqa: DTZ001
+            cal.is_market_open(datetime(2026, 8, 4, 11, 0))
 
 
 class TestSquareOffDeadlines:
@@ -102,7 +103,7 @@ class TestSquareOffDeadlines:
     def test_minutes_to_squareoff_counts_down(self, cal: MarketCalendar) -> None:
         moment = ist_at(2026, 8, 4, 14, 0)
         mins = cal.minutes_to_squareoff(moment, is_cas_stock=True, buffer_minutes=5)
-        assert 60 < mins < 70   # 14:00 -> 15:05 is 65 minutes
+        assert 60 < mins < 70  # 14:00 -> 15:05 is 65 minutes
 
 
 class TestBarAlignment:
@@ -151,8 +152,13 @@ class TestBarOHLCCoherence:
         from algotrader.common.models.market import Bar
 
         return Bar(
-            symbol="TEST", timeframe=Timeframe.M5, open_ts=datetime.now(UTC),
-            open=Decimal(o), high=Decimal(h), low=Decimal(low), close=Decimal(c),
+            symbol="TEST",
+            timeframe=Timeframe.M5,
+            open_ts=datetime.now(UTC),
+            open=Decimal(o),
+            high=Decimal(h),
+            low=Decimal(low),
+            close=Decimal(c),
             volume=100,
         )
 
@@ -167,7 +173,7 @@ class TestBarOHLCCoherence:
         ],
     )
     def test_incoherent_bars_rejected(self, name, o, h, low, c) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             self._bar(o, h, low, c)
 
     def test_coherent_bar_accepted(self) -> None:

@@ -65,8 +65,16 @@ class PrimitiveSpec(BaseModel):
 
     name: str
     category: Literal[
-        "price", "trend", "momentum", "volatility", "volume",
-        "multiframe", "context", "news", "time", "exit",
+        "price",
+        "trend",
+        "momentum",
+        "volatility",
+        "volume",
+        "multiframe",
+        "context",
+        "news",
+        "time",
+        "exit",
     ]
     description: str
     params: list[ParamSpec] = Field(default_factory=list)
@@ -80,9 +88,7 @@ class PrimitiveSpec(BaseModel):
 
         unknown = set(given) - set(specs)
         if unknown:
-            raise ValueError(
-                f"primitive {self.name!r}: unknown parameter(s) {sorted(unknown)}"
-            )
+            raise ValueError(f"primitive {self.name!r}: unknown parameter(s) {sorted(unknown)}")
 
         for spec in self.params:
             if spec.name not in given:
@@ -96,9 +102,7 @@ class PrimitiveSpec(BaseModel):
 
             if spec.type in ("int", "float"):
                 if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
-                    raise ValueError(
-                        f"primitive {self.name!r}: {spec.name!r} must be numeric"
-                    )
+                    raise ValueError(f"primitive {self.name!r}: {spec.name!r} must be numeric")
                 numeric = Decimal(str(value))
                 if spec.minimum is not None and numeric < spec.minimum:
                     raise ValueError(
@@ -115,8 +119,7 @@ class PrimitiveSpec(BaseModel):
             elif spec.type == "enum":
                 if spec.choices and str(value) not in spec.choices:
                     raise ValueError(
-                        f"primitive {self.name!r}: {spec.name!r}={value!r} not in "
-                        f"{spec.choices}"
+                        f"primitive {self.name!r}: {spec.name!r}={value!r} not in {spec.choices}"
                     )
 
 
@@ -249,8 +252,14 @@ class Hypothesis(BaseModel):
     def _not_boilerplate(cls, v: str) -> str:
         lowered = v.lower().strip()
         vacuous = (
-            "n/a", "none", "tbd", "unknown", "not applicable",
-            "the strategy works", "it makes money", "backtest shows",
+            "n/a",
+            "none",
+            "tbd",
+            "unknown",
+            "not applicable",
+            "the strategy works",
+            "it makes money",
+            "backtest shows",
         )
         if lowered in vacuous or any(lowered.startswith(p) for p in vacuous):
             raise ValueError(
@@ -323,9 +332,7 @@ class StrategyDocument(BaseModel):
             "exit": self.exit.model_dump(mode="json"),
             "constraints": self.constraints.model_dump(mode="json"),
         }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, default=str).encode()
-        ).hexdigest()
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
     def validate_against(self, registry: PrimitiveRegistry = REGISTRY) -> None:
         """Structural validation against the primitive registry.

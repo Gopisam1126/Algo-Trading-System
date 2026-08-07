@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # The application's declarative metadata.  `prepend_sys_path = src` in
 # alembic.ini makes this importable when alembic is run from Code/.
+from algotrader.common.db import models  # noqa: F401  — registers every table
 from algotrader.common.db.base import Base
 from algotrader.common.db.eventloop import configure_event_loop_policy
 

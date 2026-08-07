@@ -107,8 +107,19 @@ ignore = [
     "S101",      # assert is fine in tests
 ]
 
+# RUF001/002/003 flag "confusable" Unicode. The characters below are used
+# deliberately in prose throughout the design documents and docstrings — an
+# en dash between ranges, ≤/≥ in constraint descriptions, ₹ for rupee amounts.
+# They are typography, not homoglyph attacks, and mangling them to ASCII would
+# make the documentation worse. Anything NOT on this list is still flagged,
+# which is the point: a Cyrillic 'а' in an identifier still gets caught.
+allowed-confusables = ["–", "—", "×", "≤", "≥", "→", "₹", "’"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "DTZ"]
+# Alembic generates these and owns their shape; the revision identifiers are
+# module-level constants that do not follow normal naming rules.
+"migrations/versions/*" = ["N999", "E501"]
 
 # ---------------------------------------------------------------------------
 

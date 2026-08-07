@@ -40,16 +40,15 @@ class TestSeedStrategy:
     def test_content_hash_is_stable(self, seed_doc: StrategyDocument) -> None:
         assert seed_doc.content_hash() == seed_doc.content_hash()
 
-    def test_hash_ignores_metadata_but_not_behaviour(
-        self, seed_doc: StrategyDocument
-    ) -> None:
+    def test_hash_ignores_metadata_but_not_behaviour(self, seed_doc: StrategyDocument) -> None:
         """Renaming a strategy is not a new trial; changing its logic is."""
         renamed = seed_doc.model_copy(update={"name": "Totally Different Name"})
         assert renamed.content_hash() == seed_doc.content_hash()
 
         retuned = seed_doc.model_copy(
-            update={"constraints": seed_doc.constraints.model_copy(
-                update={"max_entries_per_day": 3})}
+            update={
+                "constraints": seed_doc.constraints.model_copy(update={"max_entries_per_day": 3})
+            }
         )
         assert retuned.content_hash() != seed_doc.content_hash()
 
@@ -91,8 +90,7 @@ class TestMandatoryExits:
             },
             "applicability": {"regimes": ["TRENDING"], "timeframe": "5m"},
             "direction": "LONG",
-            "entry": {"all_of": [{"primitive": "price_above_ma",
-                                  "params": {"period": 20}}]},
+            "entry": {"all_of": [{"primitive": "price_above_ma", "params": {"period": 20}}]},
         }
 
     def test_missing_stop_is_rejected(self) -> None:
@@ -111,8 +109,7 @@ class TestMandatoryExits:
         doc = self._base()
         doc["exit"] = {
             "stop": {"primitive": "atr_stop", "params": {"multiplier": 1.5}},
-            "time": {"primitive": "within_window",
-                     "params": {"start": "09:15", "end": "23:59"}},
+            "time": {"primitive": "within_window", "params": {"start": "09:15", "end": "23:59"}},
         }
         parsed = StrategyDocument.model_validate(doc)
         with pytest.raises(CompilationError, match="squareoff_deadline"):
@@ -140,8 +137,7 @@ class TestHypothesisRequired:
             "hypothesis": h,
             "applicability": {"regimes": ["TRENDING"], "timeframe": "5m"},
             "direction": "LONG",
-            "entry": {"all_of": [{"primitive": "price_above_ma",
-                                  "params": {"period": 20}}]},
+            "entry": {"all_of": [{"primitive": "price_above_ma", "params": {"period": 20}}]},
             "exit": {
                 "stop": {"primitive": "atr_stop", "params": {"multiplier": 1.5}},
                 "time": {"primitive": "squareoff_deadline"},
@@ -150,26 +146,38 @@ class TestHypothesisRequired:
 
     def test_boilerplate_hypothesis_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            StrategyDocument.model_validate(self._with_hypothesis({
-                "mechanism": "n/a",
-                "why_it_should_persist": "n/a",
-                "expected_failure_mode": "n/a",
-            }))
+            StrategyDocument.model_validate(
+                self._with_hypothesis(
+                    {
+                        "mechanism": "n/a",
+                        "why_it_should_persist": "n/a",
+                        "expected_failure_mode": "n/a",
+                    }
+                )
+            )
 
     def test_too_short_hypothesis_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            StrategyDocument.model_validate(self._with_hypothesis({
-                "mechanism": "it works",
-                "why_it_should_persist": "because",
-                "expected_failure_mode": "dunno",
-            }))
+            StrategyDocument.model_validate(
+                self._with_hypothesis(
+                    {
+                        "mechanism": "it works",
+                        "why_it_should_persist": "because",
+                        "expected_failure_mode": "dunno",
+                    }
+                )
+            )
 
     def test_substantive_hypothesis_accepted(self) -> None:
-        doc = StrategyDocument.model_validate(self._with_hypothesis({
-            "mechanism": "M" * 100,
-            "why_it_should_persist": "P" * 80,
-            "expected_failure_mode": "F" * 60,
-        }))
+        doc = StrategyDocument.model_validate(
+            self._with_hypothesis(
+                {
+                    "mechanism": "M" * 100,
+                    "why_it_should_persist": "P" * 80,
+                    "expected_failure_mode": "F" * 60,
+                }
+            )
+        )
         assert doc.hypothesis.mechanism
 
 
@@ -177,28 +185,29 @@ class TestOverfittingGuards:
     def test_too_many_entry_conditions_rejected(self) -> None:
         """Excessive degrees of freedom is an overfitting signal."""
         conditions = [
-            {"primitive": "price_above_ma", "params": {"period": 5 + i}}
-            for i in range(15)
+            {"primitive": "price_above_ma", "params": {"period": 5 + i}} for i in range(15)
         ]
-        doc = StrategyDocument.model_validate({
-            "id": "overfit_strat",
-            "name": "Overfit Strategy",
-            "origin": "AI_PROPOSED_OBSERVATION",
-            "created_at": "2026-08-04T00:00:00Z",
-            "created_by": "claude-opus-5",
-            "hypothesis": {
-                "mechanism": "M" * 100,
-                "why_it_should_persist": "P" * 80,
-                "expected_failure_mode": "F" * 60,
-            },
-            "applicability": {"regimes": ["TRENDING"], "timeframe": "5m"},
-            "direction": "LONG",
-            "entry": {"all_of": conditions},
-            "exit": {
-                "stop": {"primitive": "atr_stop", "params": {"multiplier": 1.5}},
-                "time": {"primitive": "squareoff_deadline"},
-            },
-        })
+        doc = StrategyDocument.model_validate(
+            {
+                "id": "overfit_strat",
+                "name": "Overfit Strategy",
+                "origin": "AI_PROPOSED_OBSERVATION",
+                "created_at": "2026-08-04T00:00:00Z",
+                "created_by": "claude-opus-5",
+                "hypothesis": {
+                    "mechanism": "M" * 100,
+                    "why_it_should_persist": "P" * 80,
+                    "expected_failure_mode": "F" * 60,
+                },
+                "applicability": {"regimes": ["TRENDING"], "timeframe": "5m"},
+                "direction": "LONG",
+                "entry": {"all_of": conditions},
+                "exit": {
+                    "stop": {"primitive": "atr_stop", "params": {"multiplier": 1.5}},
+                    "time": {"primitive": "squareoff_deadline"},
+                },
+            }
+        )
         with pytest.raises(CompilationError, match="overfitting signal"):
             compile_strategy(doc)
 
@@ -214,24 +223,27 @@ class TestNoCodeExecution:
 
     def test_strategy_document_forbids_extra_fields(self) -> None:
         with pytest.raises(ValidationError):
-            StrategyDocument.model_validate({
-                "id": "x_strat",
-                "name": "X",
-                "origin": "USER_AUTHORED",
-                "created_at": "2026-08-04T00:00:00Z",
-                "created_by": "test",
-                "hypothesis": {
-                    "mechanism": "M" * 100,
-                    "why_it_should_persist": "P" * 80,
-                    "expected_failure_mode": "F" * 60,
-                },
-                "applicability": {"regimes": ["TRENDING"], "timeframe": "5m"},
-                "direction": "LONG",
-                "entry": {"all_of": [{"primitive": "price_above_ma",
-                                      "params": {"period": 20}}]},
-                "exit": {
-                    "stop": {"primitive": "atr_stop", "params": {"multiplier": 1.5}},
-                    "time": {"primitive": "squareoff_deadline"},
-                },
-                "on_signal_exec": "import os; os.system('id')",   # <- must be rejected
-            })
+            StrategyDocument.model_validate(
+                {
+                    "id": "x_strat",
+                    "name": "X",
+                    "origin": "USER_AUTHORED",
+                    "created_at": "2026-08-04T00:00:00Z",
+                    "created_by": "test",
+                    "hypothesis": {
+                        "mechanism": "M" * 100,
+                        "why_it_should_persist": "P" * 80,
+                        "expected_failure_mode": "F" * 60,
+                    },
+                    "applicability": {"regimes": ["TRENDING"], "timeframe": "5m"},
+                    "direction": "LONG",
+                    "entry": {
+                        "all_of": [{"primitive": "price_above_ma", "params": {"period": 20}}]
+                    },
+                    "exit": {
+                        "stop": {"primitive": "atr_stop", "params": {"multiplier": 1.5}},
+                        "time": {"primitive": "squareoff_deadline"},
+                    },
+                    "on_signal_exec": "import os; os.system('id')",  # <- must be rejected
+                }
+            )

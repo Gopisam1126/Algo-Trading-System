@@ -97,7 +97,7 @@ def check_config(r: Report) -> None:
     except FileNotFoundError as exc:
         r.fail("config not found", str(exc))
         return
-    except Exception as exc:  # noqa: BLE001 — surface any validation error verbatim
+    except Exception as exc:
         r.fail("config failed validation", str(exc).split("\n")[0])
         return
 
@@ -190,7 +190,7 @@ def check_compliance(r: Report) -> None:
         from algotrader.common.enums import SystemMode
 
         cfg = load_config()
-    except Exception:  # noqa: BLE001
+    except Exception:
         r.fail("cannot check compliance", "config did not load")
         return
 
@@ -207,18 +207,24 @@ def check_compliance(r: Report) -> None:
 
     rate = cfg.execution.max_orders_per_second
     if rate <= profile.max_orders_per_second:
-        r.ok(f"order rate {rate}/sec",
-             f"{profile.display_name} allows {profile.max_orders_per_second}, SEBI 10")
+        r.ok(
+            f"order rate {rate}/sec",
+            f"{profile.display_name} allows {profile.max_orders_per_second}, SEBI 10",
+        )
     else:
-        r.fail(f"order rate {rate}/sec exceeds broker limit",
-               f"{profile.display_name} allows only {profile.max_orders_per_second}")
+        r.fail(
+            f"order rate {rate}/sec exceeds broker limit",
+            f"{profile.display_name} allows only {profile.max_orders_per_second}",
+        )
 
     # Zerodha-style redirect auth cannot complete unattended. That is an
     # operational constraint on autonomy, not a bug — surface it so it is a
     # known trade-off rather than a 07:00 surprise.
     if profile.requires_manual_daily_login:
-        r.warn(f"{profile.display_name} needs a manual daily login",
-               "redirect auth flow - unattended operation needs this solved")
+        r.warn(
+            f"{profile.display_name} needs a manual daily login",
+            "redirect auth flow - unattended operation needs this solved",
+        )
     else:
         r.ok(f"{profile.display_name} supports programmatic daily login")
 
@@ -243,8 +249,7 @@ def check_compliance(r: Report) -> None:
         r.warn("Algo-ID not set", "required before live trading")
 
     if len(cfg.notifications.recipients) <= 1:
-        r.ok("single notification recipient",
-             "broadcasting signals can trigger RA obligations")
+        r.ok("single notification recipient", "broadcasting signals can trigger RA obligations")
     else:
         r.fail("multiple notification recipients configured")
 
@@ -261,9 +266,9 @@ def check_egress_ip(r: Report) -> None:
     try:
         import urllib.request
 
-        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:  # noqa: S310
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
             actual = resp.read().decode().strip()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         r.warn("could not determine egress IP", str(exc)[:60])
         return
 
@@ -351,7 +356,7 @@ def check_broker_sdk(r: Report) -> None:
         import inspect
 
         params = inspect.signature(kiteconnect.KiteConnect.place_order).parameters
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         r.warn(f"kiteconnect {version} - could not inspect place_order", str(exc)[:60])
         return
 
@@ -380,7 +385,7 @@ def check_strategies(r: Report) -> None:
         from algotrader.strategy.dsl import REGISTRY, load_strategy_yaml
 
         r.ok(f"{len(REGISTRY.names())} primitives registered")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         r.fail("primitive registry failed to load", str(exc)[:80])
         return
 
@@ -397,7 +402,7 @@ def check_strategies(r: Report) -> None:
             doc = load_strategy_yaml(path.read_text(encoding="utf-8"))
             compile_strategy(doc)
             r.ok(f"{path.name}", f"{doc.id} v{doc.version}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             r.fail(f"{path.name} failed to compile", str(exc)[:80])
 
 
@@ -410,7 +415,7 @@ def check_secrets(r: Report) -> None:
 
     try:
         live = load_config().system.mode is SystemMode.LIVE
-    except Exception:  # noqa: BLE001
+    except Exception:
         live = False
 
     required = ["ANTHROPIC_API_KEY"]

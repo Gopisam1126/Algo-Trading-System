@@ -57,7 +57,9 @@ class TestMarketOrdersRequireProtection:
 
     @pytest.mark.parametrize("order_type", [OrderType.MARKET, OrderType.SLM])
     def test_percentage_protection_accepted(self, order_type: OrderType) -> None:
-        assert _order(order_type, market_protection=Decimal("2.5")).market_protection == Decimal("2.5")
+        assert _order(order_type, market_protection=Decimal("2.5")).market_protection == Decimal(
+            "2.5"
+        )
 
     def test_other_negatives_rejected(self) -> None:
         with pytest.raises(ValidationError):

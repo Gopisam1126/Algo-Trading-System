@@ -60,6 +60,8 @@ class Base(AsyncAttrs, DeclarativeBase):
 # absent from the migration — and worse, an existing table with no
 # corresponding import looks to Alembic like a table to DROP.
 #
-# E01-S01 task 2: add `from algotrader.common.db import models  # noqa: F401`
-# below once models.py exists.
+# Deliberately NOT imported here. `models` imports `Base` from this module, so
+# importing it back would be a circular import that only works by accident of
+# statement order. `migrations/env.py` imports the models directly instead,
+# which is the one place autogenerate actually needs them.
 # ---------------------------------------------------------------------------

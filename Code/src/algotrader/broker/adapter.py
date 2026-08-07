@@ -174,9 +174,7 @@ class ReadOnlyGuard:
     """
 
     async def place_order(self, request: OrderRequest) -> str:
-        raise PermissionError(
-            "this adapter is read-only; only execution-svc may place orders"
-        )
+        raise PermissionError("this adapter is read-only; only execution-svc may place orders")
 
     async def modify_order(self, *args: object, **kwargs: object) -> None:
         raise PermissionError("this adapter is read-only")

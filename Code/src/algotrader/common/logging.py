@@ -61,7 +61,9 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     # required a username and let every Redis password through.
     re.compile(r"(?P<pre>\b[a-z][a-z0-9+.\-]*://[^\s:/@]*:)[^\s@]+(?P<post>@)", re.I),
     # Any credential-shaped assignment
-    re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token|totp|access_token)\b\s*[:=]\s*\S+"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|secret|password|passwd|token|totp|access_token)\b\s*[:=]\s*\S+"
+    ),
 ]
 
 #: Patterns that keep surrounding context instead of replacing the whole match.
@@ -72,11 +74,25 @@ _PARTIAL_REDACTIONS: dict[int, str] = {
 }
 
 #: Field names whose values are always redacted, whatever they contain.
-_SENSITIVE_KEYS = frozenset({
-    "password", "api_key", "apikey", "secret", "token", "access_token",
-    "refresh_token", "totp", "totp_secret", "authorization", "auth",
-    "client_secret", "private_key", "session_token", "feed_token",
-})
+_SENSITIVE_KEYS = frozenset(
+    {
+        "password",
+        "api_key",
+        "apikey",
+        "secret",
+        "token",
+        "access_token",
+        "refresh_token",
+        "totp",
+        "totp_secret",
+        "authorization",
+        "auth",
+        "client_secret",
+        "private_key",
+        "session_token",
+        "feed_token",
+    }
+)
 
 
 class RedactingProcessor:
@@ -118,9 +134,7 @@ class RedactingProcessor:
             return type(value)(self._scrub_value(key, v) for v in value)
         return value
 
-    def __call__(
-        self, _logger: Any, _name: str, event_dict: dict[str, Any]
-    ) -> dict[str, Any]:
+    def __call__(self, _logger: Any, _name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
         return {k: self._scrub_value(k, v) for k, v in event_dict.items()}
 
 
@@ -140,9 +154,7 @@ class RedactingFilter(logging.Filter):
                     k: self._processor._scrub_value(str(k), v) for k, v in record.args.items()
                 }
             else:
-                record.args = tuple(
-                    self._processor._scrub_value("", a) for a in record.args
-                )
+                record.args = tuple(self._processor._scrub_value("", a) for a in record.args)
         return True
 
 
@@ -172,7 +184,7 @@ def configure_logging(
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
-        _redactor,                                   # <- redaction, always on
+        _redactor,  # <- redaction, always on
         structlog.processors.EventRenamer("message"),
     ]
     processors.append(

@@ -183,6 +183,76 @@ problems.
 
 ---
 
+### 2.3 Pre-implementation analysis — conflicts found before writing code
+
+Done 7 Aug 2026, before E01-S01. Each item below is a defect in this
+specification or a mismatch between it and the existing code that would have
+produced a bug during implementation.
+
+**A. `order_fills.total_charges` DDL is invalid PostgreSQL (§6.4).**
+The spec writes `GENERATED ALWAYS AS (...) STORED AS total_charges`, which is
+not valid syntax and fails at migration time. Correct form places the column
+name first:
+
+```sql
+total_charges NUMERIC(10,2) GENERATED ALWAYS AS
+    (brokerage + stt + exchange_charges + gst + sebi_charges + stamp_duty) STORED
+```
+
+**B. Columnstore DDL depends on the undecided pin (§2.1).**
+`timescaledb.enable_columnstore` and `add_columnstore_policy` exist only from
+2.18. On the current 2.17.2 pin they raise. Rather than block on the decision,
+the migration **detects the installed version and emits the matching DDL** —
+legacy `timescaledb.compress` + `add_compression_policy` below 2.18, columnstore
+at or above it. Verified working on both 2.17.2 and 2.29.1, so the pin can move
+in either direction without a migration rewrite.
+
+**C. `v_eligible_today` uses `CURRENT_DATE`, which is server-timezone dependent.**
+IST is UTC+5:30, so the UTC date and the IST trade date agree during the
+session but diverge between 00:00 and 05:30 IST. Any job running in that window
+— a nightly archival or an early pre-market task — would read the wrong day's
+hazard flags and could admit a T2T or ASM symbol. The view now uses an explicit
+`(now() AT TIME ZONE 'Asia/Kolkata')::date`.
+
+**D. The Pydantic models and the DDL disagree on names.** These are the
+translations the repository layer owns; they are deliberate, not accidental:
+
+| Pydantic | Column | Why they differ |
+|---|---|---|
+| `Bar.open_ts` | `ohlcv.ts` | `ts` is the hypertable partitioning column; the convention is worth keeping |
+| `Bar.symbol` (str) | `symbol_id` (int FK) | See E below |
+| `Bar.is_final` | *(not stored)* | Only final bars are persisted; a forming bar has no row |
+| *(none)* | `ohlcv.is_adjusted` | Corporate-action state, DB-side only |
+| `Position.position_id` | `positions.id` | |
+| `Position.max_favourable_excursion` | `max_favourable_exc` | Spec truncated it for no reason — **the column now uses the full name**, matching the model |
+
+**E. The `symbol` ↔ `symbol_id` impedance mismatch is real architecture, not
+plumbing.** Every domain model addresses instruments by ticker string; every
+table addresses them by integer FK. Resolving that per row would issue a query
+per bar and destroy the BP-2 warm-up budget. `InstrumentRepository` therefore
+owns a bidirectional in-memory cache, loaded once and refreshed on the daily
+instrument sync, and it is the *only* component permitted to translate.
+
+**F. Two enum columns are sized to an exact fit.** `side VARCHAR(4)` fits
+`'SELL'` with zero headroom and `direction VARCHAR(5)` fits `'SHORT'`. Widths
+are now generous, and — more usefully — the small, stable, safety-critical
+columns carry `CHECK` constraints against their permitted values rather than
+relying on length. An invalid `side` or `direction` is then impossible, not
+merely improbable. Larger and more volatile vocabularies (`OrderStatus`,
+`RejectReason`) stay width-constrained only, so adding a value does not force a
+migration. All 23 enums were checked against their column widths; none overflow.
+
+**G. Role creation cannot live in a migration as written (§6.8).**
+`CREATE ROLE ... LOGIN PASSWORD :'app_password'` would put a credential in a
+version-controlled migration. Roles are also cluster-level, not database-level,
+so they do not belong to a database's migration history. The migration now
+creates the role **`NOLOGIN` and password-less if it does not already exist**,
+and applies the grants; the operator grants `LOGIN` and sets the password
+out-of-band. BR-3/BR-4 remain fully testable via `SET ROLE`, with no credential
+committed.
+
+---
+
 ## 3. BUSINESS RULES THE SCHEMA MUST ENFORCE
 
 This is the "verify the business logic" part. Each rule below is a business

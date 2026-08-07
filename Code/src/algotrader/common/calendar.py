@@ -32,8 +32,8 @@ BLOCK_DEAL_MORNING_START = time(8, 45)
 BLOCK_DEAL_MORNING_END = time(9, 0)
 
 PRE_OPEN_START = time(9, 0)
-PRE_OPEN_ORDER_END = time(9, 8)      # order collection closes
-PRE_OPEN_MATCH_END = time(9, 12)     # matching completes
+PRE_OPEN_ORDER_END = time(9, 8)  # order collection closes
+PRE_OPEN_MATCH_END = time(9, 12)  # matching completes
 PRE_OPEN_END = time(9, 15)
 
 MARKET_OPEN = time(9, 15)
@@ -187,7 +187,9 @@ class MarketCalendar:
         if ist < session_start:
             return session_start.astimezone(UTC)
         elapsed = int((ist - session_start).total_seconds())
-        aligned = session_start + timedelta(seconds=(elapsed // interval_seconds) * interval_seconds)
+        aligned = session_start + timedelta(
+            seconds=(elapsed // interval_seconds) * interval_seconds
+        )
         return aligned.astimezone(UTC)
 
     def session_bounds(self, d: date) -> tuple[datetime, datetime]:
@@ -210,7 +212,7 @@ class HolidayCalendarStatus:
     pre-market cycle against data that will never arrive.
     """
 
-    __slots__ = ("dates", "verified", "source", "path", "count")
+    __slots__ = ("count", "dates", "path", "source", "verified")
 
     def __init__(
         self,

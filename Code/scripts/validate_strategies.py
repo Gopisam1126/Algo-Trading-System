@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from algotrader.strategy import primitives  # noqa: E402, F401 — populates REGISTRY
-from algotrader.strategy.dsl import (  # noqa: E402
+from algotrader.strategy import primitives  # noqa: F401 — populates REGISTRY
+from algotrader.strategy.dsl import (
     REGISTRY,
     CompilationError,
     compile_strategy,
@@ -52,7 +52,10 @@ def main() -> int:
         conditions = len(doc.entry.all_conditions())
         print(f"  OK    {path.name}")
         print(f"        id={doc.id} v{doc.version}  origin={doc.origin.value}")
-        print(f"        direction={doc.direction.value}  timeframe={doc.applicability.timeframe.value}")
+        print(
+            f"        direction={doc.direction.value}  "
+            f"timeframe={doc.applicability.timeframe.value}"
+        )
         print(f"        regimes={[r.value for r in doc.applicability.regimes]}")
         print(f"        entry conditions={conditions}  hash={doc.content_hash()[:12]}")
 

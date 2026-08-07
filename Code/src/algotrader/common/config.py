@@ -36,13 +36,13 @@ from algotrader.common.enums import AutonomyLevel, SystemMode, Timeframe
 # that goes through review, which is exactly the point.
 # ---------------------------------------------------------------------------
 
-MAX_ORDERS_PER_SECOND = 5          # SEBI threshold is 10; we cap at half
+MAX_ORDERS_PER_SECOND = 5  # SEBI threshold is 10; we cap at half
 MAX_RISK_PCT_PER_TRADE = Decimal("10.0")
 MAX_POSITION_SLOTS = 20
 MAX_DAILY_LOSS_PCT = Decimal("25.0")
 MAX_POSITION_PCT = Decimal("100.0")
-MIN_STRATEGY_TRIALS = 50           # below this, statistics are meaningless
-MAX_PBO_ALLOWED = Decimal("0.6")   # Probability of Backtest Overfitting
+MIN_STRATEGY_TRIALS = 50  # below this, statistics are meaningless
+MAX_PBO_ALLOWED = Decimal("0.6")  # Probability of Backtest Overfitting
 MAX_ACTIVE_STRATEGIES = 12
 MIN_EXIT_BUFFER_MINUTES = 1
 
@@ -67,8 +67,16 @@ class SystemConfig(_Model):
     @classmethod
     def _must_be_india(cls, v: str) -> str:
         """SEBI requires algos to be hosted on Indian servers."""
-        india_regions = {"ap-south-1", "ap-south-2", "centralindia", "southindia",
-                         "asia-south1", "asia-south2", "in-mumbai", "in-delhi"}
+        india_regions = {
+            "ap-south-1",
+            "ap-south-2",
+            "centralindia",
+            "southindia",
+            "asia-south1",
+            "asia-south2",
+            "in-mumbai",
+            "in-delhi",
+        }
         if v.lower() not in india_regions:
             raise ValueError(
                 f"deployment_region {v!r} is not an India region. SEBI requires "
@@ -271,8 +279,14 @@ class ScoringWeights(_Model):
     @model_validator(mode="after")
     def _sums_to_one(self) -> Self:
         total = sum(
-            (self.trend_alignment, self.relative_strength, self.volatility_fitness,
-             self.volume_expansion, self.level_proximity, self.catalyst_news),
+            (
+                self.trend_alignment,
+                self.relative_strength,
+                self.volatility_fitness,
+                self.volume_expansion,
+                self.level_proximity,
+                self.catalyst_news,
+            ),
             Decimal(0),
         )
         if abs(total - Decimal(1)) > Decimal("0.001"):
@@ -509,7 +523,7 @@ class StrategyPromotionConfig(_Model):
 
 
 class AIGenerationConfig(_Model):
-    enabled: bool = False              # Phase 2 — off until the gauntlet exists
+    enabled: bool = False  # Phase 2 — off until the gauntlet exists
     cadence: str = "weekly"
     max_proposals_per_cycle: int = Field(default=5, ge=1, le=20)
     max_active_ai_strategies: int = Field(default=3, ge=0)
