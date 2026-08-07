@@ -66,16 +66,32 @@ def create_engine(config: DatabaseConfig, password: str | None = None) -> AsyncE
     )
 
 
-def create_engine_from_url(url: str, *, echo: bool = False) -> AsyncEngine:
+def create_engine_from_url(
+    url: str, *, echo: bool = False, connect_timeout_seconds: int = 10
+) -> AsyncEngine:
     """Build an engine from a URL that is already resolved.
 
     For tests and tools that hold a DSN directly (an ephemeral testcontainer,
     a one-off migration check) rather than a :class:`DatabaseConfig`. It still
     goes through :func:`configure_event_loop_policy`, which is the part that is
     easy to forget and fails only on Windows.
+
+    ``connect_timeout_seconds`` is not optional in practice. Without it, psycopg
+    waits on the OS TCP timeout — which on an unreachable host is minutes, not
+    seconds. That turns "the database is down" into "the process appears to
+    hang", which is a far worse failure to diagnose at 09:15. It also makes the
+    audit outage tests possible: they point at a dead endpoint and need it to
+    fail promptly rather than stall the suite.
     """
     configure_event_loop_policy()
-    return create_async_engine(url, echo=echo, connect_args={"application_name": "algotrader"})
+    return create_async_engine(
+        url,
+        echo=echo,
+        connect_args={
+            "application_name": "algotrader",
+            "connect_timeout": connect_timeout_seconds,
+        },
+    )
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
