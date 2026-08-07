@@ -153,7 +153,40 @@ and no amount of engineering closes it — only evidence does.
 
 ---
 
-## 7. Rollback
+## 7. Do not promote by checking out branches locally
+
+This repository lives in a **OneDrive-synced folder**, and that makes local
+branch switching genuinely dangerous.
+
+Switching from `DEV` to `QA` asks git to delete every file `QA` does not have.
+OneDrive holds a lock on any file it is syncing — `BACKLOG_Tracker.xlsx` in
+particular — so the delete fails partway. Git reports
+`unable to unlink ... Invalid argument` as a *warning*, completes the switch,
+and leaves the tree half-emptied: source files gone, the locked file still
+there, both showing as untracked.
+
+Nothing is lost if the work is pushed, and recovery is `git checkout -f DEV`.
+But it looks alarming, and on a branch whose work was *not* pushed it would be
+real data loss.
+
+**Use the promotion workflow.** It runs on a GitHub runner with no OneDrive and
+no working tree to corrupt. If you must promote from a local clone, do it
+without a checkout at all:
+
+```bash
+SRC=$(git rev-parse origin/DEV)
+git merge-base --is-ancestor "$(git rev-parse QA)" "$SRC" || echo "QA has diverged — stop"
+NEW=$(git commit-tree "$SRC^{tree}" -p "$(git rev-parse QA)" -p "$SRC" -m "Promote DEV -> QA: <reason>")
+git update-ref refs/heads/QA "$NEW"
+git push origin QA
+```
+
+That builds the same `--no-ff` merge commit the workflow does — QA's tree ends
+up byte-identical to DEV's — while never touching a single file on disk.
+
+---
+
+## 8. Rollback
 
 Promotion uses `--no-ff`, so every promotion is a single merge commit and
 reverting one is a single operation:
@@ -172,7 +205,7 @@ is, that changes, and this section must be rewritten rather than assumed.
 
 ---
 
-## 8. The image, and a bug this work uncovered
+## 9. The image, and a bug this work uncovered
 
 **`ops/Dockerfile` did not build at all.** Setting up this pipeline was the
 first time anyone had built the deployable artifact, and it failed: the stage
