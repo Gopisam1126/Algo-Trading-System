@@ -132,10 +132,22 @@ Phase 0 complete: domain models, config with hard bounds, secrets, logging with
 redaction, NSE calendar, broker protocol (Zerodha Kite Connect primary), strategy
 DSL with 27 primitives, and 112 passing tests. Services are stubs. Nothing trades.
 
-Three items are open and tracked in `../Documents/PRE_LIVE_CHECKLIST.md`:
-Algo-ID attachment mechanic unconfirmed, `kiteconnect` on PyPI lacks
-`market_protection`, and the NSE holiday list is incomplete. `make doctor`
-checks the latter two at runtime.
+Two of the three long-standing open items closed on 7 Aug 2026, both by
+inspecting the installed SDK rather than the docs:
+
+- **`market_protection` — RESOLVED.** kiteconnect **5.2.1** exposes it on
+  `place_order()`; the gap was in 5.1.0, which the design documents were written
+  against. Its accepted values (`-1`, or 1–100) match `OrderRequest`'s validator
+  exactly. `pyproject.toml` now floors the dependency at 5.2.1.
+- **Algo-ID mechanic — RESOLVED.** `place_order()` takes an `algo_id`
+  parameter, so the ID is **client-supplied per order**, not broker-injected —
+  which is what `BrokerConfig.algo_id` already assumed. What remains is a
+  paperwork question (*which* generic ID to send), not a design one.
+- **NSE holiday list — still incomplete.** Fixed-date entries only.
+
+`make doctor` checks all three at runtime. A new finding replaces them:
+`kiteconnect` hard-pins `autobahn==19.11.2`, which carries CVE-2020-35678 in
+the WebSocket market-data path — tracked as blocker B7, not fixable locally.
 
 Next up is Phase 1 — broker authentication with daily re-login, WebSocket
 ingestion, tick cleaning, and bar construction. `INDIA_FEATURES_AND_CONFIG.md §3`

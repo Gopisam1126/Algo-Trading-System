@@ -24,6 +24,44 @@ system:
   log_level: INFO
 
 # ---------------------------------------------------------------------------
+# DATASTORES
+#
+# Connection STRUCTURE only — no passwords.  This file is version controlled,
+# so a credential here would be a committed secret.
+#
+#   Password  -> POSTGRES_PASSWORD / REDIS_PASSWORD in .env (or the secrets
+#                provider in production).
+#   Override  -> if DATABASE_URL / REDIS_URL is set in the environment it wins
+#                ENTIRELY and every field below is ignored.  That is how the
+#                containers reach host `timescaledb` instead of `localhost`,
+#                and how tests point at an ephemeral testcontainer.
+#                `make doctor` reports which source is actually in effect.
+# ---------------------------------------------------------------------------
+database:
+  host: localhost                 # `timescaledb` inside the compose network
+  port: 5432
+  name: algotrader
+  user: algotrader
+  pool_size: 10                   # nine services + migrations
+  max_overflow: 5                 # absorbs the pre-market burst
+  pool_pre_ping: true             # survives an idle-connection reap
+  pool_recycle_seconds: 1800
+  statement_timeout_ms: 30000     # longer than this is a bug, not a slow query
+  echo_sql: false                 # dev only — echoed SQL bypasses redaction
+
+redis:
+  host: localhost                 # `redis` inside the compose network
+  port: 6379
+  db: 0
+  max_connections: 20
+  socket_timeout_seconds: 5.0
+  socket_connect_timeout_seconds: 3.0
+  # The server runs with maxmemory-policy=noeviction (see docker-compose.yml),
+  # so an untrimmed stream fills the 2 GB ceiling and Redis then REFUSES
+  # WRITES rather than dropping old entries.  Hence every stream is capped.
+  default_stream_maxlen: 10000
+
+# ---------------------------------------------------------------------------
 broker:
   primary: zerodha                # angelone | zerodha | fyers | dhan | upstox
   fallback: fyers                 # free minute-level history; data redundancy

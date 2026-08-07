@@ -31,6 +31,11 @@ Read these before changing anything. They are in [`../Documents/`](../Documents/
 
 ## Quick start
 
+> **Setting up for the first time, or picking up Sprint 1?** Read
+> **[SETUP.md](SETUP.md)** instead — it covers what is already built, the one
+> decision still outstanding (the TimescaleDB pin), and the datastore
+> gotchas that will otherwise cost you an afternoon.
+
 ```bash
 cd Code
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate

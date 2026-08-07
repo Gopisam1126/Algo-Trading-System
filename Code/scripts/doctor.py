@@ -113,6 +113,75 @@ def check_config(r: Report) -> None:
     print(f"    daily loss limit   Rs {cfg.risk.daily_loss_limit_rupees:>12,.0f}")
 
 
+def check_datastores(r: Report) -> None:
+    """Report where the datastore connections actually come from.
+
+    The point of this check is that the override is never silent. `.env` and
+    `config/system.yaml` both describe a connection, and if DATABASE_URL is set
+    it wins outright — so the question "which database am I actually about to
+    talk to?" needs an answer you can read, not one you have to derive.
+
+    This does NOT attempt to connect. Reachability is a separate concern and a
+    connection attempt here would make `doctor` fail whenever the containers
+    happen to be down, which is not what it is for.
+    """
+    import os
+
+    section("Datastores")
+    try:
+        from algotrader.common.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        # check_config has already reported the reason; do not repeat it.
+        r.warn("skipped — config did not load")
+        return
+
+    # --- PostgreSQL ---
+    if os.environ.get("DATABASE_URL"):
+        r.warn(
+            "postgres: DATABASE_URL override is ACTIVE",
+            "config/system.yaml database: section is being IGNORED",
+        )
+    elif os.environ.get("POSTGRES_PASSWORD"):
+        r.ok("postgres: from system.yaml + POSTGRES_PASSWORD", cfg.database.safe_dsn())
+    else:
+        r.fail(
+            "postgres: no password and no override",
+            "set POSTGRES_PASSWORD in .env, or set DATABASE_URL",
+        )
+
+    r.ok(
+        "postgres pool (configured, not yet applied — E01-S02)",
+        f"size={cfg.database.pool_size} overflow={cfg.database.max_overflow} "
+        f"timeout={cfg.database.statement_timeout_ms}ms",
+    )
+
+    # --- Redis ---
+    if os.environ.get("REDIS_URL"):
+        r.warn(
+            "redis: REDIS_URL override is ACTIVE",
+            "config/system.yaml redis: section is being IGNORED",
+        )
+    else:
+        r.ok("redis: from system.yaml", cfg.redis.safe_dsn())
+
+    r.ok("redis stream cap", f"default maxlen={cfg.redis.default_stream_maxlen:,}")
+
+    # --- Migrations ---
+    versions = Path(__file__).resolve().parents[1] / "migrations" / "versions"
+    revisions = sorted(versions.glob("*.py")) if versions.is_dir() else []
+    if not (Path(__file__).resolve().parents[1] / "alembic.ini").exists():
+        r.fail("alembic.ini missing", "migrations cannot run")
+    elif not revisions:
+        r.warn(
+            "no migrations written yet",
+            "expected during Sprint 1 until E01-S01 lands",
+        )
+    else:
+        r.ok(f"{len(revisions)} migration(s) present", revisions[-1].name)
+
+
 def check_compliance(r: Report) -> None:
     """SEBI constraints — architectural requirements, not paperwork."""
     section("SEBI compliance")
@@ -249,9 +318,15 @@ def check_market_calendar(r: Report) -> None:
 def check_broker_sdk(r: Report) -> None:
     """Verify the installed Kite SDK can actually place compliant orders.
 
-    pykiteconnect 5.1.0 on PyPI omits `market_protection` from place_order().
-    MARKET and SL-M orders are rejected without it from 1 Apr 2026, so a plain
-    `pip install kiteconnect` yields an SDK that cannot square off a position.
+    Two parameters on ``place_order()`` are checked, and both are regulatory
+    rather than cosmetic:
+
+    - ``market_protection`` — MARKET and SL-M orders are rejected without it
+      from 1 Apr 2026, so an SDK lacking it cannot square off a position.
+      pykiteconnect 5.1.0 omitted it (zerodha/pykiteconnect#225); 5.2.1 has it.
+    - ``algo_id`` — SEBI requires every algorithmic order to carry an
+      exchange-assigned Algo-ID. Its presence here establishes that the ID is
+      **client-supplied per order**, not injected server-side by the broker.
     """
     section("Broker SDK")
 
@@ -261,7 +336,16 @@ def check_broker_sdk(r: Report) -> None:
         r.warn("kiteconnect not installed", "required before any broker work")
         return
 
-    version = getattr(kiteconnect, "__version__", "unknown")
+    # NOTE: `kiteconnect.__version__` is a SUBMODULE, not a string, so
+    # getattr(kiteconnect, "__version__") returns a module object and prints as
+    # "<module 'kiteconnect.__version__' from '...'>". Read the installed
+    # distribution metadata instead.
+    try:
+        from importlib.metadata import version as _dist_version
+
+        version = _dist_version("kiteconnect")
+    except Exception:
+        version = "unknown"
 
     try:
         import inspect
@@ -276,8 +360,16 @@ def check_broker_sdk(r: Report) -> None:
     else:
         r.fail(
             f"kiteconnect {version} LACKS market_protection",
-            "MARKET/SL-M orders will be rejected - install from git main "
+            "MARKET/SL-M orders will be rejected - upgrade to 5.2.1 or later "
             "(zerodha/pykiteconnect#225)",
+        )
+
+    if "algo_id" in params:
+        r.ok(f"kiteconnect {version} accepts algo_id per order", "SEBI: client-supplied")
+    else:
+        r.warn(
+            f"kiteconnect {version} has no algo_id parameter",
+            "confirm with Zerodha how the Algo-ID is attached (blocker B1)",
         )
 
 
@@ -355,6 +447,7 @@ def main() -> int:
     check_python(r)
     check_dependencies(r)
     check_config(r)
+    check_datastores(r)
     check_compliance(r)
     check_secrets(r)
     check_broker_sdk(r)

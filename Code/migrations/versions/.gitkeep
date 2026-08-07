@@ -1,0 +1,5 @@
+Alembic writes revision files into this directory.
+
+It is committed empty (via this placeholder) because git does not track empty
+directories, and `alembic revision` fails without it on a fresh clone.
+Delete this file once the first migration exists.

@@ -77,6 +77,152 @@ class SystemConfig(_Model):
         return v
 
 
+class DatabaseConfig(_Model):
+    """PostgreSQL / TimescaleDB connection *structure*.
+
+    There is deliberately **no password field here.**  This object is loaded
+    from ``config/system.yaml``, which is version controlled — a password in it
+    would be a committed credential.  The password comes from the secrets
+    provider (``POSTGRES_PASSWORD``) and is joined to these fields at engine
+    construction time by :meth:`dsn`.
+
+    One credential, one source.  See :meth:`dsn` for the override rule.
+
+    .. note::
+       The pool and timeout fields below are **declared here but not yet
+       applied** — nothing constructs an engine until E01-S02 builds the
+       session factory, which is where they get consumed.  ``make doctor``
+       reports them as *configured*, not as *enforced*.  Do not read a green
+       doctor line as proof that a statement timeout is active.
+    """
+
+    host: str = "localhost"
+    port: int = Field(default=5432, ge=1, le=65535)
+    name: str = "algotrader"
+    user: str = "algotrader"
+
+    # Pool sizing — LOW_LEVEL_ARCHITECTURE.md §6.3.  Ten connections covers the
+    # nine services plus migrations; overflow absorbs the pre-market burst.
+    pool_size: int = Field(default=10, ge=1, le=50)
+    max_overflow: int = Field(default=5, ge=0, le=50)
+    pool_pre_ping: bool = True
+    pool_recycle_seconds: int = Field(default=1800, ge=60)
+
+    # A query that runs longer than this is a bug, not a slow query.  The
+    # pre-market warm-up (BP-2) is the longest legitimate read and is measured
+    # in seconds, not minutes.
+    statement_timeout_ms: int = Field(default=30_000, ge=1_000, le=300_000)
+
+    echo_sql: bool = False
+
+    @field_validator("echo_sql")
+    @classmethod
+    def _echo_is_dev_only(cls, v: bool) -> bool:
+        """SQL echo prints bound parameters, which include order values.
+
+        Harmless locally, but it defeats the log redactor if it is ever left on
+        in a deployed environment, so it is refused outside development.
+        """
+        import os
+
+        if v and os.environ.get("ALGOTRADER_ENV", "development") != "development":
+            raise ValueError(
+                "database.echo_sql may only be true when ALGOTRADER_ENV=development; "
+                "echoed SQL contains bound parameters and bypasses log redaction"
+            )
+        return v
+
+    def dsn(self, password: str | None = None) -> str:
+        """Build the SQLAlchemy URL.
+
+        **Precedence, and it is explicit rather than silent:**
+
+        1. If ``DATABASE_URL`` is set in the environment it wins *entirely* and
+           every field on this object is ignored.  This is how the containers
+           reach ``timescaledb`` instead of ``localhost``, and how tests point
+           at an ephemeral testcontainer.
+        2. Otherwise the URL is assembled from these fields plus ``password``.
+
+        The old failure mode this replaces: ``.env`` carried a full
+        ``DATABASE_URL`` *and* a ``POSTGRES_PASSWORD``, so the credential had two
+        sources that silently disagreed the moment either changed.  Now there is
+        one source, and an override that announces itself — ``make doctor``
+        reports which of the two is in effect.
+
+        Returns a plain ``str`` because SQLAlchemy requires one.  Treat the
+        result as a secret: never log it.  Use :meth:`safe_dsn` for display.
+        """
+        import os
+        from urllib.parse import quote
+
+        override = os.environ.get("DATABASE_URL")
+        if override:
+            return override
+
+        if password is None:
+            raise ValueError(
+                "no database password supplied and DATABASE_URL is not set. "
+                "Set POSTGRES_PASSWORD in .env (see .env.example), or set "
+                "DATABASE_URL to override the connection entirely."
+            )
+        # The password is percent-encoded: an unescaped '@' or '/' in a
+        # generated password otherwise silently truncates the host.
+        return (
+            f"postgresql+psycopg://{quote(self.user)}:{quote(password, safe='')}"
+            f"@{self.host}:{self.port}/{self.name}"
+        )
+
+    def safe_dsn(self) -> str:
+        """The connection target with no credential in it — safe to log."""
+        import os
+
+        if os.environ.get("DATABASE_URL"):
+            return "<from DATABASE_URL override>"
+        return f"postgresql+psycopg://{self.user}@{self.host}:{self.port}/{self.name}"
+
+
+class RedisConfig(_Model):
+    """Redis connection structure.  Password handled as in :class:`DatabaseConfig`.
+
+    ``maxmemory``/``maxmemory-policy`` are deliberately **not** here — they are
+    server-side settings owned by ``ops/docker-compose.yml``.  The relevant one
+    is ``noeviction``, which means an untrimmed stream fills the 2 GB ceiling
+    and Redis then *refuses writes* rather than silently dropping data.  That is
+    why ``maxlen`` is a required argument on the stream publisher (E01-S04).
+    """
+
+    host: str = "localhost"
+    port: int = Field(default=6379, ge=1, le=65535)
+    db: int = Field(default=0, ge=0, le=15)
+    max_connections: int = Field(default=20, ge=1, le=100)
+    socket_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    socket_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
+
+    # Streams are capped so a stalled consumer cannot exhaust `noeviction`
+    # memory.  This is the default cap; hot streams override per-stream.
+    default_stream_maxlen: int = Field(default=10_000, ge=100, le=1_000_000)
+
+    def dsn(self, password: str | None = None) -> str:
+        """Build the Redis URL.  ``REDIS_URL`` overrides entirely, as above."""
+        import os
+        from urllib.parse import quote
+
+        override = os.environ.get("REDIS_URL")
+        if override:
+            return override
+
+        auth = f":{quote(password, safe='')}@" if password else ""
+        return f"redis://{auth}{self.host}:{self.port}/{self.db}"
+
+    def safe_dsn(self) -> str:
+        """The connection target with no credential in it — safe to log."""
+        import os
+
+        if os.environ.get("REDIS_URL"):
+            return "<from REDIS_URL override>"
+        return f"redis://{self.host}:{self.port}/{self.db}"
+
+
 class BrokerAuthConfig(_Model):
     method: str = "oauth_2fa"
     daily_reauth_time: time = time(7, 0)
@@ -451,6 +597,8 @@ class AppConfig(_Model):
     """Root configuration object."""
 
     system: SystemConfig = Field(default_factory=SystemConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    redis: RedisConfig = Field(default_factory=RedisConfig)
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
@@ -465,9 +613,16 @@ class AppConfig(_Model):
         """The binding constraint is min(SEBI cap, broker API limit).
 
         SEBI's threshold is 10 orders/sec and we cap at 5 — but a broker may
-        allow far less.  Zerodha Kite Connect permits roughly 3/sec, so a
-        config carried over from a different broker is actively wrong and
-        would get throttled by the broker rather than caught by us.
+        allow far less, so a config carried over from a different broker is
+        actively wrong and would get throttled by the broker rather than caught
+        by us.
+
+        Zerodha Kite Connect permits **10 orders/sec, enforced account-wide**,
+        returning HTTP 429 above it — per Zerodha staff on their own developer
+        forum.  (An earlier revision of this docstring said "roughly 3/sec",
+        which came from a third-party blog and was wrong.  The authoritative
+        per-broker figures live in ``broker/profiles.py``, which this validator
+        reads — do not restate them here.)
         """
         from algotrader.broker.profiles import get_profile
 

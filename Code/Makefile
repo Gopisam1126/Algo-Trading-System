@@ -2,7 +2,13 @@
 SHELL := /bin/bash
 PY := python
 VENV := .venv
-COMPOSE := docker compose -f ops/docker-compose.yml
+# --env-file is REQUIRED and not decorative.  Compose resolves ${VAR}
+# interpolation from an env file in the PROJECT directory, which is where the
+# compose file lives (ops/) — not from the `env_file:` entries inside it, which
+# only populate the containers' own environment.  Without this flag, `make up`
+# fails with "required variable POSTGRES_PASSWORD is missing a value" even when
+# Code/.env is present and correctly filled in.
+COMPOSE := docker compose --env-file .env -f ops/docker-compose.yml
 
 .PHONY: help
 help:  ## Show this help

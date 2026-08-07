@@ -42,9 +42,34 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b[A-Z2-7]{16,64}={0,6}\b(?=\s*(?:totp|seed|secret))", re.I),
     # Six-digit OTP adjacent to a totp/otp label
     re.compile(r"\b[0-9]{6}\b(?=\s*(?:totp|otp))", re.I),
+    # Connection URIs with embedded credentials — postgresql://, redis://,
+    # amqp://, https:// and friends. Only the password is replaced; the scheme,
+    # user and host survive, because a redacted DSN that still says *which*
+    # database failed is far more useful when debugging than a wall of asterisks.
+    #
+    # This is not hypothetical. SQLAlchemy, Alembic and psycopg all put the URL
+    # into connection errors, and `DatabaseConfig.dsn()` returns a plain string
+    # by necessity (SQLAlchemy requires one), so any `log.error("connecting to
+    # %s", dsn)` would otherwise write the database password to disk in clear
+    # text. Found by probing the redactor with a real DSN during the Sprint 1
+    # security pass — every other pattern here passed and this one did not
+    # exist.
+    #
+    # The username part is ``*`` not ``+`` on purpose: Redis URIs conventionally
+    # omit the user entirely (``redis://:password@host``), which is precisely the
+    # shape ``RedisConfig.dsn()`` produces. An earlier version of this pattern
+    # required a username and let every Redis password through.
+    re.compile(r"(?P<pre>\b[a-z][a-z0-9+.\-]*://[^\s:/@]*:)[^\s@]+(?P<post>@)", re.I),
     # Any credential-shaped assignment
     re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token|totp|access_token)\b\s*[:=]\s*\S+"),
 ]
+
+#: Patterns that keep surrounding context instead of replacing the whole match.
+#: Keyed by the pattern above, value is the replacement template.
+_PARTIAL_REDACTIONS: dict[int, str] = {
+    # index of the connection-URI pattern -> keep scheme/user/host, mask password
+    5: r"\g<pre>" + REDACTED + r"\g<post>",
+}
 
 #: Field names whose values are always redacted, whatever they contain.
 _SENSITIVE_KEYS = frozenset({
@@ -73,8 +98,11 @@ class RedactingProcessor:
         for value in self._known:
             if value in text:
                 text = text.replace(value, REDACTED)
-        for pattern in _SECRET_PATTERNS:
-            text = pattern.sub(REDACTED, text)
+        for index, pattern in enumerate(_SECRET_PATTERNS):
+            # Most patterns replace the whole match; a few keep context around
+            # the secret (see _PARTIAL_REDACTIONS) so the message stays useful.
+            replacement = _PARTIAL_REDACTIONS.get(index, REDACTED)
+            text = pattern.sub(replacement, text)
         return text
 
     def _scrub_value(self, key: str, value: Any) -> Any:

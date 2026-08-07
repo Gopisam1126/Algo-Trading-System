@@ -31,6 +31,19 @@ x-app: &app
   build:
     context: ..
     dockerfile: ops/Dockerfile
+  # These two OVERRIDE config/system.yaml's `database:` and `redis:` sections
+  # for containers only, and they must.  system.yaml says `localhost` because
+  # that is correct when you run the app on the host; inside this network the
+  # datastores are reachable as `timescaledb` and `redis`, and `localhost`
+  # would resolve to the app container itself.
+  #
+  # `environment` beats `env_file`, so these also win over anything in ../.env.
+  # The credential still comes from POSTGRES_PASSWORD — it is interpolated
+  # here, not duplicated.
+  environment:
+    DATABASE_URL: >-
+      postgresql+psycopg://${POSTGRES_USER:-algotrader}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@timescaledb:5432/${POSTGRES_DB:-algotrader}
+    REDIS_URL: redis://redis:6379/0
   volumes:
     - ../config:/app/config:ro          # config is read-only to the app
     - app-data:/app/data

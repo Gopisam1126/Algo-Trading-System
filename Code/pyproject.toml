@@ -31,11 +31,13 @@ dependencies = [
     "TA-Lib>=0.4.32",          # requires the C library — see README
 
     # --- Broker ---
-    # WARNING: pykiteconnect 5.1.0 on PyPI does NOT expose market_protection
-    # in place_order() (main branch only - zerodha/pykiteconnect#225).
-    # MARKET and SL-M orders are REJECTED without it from 1 Apr 2026.
-    # Verify support before live trading; install from git if needed.
-    "kiteconnect>=5.1",        # Zerodha Kite Connect (primary)
+    # 5.2.1 is a FLOOR, not a preference. 5.1.0 omitted `market_protection`
+    # from place_order() (zerodha/pykiteconnect#225) and MARKET/SL-M orders are
+    # rejected without it from 1 Apr 2026 — an SDK below this line cannot square
+    # off a position. 5.2.1 also adds the `algo_id` parameter, which is how the
+    # SEBI-required Algo-ID is attached (client-supplied per order).
+    # `make doctor` re-verifies both against the installed signature.
+    "kiteconnect>=5.2.1",      # Zerodha Kite Connect (primary)
 
     # --- AI ---
     "anthropic>=0.40",
@@ -125,6 +127,10 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Required from pytest-asyncio 1.0 — without it every run emits a deprecation
+# warning, and when the default eventually changes, session-scoped async
+# fixtures would silently start getting a fresh event loop per test.
+asyncio_default_fixture_loop_scope = "function"
 addopts = "--strict-markers --strict-config"
 markers = [
     "unit: fast, no I/O",
