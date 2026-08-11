@@ -174,12 +174,30 @@ no working tree to corrupt. If you must promote from a local clone, do it
 without a checkout at all:
 
 ```bash
+git fetch origin
 SRC=$(git rev-parse origin/DEV)
-git merge-base --is-ancestor "$(git rev-parse QA)" "$SRC" || echo "QA has diverged — stop"
-NEW=$(git commit-tree "$SRC^{tree}" -p "$(git rev-parse QA)" -p "$SRC" -m "Promote DEV -> QA: <reason>")
+
+# Safety check: has anyone committed work directly to QA?
+# Promotion merge commits live only on QA by construction, so they are expected
+# and must be ignored. What must NOT exist is a non-merge commit on QA that is
+# absent from DEV — that is real divergence and would be overwritten below.
+git log --no-merges --oneline origin/DEV..origin/QA | grep . \
+  && echo "QA has commits of its own — STOP, investigate before promoting" \
+  || echo "QA is clean (promotion merges only) — safe to promote"
+
+NEW=$(git commit-tree "$SRC^{tree}" -p "$(git rev-parse origin/QA)" -p "$SRC" \
+      -m "Promote DEV -> QA: <reason>")
 git update-ref refs/heads/QA "$NEW"
 git push origin QA
 ```
+
+> **The obvious check is the wrong one.** An earlier version of this section used
+> `git merge-base --is-ancestor QA DEV` to test for divergence. That reports
+> "QA has diverged" on *every* promotion after the first, because each promotion
+> creates a merge commit that exists only on QA and is therefore never an
+> ancestor of DEV. A gate that cries wolf every time is worse than no gate — it
+> gets ignored precisely when it finally means something. Test for QA-only
+> *work* (`--no-merges`), not for ancestry.
 
 That builds the same `--no-ff` merge commit the workflow does — QA's tree ends
 up byte-identical to DEV's — while never touching a single file on disk.
