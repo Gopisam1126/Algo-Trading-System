@@ -26,7 +26,7 @@ import datetime as dt
 import logging
 import uuid
 from collections.abc import Sequence
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol, cast, runtime_checkable
 
 from sqlalchemy import CursorResult, func, select
@@ -502,9 +502,37 @@ class BarRepository:
         )
 
 
+#: Adjusted prices are quantised to this, matching ``Money`` (NUMERIC(14,4))
+#: and the ``Price`` model type's ``decimal_places=4``.
+_PRICE_QUANTUM = Decimal("0.0001")
+
+
 def _adjust(value: Decimal | None, factor: Decimal) -> Decimal | None:
-    """Apply an adjustment factor, preserving None and exactness."""
-    return None if value is None else value * factor
+    """Apply an adjustment factor and quantise back to price precision.
+
+    The quantisation is required, not cosmetic. A 1:3 split has factor 1/3,
+    stored as NUMERIC(18,10); multiplying a 4-dp price by it yields 14 decimal
+    places, and ``Price`` is ``Field(decimal_places=4)``. Without this, every
+    adjusted bar for such a symbol raises ``decimal_max_places`` the moment
+    anything builds a ``Bar`` from it — the pre-market warm-up for that symbol
+    dies, and only for splits whose ratio is not a terminating decimal.
+
+    ``ROUND_HALF_UP`` rather than banker's rounding: prices round the way a
+    person expects, and adjusted history is read by humans as well as
+    indicators.
+
+    Rounding each field independently is safe for OHLC coherence because
+    rounding is monotonic — ``high >= low`` implies ``round(high) >=
+    round(low)``, so a coherent raw bar cannot become an incoherent adjusted
+    one.
+
+    Adjusted prices do not land on the ₹0.05 tick grid, and should not. They are
+    analytical values describing what a past price means today; only live order
+    prices need tick alignment.
+    """
+    if value is None:
+        return None
+    return (value * factor).quantize(_PRICE_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def _adjust_volume(volume: int, factor: Decimal) -> int:

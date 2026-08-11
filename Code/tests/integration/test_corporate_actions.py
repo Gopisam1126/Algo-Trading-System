@@ -486,6 +486,143 @@ class TestBr16RawPricesAreNotReachable:
         )
 
 
+class TestAdjustedBarsSurviveTheDomainModel:
+    """The repository's output must be constructible as a ``Bar``.
+
+    Every other test here asserts on database values or on factor arithmetic,
+    and all of them passed while a 1:3 split made the pre-market warm-up
+    unusable: ``Price`` is ``Field(decimal_places=4)``, the factor is stored as
+    NUMERIC(18,10), and raw * factor is 14 decimal places. The failure only
+    appears for ratios that are not terminating decimals, and only once
+    something actually builds a domain object from the read.
+    """
+
+    @pytest.mark.parametrize(
+        ("ratio_from", "ratio_to"),
+        [(1, 3), (1, 6), (2, 3), (1, 7), (3, 7), (1, 5), (1, 2)],
+    )
+    async def test_a_repeating_ratio_still_produces_a_valid_bar(
+        self, session: AsyncSession, symbol_id: int, ratio_from: int, ratio_to: int
+    ) -> None:
+        from algotrader.common.models.market import Bar
+
+        await _seed_daily_bars(session, symbol_id)
+        actions = CorporateActionRepository(session)
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "SPLIT",
+                    "ex_date": SPLIT_DATE,
+                    "ratio_from": Decimal(ratio_from),
+                    "ratio_to": Decimal(ratio_to),
+                    "source": "test",
+                }
+            ]
+        )
+        await session.flush()
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+
+        repo = InstrumentRepository(session)
+        await repo.refresh_cache()
+        bars = BarRepository(session, repo)
+
+        rows = await bars.latest_n("SPLITCO", Timeframe.D1, 40)
+        assert rows, "no bars came back"
+        for row in rows:
+            # Raises decimal_max_places if the repository hands back an
+            # unquantised product.
+            Bar(
+                symbol=row["symbol"],
+                timeframe=row["timeframe"],
+                open_ts=row["open_ts"],
+                open=row["open"],
+                high=row["high"],
+                low=row["low"],
+                close=row["close"],
+                volume=row["volume"],
+                vwap=row["vwap"],
+            )
+
+    async def test_warm_up_batch_output_is_also_model_ready(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        """The pre-market path specifically — it is the one with a deadline."""
+        from algotrader.common.models.market import Bar
+
+        await _seed_daily_bars(session, symbol_id)
+        actions = CorporateActionRepository(session)
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "SPLIT",
+                    "ex_date": SPLIT_DATE,
+                    "ratio_from": Decimal(1),
+                    "ratio_to": Decimal(3),
+                    "source": "test",
+                }
+            ]
+        )
+        await session.flush()
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+
+        repo = InstrumentRepository(session)
+        await repo.refresh_cache()
+        bars = BarRepository(session, repo)
+
+        batch = await bars.warm_up_batch(["SPLITCO"], Timeframe.D1, 30)
+        assert batch["SPLITCO"], "warm_up_batch returned nothing"
+        for row in batch["SPLITCO"]:
+            Bar(
+                symbol=row["symbol"],
+                timeframe=row["timeframe"],
+                open_ts=row["open_ts"],
+                open=row["open"],
+                high=row["high"],
+                low=row["low"],
+                close=row["close"],
+                volume=row["volume"],
+                vwap=row["vwap"],
+            )
+
+    async def test_rounding_cannot_break_ohlc_coherence(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        """Quantising each field separately must not invert high/low.
+
+        Rounding is monotonic so this holds, but it is the assumption the
+        per-field quantisation rests on and it is cheap to pin down.
+        """
+        await _seed_daily_bars(session, symbol_id)
+        actions = CorporateActionRepository(session)
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "SPLIT",
+                    "ex_date": SPLIT_DATE,
+                    "ratio_from": Decimal(1),
+                    "ratio_to": Decimal(7),
+                    "source": "test",
+                }
+            ]
+        )
+        await session.flush()
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+
+        repo = InstrumentRepository(session)
+        await repo.refresh_cache()
+        rows = await BarRepository(session, repo).latest_n("SPLITCO", Timeframe.D1, 40)
+        for row in rows:
+            assert row["high"] >= row["low"]
+            assert row["high"] >= row["open"] and row["high"] >= row["close"]
+            assert row["low"] <= row["open"] and row["low"] <= row["close"]
+
+
 class TestConcurrentRecomputeIsSerialised:
     async def test_recompute_holds_an_advisory_lock_for_the_symbol(
         self, session: AsyncSession, symbol_id: int, migrated_database: str

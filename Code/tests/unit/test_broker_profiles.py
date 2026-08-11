@@ -96,3 +96,61 @@ class TestConfigEnforcesBrokerLimit:
         cfg = load_config()
         profile = get_profile(cfg.broker.primary)
         assert cfg.execution.max_orders_per_second <= profile.max_orders_per_second
+
+
+class TestCredentialEnvVars:
+    """`make doctor` is the pre-flight gate, so it must check the RIGHT broker.
+
+    It previously hardcoded Angel One's three variables while `broker.primary`
+    was `zerodha`. In live mode that would hard-fail on credentials this
+    deployment never uses, while reporting nothing about the Kite credentials it
+    does — a gate that reports green on an unconfigured broker. These tests tie
+    the variable names to the profile and to what `.env.example` documents, so
+    the two cannot drift apart again.
+    """
+
+    def test_every_profile_the_shipped_config_uses_declares_its_credentials(self) -> None:
+        from algotrader.common.config import load_config
+
+        cfg = load_config()
+        for role, key in (("primary", cfg.broker.primary), ("fallback", cfg.broker.fallback)):
+            if not key:
+                continue
+            profile = get_profile(key)
+            assert profile.credential_env_vars, (
+                f"the {role} broker {key!r} declares no credential_env_vars, so "
+                f"doctor cannot check it and will report green when unconfigured"
+            )
+
+    def test_declared_credentials_are_documented_in_env_example(self) -> None:
+        """A variable doctor demands but .env.example never mentions is unsettable.
+
+        This is the failure that hid the original bug: ANGELONE_* appeared in
+        doctor and nowhere else in the repo, so nobody following SETUP.md would
+        ever have set them.
+        """
+        from pathlib import Path
+
+        from algotrader.common.config import load_config
+
+        example = Path(__file__).resolve().parents[2] / ".env.example"
+        text = example.read_text(encoding="utf-8")
+
+        cfg = load_config()
+        for key in (cfg.broker.primary, cfg.broker.fallback):
+            if not key:
+                continue
+            for var in get_profile(key).credential_env_vars:
+                assert var in text, (
+                    f"{var} is required by the {key} profile but is not in "
+                    f".env.example, so there is no documented way to set it"
+                )
+
+    def test_access_tokens_are_not_treated_as_pre_flight_credentials(self) -> None:
+        """A token produced BY the daily login cannot be required BEFORE it."""
+        for profile in PROFILES.values():
+            for var in profile.credential_env_vars:
+                assert "ACCESS_TOKEN" not in var, (
+                    f"{profile.key} lists {var}, which the auth flow writes; "
+                    f"requiring it pre-flight would fail every morning by design"
+                )

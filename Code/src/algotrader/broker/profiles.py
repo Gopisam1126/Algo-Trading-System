@@ -87,6 +87,17 @@ class BrokerProfile:
     #: Broker-imposed daily order cap, if any (0 = none published).
     max_orders_per_day: int = 0
 
+    #: Environment variables that MUST be present to authenticate with this
+    #: broker. Lives here rather than in ``doctor.py`` because the broker is
+    #: chosen in config: hardcoding one broker's variable names into the
+    #: pre-flight check means it validates whichever broker the author happened
+    #: to have in mind, not the one actually configured.
+    #:
+    #: Tokens obtained BY the daily auth flow are deliberately excluded —
+    #: ``KITE_ACCESS_TOKEN`` is an output of logging in, so requiring it before
+    #: login would fail every morning by design.
+    credential_env_vars: tuple[str, ...] = ()
+
     notes: str = ""
     verified_on: str = "2026-08"
     caveats: list[str] = field(default_factory=list)
@@ -114,6 +125,7 @@ ZERODHA = BrokerProfile(
     static_ip_order_endpoints_only=True,
     requires_market_protection=True,
     max_orders_per_day=3000,
+    credential_env_vars=("KITE_API_KEY", "KITE_API_SECRET", "KITE_USER_ID"),
     notes=(
         "Most mature Indian broker API - best documentation and ecosystem. "
         "Static IP applies to ORDER endpoints only; quotes, WebSocket, "
@@ -157,6 +169,7 @@ ANGELONE = BrokerProfile(
     requires_manual_daily_login=False,
     monthly_cost_inr=0,
     historical_data_extra_cost=False,
+    credential_env_vars=("ANGELONE_API_KEY", "ANGELONE_CLIENT_ID", "ANGELONE_TOTP_SECRET"),
     notes="Free, programmatic TOTP login, highest order-rate headroom.",
     caveats=[
         "WebSocket stability at the open and on expiry days is a "
@@ -174,6 +187,7 @@ FYERS = BrokerProfile(
     requires_manual_daily_login=True,
     monthly_cost_inr=0,
     historical_data_extra_cost=False,
+    credential_env_vars=("FYERS_APP_ID", "FYERS_SECRET_KEY"),
     notes="Free API with free minute-level history (~1-2 years) — useful as a "
     "data fallback even when trading elsewhere.",
 )
