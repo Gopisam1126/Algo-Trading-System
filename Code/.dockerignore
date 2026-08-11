@@ -24,6 +24,7 @@
 !src/
 !config/
 !pyproject.toml
+!constraints.txt
 !README.md
 
 # --- and strip build noise back out of those ---

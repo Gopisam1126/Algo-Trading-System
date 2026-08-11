@@ -27,11 +27,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md constraints.txt ./
 COPY src ./src
+# `-c constraints.txt` is what makes this image reproducible. pyproject declares
+# floors (`>=`), so without it this build resolves dependencies independently of
+# the CI run that verified the code — the artifact would not be the thing that
+# was tested, and a breaking upstream release would land silently.
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir .
+    && /opt/venv/bin/pip install --no-cache-dir -c constraints.txt .
 
 # --- Stage 2: runtime ------------------------------------------------------
 FROM python:3.11-slim-bookworm AS runtime

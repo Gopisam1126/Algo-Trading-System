@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -132,6 +133,13 @@ class RedactingProcessor:
             return {k: self._scrub_value(k, v) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return type(value)(self._scrub_value(key, v) for v in value)
+        if isinstance(value, BaseException):
+            # An exception object is not a str, so it used to fall through here
+            # untouched — and the formatter calls str() on it much later, well
+            # past any redaction. `log.warning("failed: %s", exc)` therefore
+            # printed the DSN password in full. Rendering it here is what makes
+            # the scrub actually apply.
+            return self._scrub_text(f"{type(value).__name__}: {value}")
         return value
 
     def __call__(self, _logger: Any, _name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
@@ -139,7 +147,25 @@ class RedactingProcessor:
 
 
 class RedactingFilter(logging.Filter):
-    """stdlib logging filter — catches third-party library output."""
+    """stdlib logging filter — catches third-party library output.
+
+    **Tracebacks are the leak path that matters most**, and they do not travel
+    through ``msg`` or ``args``. ``logging.Formatter.format`` renders
+    ``record.exc_info`` itself, long after every filter has run, so an earlier
+    version of this class scrubbed the message perfectly and still wrote
+
+        ConnectionError: could not connect to
+        postgresql+psycopg://algotrader:<real password>@db.internal:5432/...
+
+    to disk on the first failed healthcheck. SQLAlchemy, psycopg and Alembic all
+    put the connection URL into their exceptions, and ``engine.healthcheck``
+    logs with ``exc_info=True`` by design.
+
+    The fix relies on how the formatter is written: it renders from
+    ``exc_info`` **only when ``exc_text`` is empty**, and uses ``exc_text``
+    verbatim when it is set. Pre-rendering it here and scrubbing that string
+    means the formatter never sees the raw traceback.
+    """
 
     def __init__(self, processor: RedactingProcessor) -> None:
         super().__init__()
@@ -155,6 +181,17 @@ class RedactingFilter(logging.Filter):
                 }
             else:
                 record.args = tuple(self._processor._scrub_value("", a) for a in record.args)
+
+        if record.exc_info:
+            if not record.exc_text:
+                record.exc_text = "".join(traceback.format_exception(*record.exc_info))
+        if record.exc_text:
+            record.exc_text = self._processor._scrub_text(record.exc_text)
+
+        # `stack_info` is already a rendered string and is appended verbatim.
+        if record.stack_info:
+            record.stack_info = self._processor._scrub_text(record.stack_info)
+
         return True
 
 

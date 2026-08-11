@@ -20,6 +20,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 
 import psycopg
 import pytest
@@ -432,3 +433,118 @@ class TestMoneyPrecision:
         ).fetchall()
         naive = [(t, c) for t, c, d in rows if d != "timestamp with time zone"]
         assert not naive, f"naive timestamp columns: {naive}"
+
+
+class TestEveryTableHasDeliberateGrants:
+    """No table may ship without a decision about who can touch it.
+
+    The grant migration enumerates tables **by name**, so any table added later
+    gets nothing. `corporate_action` shipped exactly that way: zero privileges
+    for `algotrader_app`, and its sequence missing USAGE too. Every test passed,
+    because the harness connects as the table owner. The first failure would
+    have been in production, on the corporate action feed, as
+    InsufficientPrivilege.
+
+    These tests compare the live catalogue against the model metadata rather
+    than against a hardcoded list, so a new table fails here the moment it is
+    created rather than the moment it is used.
+    """
+
+    #: Append-only by design (BR-3, BR-4). UPDATE/DELETE must stay absent.
+    APPEND_ONLY: ClassVar[set[str]] = {"decision_log", "strategy_trial"}
+
+    #: Owned by tooling, not the application. Migrations run as the owner.
+    NOT_APP_TABLES: ClassVar[set[str]] = {"alembic_version"}
+
+    @staticmethod
+    def _granted(conn: psycopg.Connection, table: str) -> set[str]:
+        rows = conn.execute(
+            """
+            SELECT privilege_type FROM information_schema.role_table_grants
+            WHERE table_name = %s AND grantee = 'algotrader_app'
+            """,
+            (table,),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _model_tables(self) -> set[str]:
+        from algotrader.common.db.base import Base
+
+        return set(Base.metadata.tables)
+
+    def test_no_model_table_is_completely_ungranted(self, conn: psycopg.Connection) -> None:
+        """The failure that shipped: a table the app role cannot see at all."""
+        ungranted = sorted(
+            t for t in self._model_tables() - self.NOT_APP_TABLES if not self._granted(conn, t)
+        )
+        assert not ungranted, (
+            f"{ungranted} have NO privileges for algotrader_app. The grant "
+            f"migration lists tables by name, so a new table gets nothing and "
+            f"fails only in production. Add a grant migration for it."
+        )
+
+    def test_mutable_tables_can_be_written_and_corrected(self, conn: psycopg.Connection) -> None:
+        from algotrader.common.db.models import MUTABLE_TABLES
+
+        required = {"SELECT", "INSERT", "UPDATE", "DELETE"}
+        for table in MUTABLE_TABLES:
+            missing = required - self._granted(conn, table)
+            assert not missing, f"{table} is declared MUTABLE but is missing {sorted(missing)}"
+
+    def test_append_only_tables_still_refuse_update_and_delete(
+        self, conn: psycopg.Connection
+    ) -> None:
+        """The control. Fixing one grant gap must not blanket-grant everything."""
+        for table in self.APPEND_ONLY:
+            granted = self._granted(conn, table)
+            assert "INSERT" in granted and "SELECT" in granted
+            assert not ({"UPDATE", "DELETE"} & granted), (
+                f"{table} is append-only (BR-3/BR-4) but has {sorted(granted)}"
+            )
+
+    def test_every_sequence_backing_a_writable_table_is_usable(
+        self, conn: psycopg.Connection
+    ) -> None:
+        """A table grant without a sequence grant still fails on INSERT.
+
+        `GRANT ... ON ALL SEQUENCES` only covers sequences existing at that
+        moment, which is why corporate_action_id_seq was missed alongside its
+        table. nextval() fails before any row is written.
+        """
+        rows = conn.execute(
+            """
+            SELECT c.relname, has_sequence_privilege('algotrader_app', c.oid, 'USAGE')
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'S' AND n.nspname = 'public'
+            """
+        ).fetchall()
+        unusable = sorted(name for name, usable in rows if not usable)
+        assert not unusable, f"algotrader_app cannot use sequences {unusable}; INSERT will fail"
+
+    def test_the_app_role_can_actually_write_a_corporate_action(
+        self, conn: psycopg.Connection, symbol_id: int
+    ) -> None:
+        """End to end under the production role, not the owner.
+
+        This is the probe that would have caught the original defect: every
+        other corporate action test runs as the owner and cannot see the
+        permission at all.
+        """
+        conn.execute("SET ROLE algotrader_app")
+        conn.execute(
+            """
+            INSERT INTO corporate_action
+                (symbol_id, action_type, ex_date, ratio_from, ratio_to, source)
+            VALUES (%s, 'SPLIT', DATE '2026-06-15', 1, 5, 'test')
+            """,
+            (symbol_id,),
+        )
+        row = conn.execute(
+            "SELECT count(*) FROM corporate_action WHERE symbol_id = %s", (symbol_id,)
+        ).fetchone()
+        assert row is not None and row[0] == 1
+
+        # A mis-entered action must be correctable — this table is NOT an
+        # audit record, and recompute rebuilds from whatever it holds.
+        conn.execute("UPDATE corporate_action SET ratio_to = 10 WHERE symbol_id = %s", (symbol_id,))
+        conn.execute("DELETE FROM corporate_action WHERE symbol_id = %s", (symbol_id,))
