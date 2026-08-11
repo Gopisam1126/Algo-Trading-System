@@ -179,3 +179,101 @@ class TestBarOHLCCoherence:
     def test_coherent_bar_accepted(self) -> None:
         bar = self._bar("100", "105", "98", "102")
         assert bar.high >= bar.close >= bar.low
+
+
+class TestTradingDaySearchIsBounded:
+    """Bad holiday data must fail loudly, not answer confidently.
+
+    An unbounded search does not hang — it returns a wrong date. With a
+    malformed list covering six months, ``previous_trading_day(2026-06-15)``
+    returned 2025-12-31: a caller fetching "yesterday's close" would silently
+    get a price from another season.
+
+    This is a live risk rather than a theoretical one. ``config/nse_holidays.yaml``
+    is hand-transcribed from the NSE circular and is currently flagged incomplete
+    (blocker B3), so a paste or date-format error is exactly the kind of mistake
+    waiting to happen.
+    """
+
+    @staticmethod
+    def _calendar_with_a_broken_list() -> MarketCalendar:
+        from datetime import date as _d
+        from datetime import timedelta as _td
+
+        return MarketCalendar(frozenset({_d(2026, 1, 1) + _td(days=i) for i in range(400)}))
+
+    def test_previous_trading_day_refuses_to_walk_months_back(self) -> None:
+        import datetime as _dt
+
+        from algotrader.common.calendar import HolidayDataError
+
+        with pytest.raises(HolidayDataError, match="almost certainly wrong"):
+            self._calendar_with_a_broken_list().previous_trading_day(_dt.date(2026, 6, 15))
+
+    def test_next_trading_day_refuses_to_walk_months_forward(self) -> None:
+        import datetime as _dt
+
+        from algotrader.common.calendar import HolidayDataError
+
+        with pytest.raises(HolidayDataError, match="almost certainly wrong"):
+            self._calendar_with_a_broken_list().next_trading_day(_dt.date(2026, 6, 15))
+
+    def test_the_error_names_the_file_to_look_at(self) -> None:
+        import datetime as _dt
+
+        from algotrader.common.calendar import HolidayDataError
+
+        with pytest.raises(HolidayDataError) as exc:
+            self._calendar_with_a_broken_list().previous_trading_day(_dt.date(2026, 6, 15))
+        assert "nse_holidays.yaml" in str(exc.value), "the error must say where to look"
+
+    def test_a_normal_long_weekend_still_resolves(self) -> None:
+        """The bound must not break real holiday clusters.
+
+        Thu + Fri holidays either side of a weekend is four consecutive
+        non-trading days, which NSE genuinely does.
+        """
+        import datetime as _dt
+
+        holidays = frozenset(
+            {_dt.date(2026, 3, 19), _dt.date(2026, 3, 20)}  # Thursday, Friday
+        )
+        cal = MarketCalendar(holidays)
+        # From Saturday, the previous trading day is Wednesday the 18th.
+        assert cal.previous_trading_day(_dt.date(2026, 3, 21)) == _dt.date(2026, 3, 18)
+        # From Friday, the next is Monday the 23rd.
+        assert cal.next_trading_day(_dt.date(2026, 3, 20)) == _dt.date(2026, 3, 23)
+
+
+class TestTradingDaysBetweenRejectsAnInvertedRange:
+    def test_start_after_end_raises(self) -> None:
+        """Silently returning [] would make a reversed backfill a no-op.
+
+        A backfill that reports success having fetched nothing leaves a
+        permanent gap — market data cannot be re-derived.
+        """
+        import datetime as _dt
+
+        cal = MarketCalendar(frozenset())
+        with pytest.raises(ValueError, match="inverted range"):
+            cal.trading_days_between(_dt.date(2026, 6, 15), _dt.date(2026, 6, 1))
+
+    def test_a_single_day_range_is_still_valid(self) -> None:
+        import datetime as _dt
+
+        cal = MarketCalendar(frozenset())
+        assert cal.trading_days_between(_dt.date(2026, 6, 15), _dt.date(2026, 6, 15)) == [
+            _dt.date(2026, 6, 15)
+        ]
+
+    def test_a_normal_range_excludes_weekends_and_holidays(self) -> None:
+        import datetime as _dt
+
+        cal = MarketCalendar(frozenset({_dt.date(2026, 6, 17)}))
+        days = cal.trading_days_between(_dt.date(2026, 6, 15), _dt.date(2026, 6, 21))
+        assert days == [
+            _dt.date(2026, 6, 15),
+            _dt.date(2026, 6, 16),
+            _dt.date(2026, 6, 18),
+            _dt.date(2026, 6, 19),
+        ]

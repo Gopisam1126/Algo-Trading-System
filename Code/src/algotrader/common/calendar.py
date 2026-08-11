@@ -51,6 +51,25 @@ SQUAREOFF_FNO = time(15, 25)
 #: Weekly market holidays (Sat/Sun).  0 = Monday.
 WEEKEND = {5, 6}
 
+#: How far ``next_trading_day`` / ``previous_trading_day`` will search before
+#: concluding the holiday data is wrong.
+#:
+#: NSE's longest genuine closure is a weekend abutting two or three holidays —
+#: about five days. Ten leaves room for an unusual cluster while still catching
+#: a malformed list, which is the real hazard: an unbounded search does not
+#: hang, it silently returns a date months away and every caller believes it.
+MAX_CONSECUTIVE_NON_TRADING_DAYS = 10
+
+
+class HolidayDataError(ValueError):
+    """The holiday list is internally implausible, not merely incomplete.
+
+    Distinct from "unverified" (see :class:`HolidayCalendarStatus`): that means
+    nobody has checked it against the circular yet, which ``doctor`` warns about.
+    This means the data cannot be right.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Holidays
 # ---------------------------------------------------------------------------
@@ -79,18 +98,62 @@ class MarketCalendar:
         return d.weekday() not in WEEKEND and d not in self._holidays
 
     def next_trading_day(self, d: date) -> date:
-        nxt = d + timedelta(days=1)
-        while not self.is_trading_day(nxt):
-            nxt += timedelta(days=1)
-        return nxt
+        """The next trading day after ``d``.
+
+        Bounded: see :data:`MAX_CONSECUTIVE_NON_TRADING_DAYS`.
+        """
+        return self._walk(d, step=1)
 
     def previous_trading_day(self, d: date) -> date:
-        prev = d - timedelta(days=1)
-        while not self.is_trading_day(prev):
-            prev -= timedelta(days=1)
-        return prev
+        """The most recent trading day before ``d``.
+
+        Bounded: see :data:`MAX_CONSECUTIVE_NON_TRADING_DAYS`.
+        """
+        return self._walk(d, step=-1)
+
+    def _walk(self, d: date, *, step: int) -> date:
+        """Search for the nearest trading day, refusing to search absurdly far.
+
+        The bound is the point. An unbounded search does not hang on bad holiday
+        data — it silently returns a *wrong answer*, which is worse. With a
+        malformed list covering six months, ``previous_trading_day`` was observed
+        walking back 166 days and reporting 2025-12-31 as the day before
+        2026-06-15. Nothing raises; a caller fetching "yesterday's close" simply
+        gets a price from another season and computes indicators on it.
+
+        That input is not hypothetical: ``config/nse_holidays.yaml`` is
+        hand-transcribed from the NSE circular and is currently flagged
+        incomplete (blocker B3), so a paste or format error is a live risk.
+
+        NSE's longest real closure is a weekend abutting two or three holidays.
+        Anything past the bound means the data is wrong, and saying so beats
+        answering confidently.
+        """
+        cursor = d
+        for _ in range(MAX_CONSECUTIVE_NON_TRADING_DAYS):
+            cursor += timedelta(days=step)
+            if self.is_trading_day(cursor):
+                return cursor
+        direction = "after" if step > 0 else "before"
+        raise HolidayDataError(
+            f"no trading day found within {MAX_CONSECUTIVE_NON_TRADING_DAYS} days "
+            f"{direction} {d.isoformat()}. NSE never closes for that long, so the "
+            f"holiday list is almost certainly wrong — check "
+            f"{DEFAULT_HOLIDAY_FILE} for a date-format or paste error."
+        )
 
     def trading_days_between(self, start: date, end: date) -> list[date]:
+        """Trading days in ``[start, end]``, inclusive.
+
+        An inverted range raises rather than returning ``[]``. A backfill handed
+        reversed dates would otherwise report success having fetched nothing,
+        and a silent gap in market data is permanent — it cannot be re-derived.
+        """
+        if start > end:
+            raise ValueError(
+                f"start {start.isoformat()} is after end {end.isoformat()}; "
+                f"an inverted range would silently select no days"
+            )
         out: list[date] = []
         cur = start
         while cur <= end:

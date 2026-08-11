@@ -22,6 +22,7 @@ from hypothesis import strategies as st
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from algotrader.common.db import corporate_actions as ca_module
 from algotrader.common.db import engine as db_engine
 from algotrader.common.db.corporate_actions import (
     ActionFactors,
@@ -704,3 +705,200 @@ class TestIngestDoesNotTouchFactors:
         assert {Decimal(r[0]) for r in rows} == {Decimal("0.2")}, (
             "re-ingesting bars reset their adjustment factors to raw"
         )
+
+
+class TestActionTypesNotYetExercised:
+    """Branches coverage showed were never executed.
+
+    Two of them matter more than the numbers suggest. The dividend-adjustment
+    body is dormant behind ``APPLY_DIVIDEND_ADJUSTMENT = False``, so the day
+    someone flips that flag they run code no test has ever touched — and it
+    rewrites every historical price. The consolidation path had never been run
+    against the database at all, only in factor arithmetic.
+    """
+
+    def test_a_zero_or_negative_ratio_is_refused(self) -> None:
+        """A zero denominator is a crash; a negative one silently flips prices."""
+        for a, b in ((0, 5), (5, 0), (-1, 5), (5, -1)):
+            with pytest.raises(AdjustmentError, match="positive"):
+                factors_for(
+                    CorporateActionType.SPLIT,
+                    ratio_from=Decimal(a),
+                    ratio_to=Decimal(b),
+                )
+
+    def test_rights_is_an_explicit_no_op_not_a_silent_one(self) -> None:
+        """RIGHTS needs the subscription price modelled; 1.0 is the honest answer."""
+        f = factors_for(CorporateActionType.RIGHTS)
+        assert f.price == Decimal(1)
+        assert f.volume == Decimal(1)
+
+    async def test_a_consolidation_raises_price_and_lowers_volume(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        """A 5:1 reverse split - the mirror image of a split, never DB-tested."""
+        await _seed_daily_bars(session, symbol_id)
+        actions = CorporateActionRepository(session)
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "CONSOLIDATION",
+                    "ex_date": SPLIT_DATE,
+                    "ratio_from": Decimal(5),
+                    "ratio_to": Decimal(1),
+                    "source": "test",
+                }
+            ]
+        )
+        await session.flush()
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT price_adj_factor, volume_adj_factor FROM ohlcv "
+                    "WHERE symbol_id = :s AND ts < CAST(:d AS date)"
+                ),
+                {"s": symbol_id, "d": SPLIT_DATE},
+            )
+        ).all()
+        assert {(Decimal(r[0]), Decimal(r[1])) for r in rows} == {(Decimal(5), Decimal("0.2"))}, (
+            "a consolidation must raise historical price and cut historical volume"
+        )
+
+    async def test_a_dividend_leaves_prices_untouched_while_disabled(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        """The shipped default. Recorded for audit, never applied."""
+        await _seed_daily_bars(session, symbol_id)
+        actions = CorporateActionRepository(session)
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "DIVIDEND",
+                    "ex_date": SPLIT_DATE,
+                    "dividend_amount": Decimal(25),
+                    "source": "test",
+                }
+            ]
+        )
+        await session.flush()
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+
+        factors = await TestAgainstTheDatabase._factors(session, symbol_id)
+        assert factors == {(Decimal(1), Decimal(1))}
+
+    def test_the_dormant_dividend_formula_is_correct_when_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exercised behind the flag so flipping it is not a leap of faith.
+
+        A 25 rupee dividend on a 500 close leaves 95% of the price, and volume
+        must not move - that asymmetry is the whole reason two factors exist.
+        """
+        monkeypatch.setattr(ca_module, "APPLY_DIVIDEND_ADJUSTMENT", True)
+        f = factors_for(
+            CorporateActionType.DIVIDEND,
+            dividend_amount=Decimal(25),
+            reference_close=Decimal(500),
+        )
+        assert f.price == Decimal("0.95")
+        assert f.volume == Decimal(1), "a dividend must never scale volume"
+
+    def test_the_dormant_path_refuses_bad_source_data(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ca_module, "APPLY_DIVIDEND_ADJUSTMENT", True)
+
+        with pytest.raises(AdjustmentError, match="close before the ex-date"):
+            factors_for(CorporateActionType.DIVIDEND, dividend_amount=Decimal(25))
+
+        with pytest.raises(AdjustmentError, match="bad source data"):
+            factors_for(
+                CorporateActionType.DIVIDEND,
+                dividend_amount=Decimal(500),
+                reference_close=Decimal(500),
+            )
+
+    async def test_a_split_and_a_consolidation_on_one_symbol_compose(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        """Mixed action types must combine, not overwrite each other."""
+        await _seed_daily_bars(session, symbol_id, days=60)
+        actions = CorporateActionRepository(session)
+        early, late = SPLIT_DATE - dt.timedelta(days=30), SPLIT_DATE
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "SPLIT",
+                    "ex_date": early,
+                    "ratio_from": Decimal(1),
+                    "ratio_to": Decimal(2),
+                    "source": "test",
+                },
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "CONSOLIDATION",
+                    "ex_date": late,
+                    "ratio_from": Decimal(4),
+                    "ratio_to": Decimal(1),
+                    "source": "test",
+                },
+            ]
+        )
+        await session.flush()
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+
+        oldest = (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT price_adj_factor FROM ohlcv "
+                    "WHERE symbol_id = :s AND ts < CAST(:d AS date)"
+                ),
+                {"s": symbol_id, "d": early},
+            )
+        ).all()
+        middle = (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT price_adj_factor FROM ohlcv WHERE symbol_id = :s "
+                    "AND ts >= CAST(:lo AS date) AND ts < CAST(:hi AS date)"
+                ),
+                {"s": symbol_id, "lo": early, "hi": late},
+            )
+        ).all()
+
+        # Before both: 1/2 * 4 = 2. Between them: only the consolidation, = 4.
+        assert {Decimal(r[0]) for r in oldest} == {Decimal(2)}
+        assert {Decimal(r[0]) for r in middle} == {Decimal(4)}
+
+    async def test_an_action_dated_before_every_bar_changes_nothing(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        """Only bars strictly before the ex-date are adjusted."""
+        await _seed_daily_bars(session, symbol_id)
+        actions = CorporateActionRepository(session)
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "SPLIT",
+                    "ex_date": SPLIT_DATE - dt.timedelta(days=365),
+                    "ratio_from": Decimal(1),
+                    "ratio_to": Decimal(5),
+                    "source": "test",
+                }
+            ]
+        )
+        await session.flush()
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+
+        factors = await TestAgainstTheDatabase._factors(session, symbol_id)
+        assert factors == {(Decimal(1), Decimal(1))}
