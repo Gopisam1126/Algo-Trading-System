@@ -8,11 +8,17 @@ header.payload.signature structure instead.
 
 from __future__ import annotations
 
+import io
+import logging
+
 import pytest
 
 structlog = pytest.importorskip("structlog", reason="structlog is a runtime dependency")
 
-from algotrader.common.logging import RedactingProcessor  # noqa: E402
+from algotrader.common.logging import (  # noqa: E402
+    RedactingFilter,
+    RedactingProcessor,
+)
 from algotrader.common.secrets import SecretString  # noqa: E402
 
 KNOWN = "MYBROKERSECRET99"
@@ -158,3 +164,121 @@ class TestNoFalsePositives:
     def test_numeric_fields_survive(self, redactor: RedactingProcessor) -> None:
         out = render(redactor, {"quantity": 120, "confidence": 0.82, "symbol": "INFY"})
         assert "120" in out and "0.82" in out and "INFY" in out
+
+
+class TestRedactionSurvivesExceptions:
+    """The traceback path — how a scrubbed message still leaks the password.
+
+    `logging.Formatter.format` renders `record.exc_info` itself, long after every
+    filter has run. So a filter that only touches `msg` and `args` can be
+    completely correct and still write the DSN password to disk the first time
+    `engine.healthcheck` fails, because that logs with `exc_info=True` and
+    SQLAlchemy puts the connection URL in its exceptions.
+
+    This is the third redaction defect found in this module by probing rather
+    than reading (after the short-JWT header and the missing connection-URI
+    pattern), which is why every leak path below is asserted separately instead
+    of trusting one representative case.
+    """
+
+    PASSWORD = "SuperSecretDbPassw0rd"
+    DSN = f"postgresql+psycopg://algotrader:{PASSWORD}@db.internal:5432/algotrader"
+
+    def _capture(self, emit) -> str:
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.addFilter(RedactingFilter(RedactingProcessor({self.PASSWORD})))
+        logger = logging.getLogger(f"probe.{id(emit)}")
+        logger.handlers = [handler]
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        emit(logger)
+        handler.flush()
+        return buf.getvalue()
+
+    def test_exc_info_traceback_is_scrubbed(self) -> None:
+        def emit(logger):
+            try:
+                raise ConnectionError(f"could not connect to {self.DSN}")
+            except ConnectionError:
+                logger.warning("database healthcheck failed", exc_info=True)
+
+        out = self._capture(emit)
+        assert self.PASSWORD not in out, "the password leaked through the traceback"
+        assert "REDACTED" in out
+
+    def test_an_exception_passed_as_a_format_arg_is_scrubbed(self) -> None:
+        """An Exception is not a str, so it used to pass through untouched."""
+
+        def emit(logger):
+            try:
+                raise ConnectionError(f"could not connect to {self.DSN}")
+            except ConnectionError as exc:
+                logger.warning("healthcheck failed: %s", exc)
+
+        out = self._capture(emit)
+        assert self.PASSWORD not in out, "the password leaked through an exception arg"
+
+    def test_a_chained_exception_is_scrubbed(self) -> None:
+        """`raise ... from ...` renders BOTH tracebacks."""
+
+        def emit(logger):
+            try:
+                try:
+                    raise ValueError(f"inner carried {self.DSN}")
+                except ValueError as inner:
+                    raise RuntimeError("outer") from inner
+            except RuntimeError:
+                logger.error("wrapped failure", exc_info=True)
+
+        out = self._capture(emit)
+        assert self.PASSWORD not in out, "the password leaked from the chained cause"
+
+    def test_stack_info_is_scrubbed(self) -> None:
+        def emit(logger):
+            token = f"sk-ant-{'x' * 40}"
+            logger.warning("state dump %s", token, stack_info=True)
+
+        out = self._capture(emit)
+        assert "sk-ant-xxxx" not in out
+
+    def test_the_message_still_survives_redaction(self) -> None:
+        """Redaction must not destroy the diagnostic value of the log line.
+
+        A DSN scrubbed to nothing tells you the database failed but not WHICH
+        one — the scheme, user and host are deliberately preserved.
+        """
+
+        def emit(logger):
+            try:
+                raise ConnectionError(f"could not connect to {self.DSN}")
+            except ConnectionError:
+                logger.warning("database healthcheck failed", exc_info=True)
+
+        out = self._capture(emit)
+        assert "db.internal" in out, "the host must survive so the log is still useful"
+        assert "ConnectionError" in out, "the exception type must survive"
+
+    def test_a_known_secret_in_a_traceback_is_scrubbed_even_without_a_pattern(self) -> None:
+        """Registered values are scrubbed by exact match, not only by shape.
+
+        A broker session token has no recognisable format, so the regex layer
+        cannot catch it. The known-values layer must reach the traceback too.
+        """
+        opaque = "Zq7Lm2Xr9Tb4Nv6Hd1Ks"
+
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.addFilter(RedactingFilter(RedactingProcessor({opaque})))
+        logger = logging.getLogger("probe.opaque")
+        logger.handlers = [handler]
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+
+        try:
+            raise RuntimeError(f"broker rejected session {opaque}")
+        except RuntimeError:
+            logger.error("broker call failed", exc_info=True)
+        handler.flush()
+
+        assert opaque not in buf.getvalue()
