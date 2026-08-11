@@ -283,3 +283,25 @@ class RejectReason(StrEnum):
     INDICATORS_NOT_READY = "INDICATORS_NOT_READY"
     STALE_DATA = "STALE_DATA"
     EVENT_BLACKOUT = "EVENT_BLACKOUT"
+
+
+class CorporateActionType(StrEnum):
+    """Corporate actions that change the meaning of a historical price.
+
+    SPLIT and BONUS both restate the share count, so both scale price and
+    volume. DIVIDEND reduces price only — volume is untouched, which is why
+    price and volume carry separate adjustment factors.
+    """
+
+    SPLIT = "SPLIT"
+    BONUS = "BONUS"
+    DIVIDEND = "DIVIDEND"
+    RIGHTS = "RIGHTS"
+    CONSOLIDATION = "CONSOLIDATION"
+
+
+class SurveillanceCategory(StrEnum):
+    """ASM list membership. Both are hard exclusions; the distinction is for audit."""
+
+    SHORT_TERM = "SHORT_TERM"
+    LONG_TERM = "LONG_TERM"

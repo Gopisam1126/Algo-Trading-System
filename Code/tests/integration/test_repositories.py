@@ -24,7 +24,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from algotrader.common.db import engine as db_engine
@@ -332,10 +332,20 @@ class TestBulkInsertPerformance:
     async def test_100k_bars_in_under_10_seconds(
         self, session: AsyncSession, instruments: InstrumentRepository
     ) -> None:
-        """Measured, not asserted in a comment. This is the backfill path."""
+        """Measured, not asserted in a comment. This is the backfill path.
+
+        The TRUNCATE is what makes the number mean anything. ``migrated_database``
+        is session-scoped, and every earlier test that inserted bars left dead
+        tuples behind — rolling back a transaction does not reclaim them. Without
+        this the measurement drifts with suite order: 7.9 s run alone, 10.9 s
+        after the rest of the file. TRUNCATE swaps in a fresh relfilenode and the
+        surrounding rollback puts the old one back, so this is measuring the
+        backfill path rather than the accumulated bloat of the test session.
+        """
         bars = BarRepository(session, instruments)
         sid = await instruments.symbol_id("INFY")
         rows = [_bar(sid, m) for m in range(100_000)]
+        await session.execute(text("TRUNCATE ohlcv"))
 
         started = time.perf_counter()
         for chunk in range(0, len(rows), 10_000):

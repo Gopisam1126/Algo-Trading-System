@@ -35,6 +35,8 @@ import pyarrow.parquet as pq
 from sqlalchemy import CursorResult, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from algotrader.common.db.corporate_actions import CorporateActionRepository
+
 log = logging.getLogger(__name__)
 
 #: Parquet columns for `ohlcv`, in a fixed order. Fixed because the restore
@@ -51,7 +53,8 @@ _BAR_COLUMNS = (
     "volume",
     "trade_count",
     "vwap",
-    "is_adjusted",
+    "price_adj_factor",
+    "volume_adj_factor",
     "synthetic",
 )
 
@@ -103,7 +106,7 @@ async def archive_bars(
         await session.execute(
             text(
                 "SELECT symbol_id, timeframe, ts, open, high, low, close, volume, "
-                "       trade_count, vwap, is_adjusted, synthetic "
+                "       trade_count, vwap, price_adj_factor, volume_adj_factor, synthetic "
                 "FROM ohlcv WHERE ts >= :start AND ts < :end ORDER BY symbol_id, timeframe, ts"
             ),
             {"start": start, "end": end},
@@ -167,6 +170,15 @@ async def restore_bars(session: AsyncSession, path: Path | str) -> int:
     ``ON CONFLICT DO NOTHING``, not ``DO UPDATE``: a restore must never
     overwrite data that is currently live. If a row already exists, the live
     copy is authoritative — the archive is older by definition.
+
+    Adjustment factors are recomputed after the insert, and that is not
+    housekeeping. Archived bars are not in ``ohlcv``, so every corporate action
+    recorded while they were away updated the live bars and missed them. Their
+    stored factors are frozen at archive time. Restoring them as-is splices an
+    unadjusted segment onto an adjusted series — a discontinuity that raises
+    nothing, looks like a real price move, and corrupts every backtest crossing
+    it. ``recompute_factors`` rebuilds from the full action history, so a single
+    call heals the restored range no matter how many actions were missed.
     """
     records = read_archive(path)
     if not records:
@@ -178,16 +190,27 @@ async def restore_bars(session: AsyncSession, path: Path | str) -> int:
         await session.execute(
             text(
                 "INSERT INTO ohlcv (symbol_id, timeframe, ts, open, high, low, close, "
-                "                   volume, trade_count, vwap, is_adjusted, synthetic) "
+                "                   volume, trade_count, vwap, price_adj_factor, "
+                "                   volume_adj_factor, synthetic) "
                 "VALUES (:symbol_id, :timeframe, :ts, CAST(:open AS NUMERIC), "
                 "        CAST(:high AS NUMERIC), CAST(:low AS NUMERIC), "
                 "        CAST(:close AS NUMERIC), :volume, :trade_count, "
-                "        CAST(:vwap AS NUMERIC), :is_adjusted, :synthetic) "
+                "        CAST(:vwap AS NUMERIC), CAST(:price_adj_factor AS NUMERIC), "
+                "        CAST(:volume_adj_factor AS NUMERIC), :synthetic) "
                 "ON CONFLICT (symbol_id, timeframe, ts) DO NOTHING"
             ),
             chunk,
         )
         restored += len(chunk)
+
+    symbol_ids = sorted({int(r["symbol_id"]) for r in records})
+    await CorporateActionRepository(session).recompute_all(symbol_ids)
+    log.info(
+        "restored %d bars from %s and recomputed factors for %d symbols",
+        restored,
+        path,
+        len(symbol_ids),
+    )
     return restored
 
 

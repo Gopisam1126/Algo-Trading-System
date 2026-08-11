@@ -204,7 +204,12 @@ CREATE TABLE ohlcv (
     volume        BIGINT       NOT NULL,
     trade_count   INTEGER,
     vwap          NUMERIC(14,4),
-    is_adjusted   BOOLEAN      NOT NULL DEFAULT FALSE,  -- corporate action applied
+    -- OHLC above is RAW and never mutated (BR-15). Adjusted = raw * factor,
+    -- applied on read. A boolean cannot support re-adjustment: the second
+    -- action needs the factor already applied, and adjusting in place
+    -- compounds silently. See SPRINT02_TECHNICAL_SPEC.md §4.
+    price_adj_factor  NUMERIC(18,10) NOT NULL DEFAULT 1.0,
+    volume_adj_factor NUMERIC(18,10) NOT NULL DEFAULT 1.0,
     PRIMARY KEY (symbol_id, timeframe, ts)
 );
 SELECT create_hypertable('ohlcv', 'ts', chunk_time_interval => INTERVAL '7 days');

@@ -82,11 +82,28 @@ def _database_url() -> str:
 def _include_object(
     obj: Any, name: str | None, type_: str, reflected: bool, compare_to: Any
 ) -> bool:
-    """Keep TimescaleDB's internal objects out of autogenerate.
+    """Keep objects autogenerate does not own out of its comparison.
 
-    See the module docstring — without this, autogenerate proposes dropping
-    every hypertable chunk.  Chunks are an implementation detail of the
-    hypertable and are managed by TimescaleDB, never by a migration.
+    Three classes are excluded, and each one exists because autogenerate
+    otherwise proposes a destructive change:
+
+    1. **TimescaleDB internals.** Chunks live in ``_timescaledb_internal`` and
+       are not in ``Base.metadata``, so autogenerate sees hundreds of unknown
+       tables and emits ``DROP TABLE`` for each. Running that destroys the
+       market data while reporting success.
+
+    2. **TimescaleDB's own indexes.** ``create_hypertable`` builds
+       ``<table>_ts_idx`` itself. It is not in the model, so autogenerate
+       proposes dropping it — removing the time index the hypertable is built
+       around.
+
+    3. **Enum CHECK constraints.** ``Enum(create_constraint=True)`` creates a
+       CHECK at table-creation time, but alembic does not associate the
+       reflected constraint with the type, so every autogenerate run proposes
+       dropping all of them. Accepting that would silently remove every enum
+       validation in the schema — the precise defect QA-SEC found when
+       ``create_constraint`` defaulted to False, reintroduced by a migration
+       nobody read closely.
     """
     internal_schemas = {
         "_timescaledb_internal",
@@ -97,13 +114,18 @@ def _include_object(
         "timescaledb_information",
         "timescaledb_experimental",
     }
-    schema = getattr(obj, "schema", None)
-    if schema in internal_schemas:
+    if getattr(obj, "schema", None) in internal_schemas:
         return False
-    # Chunks are named _hyper_<id>_<n>_chunk and may be reflected into public
-    # on some versions; exclude them by shape as well as by schema.
+
     if type_ == "table" and name and name.startswith("_hyper_"):
         return False
+
+    if type_ == "index" and name and name.endswith("_ts_idx"):
+        return False
+
+    if type_ == "check_constraint" and name and name.endswith("_enum"):
+        return False
+
     return True
 
 
