@@ -428,14 +428,19 @@ Multiply by 1.5 if you are learning the domain as you go.
 
 **Tasks**
 - [ ] Fetch corporate action data
-- [ ] Apply split/bonus adjustment factors to historical series
-- [ ] Mark `is_adjusted` on affected rows
-- [ ] Re-adjustment when a new action is announced
-- [ ] Verify against a known historical split
+- [x] Store actions in `corporate_action`, the source of truth for adjustment
+- [x] Derive `price_adj_factor` / `volume_adj_factor` per bar; raw OHLC untouched
+- [x] Re-adjustment when a new action is announced — full recompute, idempotent
+- [x] Verify against a known historical split
 
 **Acceptance**
 - A known 1:5 split produces a continuous price series across the event
 - 🔴 Unadjusted data can never reach the indicator engine
+
+**Status** — the schema, adjustment engine and BR-16 enforcement are built and
+tested; only the *feed* remains, which is why this story is not closed. Fetching
+corporate actions needs a source (broker API or exchange filing), so it carries
+the same credential dependency as the rest of E03.
 
 ---
 

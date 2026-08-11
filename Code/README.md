@@ -5,9 +5,12 @@ market data, computes technical indicators across multiple timeframes, monitors
 news and macro conditions, uses AI for pattern synthesis and reasoning, and
 executes risk-gated trades across multiple stocks concurrently.
 
-> **Status: Phase 0 — foundation scaffold.** The safety-critical primitives
-> (domain models, config validation, secrets, calendar, strategy DSL) are built
-> and tested — **112 tests passing**. The services are not yet implemented.
+> **Status: Phase 0 complete, E01 (persistence & data layer) built.** The
+> safety-critical primitives (domain models, config validation, secrets,
+> calendar, strategy DSL) and the full data layer (TimescaleDB schema, async
+> repositories, hash-chained audit log, Redis primitives, retention, corporate
+> action adjustment) are built and tested — **379 tests passing**, CI green.
+> The services that would use them are not yet implemented.
 > **Nothing trades yet.**
 
 ---

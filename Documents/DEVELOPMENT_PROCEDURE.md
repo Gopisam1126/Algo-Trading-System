@@ -475,6 +475,11 @@ is named.
 | `make up` never passed compose an `--env-file` | Error message blames the wrong thing | 4.1 probe |
 | Spec's `order_fills` DDL was invalid PostgreSQL | Looked like SQL | 1.2 run the spec's SQL |
 | `make check` was already red, so it could not gate anything | Nobody ran it | 6 quality gate |
+| Adjustment factors were only *approximately* order-independent — `Decimal` quotient multiplication rounds at 28 digits | Every scalar test passed; the error is in the last digits | 4.3 **property** test over generated orderings |
+| `restore_bars` reinserted archived bars carrying factors frozen before later corporate actions | Archive/restore is a second write path that does not look like one | 1.1 trace every path rows LEAVE **and re-enter** by |
+| Two concurrent `recompute_factors` calls could lose a newly-announced action | Both writers are self-consistent, so row locks see nothing wrong | 1.1 serialise on the **read** when the write depends on it |
+| A 100k-row insert benchmark drifted 7.9 s → 10.9 s purely from dead tuples left by earlier tests | Passed alone, failed in suite — read as flake | 4.1 make the measurement independent of suite order |
+| `gsm_stage` / `asm_category` existed in the schema but were in neither the upsert's conflict set nor the read projection | A half-wired column looks identical to a wired one | 4.2 read the column back through the repository |
 
 ---
 

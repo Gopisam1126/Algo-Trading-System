@@ -176,6 +176,54 @@ class TestRestore:
         count = (await session.execute(text("SELECT count(*) FROM ohlcv"))).scalar_one()
         assert count == 20
 
+    async def test_restore_heals_adjustments_it_missed_while_archived(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        """A split announced while the bars were archived must still reach them.
+
+        Archived bars are not in ``ohlcv``, so the recompute that followed the
+        split never saw them and their stored factors are stale. Restoring them
+        unchanged would splice raw prices onto an adjusted series — no error, no
+        failing query, just a fabricated 80% gap in the history.
+        """
+        from algotrader.common.db.corporate_actions import CorporateActionRepository
+
+        await session.execute(text("DELETE FROM corporate_action"))
+        result = await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        await retention.purge_archived_bars(session, tmp_path, start=BASE, end=LATER)
+        await session.commit()
+
+        actions = CorporateActionRepository(session)
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": seeded,
+                    "action_type": "SPLIT",
+                    "ex_date": (BASE + dt.timedelta(days=10)).date(),
+                    "ratio_from": Decimal(1),
+                    "ratio_to": Decimal(5),
+                    "source": "test",
+                }
+            ]
+        )
+        await session.flush()
+
+        await retention.restore_bars(session, result.path)
+        await session.flush()
+
+        factors = (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT price_adj_factor FROM ohlcv "
+                    "WHERE symbol_id = :s AND ts < CAST(:d AS date)"
+                ),
+                {"s": seeded, "d": (BASE + dt.timedelta(days=10)).date()},
+            )
+        ).all()
+        assert {Decimal(f[0]) for f in factors} == {Decimal("0.2")}, (
+            "restored bars kept their pre-archive factors and missed the split"
+        )
+
 
 class TestPurgeRefusesWithoutAVerifiedArchive:
     """The only destructive path. Every refusal is tested."""

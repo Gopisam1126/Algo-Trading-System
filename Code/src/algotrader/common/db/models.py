@@ -41,6 +41,8 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -52,6 +54,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from algotrader.common.db.base import Base
 from algotrader.common.db.types import (
+    AdjFactor,
     Charge,
     Money,
     Pct5,
@@ -62,6 +65,7 @@ from algotrader.common.db.types import (
     Ts,
 )
 from algotrader.common.enums import (
+    CorporateActionType,
     Direction,
     Exchange,
     OrderIntent,
@@ -69,6 +73,7 @@ from algotrader.common.enums import (
     PositionStatus,
     Product,
     Side,
+    SurveillanceCategory,
     Timeframe,
 )
 
@@ -184,6 +189,18 @@ class InstrumentDailyStatus(Base):
     is_t2t: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     is_asm: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     is_gsm: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    #: GSM stages escalate: the lower ones mean a reduced band and 100% margin,
+    #: the higher ones move the stock to periodic call auction and permit no
+    #: upward price movement at all. A boolean cannot distinguish "restricted"
+    #: from "structurally untradeable". NULL when not in GSM.
+    gsm_stage: Mapped[int | None] = mapped_column(SmallInteger)
+
+    #: Which ASM list. Both are hard exclusions, so this changes no filtering —
+    #: it exists so "why was this excluded" has an answer.
+    asm_category: Mapped[str | None] = mapped_column(
+        _enum(SurveillanceCategory, "asm_category_enum")
+    )
     is_fno_ban: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     #: Drives the per-stock square-off deadline (15:10 CAS vs 15:20 non-CAS).
     is_cas_stock: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
@@ -228,7 +245,26 @@ class Ohlcv(Base):
     volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
     trade_count: Mapped[int | None] = mapped_column(Integer)
     vwap: Mapped[Decimal | None] = mapped_column(Money)
-    is_adjusted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    #: BR-15. The OHLC columns above are RAW, exactly as the exchange published
+    #: them, and are never mutated. Adjusted price = raw * price_adj_factor.
+    #:
+    #: A boolean `is_adjusted` cannot support re-adjustment: when a second
+    #: corporate action arrives you need the factor already applied, and a
+    #: boolean does not carry it. Adjusting in place compounds silently — no
+    #: error, no failing test, just a permanently wrong series. Storing the
+    #: factor makes re-adjustment a recompute from the full action history,
+    #: which is idempotent.
+    #:
+    #: Two factors, not one: a dividend moves price but leaves volume alone, so
+    #: a single reciprocal factor would corrupt volume on every dividend.
+    price_adj_factor: Mapped[Decimal] = mapped_column(
+        AdjFactor, nullable=False, server_default="1.0"
+    )
+    volume_adj_factor: Mapped[Decimal] = mapped_column(
+        AdjFactor, nullable=False, server_default="1.0"
+    )
+
     synthetic: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     __table_args__ = (
@@ -244,6 +280,60 @@ class Ohlcv(Base):
             "high >= low AND high >= open AND high >= close AND low <= open AND low <= close",
             name="ohlc_coherent",
         ),
+    )
+
+
+class CorporateAction(Base):
+    """Splits, bonuses and dividends. **The source of truth for adjustment.**
+
+    BR-19: an action is recorded here before any price is adjusted for it, and
+    the adjustment factors on ``ohlcv`` are derived from this table. That makes
+    adjustment reproducible — a mis-entered action is fixed by correcting the
+    row and recomputing, because the raw prices were never touched.
+
+    ``UNIQUE (symbol_id, action_type, ex_date)`` is what makes ingestion
+    idempotent: re-fetching the same announcement updates rather than
+    double-counting it, and a double-counted split silently halves every
+    historical price again.
+    """
+
+    __tablename__ = "corporate_action"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    symbol_id: Mapped[int] = mapped_column(Integer, ForeignKey("instruments.id"), nullable=False)
+    action_type: Mapped[str] = mapped_column(
+        _enum(CorporateActionType, "corporate_action_type_enum"), nullable=False
+    )
+    #: The first day the price trades at the new basis. Bars strictly before it
+    #: are the ones needing adjustment.
+    ex_date: Mapped[dt.date] = mapped_column(Date, nullable=False)
+
+    #: A 1:5 split is from=1, to=5. Required for SPLIT/BONUS/CONSOLIDATION.
+    ratio_from: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    ratio_to: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    #: Per-share amount. Required for DIVIDEND.
+    dividend_amount: Mapped[Decimal | None] = mapped_column(Money)
+
+    announced_at: Mapped[dt.datetime | None] = mapped_column(Ts)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    fetched_at: Mapped[dt.datetime] = mapped_column(Ts, nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("symbol_id", "action_type", "ex_date", name="uq_action"),
+        CheckConstraint("ratio_from IS NULL OR ratio_from > 0", name="ratio_from_positive"),
+        CheckConstraint("ratio_to IS NULL OR ratio_to > 0", name="ratio_to_positive"),
+        CheckConstraint("dividend_amount IS NULL OR dividend_amount > 0", name="dividend_positive"),
+        # A ratio action without a ratio, or a dividend without an amount, would
+        # compute a factor of 1.0 and silently do nothing — the failure mode
+        # this whole design exists to prevent.
+        CheckConstraint(
+            "(action_type IN ('SPLIT', 'BONUS', 'CONSOLIDATION') "
+            " AND ratio_from IS NOT NULL AND ratio_to IS NOT NULL) "
+            "OR (action_type = 'DIVIDEND' AND dividend_amount IS NOT NULL) "
+            "OR action_type = 'RIGHTS'",
+            name="action_has_its_operands",
+        ),
+        Index("ix_action_symbol_date", "symbol_id", "ex_date"),
     )
 
 
@@ -747,6 +837,7 @@ Index("ix_journal_date", text("trade_date DESC"))
 MUTABLE_TABLES: tuple[str, ...] = (
     "instruments",
     "instrument_daily_status",
+    "corporate_action",
     "ohlcv",
     "daily_plan",
     "plan_candidate",

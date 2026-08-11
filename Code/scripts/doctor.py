@@ -285,10 +285,22 @@ def check_market_calendar(r: Report) -> None:
     pre-market pipeline against data that never arrives, and potentially
     compute indicators across a phantom session. Nothing errors — it just
     quietly does the wrong thing. Hence an explicit check.
+
+    BR-20 requires this to BLOCK live trading, not merely warn about it. An
+    incomplete list warns in development, where trading against a phantom
+    session costs nothing, and fails in live mode, where it means real orders
+    on a day the exchange is shut.
     """
     section("Market calendar")
 
     from algotrader.common.calendar import DEFAULT_HOLIDAY_FILE, load_holidays_with_status
+    from algotrader.common.config import load_config
+    from algotrader.common.enums import SystemMode
+
+    try:
+        live = load_config().system.mode is SystemMode.LIVE
+    except Exception:
+        live = False
 
     path = Path(__file__).parents[1] / DEFAULT_HOLIDAY_FILE
     status = load_holidays_with_status(str(path) if path.exists() else None)
@@ -299,6 +311,12 @@ def check_market_calendar(r: Report) -> None:
         r.fail(
             "NO holiday list loaded",
             "every weekday will be treated as a trading day",
+        )
+    elif live:
+        r.fail(
+            f"holiday list INCOMPLETE ({status.count} dates) and mode is LIVE",
+            "BR-20: verify against the NSE circular and set "
+            "verified_against_nse_circular: true before trading real capital",
         )
     else:
         r.warn(
@@ -407,31 +425,64 @@ def check_strategies(r: Report) -> None:
 
 
 def check_secrets(r: Report) -> None:
+    """Credential presence, for the broker that is actually configured.
+
+    The variable names come from the broker profile, not from a list here. An
+    earlier version hardcoded Angel One's three variables while
+    ``broker.primary`` was ``zerodha``: it would have hard-failed live mode on
+    credentials this deployment never uses, and reported nothing at all about
+    the Kite credentials it does. A pre-flight check that validates the wrong
+    broker is worse than no check, because it reports green.
+    """
     section("Secrets")
     import os
 
+    from algotrader.broker.profiles import get_profile
     from algotrader.common.config import load_config
     from algotrader.common.enums import SystemMode
 
+    live = False
+    primary_key = fallback_key = None
     try:
-        live = load_config().system.mode is SystemMode.LIVE
-    except Exception:
-        live = False
+        cfg = load_config()
+        live = cfg.system.mode is SystemMode.LIVE
+        primary_key = cfg.broker.primary
+        fallback_key = cfg.broker.fallback
+    except Exception as exc:
+        r.warn("could not read broker config", f"{type(exc).__name__}: {exc}")
 
-    required = ["ANTHROPIC_API_KEY"]
-    broker = ["ANGELONE_API_KEY", "ANGELONE_CLIENT_ID", "ANGELONE_TOTP_SECRET"]
-
-    for key in required:
+    for key in ("ANTHROPIC_API_KEY",):
         (r.ok if os.environ.get(key) else (r.fail if live else r.warn))(
             f"{key} {'set' if os.environ.get(key) else 'not set'}"
         )
-    for key in broker:
-        if os.environ.get(key):
-            r.ok(f"{key} set")
-        elif live:
-            r.fail(f"{key} not set", "required for live trading")
-        else:
-            r.warn(f"{key} not set", "required before live trading")
+
+    def _check(broker_key: str | None, *, role: str, blocks_live: bool) -> None:
+        if not broker_key:
+            return
+        try:
+            profile = get_profile(broker_key)
+        except ValueError as exc:
+            r.fail(f"{role} broker {broker_key!r} is not a known profile", str(exc))
+            return
+        if not profile.credential_env_vars:
+            r.warn(
+                f"{profile.display_name} declares no credential variables",
+                f"add credential_env_vars to the {broker_key} profile before using it",
+            )
+            return
+        for key in profile.credential_env_vars:
+            if os.environ.get(key):
+                r.ok(f"{key} set", f"{role}: {profile.display_name}")
+            elif live and blocks_live:
+                r.fail(f"{key} not set", f"required for live trading ({profile.display_name})")
+            else:
+                r.warn(f"{key} not set", f"{role}: {profile.display_name}")
+
+    _check(primary_key, role="primary", blocks_live=True)
+    # The fallback is data redundancy, not an order path, so a missing
+    # credential there degrades coverage rather than stopping trading.
+    if fallback_key and fallback_key != primary_key:
+        _check(fallback_key, role="fallback", blocks_live=False)
 
     if Path(".env").exists():
         import stat

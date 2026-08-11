@@ -26,7 +26,7 @@ import datetime as dt
 import logging
 import uuid
 from collections.abc import Sequence
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol, cast, runtime_checkable
 
 from sqlalchemy import CursorResult, func, select
@@ -266,7 +266,6 @@ class BarRepository:
                     "volume": stmt.excluded.volume,
                     "trade_count": stmt.excluded.trade_count,
                     "vwap": stmt.excluded.vwap,
-                    "is_adjusted": stmt.excluded.is_adjusted,
                     "synthetic": stmt.excluded.synthetic,
                 },
             )
@@ -304,13 +303,11 @@ class BarRepository:
             "volume",
             "trade_count",
             "vwap",
-            "is_adjusted",
             "synthetic",
         )
         defaults: dict[str, Any] = {
             "trade_count": None,
             "vwap": None,
-            "is_adjusted": False,
             "synthetic": False,
         }
 
@@ -454,6 +451,44 @@ class BarRepository:
         )
         return [_bar_to_dict(b, symbol) for b in rows]
 
+    async def raw_bars_for_audit(
+        self, symbol: str, timeframe: Timeframe, n: int
+    ) -> list[dict[str, Any]]:
+        """Unadjusted bars, exactly as the exchange published them.
+
+        Named to be hard to reach for. Nothing in the trading path may use this:
+        indicators, signals and backtests all read adjusted prices via the
+        methods above (BR-16). This exists for reconciliation against a source
+        and for answering "what did the tape actually say on that day".
+        """
+        sid = await self._instruments.symbol_id(symbol)
+        rows = (
+            (
+                await self._session.execute(
+                    select(Ohlcv)
+                    .where(Ohlcv.symbol_id == sid, Ohlcv.timeframe == timeframe.value)
+                    .order_by(Ohlcv.ts.desc())
+                    .limit(n)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [
+            {
+                "symbol": symbol,
+                "open_ts": b.ts,
+                "open": b.open,
+                "high": b.high,
+                "low": b.low,
+                "close": b.close,
+                "volume": b.volume,
+                "price_adj_factor": b.price_adj_factor,
+                "volume_adj_factor": b.volume_adj_factor,
+            }
+            for b in reversed(rows)
+        ]
+
     async def count(self, symbol: str, timeframe: Timeframe) -> int:
         sid = await self._instruments.symbol_id(symbol)
         return int(
@@ -467,41 +502,94 @@ class BarRepository:
         )
 
 
-def _bar_to_dict(bar: Ohlcv, symbol: str) -> dict[str, Any]:
-    """ORM row -> plain dict.
+#: Adjusted prices are quantised to this, matching ``Money`` (NUMERIC(14,4))
+#: and the ``Price`` model type's ``decimal_places=4``.
+_PRICE_QUANTUM = Decimal("0.0001")
 
-    Repositories return dicts, not ORM instances. An ORM object carries session
-    affinity and lazy loaders; once its session closes, touching an unloaded
-    attribute raises ``MissingGreenlet`` deep inside business logic. A dict
-    cannot do that.
+
+def _adjust(value: Decimal | None, factor: Decimal) -> Decimal | None:
+    """Apply an adjustment factor and quantise back to price precision.
+
+    The quantisation is required, not cosmetic. A 1:3 split has factor 1/3,
+    stored as NUMERIC(18,10); multiplying a 4-dp price by it yields 14 decimal
+    places, and ``Price`` is ``Field(decimal_places=4)``. Without this, every
+    adjusted bar for such a symbol raises ``decimal_max_places`` the moment
+    anything builds a ``Bar`` from it — the pre-market warm-up for that symbol
+    dies, and only for splits whose ratio is not a terminating decimal.
+
+    ``ROUND_HALF_UP`` rather than banker's rounding: prices round the way a
+    person expects, and adjusted history is read by humans as well as
+    indicators.
+
+    Rounding each field independently is safe for OHLC coherence because
+    rounding is monotonic — ``high >= low`` implies ``round(high) >=
+    round(low)``, so a coherent raw bar cannot become an incoherent adjusted
+    one.
+
+    Adjusted prices do not land on the ₹0.05 tick grid, and should not. They are
+    analytical values describing what a past price means today; only live order
+    prices need tick alignment.
     """
+    if value is None:
+        return None
+    return (value * factor).quantize(_PRICE_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _adjust_volume(volume: int, factor: Decimal) -> int:
+    """Adjusted share count, truncated rather than rounded.
+
+    A consolidation scales volume down and can leave a fraction. Truncating
+    under-reports liquidity by at most one share; rounding up would over-report
+    it, and this number feeds the liquidity filter that decides whether a symbol
+    is tradeable at all. Erring toward "less liquid than it looks" is the safe
+    direction.
+    """
+    return int(volume * factor)
+
+
+def _bar_to_dict(bar: Ohlcv, symbol: str) -> dict[str, Any]:
+    """ORM row -> plain dict, with corporate action adjustment applied.
+
+    BR-16: this is the only shape bars leave the repository in, and it is always
+    adjusted. There is deliberately no sibling that returns raw prices, so no
+    caller in the trading path can ask for unadjusted data by accident. Use
+    :meth:`BarRepository.raw_bars_for_audit` when the unadjusted series is
+    genuinely what you want.
+
+    Repositories return dicts, not ORM instances: a detached ORM object raises
+    ``MissingGreenlet`` on an unloaded attribute deep inside business logic.
+    """
+    price_f = bar.price_adj_factor
+    volume_f = bar.volume_adj_factor
     return {
         "symbol": symbol,
         "timeframe": bar.timeframe,
         "open_ts": bar.ts,
-        "open": bar.open,
-        "high": bar.high,
-        "low": bar.low,
-        "close": bar.close,
-        "volume": bar.volume,
+        "open": _adjust(bar.open, price_f),
+        "high": _adjust(bar.high, price_f),
+        "low": _adjust(bar.low, price_f),
+        "close": _adjust(bar.close, price_f),
+        "volume": _adjust_volume(bar.volume, volume_f),
         "trade_count": bar.trade_count,
-        "vwap": bar.vwap,
+        "vwap": _adjust(bar.vwap, price_f),
         "synthetic": bar.synthetic,
     }
 
 
 def _row_to_bar_dict(mapping: Any, symbol: str) -> dict[str, Any]:
+    price_f = mapping["price_adj_factor"]
+    volume_f = mapping["volume_adj_factor"]
     return {
         "symbol": symbol,
         "timeframe": mapping["timeframe"],
         "open_ts": mapping["ts"],
-        "open": mapping["open"],
-        "high": mapping["high"],
-        "low": mapping["low"],
-        "close": mapping["close"],
-        "volume": mapping["volume"],
+        "open": _adjust(mapping["open"], price_f),
+        "high": _adjust(mapping["high"], price_f),
+        "low": _adjust(mapping["low"], price_f),
+        "close": _adjust(mapping["close"], price_f),
+        "volume": _adjust_volume(mapping["volume"], volume_f),
         "trade_count": mapping["trade_count"],
-        "vwap": mapping["vwap"],
+        "vwap": _adjust(mapping["vwap"], price_f),
         "synthetic": mapping["synthetic"],
     }
 
@@ -530,6 +618,8 @@ class DailyStatusRepository:
                     "is_t2t",
                     "is_asm",
                     "is_gsm",
+                    "gsm_stage",
+                    "asm_category",
                     "is_fno_ban",
                     "is_cas_stock",
                     "circuit_band_pct",
@@ -562,6 +652,13 @@ class DailyStatusRepository:
             "is_t2t": row.is_t2t,
             "is_asm": row.is_asm,
             "is_gsm": row.is_gsm,
+            # Detail behind the booleans. GSM stage drives how severe the
+            # restriction is (stage 1 is a price band; stage 4 is trade-for-trade
+            # with 100% margin), and the ASM category separates short- from
+            # long-term. Both are exposed here so the exclusion logic can explain
+            # *why* a symbol was skipped rather than only that it was.
+            "gsm_stage": row.gsm_stage,
+            "asm_category": row.asm_category,
             "is_fno_ban": row.is_fno_ban,
             "is_cas_stock": row.is_cas_stock,
             "circuit_band_pct": row.circuit_band_pct,

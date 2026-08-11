@@ -103,15 +103,16 @@ resolve to "no trade" rather than a forced decision.
 
 ## 2. Current Status — What Exists, What Doesn't
 
-### 2.1 Status: Phase 0 complete
+### 2.1 Status: Phase 0 complete, E01 (persistence & data layer) built
 
 | Metric | Value |
 |---|---|
-| Python code | 4,577 lines |
-| Design documentation | 4,815 lines across 8 documents |
-| Tests | **112 passing** |
+| Python code | 8,256 lines (`src/`) + 5,427 lines of tests |
+| Design documentation | 11,559 lines across 12 documents |
+| Tests | **379 passing** |
+| Database migrations | 4, forward and reverse verified |
 | Strategy primitives | 27 registered |
-| Git commits | 6, on branch `DEV` |
+| Git commits | 22, on branch `DEV` |
 | **Trades placed** | **Zero. Nothing trades.** |
 
 ### 2.2 What is BUILT and tested
@@ -127,6 +128,13 @@ resolve to "no trade" rather than a forced decision.
 | Strategy DSL | ✅ Complete | 27 primitives, compiler, no code execution possible |
 | Docker topology | ✅ Written | 13 services, network-segmented, not yet run |
 | Pre-flight (`doctor.py`) | ✅ Complete | Environment, config, SEBI, SDK, calendar checks |
+| **Database schema** | ✅ Complete | TimescaleDB hypertables, BR-1..BR-20 as constraints, 4 reversible migrations |
+| **Repository layer** | ✅ Complete | Async SQLAlchemy, ORM confined here, COPY-based backfill |
+| **Audit log** | ✅ Complete | Hash-chained, append-only, survives a database outage via disk buffer |
+| **Redis layer** | ✅ Complete | Typed state, slot locks, token bucket, timer ZSET, event streams |
+| **Retention** | ✅ Complete | Parquet archive, verified before any purge, self-healing restore |
+| **Corporate actions** | ✅ Complete | Raw prices immutable; adjustment stored as factors (BR-15/16/19) |
+| **CI/CD** | ✅ Complete | GitHub Actions, gated promotion to QA |
 
 ### 2.3 What is NOT built
 
@@ -144,8 +152,12 @@ Every service directory exists with an `__init__.py` and nothing else:
 | `api/` | ❌ Stub — no dashboard |
 | `notifier/` | ❌ Stub — no Telegram |
 | `ai/` | ❌ Stub — no Anthropic client |
-| Database | ❌ No migrations written |
 | Strategy validation gauntlet | ❌ Designed, not implemented |
+
+The **data layer underneath them is built** (§2.2). What is missing is the
+services that would use it: there is a repository ready to store bars and no
+ingester to produce them, an audit chain ready to record decisions and nothing
+that decides. The corporate action *engine* is complete; its *feed* is not.
 
 ### 2.4 Honest assessment
 
@@ -154,9 +166,17 @@ four invariants (§3.1) are enforced by code with tests that fail if they are
 removed. The parts that are easy to get subtly wrong — money arithmetic, timezone
 handling, per-stock square-off deadlines, secret handling — are done and verified.
 
-**What remains:** all the actual functionality. Phase 0 is roughly 15% of the MVP
-by effort. The remaining 85% is service implementation, which is more code but
-less dangerous, because the invariants that constrain it are already in place.
+**What remains:** all the actual functionality. Phase 0 plus E01 is roughly 25%
+of the MVP by effort. The remainder is service implementation, which is more code
+but less dangerous, because the invariants that constrain it are already in place.
+
+**What QA has actually caught here.** Seven security findings and two pre-flight
+defects, none of which a code read would have found — a hash chain that could be
+forged through delimiter ambiguity, a redactor with no pattern for connection
+URIs, adjustment factors that were only approximately order-independent, and a
+`doctor` that validated the wrong broker's credentials entirely. The lesson
+recorded in `DEVELOPMENT_PROCEDURE.md §12` is the one that keeps paying: run the
+probe, do not read the code and conclude.
 
 ---
 
@@ -215,7 +235,7 @@ has no way to say it.
 | # | Constraint | Source | Enforced in |
 |---|---|---|---|
 | C1 | India-hosted server, static broker-whitelisted IP | SEBI | Infrastructure + config validation |
-| C2 | Order rate below 10/sec; system runs at 3 | SEBI + Zerodha | `BrokerAdapter` token bucket |
+| C2 | Order rate below 10/sec; system runs at 3 | SEBI + Zerodha | `common/redis/primitives.py` token bucket (atomic Lua), capped by `config.py` hard bounds |
 | C3 | Daily re-auth before pre-open | SEBI | `AuthManager` scheduled job |
 | C4 | LLM never sizes/orders | Design | `Recommendation` type |
 | C5 | Own-terms exit before broker square-off | NSE CAS | `PositionManager` timer |
@@ -664,7 +684,7 @@ Algo-Trading-System/
 | `dsl.py` | 376 | Strategy document schema, `PrimitiveRegistry`, compiler. `ExitRules` **requires** stop and time exits. `Hypothesis` requires substantive text (boilerplate rejected). |
 | `primitives/registry.py` | 280 | The 27 vetted primitives — price, trend, momentum, volatility, volume, multiframe, context, news, time, exit. Each with declared parameter bounds. |
 
-#### `tests/` — 112 tests
+#### `tests/` — 379 tests
 
 | File | Lines | Covers |
 |---|---|---|

@@ -130,7 +130,25 @@ Never commit a `.env`, a credential, or anything under `data/`.
 
 Phase 0 complete: domain models, config with hard bounds, secrets, logging with
 redaction, NSE calendar, broker protocol (Zerodha Kite Connect primary), strategy
-DSL with 27 primitives, and 112 passing tests. Services are stubs. Nothing trades.
+DSL with 27 primitives. Services are stubs. Nothing trades.
+
+E01 (persistence and data layer) is built: TimescaleDB schema with the BR-1..BR-20
+constraints, async repositories, the hash-chained audit log, Redis primitives,
+archive/restore, and CI with gated promotion to QA. **360 passing tests.**
+
+The corporate action adjustment engine landed 11 Aug 2026 and resolves what was
+`E03-S02`'s blocking design conflict. The rule it enforces is worth knowing before
+touching `ohlcv`:
+
+- **Raw OHLC is immutable (BR-15).** Adjusted price = `raw * price_adj_factor`,
+  applied by the repository on read. Never adjust a stored price in place — the
+  second corporate action compounds the first with no error and no failing test.
+- **Only `recompute_factors` writes the factor columns.** The ingest path omits
+  them from both its column list and its `ON CONFLICT` set on purpose; adding
+  them "for symmetry" would reset every adjusted bar on the next backfill.
+- **BR-16 is structural.** `BarRepository` has no method returning raw prices.
+  `raw_bars_for_audit()` is the deliberate exception and nothing in the trading
+  path may call it.
 
 Two of the three long-standing open items closed on 7 Aug 2026, both by
 inspecting the installed SDK rather than the docs:

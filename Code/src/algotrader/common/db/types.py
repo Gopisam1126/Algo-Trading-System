@@ -41,10 +41,26 @@ Stat = Numeric(8, 4)
 #: Probabilities in [0, 1] — PBO, AI confidence.
 Prob = Numeric(5, 4)
 
+#: Corporate action adjustment factor. Ten decimal places because factors
+#: multiply: a symbol with several splits accumulates a product, and rounding
+#: each one to four places would drift the earliest prices measurably.
+AdjFactor = Numeric(18, 10)
+
 #: Timezone-aware timestamp. The only kind this system stores.
 Ts = TIMESTAMP(timezone=True)
 
 #: SHA-256 hex digest, fixed width.
 HASH_LEN = 64
 
-__all__ = ["HASH_LEN", "Charge", "Money", "Pct5", "Pct6", "Pnl", "Prob", "Stat", "Ts"]
+__all__ = [
+    "HASH_LEN",
+    "AdjFactor",
+    "Charge",
+    "Money",
+    "Pct5",
+    "Pct6",
+    "Pnl",
+    "Prob",
+    "Stat",
+    "Ts",
+]

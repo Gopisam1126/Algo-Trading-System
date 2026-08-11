@@ -183,3 +183,119 @@ class TestLiveModeRequiresCompliance:
     def test_paper_mode_does_not_require_them(self) -> None:
         cfg = AppConfig.model_validate({"system": {"mode": "paper"}})
         assert cfg.system.mode.value == "paper"
+
+
+class TestReadOnlyAdapterCannotTrade:
+    """The read-only / trading adapter split is a security boundary.
+
+    ``LOW_LEVEL_ARCHITECTURE.md §10.3`` and `MASTER_REFERENCE §1.1` both state
+    that compromising any service other than execution-svc cannot place an
+    order. That guarantee rests entirely on three ``raise PermissionError``
+    lines in ``ReadOnlyGuard`` — which had no test at all until QA measured
+    coverage and found ``broker/adapter.py`` at 0%.
+
+    A claim this load-bearing needs a probe, not a code read: delete the raises
+    and every other test in this repository still passes.
+    """
+
+    @staticmethod
+    def _guard() -> object:
+        from algotrader.broker.adapter import ReadOnlyGuard
+
+        return ReadOnlyGuard()
+
+    async def test_place_order_is_refused(self) -> None:
+        import pytest as _pytest
+
+        with _pytest.raises(PermissionError, match="read-only"):
+            await self._guard().place_order(object())  # type: ignore[attr-defined]
+
+    async def test_modify_order_is_refused(self) -> None:
+        import pytest as _pytest
+
+        with _pytest.raises(PermissionError, match="read-only"):
+            await self._guard().modify_order()  # type: ignore[attr-defined]
+
+    async def test_cancel_order_is_refused(self) -> None:
+        import pytest as _pytest
+
+        with _pytest.raises(PermissionError, match="read-only"):
+            await self._guard().cancel_order("X123")  # type: ignore[attr-defined]
+
+    def test_the_guard_covers_every_state_changing_method(self) -> None:
+        """The real risk is a NEW mutating method the guard does not override.
+
+        ``TradingAdapter`` gaining ``place_gtt`` or ``exit_position`` without a
+        matching override would leave a read-only adapter able to move real
+        money. This fails the moment that happens.
+
+        Scoped to *mutating* verbs deliberately. ``TradingAdapter`` also adds
+        account reads — ``fetch_margins``, ``fetch_positions``,
+        ``fetch_orderbook``, ``find_by_client_order_id`` — which are correctly
+        absent from ``MarketDataAdapter`` but change nothing at the broker and
+        so need no guard.
+        """
+        from algotrader.broker.adapter import ReadOnlyGuard, TradingAdapter
+
+        mutating_verbs = (
+            "place",
+            "modify",
+            "cancel",
+            "exit",
+            "square_off",
+            "squareoff",
+            "submit",
+            "close",
+            "amend",
+            "convert",
+        )
+        trading = {n for n in dir(TradingAdapter) if not n.startswith("_")}
+        mutating = {n for n in trading if any(n.startswith(v) for v in mutating_verbs)}
+        guarded = {n for n in vars(ReadOnlyGuard) if not n.startswith("_")}
+
+        assert mutating, "no mutating methods found — the verb list has gone stale"
+        unguarded = mutating - guarded
+        assert not unguarded, (
+            f"TradingAdapter exposes {sorted(unguarded)} which ReadOnlyGuard does "
+            f"not override, so a read-only adapter could change broker state"
+        )
+
+
+class TestBrokerSessionExpiry:
+    """C3 — daily re-auth. An expiry predicate that is wrong fails open."""
+
+    def test_a_past_expiry_reads_as_expired(self) -> None:
+        import datetime as _dt
+
+        from algotrader.broker.adapter import BrokerSession
+
+        now = _dt.datetime.now(_dt.UTC)
+        s = BrokerSession(
+            broker="zerodha",
+            client_id="AB1234",
+            authenticated_at=now - _dt.timedelta(hours=9),
+            expires_at=now - _dt.timedelta(seconds=1),
+        )
+        assert s.is_expired
+
+    def test_a_future_expiry_reads_as_live(self) -> None:
+        import datetime as _dt
+
+        from algotrader.broker.adapter import BrokerSession
+
+        now = _dt.datetime.now(_dt.UTC)
+        s = BrokerSession(
+            broker="zerodha",
+            client_id="AB1234",
+            authenticated_at=now,
+            expires_at=now + _dt.timedelta(hours=8),
+        )
+        assert not s.is_expired
+
+    def test_the_session_carries_no_token_field(self) -> None:
+        """Invariant 3 at the session boundary — a token here would be logged."""
+        from algotrader.broker.adapter import BrokerSession
+
+        fields = set(BrokerSession.model_fields)
+        leaky = {f for f in fields if any(k in f.lower() for k in ("token", "secret", "password"))}
+        assert not leaky, f"BrokerSession exposes {leaky}; tokens belong in SecretString"

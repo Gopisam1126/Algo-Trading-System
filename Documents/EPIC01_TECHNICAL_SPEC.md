@@ -222,7 +222,7 @@ translations the repository layer owns; they are deliberate, not accidental:
 | `Bar.open_ts` | `ohlcv.ts` | `ts` is the hypertable partitioning column; the convention is worth keeping |
 | `Bar.symbol` (str) | `symbol_id` (int FK) | See E below |
 | `Bar.is_final` | *(not stored)* | Only final bars are persisted; a forming bar has no row |
-| *(none)* | `ohlcv.is_adjusted` | Corporate-action state, DB-side only |
+| *(none)* | `ohlcv.price_adj_factor`, `ohlcv.volume_adj_factor` | Corporate-action state, DB-side only. The repository applies both on read, so `Bar` always carries adjusted values and never needs the factors themselves. Superseded `is_adjusted BOOLEAN` — see `SPRINT02_TECHNICAL_SPEC.md §4` |
 | `Position.position_id` | `positions.id` | |
 | `Position.max_favourable_excursion` | `max_favourable_exc` | Spec truncated it for no reason — **the column now uses the full name**, matching the model |
 
@@ -482,7 +482,11 @@ CREATE TABLE ohlcv (
     volume        BIGINT        NOT NULL CHECK (volume >= 0),
     trade_count   INTEGER       CHECK (trade_count IS NULL OR trade_count >= 0),
     vwap          NUMERIC(14,4),
-    is_adjusted   BOOLEAN       NOT NULL DEFAULT FALSE,
+    -- BR-15: OHLC above is RAW and is never mutated. Adjusted price is
+    -- raw * price_adj_factor, applied by the repository on read. Two factors
+    -- because a dividend moves price but not volume.
+    price_adj_factor  NUMERIC(18,10) NOT NULL DEFAULT 1.0,
+    volume_adj_factor NUMERIC(18,10) NOT NULL DEFAULT 1.0,
     synthetic     BOOLEAN       NOT NULL DEFAULT FALSE,
 
     -- BR-6: no duplicate bars
