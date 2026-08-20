@@ -145,7 +145,7 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["talib.*", "pandas_ta.*", "lightgbm.*", "pyarrow.*"]
+module = ["talib.*", "pandas_ta.*", "lightgbm.*", "pyarrow.*", "kiteconnect.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

@@ -120,8 +120,13 @@ ZERODHA = BrokerProfile(
     auth_flow=AuthFlow.REDIRECT_REQUEST_TOKEN,
     daily_token_expiry=True,
     requires_manual_daily_login=True,
-    monthly_cost_inr=500,  # data APIs; order placement reported free
-    historical_data_extra_cost=True,
+    # RESOLVED Aug 2026 (blocker B4): Zerodha restructured pricing. The
+    # Personal tier is free (orders, GTT, margins, portfolio) but carries NO
+    # data. Connect at Rs.500/month/app adds real-time WebSocket AND historical
+    # candles. There is no separate historical add-on any more, so the total
+    # cost of the data this system needs is Rs.500/month, not Rs.500 + Rs.2000.
+    monthly_cost_inr=500,
+    historical_data_extra_cost=False,
     static_ip_order_endpoints_only=True,
     requires_market_protection=True,
     max_orders_per_day=3000,
@@ -150,12 +155,16 @@ ZERODHA = BrokerProfile(
         "sit under one developer profile.",
         "Zerodha applies a ~3,000 orders/day account cap for most users, "
         "extendable on request - unlikely to bind for this system.",
-        "Historical data is a separate paid add-on beyond the base API "
-        "subscription - CONFIRM current pricing with Zerodha.",
-        "Self-developed algos under 10 OPS receive a GENERIC exchange algo ID "
-        "rather than a unique one. Sources disagree on whether the developer "
-        "attaches it via the order `tag` field or the broker injects it - "
-        "CONFIRM with Zerodha before going live.",
+        "Historical data is INCLUDED in the Rs.500/month Connect plan as of "
+        "Aug 2026; the old separate add-on no longer exists. The free Personal "
+        "tier has no data at all, so it cannot feed this system.",
+        "Self-developed algos under 10 OPS need no exchange registration; SEBI's "
+        "framework has the BROKER tag the strategy. Zerodha's own compliance "
+        "guidance covers static IP, the 10 OPS cap and market protection and "
+        "never asks the developer to supply an algo_id - so leaving it unset is "
+        "the working assumption. Still worth one confirmation before live.",
+        "The order `tag` field is alphanumeric, max 20 chars, and IS returned in "
+        "the orderbook - which is what makes query-by-tag a real recovery path.",
     ],
 )
 
