@@ -29,6 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict
@@ -84,15 +85,39 @@ class SessionEnvelope(BaseModel):
     expires_at: dt.datetime
 
 
+#: Kite api_keys are alphanumeric. Anything else is either a typo or an attempt
+#: to steer the URL, and both should stop here.
+_API_KEY = re.compile(r"[A-Za-z0-9]{1,64}")
+
+
 def login_url(api_key: str) -> str:
     """The Kite login URL, for the DASHBOARD to render — never for a message.
 
     Contains only ``api_key``, which is an app identifier rather than a
     credential. It is still not sent anywhere outbound: see the module
     docstring.
+
+    **The api_key is validated, not escaped.** Interpolated unchecked, a value
+    of ``realkey&redirect_uri=https://evil.example.com`` produces a perfectly
+    valid Kite login URL that returns the request_token to somebody else — and
+    the operator, having navigated from their own bookmark as designed, would
+    see nothing wrong. A CRLF in the same position is equally accepted.
+
+    Percent-encoding would neutralise both, but a Kite api_key containing an
+    ampersand or a newline is not a real api_key: it is a mis-paste or an
+    attempt to steer the flow. Refusing says so; encoding would quietly carry
+    the mistake into an URL that then fails at the broker for an unrelated-
+    looking reason.
     """
     if not api_key:
         raise AuthenticationError("no api_key configured; cannot build a login URL")
+    if _API_KEY.fullmatch(api_key) is None:
+        raise AuthenticationError(
+            f"api_key {api_key[:12]!r}... is not alphanumeric. It would be "
+            f"interpolated into the login URL, where '&' injects parameters (a "
+            f"hostile redirect_uri sends your request_token elsewhere) and CRLF "
+            f"splits the request. Check the value in your secrets provider."
+        )
     return f"{KITE_LOGIN_BASE}?api_key={api_key}&v=3"
 
 
@@ -151,6 +176,11 @@ class KiteAuthManager:
         self._session: BrokerSession | None = None
 
     # -- state ---------------------------------------------------------------
+
+    @property
+    def api_key(self) -> str:
+        """The app identifier. Not a credential — it appears in the login URL."""
+        return self._api_key
 
     @property
     def session(self) -> BrokerSession | None:

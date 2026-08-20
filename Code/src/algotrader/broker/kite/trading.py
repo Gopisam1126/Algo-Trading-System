@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -43,7 +44,7 @@ from algotrader.broker.kite import mapping
 from algotrader.broker.kite.errors import classify
 from algotrader.broker.kite.market_data import KiteReads
 from algotrader.broker.ratelimit import BrokerRateLimiter
-from algotrader.common.enums import OrderType
+from algotrader.common.enums import OrderType, Side
 from algotrader.common.models.trading import Order, OrderRequest
 
 log = logging.getLogger(__name__)
@@ -79,10 +80,12 @@ class KiteTradingAdapter(KiteReads):
         limiter: BrokerRateLimiter | None = None,
         algo_id: str = "",
         margin_ttl_seconds: float = DEFAULT_MARGIN_TTL_SECONDS,
+        tick_size_for: Callable[[str], Decimal] | None = None,
     ) -> None:
         super().__init__(auth=auth, client=client, limiter=limiter)
         self._algo_id = algo_id
         self._margin_ttl = margin_ttl_seconds
+        self._tick_size_for = tick_size_for
         self._margin: MarginSnapshot | None = None
 
     # -- the write path ------------------------------------------------------
@@ -100,6 +103,43 @@ class KiteTradingAdapter(KiteReads):
             return await asyncio.to_thread(fn, *args, **kwargs)
         except Exception as exc:
             raise classify(exc, mutating=True) from None
+
+    def _snap(self, price: Decimal | None, symbol: str, side: Side) -> Decimal | None:
+        """Round a price onto the instrument's tick grid, or refuse.
+
+        E02-S06's acceptance criterion is that a limit price is ALWAYS snapped
+        before submission, and the exchange rejects anything off-grid. This is
+        not a nicety: a stop derived from ATR is essentially never on a 0.05
+        grid by accident, so without this every computed stop would be rejected
+        by the broker.
+
+        Refusing when no tick resolver is wired is deliberate. Falling back to a
+        hardcoded 0.05 would be right for most of the market and silently wrong
+        for the rest — and "silently wrong for some symbols" is exactly the
+        failure mode that only appears once real money is on it.
+        """
+        if price is None:
+            return None
+        if self._tick_size_for is None:
+            raise OrderRejectedError(
+                f"cannot submit a priced order for {symbol}: no tick-size resolver is "
+                f"wired, so the price cannot be snapped to the instrument's grid and "
+                f"the exchange would reject it. Construct the adapter with "
+                f"tick_size_for=...",
+                reason_code="NO_TICK_RESOLVER",
+            )
+        tick = self._tick_size_for(symbol)
+        snapped = mapping.round_to_tick(price, tick, side=side)
+        if snapped != price:
+            log.info(
+                "snapped %s %s price %s -> %s on a %s tick",
+                symbol,
+                side.value,
+                price,
+                snapped,
+                tick,
+            )
+        return snapped
 
     def _build_params(self, request: OrderRequest) -> dict[str, Any]:
         """Translate an OrderRequest into Kite's argument names.
@@ -132,10 +172,12 @@ class KiteTradingAdapter(KiteReads):
             "order_type": mapping.order_type_out(request.order_type),
             "tag": mapping.broker_tag(request.client_order_id),
         }
-        if request.limit_price is not None:
-            params["price"] = float(request.limit_price)
-        if request.trigger_price is not None:
-            params["trigger_price"] = float(request.trigger_price)
+        limit_price = self._snap(request.limit_price, request.symbol, request.side)
+        trigger_price = self._snap(request.trigger_price, request.symbol, request.side)
+        if limit_price is not None:
+            params["price"] = float(limit_price)
+        if trigger_price is not None:
+            params["trigger_price"] = float(trigger_price)
         if request.market_protection is not None:
             params["market_protection"] = float(request.market_protection)
 
