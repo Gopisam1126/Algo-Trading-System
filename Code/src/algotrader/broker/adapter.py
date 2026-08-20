@@ -96,6 +96,25 @@ class AmbiguousOrderError(BrokerError):
     """
 
 
+class DuplicateBrokerOrderError(BrokerError):
+    """More than one live broker order carries our idempotency key.
+
+    This is the failure idempotency exists to prevent, so it must never be
+    resolved by picking one. Returning the first match silently would hand the
+    recovery path a stale rejected order and invite a resubmission on top of a
+    live one. Halt and escalate instead.
+    """
+
+    def __init__(self, client_order_id: str, broker_order_ids: list[str]) -> None:
+        super().__init__(
+            f"{len(broker_order_ids)} broker orders carry client_order_id "
+            f"{client_order_id}: {broker_order_ids}. A duplicate exists — do not "
+            f"place anything else for this id until it is resolved by hand."
+        )
+        self.client_order_id = client_order_id
+        self.broker_order_ids = broker_order_ids
+
+
 @runtime_checkable
 class MarketDataAdapter(Protocol):
     """Read-only broker surface."""

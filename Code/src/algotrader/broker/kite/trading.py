@@ -35,6 +35,7 @@ from typing import Any
 
 from algotrader.broker.adapter import (
     AmbiguousOrderError,
+    DuplicateBrokerOrderError,
     MarginSnapshot,
     OrderRejectedError,
 )
@@ -199,23 +200,71 @@ class KiteTradingAdapter(KiteReads):
 
     # -- reads that execution needs -----------------------------------------
 
+    async def fetch_raw_orders(self) -> list[dict[str, Any]]:
+        """The orderbook as the broker states it, unmapped.
+
+        Reconciliation diffs on IDENTITY — which broker order ids exist, and do
+        we have a record of each. That question needs no enum mapping, and
+        insisting on one would make an order type this system does not model
+        (an iceberg placed by hand, a GTT firing) able to break the very loop
+        that is supposed to notice it.
+        """
+        return list(await self._call(self._client.orders))
+
     async def fetch_orderbook(self) -> list[Order]:
+        """Orders this system can model, skipping those it cannot.
+
+        A personal Kite account is also used by a human, so foreign order types
+        are expected rather than exotic. Letting one unmappable row raise would
+        return NOTHING from the read the 30-second reconciliation loop depends
+        on — losing sight of every other order, including a genuinely unknown
+        position, which is the exact condition the kill switch exists for.
+
+        Skipped rows are logged at ERROR with their id, and
+        :meth:`fetch_raw_orders` still sees them, so nothing disappears.
+        """
         raw = await self._call(self._client.orders)
-        return [self._to_order(row) for row in raw]
+        out: list[Order] = []
+        for row in raw:
+            try:
+                out.append(self._to_order(row))
+            except (mapping.MappingError, KeyError, ValueError) as exc:
+                log.error(
+                    "broker order %s could not be mapped (%s) — it is NOT in the "
+                    "modelled orderbook. Reconcile it from fetch_raw_orders.",
+                    row.get("order_id"),
+                    exc,
+                )
+        return out
 
     async def find_by_client_order_id(self, client_order_id: str) -> Order | None:
         """The recovery path after an ambiguous failure.
 
         Matches on the truncated tag, because that is what the broker actually
         stored. Comparing against the full id would never match and would make
-        every ambiguous order look absent — which is precisely the condition
-        under which a caller would wrongly resubmit.
+        every ambiguous order look absent — precisely the condition under which
+        a caller would wrongly resubmit.
+
+        Two or more matches raise. That state means a duplicate already exists,
+        which is the failure idempotency is for; returning the first match would
+        hand back whichever the broker happened to list first — observed to be a
+        stale REJECTED order sitting in front of the live OPEN one, which reads
+        as "not placed" and invites a second submission on top of a real
+        position.
         """
         wanted = mapping.broker_tag(client_order_id)
-        for row in await self._call(self._client.orders):
-            if str(row.get("tag") or "") == wanted:
-                return self._to_order(row)
-        return None
+        matches = [
+            row
+            for row in await self._call(self._client.orders)
+            if str(row.get("tag") or "") == wanted
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise DuplicateBrokerOrderError(
+                client_order_id, [str(m.get("order_id")) for m in matches]
+            )
+        return self._to_order(matches[0])
 
     async def fetch_positions(self) -> list[dict[str, Any]]:
         """Raw broker positions.
@@ -281,9 +330,9 @@ class KiteTradingAdapter(KiteReads):
             broker_order_id=str(row.get("order_id")),
             correlation_id=correlation,
             symbol=str(row.get("tradingsymbol")),
-            side=mapping._SIDE_IN[str(row["transaction_type"]).upper()],
-            order_type=mapping._ORDER_TYPE_IN[str(row["order_type"]).upper()],
-            product=mapping._PRODUCT_IN[str(row["product"]).upper()],
+            side=mapping.side_in(str(row["transaction_type"])),
+            order_type=mapping.order_type_in(str(row["order_type"])),
+            product=mapping.product_in(str(row["product"])),
             quantity=int(row.get("quantity") or 0),
             limit_price=Decimal(str(row["price"])) if row.get("price") else None,
             trigger_price=Decimal(str(row["trigger_price"])) if row.get("trigger_price") else None,

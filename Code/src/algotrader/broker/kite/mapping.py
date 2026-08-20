@@ -138,6 +138,36 @@ def side_out(value: Side) -> str:
         raise MappingError(f"no Kite transaction type for {value!r}") from None
 
 
+def order_type_in(value: str) -> OrderType:
+    """Kite order type -> ours, refusing anything we do not model.
+
+    Zerodha supports varieties this system does not place — iceberg, cover,
+    bracket, AMO, auction. Encountering one means the order came from somewhere
+    else (the Kite app, a GTT firing), which is a real condition on a personal
+    account, not an exotic edge case. Raising a typed error lets the caller
+    treat it as a foreign order rather than crashing on a bare ``KeyError``
+    that nothing in the taxonomy catches.
+    """
+    try:
+        return _ORDER_TYPE_IN[str(value).upper().strip()]
+    except KeyError:
+        raise MappingError(f"unmodelled Kite order type {value!r}") from None
+
+
+def product_in(value: str) -> Product:
+    try:
+        return _PRODUCT_IN[str(value).upper().strip()]
+    except KeyError:
+        raise MappingError(f"unmodelled Kite product {value!r}") from None
+
+
+def side_in(value: str) -> Side:
+    try:
+        return _SIDE_IN[str(value).upper().strip()]
+    except KeyError:
+        raise MappingError(f"unmodelled Kite transaction type {value!r}") from None
+
+
 def status_in(value: str) -> OrderStatus:
     """Kite status -> ours.
 
