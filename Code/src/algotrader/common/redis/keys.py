@@ -210,6 +210,21 @@ def order_rate_limit() -> str:
     return f"{RATELIMIT}:orders"
 
 
+def data_rate_limit() -> str:
+    """A SEPARATE bucket for quote and historical calls.
+
+    Kept apart from the order bucket on purpose: a backfill burning through the
+    data budget must never be able to starve an exit order. The broker meters
+    them separately too.
+    """
+    return f"{RATELIMIT}:data"
+
+
+def broker_session() -> str:
+    """The current broker session envelope (never the token itself)."""
+    return f"{STATE}:broker:session"
+
+
 def squareoff_timer() -> str:
     """ZSET — score is the deadline epoch; member is the position id."""
     return f"{TIMER}:squareoff"

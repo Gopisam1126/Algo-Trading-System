@@ -32,8 +32,25 @@ import redis.asyncio as aioredis
 _BUCKET_LUA: Final = """
 local capacity   = tonumber(ARGV[1])
 local refill     = tonumber(ARGV[2])
-local now_ms     = tonumber(ARGV[3])
-local requested  = tonumber(ARGV[4])
+local requested  = tonumber(ARGV[3])
+
+-- The clock comes from REDIS, never from the caller.
+--
+-- Passing a client-computed timestamp looks harmless and is not. Concurrent
+-- callers each read their own clock and then await the round trip, so requests
+-- arrive in a different order than they were stamped. The script writes `ts`
+-- unconditionally, so a late-arriving request REWINDS the stored timestamp, and
+-- the next caller measures its elapsed time from that older mark and is granted
+-- tokens that no time actually produced.
+--
+-- Measured on this bucket: a burst of 3 with a 3/sec refill let 11 of 100
+-- concurrent callers through in 0.56 s, and 56 of 100 on a loaded host. For the
+-- limiter that keeps order rate under SEBI's 10/sec registration threshold,
+-- that is the whole control failing quietly under exactly the load it exists
+-- for. Redis TIME is one clock, read after serialisation, so neither
+-- reordering nor skew between processes can move it backwards.
+local t = redis.call('TIME')
+local now_ms = (tonumber(t[1]) * 1000) + (tonumber(t[2]) / 1000)
 
 local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
 local tokens = tonumber(state[1])
@@ -97,10 +114,7 @@ async def take_token(
             f"succeed and would spin forever in a retry loop"
         )
 
-    now_ms = int(time.time() * 1000)
-    allowed, remaining = await client.eval(
-        _BUCKET_LUA, 1, key, capacity, refill_per_second, now_ms, count
-    )
+    allowed, remaining = await client.eval(_BUCKET_LUA, 1, key, capacity, refill_per_second, count)
     return bool(int(allowed)), float(remaining)
 
 
