@@ -300,15 +300,23 @@ class TestMarketProtectionCannotBeSkipped:
         with pytest.raises(OrderRejectedError):
             adapter._build_params(stripped)
 
-    def test_a_limit_order_needs_no_protection(self, adapter: KiteTradingAdapter) -> None:
+    def test_a_limit_order_needs_no_protection(self) -> None:
         """The requirement is specific to MARKET and SL-M; applying it to LIMIT
-        would reject perfectly valid orders."""
+        would reject perfectly valid orders.
+
+        Built with a tick resolver because a priced order now requires one —
+        see TestAPricedOrderIsAlwaysOnTheTickGrid. That rule is separate from
+        market protection and must not be confused with it here.
+        """
+        priced = KiteTradingAdapter(
+            auth=_auth(), client=object(), tick_size_for=lambda _s: Decimal("0.05")
+        )
         request = _market_request(
             order_type=OrderType.LIMIT,
             limit_price=Decimal("1000"),
             market_protection=None,
         )
-        params = adapter._build_params(request)
+        params = priced._build_params(request)
         assert "market_protection" not in params
 
 

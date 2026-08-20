@@ -16,6 +16,7 @@ risk engine from config and live broker margin.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated
@@ -211,6 +212,31 @@ class RiskDecision(_Frozen):
 # ---------------------------------------------------------------------------
 
 
+#: Instrument symbols arrive from the broker's daily dump — external data this
+#: system does not author — and flow into log lines, broker payloads and Redis
+#: keys. QA-SEC-03 established the Redis half of that; the same value reaching
+#: an order log line lets a NEWLINE forge a whole log entry, because a symbol
+#: carrying a line break appends a fabricated CRITICAL line of its own.
+#: Application logs are what an incident is reconstructed from, so a forgeable
+#: line is a real problem even though nothing crashes.
+#:
+#: Same allowlist as ``common/redis/keys._SAFE_COMPONENT``, deliberately: one
+#: definition of what a symbol may contain, applied wherever untrusted symbol
+#: text crosses a boundary.
+_SAFE_SYMBOL = re.compile(r"[A-Za-z0-9_\-&.]{1,64}")
+
+
+def _validate_symbol(value: str) -> str:
+    if _SAFE_SYMBOL.fullmatch(value) is None:
+        shown = value[:32]
+        raise ValueError(
+            f"symbol {shown!r} is not a valid instrument symbol. Allowed: letters, "
+            f"digits and _ - & . (1-64 chars). A newline here forges a log line; "
+            f"a ':' collides with another Redis key."
+        )
+    return value
+
+
 class OrderRequest(_Frozen):
     """An order about to be sent to the broker.
 
@@ -244,6 +270,8 @@ class OrderRequest(_Frozen):
     #: Note this is NOT the same as our own stop-loss: it bounds slippage on
     #: the fill, it does not bound the position's risk.
     market_protection: Decimal | None = None
+
+    _symbol_is_safe = field_validator("symbol")(_validate_symbol)
 
     @model_validator(mode="after")
     def _price_required_for_type(self) -> OrderRequest:
