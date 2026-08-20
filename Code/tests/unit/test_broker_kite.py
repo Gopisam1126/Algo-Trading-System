@@ -17,7 +17,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from algotrader.broker.adapter import AmbiguousOrderError
+from algotrader.broker.adapter import AmbiguousOrderError, DuplicateBrokerOrderError
 from algotrader.broker.kite import mapping
 from algotrader.broker.kite.auth import KiteAuthManager, next_expiry
 from algotrader.broker.kite.instruments import InstrumentSync, tick_grid_is_respected
@@ -416,3 +416,88 @@ class TestReadPath:
                 dt.datetime(2026, 2, 1, tzinfo=dt.UTC),
                 dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
             )
+
+
+class TestTheOrderbookSurvivesForeignOrders:
+    """Found by QA probing after E02 was written and pushed.
+
+    `fetch_orderbook` is what the 30-second reconciliation loop calls. It used
+    to index private mapping dicts directly, so a single order type this system
+    does not model raised a bare `KeyError` — not in the broker taxonomy, so
+    nothing caught it — and killed the WHOLE read. One iceberg order placed by
+    hand in the Kite app, and reconciliation returned nothing at all: every
+    other order invisible, including a genuinely unknown position, which is the
+    condition the kill switch exists for.
+
+    A personal account is also traded by a human, so foreign order types are
+    normal here rather than exotic.
+    """
+
+    @staticmethod
+    def _foreign_row(**over: Any) -> dict[str, Any]:
+        return _order_row(order_id="FOREIGN", order_type="ICEBERG", tag="", **over)
+
+    async def test_an_unmodelled_order_type_does_not_raise_a_bare_keyerror(self) -> None:
+        with pytest.raises(mapping.MappingError, match="unmodelled Kite order type"):
+            mapping.order_type_in("ICEBERG")
+
+    async def test_an_unmappable_row_does_not_lose_the_rest_of_the_book(self) -> None:
+        rows = [self._foreign_row(), _order_row(order_id="OURS")]
+        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        orders = await adapter.fetch_orderbook()
+        assert [o.broker_order_id for o in orders] == ["OURS"], (
+            "the modelled order must survive an unmappable sibling"
+        )
+
+    async def test_the_raw_read_still_sees_everything(self) -> None:
+        """Nothing may disappear. Reconciliation diffs on identity, which needs
+        no enum mapping — so the foreign order is still visible there."""
+        rows = [self._foreign_row(), _order_row(order_id="OURS")]
+        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        raw = await adapter.fetch_raw_orders()
+        assert {str(r["order_id"]) for r in raw} == {"FOREIGN", "OURS"}
+
+    async def test_an_unmodelled_product_is_also_tolerated(self) -> None:
+        rows = [_order_row(order_id="ODD", product="BO"), _order_row(order_id="OURS")]
+        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        assert [o.broker_order_id for o in await adapter.fetch_orderbook()] == ["OURS"]
+
+    async def test_an_empty_book_is_not_an_error(self) -> None:
+        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=[]))
+        assert await adapter.fetch_orderbook() == []
+
+
+class TestADuplicateTagIsNeverResolvedByPicking:
+    """The failure idempotency exists to prevent must not be papered over.
+
+    Returning the first match was observed handing back a stale REJECTED order
+    sitting ahead of the live OPEN one. After an ambiguous failure that reads as
+    "not placed" and invites a second submission on top of a real position.
+    """
+
+    async def test_two_orders_with_our_tag_raise(self) -> None:
+        tag = mapping.broker_tag("a" * 32)
+        rows = [
+            _order_row(order_id="OLD", tag=tag, status="REJECTED"),
+            _order_row(order_id="NEW", tag=tag, status="OPEN"),
+        ]
+        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        with pytest.raises(DuplicateBrokerOrderError) as exc:
+            await adapter.find_by_client_order_id("a" * 32)
+        assert set(exc.value.broker_order_ids) == {"OLD", "NEW"}
+
+    async def test_the_error_names_both_orders_for_the_human(self) -> None:
+        tag = mapping.broker_tag("a" * 32)
+        rows = [_order_row(order_id="OLD", tag=tag), _order_row(order_id="NEW", tag=tag)]
+        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        with pytest.raises(DuplicateBrokerOrderError, match="do not place anything else"):
+            await adapter.find_by_client_order_id("a" * 32)
+
+    async def test_exactly_one_match_still_returns_it(self) -> None:
+        """The control — the fix must not break the normal recovery path."""
+        tag = mapping.broker_tag("a" * 32)
+        adapter = KiteTradingAdapter(
+            auth=_auth(), client=FakeKite(orders=[_order_row(order_id="ONE", tag=tag)])
+        )
+        found = await adapter.find_by_client_order_id("a" * 32)
+        assert found is not None and found.broker_order_id == "ONE"
