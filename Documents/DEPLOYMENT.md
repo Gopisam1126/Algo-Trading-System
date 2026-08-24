@@ -71,9 +71,25 @@ Two design decisions worth knowing:
   `autobahn 19.11.2` (CVE-2020-35678) and a permanently red check trains
   everyone to ignore it, which is worse than no check.
 
-  B7 is now closed. The pin turned out to be *declarative* rather than a
-  runtime requirement, `kiteconnect` 5.2.1 works under `autobahn 26.7.1`, and
-  `pyproject.toml` floors it at `>=20.12.3`. With the known finding gone,
+  B7 is now closed, though not the way it was first attempted. A floor of
+  `>=20.12.3` in `pyproject.toml` looked like the obvious fix and is
+  **unsatisfiable**: `==19.11.2` is a hard pin, so pip fails outright with
+  `ResolutionImpossible` rather than warning. That broke every CI job for two
+  commits, and it broke them only in CI — locally the package had been
+  force-installed over an already-resolved environment, so the environment
+  being verified was one `pip install` could never produce.
+
+  The pin is *declarative* rather than a runtime requirement, so the working
+  fix is to let resolution succeed and then replace the package:
+
+  ```
+  pip install -c constraints.txt -e ".[dev]"
+  pip install --no-deps --upgrade "autobahn==26.7.1"
+  ```
+
+  applied in every CI install job, `ops/Dockerfile` and `make install`.
+  `tests/security/test_dependency_hygiene.py` is the enforcement: it fails on
+  a vulnerable autobahn and asserts every install site carries the override. With the known finding gone,
   "advisory" only means the next CVE arrives silently, so the check blocks.
 
   Two details worth keeping:
