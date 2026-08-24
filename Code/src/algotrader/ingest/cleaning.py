@@ -159,8 +159,17 @@ class Deduplicator:
     """
 
     capacity_per_instrument: int = 512
+    #: How many INSTRUMENTS to keep windows for. The per-instrument window was
+    #: bounded from the start; the map holding them was not, so a feed churning
+    #: tokens — re-listings, corporate actions, a subscription that changes
+    #: daily — grew it without limit for the life of the process. A universe of
+    #: 200 fits several times over, so eviction only ever reaches symbols that
+    #: genuinely stopped ticking.
+    max_instruments: int = 1024
     rejections: RejectionLog = field(default_factory=RejectionLog)
-    _seen: dict[int, OrderedDict[tuple[object, ...], None]] = field(default_factory=dict)
+    _seen: OrderedDict[int, OrderedDict[tuple[object, ...], None]] = field(
+        default_factory=OrderedDict
+    )
 
     def is_duplicate(self, tick: RawTick) -> bool:
         key = (
@@ -169,7 +178,14 @@ class Deduplicator:
             tick.volume,
             tick.last_quantity,
         )
-        window = self._seen.setdefault(tick.instrument_token, OrderedDict())
+        window = self._seen.get(tick.instrument_token)
+        if window is None:
+            window = OrderedDict()
+            self._seen[tick.instrument_token] = window
+            if len(self._seen) > self.max_instruments:
+                self._seen.popitem(last=False)
+        else:
+            self._seen.move_to_end(tick.instrument_token)
         if key in window:
             window.move_to_end(key)
             self.rejections.record(DUPLICATE, f"token={tick.instrument_token}")
@@ -320,6 +336,21 @@ class CleaningPipeline:
     replayed tick cannot update the last-price baseline the filter compares
     against — otherwise a duplicate would reset the reference and let a genuine
     outlier through immediately afterwards.
+
+    **On the apparent circular dependency.** The outlier filter wants ATR
+    (E06), ATR is computed from bars (E05), and bars are built from the ticks
+    this pipeline cleans. Read as a runtime loop that cannot be broken — but it
+    is not one, because the ATR that matters is **yesterday's**, loaded from
+    ``ohlcv`` at warm-up before the feed connects. Today's ticks never feed
+    today's threshold.
+
+    Whoever wires this up must therefore call :meth:`OutlierFilter.set_atr_pct`
+    from the warm-up path, using the previous session's daily ATR, and NOT from
+    the live bar stream. Feeding it live bars would make the threshold widen in
+    response to the very outliers it exists to reject — each bad print raising
+    ATR, each raised ATR admitting a worse print. Until that call exists the
+    filter runs on its 2% cold-start floor, which is safe but blunt; the floor
+    is the reason this degrades rather than fails.
     """
 
     validator: TickValidator = field(default_factory=TickValidator)

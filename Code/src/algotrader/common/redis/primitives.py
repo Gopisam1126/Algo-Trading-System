@@ -79,8 +79,17 @@ return {allowed, tostring(tokens)}
 """
 
 
-class RateLimitError(RuntimeError):
-    """Raised when the limiter is configured incorrectly."""
+class RateLimiterConfigError(RuntimeError):
+    """The limiter itself is misconfigured — NOT "you hit the limit".
+
+    Named apart from :class:`algotrader.broker.adapter.RateLimitError` on
+    purpose. That one is transient and means back off and retry. This one is
+    permanent: a bucket with zero capacity, or a negative refill rate, will
+    never allow anything through no matter how long the caller waits. When the
+    two shared a name, a caller could import either and wrap it in a
+    retry-with-backoff loop — which is correct for one and an infinite loop for
+    the other, with no failing test because the bucket never becomes healthy.
+    """
 
 
 async def take_token(
@@ -103,13 +112,15 @@ async def take_token(
     but cannot raise it past the SEBI-safe bound.
     """
     if capacity <= 0:
-        raise RateLimitError("capacity must be positive")
+        raise RateLimiterConfigError("capacity must be positive")
     if refill_per_second <= 0:
-        raise RateLimitError("refill_per_second must be positive, or the bucket never refills")
+        raise RateLimiterConfigError(
+            "refill_per_second must be positive, or the bucket never refills"
+        )
     if count <= 0:
-        raise RateLimitError("count must be positive")
+        raise RateLimiterConfigError("count must be positive")
     if count > capacity:
-        raise RateLimitError(
+        raise RateLimiterConfigError(
             f"requested {count} tokens but capacity is {capacity} — this can never "
             f"succeed and would spin forever in a retry loop"
         )

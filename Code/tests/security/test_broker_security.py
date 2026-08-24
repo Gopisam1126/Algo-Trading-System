@@ -361,3 +361,36 @@ class TestAlgoIdIsOptionalByDesign:
     def test_a_configured_algo_id_is_attached(self) -> None:
         adapter = KiteTradingAdapter(auth=_auth(), client=object(), algo_id="GENERIC123")
         assert adapter._build_params(_market_request())["algo_id"] == "GENERIC123"
+
+
+class TestTheTwoRateLimitFailuresAreToldApart:
+    """Found by audit: two exception classes were both named ``RateLimitError``
+    with opposite retry semantics.
+
+    ``broker.adapter.RateLimitError`` is transient — back off and retry.
+    ``redis.primitives.RateLimiterConfigError`` is permanent — a bucket with
+    zero capacity never becomes healthy. When both were called
+    ``RateLimitError``, a caller could import either, wrap it in the standard
+    retry-with-backoff, and get an infinite loop for one of them, with no
+    failing test because the condition never clears.
+    """
+
+    def test_they_are_distinct_types(self) -> None:
+        from algotrader.common.redis import RateLimiterConfigError
+
+        assert RateLimitError is not RateLimiterConfigError
+
+    def test_neither_catches_the_other(self) -> None:
+        """The concrete trap: `except RateLimitError` around a token-bucket call
+        must not swallow a configuration failure and retry it forever."""
+        from algotrader.common.redis import RateLimiterConfigError
+
+        assert not issubclass(RateLimiterConfigError, RateLimitError)
+        assert not issubclass(RateLimitError, RateLimiterConfigError)
+
+    def test_only_the_broker_one_is_marked_retryable(self) -> None:
+        from algotrader.broker.kite.errors import is_retryable
+        from algotrader.common.redis import RateLimiterConfigError
+
+        assert is_retryable(RateLimitError("hit the broker limit"))
+        assert not is_retryable(RateLimiterConfigError("capacity must be positive"))

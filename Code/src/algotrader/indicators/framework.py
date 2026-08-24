@@ -31,6 +31,7 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from algotrader.common.models.market import Bar
@@ -38,6 +39,46 @@ from algotrader.common.models.market import Bar
 
 class IndicatorError(RuntimeError):
     """An indicator was misconfigured or asked for a value it does not have."""
+
+
+def _checked_period(value: object, *, minimum: int, what: str) -> int:
+    """Validate a period arriving from a SNAPSHOT, not just from a constructor.
+
+    ``restore`` reads state that has round-tripped through Redis, and it used to
+    trust it. A snapshot carrying ``period: -5`` produced an EMA with
+    ``alpha = -0.5`` — an indicator that diverges instead of converging, emits
+    numbers the whole time, and is wrong in a direction nothing downstream can
+    detect. Version skew or a partially-written key is enough to cause it; an
+    attacker is not required.
+    """
+    try:
+        period: int = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        raise IndicatorError(f"{what} period is not an integer: {value!r}") from None
+    if period < minimum:
+        raise IndicatorError(
+            f"{what} period must be >= {minimum}, got {period}. A snapshot carrying "
+            f"this would restore an indicator that emits values and diverges."
+        )
+    return period
+
+
+def to_decimal(value: float | None, places: int = 4) -> Decimal | None:
+    """The one sanctioned crossing from indicator float back into money.
+
+    Indicators compute in ``float`` deliberately — they are the numerical-library
+    boundary CLAUDE.md carves out, and TA-Lib parity is defined in float. But an
+    ATR of ``1.4000000000000057`` becoming a stop distance, and then a position
+    size, drags that representation error into the money path where the rest of
+    the system is ``Decimal``.
+
+    Quantising here makes the crossing explicit and lossy-on-purpose rather than
+    implicit and lossy-by-accident. Anything feeding sizing or a stop price goes
+    through this.
+    """
+    if value is None:
+        return None
+    return Decimal(repr(value)).quantize(Decimal(10) ** -places, rounding=ROUND_HALF_UP)
 
 
 class Indicator(ABC):
@@ -119,7 +160,7 @@ class _Wilder:
         return {"period": self.period, "seed": list(self._seed), "value": self._value}
 
     def restore(self, state: dict[str, Any]) -> None:
-        self.period = int(state["period"])
+        self.period = _checked_period(state["period"], minimum=1, what="Wilder")
         self._seed = [float(x) for x in state.get("seed", [])]
         self._value = None if state.get("value") is None else float(state["value"])
 
@@ -155,7 +196,7 @@ class SMA(Indicator):
         return {"period": self.period, "window": list(self._window)}
 
     def restore(self, state: dict[str, Any]) -> None:
-        self.period = int(state["period"])
+        self.period = _checked_period(state["period"], minimum=1, what="SMA")
         self._window = deque((float(x) for x in state["window"]), maxlen=self.period)
         self._sum = sum(self._window)
 
@@ -205,7 +246,7 @@ class EMA(Indicator):
         return {"period": self.period, "seed": list(self._seed), "value": self._value}
 
     def restore(self, state: dict[str, Any]) -> None:
-        self.period = int(state["period"])
+        self.period = _checked_period(state["period"], minimum=1, what="EMA")
         self.alpha = 2.0 / (self.period + 1.0)
         self._seed = [float(x) for x in state.get("seed", [])]
         self._value = None if state.get("value") is None else float(state["value"])
@@ -264,7 +305,7 @@ class RSI(Indicator):
         }
 
     def restore(self, state: dict[str, Any]) -> None:
-        self.period = int(state["period"])
+        self.period = _checked_period(state["period"], minimum=2, what="RSI")
         self._gains.restore(state["gains"])
         self._losses.restore(state["losses"])
         self._previous_close = (
@@ -314,10 +355,26 @@ class ATR(Indicator):
         return self._wilder.update(true_range)
 
     def percent_of(self, price: float) -> float | None:
-        """ATR as a percentage of price — what the outlier filter wants."""
+        """ATR as a percentage of price — what the outlier filter wants.
+
+        Stays ``float``: the outlier filter compares it against a threshold and
+        nothing downstream of that comparison is money.
+        """
         if self.value is None or price <= 0:
             return None
         return self.value / price * 100.0
+
+    def as_decimal(self, places: int = 4) -> Decimal | None:
+        """ATR for the MONEY path — stop distance, and therefore position size.
+
+        Use this, not ``.value``, anywhere the number becomes rupees. ``.value``
+        is ``1.4000000000000057``; multiplied by a stop multiplier and divided
+        into a risk budget, that representation error reaches the quantity. The
+        quantisation is deliberate and one-directional, which is the point of a
+        named boundary rather than an implicit ``Decimal()`` at whichever call
+        site happens to need one.
+        """
+        return to_decimal(self.value, places)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -327,7 +384,7 @@ class ATR(Indicator):
         }
 
     def restore(self, state: dict[str, Any]) -> None:
-        self.period = int(state["period"])
+        self.period = _checked_period(state["period"], minimum=1, what="ATR")
         self._wilder.restore(state["wilder"])
         self._previous_close = (
             None if state.get("previous_close") is None else float(state["previous_close"])
@@ -416,8 +473,8 @@ class MACD(Indicator):
         }
 
     def restore(self, state: dict[str, Any]) -> None:
-        self.fast_period = int(state["fast_period"])
-        self.slow_period = int(state["slow_period"])
+        self.fast_period = _checked_period(state["fast_period"], minimum=1, what="MACD fast")
+        self.slow_period = _checked_period(state["slow_period"], minimum=2, what="MACD slow")
         self._fast_alpha = 2.0 / (self.fast_period + 1.0)
         self._slow_alpha = 2.0 / (self.slow_period + 1.0)
         self._buffer = deque((float(x) for x in state["buffer"]), maxlen=self.slow_period)
@@ -489,7 +546,7 @@ class BollingerBands(Indicator):
         }
 
     def restore(self, state: dict[str, Any]) -> None:
-        self.period = int(state["period"])
+        self.period = _checked_period(state["period"], minimum=2, what="Bollinger")
         self.deviations = float(state["deviations"])
         self._window = deque((float(x) for x in state["window"]), maxlen=self.period)
 
@@ -579,6 +636,6 @@ class VolumeRatio(Indicator):
         return {"period": self.period, "window": list(self._window), "value": self._value}
 
     def restore(self, state: dict[str, Any]) -> None:
-        self.period = int(state["period"])
+        self.period = _checked_period(state["period"], minimum=1, what="VolumeRatio")
         self._window = deque((float(x) for x in state["window"]), maxlen=self.period)
         self._value = None if state.get("value") is None else float(state["value"])

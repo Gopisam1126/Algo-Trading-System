@@ -323,3 +323,106 @@ class TestAtrPercent:
         atr = ATR(14)
         atr.warm_up(_series(n=60))
         assert atr.percent_of(0.0) is None
+
+
+class TestRestoreValidatesAsStrictlyAsInit:
+    """Found by auditing E05/E06 rather than by a failing test.
+
+    `__init__` validated its period; `restore` did not. A snapshot carrying
+    `period: -5` produced an EMA with `alpha = -0.5` — an indicator that
+    DIVERGES instead of converging, emits numbers the whole time, and is wrong
+    in a direction nothing downstream can detect. Version skew or a
+    partially-written Redis key is enough; an attacker is not required.
+    """
+
+    @pytest.mark.parametrize("bad", [-5, 0, "x", None], ids=["negative", "zero", "text", "none"])
+    def test_a_corrupt_period_is_refused_on_restore(self, bad: object) -> None:
+        with pytest.raises(IndicatorError):
+            EMA(20).restore({"period": bad, "seed": [], "value": 1.0})
+
+    def test_a_diverging_alpha_can_no_longer_be_constructed(self) -> None:
+        """The specific consequence: a negative period yields a negative alpha,
+        which amplifies every update instead of damping it."""
+        with pytest.raises(IndicatorError):
+            EMA(20).restore({"period": -5, "seed": [], "value": 100.0})
+
+    @pytest.mark.parametrize(
+        ("factory", "state"),
+        [
+            (lambda: SMA(20), {"period": 0, "window": []}),
+            (
+                lambda: RSI(14),
+                {
+                    "period": 1,
+                    "gains": {"period": 1, "seed": [], "value": None},
+                    "losses": {"period": 1, "seed": [], "value": None},
+                    "previous_close": None,
+                    "value": None,
+                },
+            ),
+            (
+                lambda: ATR(14),
+                {
+                    "period": -1,
+                    "wilder": {"period": 1, "seed": [], "value": None},
+                    "previous_close": None,
+                },
+            ),
+            (lambda: BollingerBands(20), {"period": 1, "deviations": 2.0, "window": []}),
+            (lambda: VolumeRatio(20), {"period": 0, "window": [], "value": None}),
+        ],
+        ids=["sma", "rsi", "atr", "bollinger", "volume_ratio"],
+    )
+    def test_every_indicator_validates_on_restore(self, factory, state: dict) -> None:
+        with pytest.raises(IndicatorError):
+            factory().restore(state)
+
+    def test_a_valid_snapshot_still_restores(self) -> None:
+        """The control — validation must not break the normal path."""
+        live = EMA(20)
+        live.warm_up(_series(n=40))
+        restored = EMA(20)
+        restored.restore(live.snapshot())
+        assert restored.value == live.value
+
+
+class TestTheMoneyBoundaryIsExplicit:
+    """ATR reaches position sizing, and sizing is Decimal everywhere else.
+
+    Indicators compute in float on purpose — they are the numerical-library
+    boundary, and TA-Lib parity is defined in float. But `1.4000000000000057`
+    multiplied by a stop multiplier and divided into a risk budget carries that
+    representation error into the quantity. The crossing needs to be named.
+    """
+
+    def _warm_atr(self) -> ATR:
+        atr = ATR(14)
+        atr.warm_up(_series(n=60))
+        return atr
+
+    def test_value_stays_float_for_the_indicator_path(self) -> None:
+        assert isinstance(self._warm_atr().value, float)
+
+    def test_as_decimal_gives_the_money_path_a_decimal(self) -> None:
+
+        assert isinstance(self._warm_atr().as_decimal(), Decimal)
+
+    def test_the_quantisation_removes_the_representation_tail(self) -> None:
+
+        from algotrader.indicators.framework import to_decimal
+
+        assert to_decimal(1.4000000000000057) == Decimal("1.4000")
+
+    def test_it_rounds_half_up_not_bankers(self) -> None:
+        """Banker's rounding on money is a surprise; half-up is what a contract
+        note does."""
+
+        from algotrader.indicators.framework import to_decimal
+
+        assert to_decimal(1.00005, places=4) == Decimal("1.0001")
+
+    def test_none_survives_the_crossing(self) -> None:
+        from algotrader.indicators.framework import to_decimal
+
+        assert to_decimal(None) is None
+        assert ATR(14).as_decimal() is None

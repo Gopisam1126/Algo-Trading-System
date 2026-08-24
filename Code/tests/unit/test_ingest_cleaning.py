@@ -267,3 +267,38 @@ class TestThePipelineAsAWhole:
         for i in range(200):
             p.process(_raw(str(2500 + i * 0.05), volume=1000 + i), "INFY", now=NOW)
         assert not p.looks_unhealthy()
+
+
+class TestTheDedupMapIsBounded:
+    """Found by auditing: the per-instrument WINDOW was bounded from the start;
+    the map holding those windows was not.
+
+    A feed churning tokens — re-listings, corporate actions, a subscription that
+    changes daily — grew it without limit for the life of the process. A
+    universe of 200 fits several times over, so eviction only ever reaches
+    symbols that genuinely stopped ticking.
+    """
+
+    def test_the_instrument_map_does_not_grow_without_limit(self) -> None:
+        d = cleaning.Deduplicator(max_instruments=64)
+        for token in range(1000):
+            d.is_duplicate(_raw(token=token))
+        assert len(d._seen) <= 64
+
+    def test_an_actively_ticking_symbol_is_not_evicted(self) -> None:
+        """LRU on the instrument dimension: a symbol still ticking must keep its
+        window even while hundreds of others churn through."""
+        d = cleaning.Deduplicator(max_instruments=8)
+        hot = _raw(token=1, volume=1)
+        d.is_duplicate(hot)
+        for token in range(2, 200):
+            d.is_duplicate(_raw(token=token))
+            d.is_duplicate(hot)  # keep the hot symbol fresh
+        assert d.is_duplicate(hot), "the continuously-ticking symbol was evicted"
+
+    def test_the_per_instrument_window_is_still_bounded(self) -> None:
+        """The original bound must survive the new one."""
+        d = cleaning.Deduplicator(capacity_per_instrument=4, max_instruments=64)
+        for i in range(50):
+            d.is_duplicate(_raw(volume=1000 + i))
+        assert len(d._seen[TOKEN]) <= 4
