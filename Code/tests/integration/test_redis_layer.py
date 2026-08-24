@@ -171,11 +171,11 @@ class TestTokenBucket:
 
     async def test_impossible_request_is_rejected_not_looped(self, r: aioredis.Redis) -> None:
         """Asking for more than capacity can never succeed — fail fast, not spin."""
-        with pytest.raises(primitives.RateLimitError):
+        with pytest.raises(primitives.RateLimiterConfigError):
             await primitives.take_token(r, "ratelimit:x", capacity=3, refill_per_second=1, count=4)
 
     async def test_zero_refill_is_rejected(self, r: aioredis.Redis) -> None:
-        with pytest.raises(primitives.RateLimitError):
+        with pytest.raises(primitives.RateLimiterConfigError):
             await primitives.take_token(r, "ratelimit:x", capacity=3, refill_per_second=0)
 
 

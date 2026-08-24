@@ -29,7 +29,7 @@ from algotrader.common.redis.locks import (
     release_lock,
 )
 from algotrader.common.redis.primitives import (
-    RateLimitError,
+    RateLimiterConfigError,
     cancel,
     peek_next,
     pop_due,
@@ -51,7 +51,7 @@ from algotrader.common.redis.state import (
 __all__ = [
     "MAX_TTL_MS",
     "LockError",
-    "RateLimitError",
+    "RateLimiterConfigError",
     "acquire_lock",
     "assert_noeviction",
     "build_client",
