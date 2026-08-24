@@ -8,7 +8,8 @@ catch a regression that would otherwise show up as unexplained daily slippage.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -277,3 +278,111 @@ class TestTradingDaysBetweenRejectsAnInvertedRange:
             _dt.date(2026, 6, 18),
             _dt.date(2026, 6, 19),
         ]
+
+
+class TestTheHolidayListIsNowVerified:
+    """Blocker B3, closed 24 Aug 2026.
+
+    The list was fixed-date entries only, so every lunar-calendar festival —
+    Holi, Diwali, Bakri Id, Guru Nanak Jayanti — read as a normal trading day.
+    Transcribing it needed three independent publications of the circular
+    because the first two disagreed: one omitted 24 Nov (Guru Nanak Jayanti),
+    the other omitted 15 Jan (Maharashtra municipal elections, a separate
+    special closure rather than part of the annual circular). Both are real.
+    """
+
+    def _status(self):
+        from algotrader.common.calendar import load_holidays_with_status
+
+        path = Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml"
+        return load_holidays_with_status(str(path))
+
+    def test_the_file_declares_itself_verified(self) -> None:
+        assert self._status().is_trustworthy
+
+    def test_the_lunar_festivals_are_present(self) -> None:
+        """The whole point of B3 — these are the ones a fixed-date list misses."""
+        dates = self._status().dates
+        for day, name in [
+            (date(2026, 3, 3), "Holi"),
+            (date(2026, 3, 26), "Ram Navami"),
+            (date(2026, 5, 28), "Bakri Id"),
+            (date(2026, 6, 26), "Muharram"),
+            (date(2026, 9, 14), "Ganesh Chaturthi"),
+            (date(2026, 10, 20), "Dussehra"),
+            (date(2026, 11, 10), "Diwali Balipratipada"),
+            (date(2026, 11, 24), "Guru Nanak Jayanti"),
+        ]:
+            assert day in dates, f"{name} ({day}) missing from the holiday list"
+
+    def test_the_two_contested_dates_are_both_included(self) -> None:
+        dates = self._status().dates
+        assert date(2026, 1, 15) in dates, "Maharashtra election closure"
+        assert date(2026, 11, 24) in dates, "Guru Nanak Jayanti"
+
+    def test_the_trading_day_count_is_plausible(self) -> None:
+        """A sanity bound rather than an exact figure: NSE runs roughly 245-250
+        sessions a year, and a list that produced 260 or 200 would be wrong in
+        a way no individual date check would catch."""
+        from algotrader.common.calendar import MarketCalendar
+
+        status = self._status()
+        cal = MarketCalendar(status.dates, covers_years=status.covers_years)
+        trading = sum(
+            1 for i in range(365) if cal.is_trading_day(date(2026, 1, 1) + timedelta(days=i))
+        )
+        assert 240 <= trading <= 252, f"{trading} trading days is implausible for NSE"
+
+    def test_muhurat_sunday_is_not_a_normal_trading_day(self) -> None:
+        """Muhurat trading is a real session on a SUNDAY. The default is to
+        stand down — a one-hour ceremonial session has different liquidity and
+        spreads from the sessions every strategy was validated against."""
+        from algotrader.common.calendar import MarketCalendar
+
+        status = self._status()
+        cal = MarketCalendar(status.dates, covers_years=status.covers_years)
+        assert not cal.is_trading_day(date(2026, 11, 8))
+
+
+class TestAnUncoveredYearIsRefusedNotAnswered:
+    """A holiday list is published one year at a time.
+
+    A 2026 file knows nothing about 2027, and answering "no holidays in 2027"
+    is a calendar that looks entirely healthy right up to the moment it
+    schedules a pre-market run on Republic Day.
+    """
+
+    def _calendar(self):
+        from algotrader.common.calendar import MarketCalendar
+
+        return MarketCalendar(frozenset({date(2026, 1, 26)}), covers_years=frozenset({2026}))
+
+    def test_a_covered_year_is_answered(self) -> None:
+        assert self._calendar().is_trading_day(date(2026, 8, 20))
+
+    def test_an_uncovered_year_raises(self) -> None:
+        from algotrader.common.calendar import HolidayDataError
+
+        with pytest.raises(HolidayDataError, match="2027"):
+            self._calendar().is_trading_day(date(2027, 1, 5))
+
+    def test_the_error_says_what_to_do(self) -> None:
+        from algotrader.common.calendar import HolidayDataError
+
+        with pytest.raises(HolidayDataError, match=r"nse_holidays\.yaml"):
+            self._calendar().is_trading_day(date(2027, 1, 5))
+
+    def test_a_calendar_with_no_declared_coverage_still_answers(self) -> None:
+        """Hand-built calendars in tests declare no coverage and must keep
+        working — the guard is for the loaded file, not for every instance."""
+        from algotrader.common.calendar import MarketCalendar
+
+        assert MarketCalendar(frozenset()).is_trading_day(date(2030, 8, 20))
+
+    def test_coverage_is_inferred_when_the_file_forgets_to_declare_it(self) -> None:
+        from algotrader.common.calendar import HolidayCalendarStatus
+
+        status = HolidayCalendarStatus(
+            frozenset({date(2026, 1, 26)}), verified=True, source="t", path=None
+        )
+        assert status.covers(date(2026, 5, 1))

@@ -1,12 +1,20 @@
 """Kite WebSocket wire protocol — parsing, with no socket in sight.
 
-**Why this exists rather than ``KiteTicker``.** The SDK's ticker pulls in
-``autobahn[twisted]==19.11.2``, which carries CVE-2020-35678 and is pinned
-exactly by ``kiteconnect``, so it cannot be upgraded (blocker B7). It also drags
-a Twisted reactor into an asyncio process. The wire protocol is fully documented
-— endpoint, subscribe messages, and byte-level packet layouts — so implementing
-it directly removes the vulnerable dependency from the reachable code *and* the
-reactor-bridging problem, in one move.
+**Why this exists rather than ``KiteTicker``.** The SDK's ticker is built on
+``autobahn[twisted]``, which drags a Twisted reactor into an asyncio process
+and has to be bridged. The wire protocol is fully documented — endpoint,
+subscribe messages, byte-level packet layouts — so implementing it directly
+avoids the bridge entirely.
+
+An earlier version of this note also claimed it removed CVE-2020-35678 from the
+reachable code. That was WRONG, and the correction is worth keeping: importing
+``kiteconnect`` at all executes ``kiteconnect/__init__.py``, which imports
+``.ticker`` unconditionally, so autobahn and Twisted load into any process that
+touches the broker layer whether or not a ticker is ever constructed. Not using
+a package is not the same as not having it. Blocker B7 was closed the only way
+it could be — by upgrading autobahn past the CVE (``>=20.12.3`` in
+``pyproject.toml``), which kiteconnect 5.2.1 tolerates because its ``==`` pin is
+declarative rather than a runtime requirement.
 
 Everything here is a pure function over ``bytes``. That is deliberate: the
 parsing is the part most likely to be subtly wrong, and it is the part a socket

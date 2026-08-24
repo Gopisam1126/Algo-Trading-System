@@ -50,6 +50,7 @@ from algotrader.strategy.runtime import (
     UnevaluableStrategyError,
     evaluate_condition,
     evaluate_group,
+    evaluate_stop,
     evaluate_target,
     load_evaluators,
 )
@@ -999,3 +1000,92 @@ class TestRegistryBoundsHoldAtLoadTime:
         from algotrader.strategy.runtime import verify_condition
 
         verify_condition(_cond("news_score_above", threshold=0.5))
+
+
+class TestTheGuardsHoldThroughFireNotJustInIsolation:
+    """Both tests here exist because a MUTATION survived.
+
+    The originals called ``directional_agreement`` and
+    ``_stop_is_on_the_right_side`` directly. Reverting ``fire()`` to the buggy
+    behaviour therefore changed nothing any test could see — the helpers were
+    correct and unused by the assertions. Testing a helper is not testing the
+    path that calls it.
+    """
+
+    #: Bearish tape: the fast average is BELOW the slow one on every timeframe.
+    def _bearish_but_breaking_out(self) -> MultiTimeframeSnapshot:
+        return MultiTimeframeSnapshot(
+            symbol="INFY",
+            all_ready=True,
+            per_timeframe={
+                tf: {"ema_20": 100.0, "ema_50": 110.0, "atr_14": 2.0}
+                for tf in (Timeframe.M5, Timeframe.M15, Timeframe.H1)
+            },
+        )
+
+    def test_a_long_into_a_bearish_tape_reports_zero_agreement(self, document, ctx) -> None:
+        """``abs(trend_agreement())`` would report 3 of 3 here. The number goes
+        into Recommendation and the AI confirmation prompt."""
+        snapshot = self._bearish_but_breaking_out()
+        context = ctx(snapshot=snapshot, last_price=Decimal("1200"))
+        trigger = StrategyEvaluator(document).fire(context, correlation_id=CID)
+        assert trigger is not None, "the fixture must actually fire for this to test anything"
+        assert abs(snapshot.trend_agreement()) == 3, "the buggy value would have been 3"
+        assert trigger.timeframe_agreement == 0
+
+    def test_a_wrong_sided_stop_is_refused_by_fire_not_raised(self, ctx) -> None:
+        """A structure stop can legitimately resolve ABOVE the price for a long
+        — a prior-day high that price has not reached. ``Trigger`` would raise
+        on it; ``fire()`` must decline cleanly instead, because an exception
+        here kills the evaluation of every other symbol in the loop."""
+        doc = compile_strategy(load_strategy_yaml(_STRUCTURE_STOP_STRATEGY))
+        levels = LevelSet(symbol="INFY", prior_high=Decimal("1500"))
+        context = ctx(
+            last_price=Decimal("1200"),
+            levels=levels,
+            snapshot=MultiTimeframeSnapshot(
+                symbol="INFY",
+                all_ready=True,
+                per_timeframe={
+                    tf: {"ema_20": 100.0, "ema_50": 90.0, "atr_14": 2.0}
+                    for tf in (Timeframe.M5, Timeframe.M15, Timeframe.H1)
+                },
+            ),
+        )
+        evaluator = StrategyEvaluator(doc)
+        assert evaluator.evaluate(context).fired is True, "entry must pass to reach the stop"
+        assert evaluate_stop(doc, context) > context.last_price, "stop must be wrong-sided"
+        assert evaluator.fire(context, correlation_id=CID) is None
+
+    def test_the_refusal_is_logged_as_an_error(self, ctx, caplog: pytest.LogCaptureFixture) -> None:
+        """A silent None here is indistinguishable from 'conditions not met',
+        and this one is a strategy bug worth surfacing."""
+        doc = compile_strategy(load_strategy_yaml(_STRUCTURE_STOP_STRATEGY))
+        context = ctx(
+            last_price=Decimal("1200"),
+            levels=LevelSet(symbol="INFY", prior_high=Decimal("1500")),
+            snapshot=MultiTimeframeSnapshot(
+                symbol="INFY",
+                all_ready=True,
+                per_timeframe={
+                    tf: {"ema_20": 100.0, "ema_50": 90.0, "atr_14": 2.0}
+                    for tf in (Timeframe.M5, Timeframe.M15, Timeframe.H1)
+                },
+            ),
+        )
+        with caplog.at_level("ERROR"):
+            StrategyEvaluator(doc).fire(context, correlation_id=CID)
+        assert "wrong side" in caplog.text
+
+
+#: The same strategy with the opening-range condition dropped and the atr_stop
+#: swapped for a structure_stop, so the stop can resolve on the WRONG side of
+#: the entry — a prior-day high that price has not reached.
+_BREAKOUT_CONDITION = (
+    "- {primitive: price_breaks_level, params: {level: opening_range_high, direction: above}}\n    "
+)
+
+_STRUCTURE_STOP_STRATEGY = STRATEGY_YAML.replace(_BREAKOUT_CONDITION, "").replace(
+    "stop: {primitive: atr_stop, params: {multiplier: 1.5, period: 14}}",
+    "stop: {primitive: structure_stop, params: {level: prev_day_high, buffer_pct: 0.1}}",
+)

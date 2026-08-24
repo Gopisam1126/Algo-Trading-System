@@ -135,13 +135,27 @@ jobs:
         run: pytest tests/security/ -q
 
       - name: Dependency audit
-        # Does NOT fail the build. One finding is known and tracked as blocker
-        # B7 (kiteconnect pins autobahn 19.11.2, CVE-2020-35678) and cannot be
-        # fixed locally. A hard failure here would train everyone to ignore a
-        # permanently red check, which is worse than no check. The report is
-        # published as an artifact and reviewed each sprint.
-        continue-on-error: true
-        run: pip-audit --desc --format=json --output=pip-audit.json || true
+        # HARD GATE as of 24 Aug 2026. This was advisory while B7 was open —
+        # kiteconnect pins autobahn 19.11.2 (CVE-2020-35678) and a permanently
+        # red check trains people to ignore it. B7 is now closed: the pin is
+        # declarative, kiteconnect works under autobahn 26.7.1, and
+        # pyproject floors it at >=20.12.3.
+        #
+        # With the known finding gone, "advisory" only means the next CVE
+        # arrives silently. The audit is clean, so it can and must block.
+        # --skip-editable, NOT --strict. `--strict` treats a SKIPPED dependency
+        # as an error, and the local editable `algotrader` package is always
+        # skipped because it is not on PyPI — so --strict fails every run for a
+        # reason that has nothing to do with vulnerabilities. Without it,
+        # pip-audit still exits non-zero when it actually finds one, which is
+        # the behaviour this gate wants.
+        run: pip-audit --desc --skip-editable --format=json --output=pip-audit.json
+
+      - name: Static application security testing
+        # Fails on MEDIUM and above only. Every LOW in this codebase is an
+        # assert used for type narrowing behind an explicit guard, and nothing
+        # runs under python -O; gating on LOW would be noise that gets muted.
+        run: bandit -r src/ -q --severity-level medium --confidence-level medium
 
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2

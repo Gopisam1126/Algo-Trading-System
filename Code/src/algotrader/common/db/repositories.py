@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 import uuid
 from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal
@@ -44,6 +45,13 @@ from algotrader.common.db.models import (
 from algotrader.common.enums import PositionStatus, Timeframe
 
 log = logging.getLogger(__name__)
+
+#: A SQL identifier this codebase is willing to interpolate. PostgreSQL cannot
+#: parameterise identifiers, so column names must be built as text; this is the
+#: allowlist that makes doing so safe. Deliberately stricter than PostgreSQL's
+#: own rules — no quotes, no dots, no spaces — because every identifier here is
+#: a plain column name we wrote ourselves.
+_SAFE_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 #: PostgreSQL's wire protocol allows at most 65535 bound parameters per
 #: statement. Every multi-row INSERT in this module sizes its chunks against
@@ -324,6 +332,18 @@ class BarRepository:
         # option; every VALUE still travels through COPY's binary protocol or a
         # bound parameter. Nothing here is reachable from market data, news, or
         # a request.
+        # The justification above is a comment, and a comment does not survive
+        # a refactor. This does: every identifier is checked against a strict
+        # pattern immediately before it is interpolated, so a future change
+        # that made `columns` reachable from data fails loudly here instead of
+        # building a query. It also lets the bandit suppression below be backed
+        # by an executed check rather than by a promise.
+        for identifier in columns:
+            if not _SAFE_IDENTIFIER.fullmatch(identifier):
+                raise ValueError(
+                    f"refusing to build SQL with a non-identifier column name: {identifier!r}"
+                )
+
         col_list = ", ".join(columns)
         async with driver.cursor() as cur:
             # IF NOT EXISTS + TRUNCATE, not a bare CREATE. `ON COMMIT DROP` only
@@ -336,14 +356,16 @@ class BarRepository:
                 "(LIKE ohlcv INCLUDING DEFAULTS) ON COMMIT DROP"
             )
             await cur.execute("TRUNCATE _bar_load")
-            async with cur.copy(f"COPY _bar_load ({col_list}) FROM STDIN") as copy:
+            async with cur.copy(  # nosec B608 - identifiers validated above
+                f"COPY _bar_load ({col_list}) FROM STDIN"
+            ) as copy:
                 for bar in bars:
                     await copy.write_row(tuple(bar.get(c, defaults.get(c)) for c in columns))
 
             updatable = [c for c in columns if c not in ("symbol_id", "timeframe", "ts")]
             assignments = ", ".join(f"{c} = EXCLUDED.{c}" for c in updatable)
             await cur.execute(
-                f"INSERT INTO ohlcv ({col_list}) "  # noqa: S608 - identifiers only
+                f"INSERT INTO ohlcv ({col_list}) "  # noqa: S608  # nosec B608 - see _SAFE_IDENTIFIER
                 f"SELECT DISTINCT ON (symbol_id, timeframe, ts) {col_list} "
                 f"FROM _bar_load "
                 f"ORDER BY symbol_id, timeframe, ts, ctid DESC "

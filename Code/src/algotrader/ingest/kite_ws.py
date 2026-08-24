@@ -1,8 +1,9 @@
 """Kite WebSocket client (E05-S01) — connection, reconnection, and the gap signal.
 
 Built on ``websockets`` rather than ``KiteTicker``. See ``kite_protocol`` for
-why: it removes the vulnerable ``autobahn`` from the reachable code and the
-Twisted reactor from an asyncio process, together.
+why: it keeps a Twisted reactor out of an asyncio process. It does NOT remove
+autobahn from the process — importing ``kiteconnect`` loads it regardless — and
+that CVE was closed by upgrading the package instead.
 
 **The reconnect is the story, not the connect.** A feed that drops and silently
 resumes is worse than one that stays down, because the indicators keep updating

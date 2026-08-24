@@ -1,51 +1,95 @@
 # ===========================================================================
-# NSE trading holidays
+# NSE trading holidays — 2026 equity segment
 #
-# ⚠️  THIS FILE IS INCOMPLETE.  It contains only the FIXED-DATE holidays that
-#     can be stated with confidence.  India's market calendar is dominated by
-#     lunar-calendar festivals whose dates shift each year and which NSE
-#     publishes by circular.
+# Transcribed 24 Aug 2026 from NSE's published 2026 trading-holiday list,
+# cross-checked across three independent publications of the circular. This
+# closes blocker B3.
 #
-#     Populate the remaining dates from NSE's official trading-holiday
-#     circular before live trading:
-#     https://www.nseindia.com/resources/exchange-communication-holidays
+# WHY THREE SOURCES. The first two disagreed, and the disagreement was not
+# noise:
+#   * one omitted 24 Nov (Prakash Gurpurb Sri Guru Nanak Dev)
+#   * one omitted 15 Jan (Maharashtra municipal elections)
+# A third source resolved it. The explanation is that the annual circular
+# carries 15 weekday holidays, and 15 Jan is a SEPARATE special closure
+# announced for the Maharashtra municipal elections. Both are real closures,
+# so both are listed here.
 #
-#     Why this matters: an incomplete list means the system treats a market
-#     holiday as a normal trading day.  It will attempt a pre-market run,
-#     find no data, and either fail loudly (best case) or compute indicators
-#     across a phantom session (worse).  `doctor.py` warns while this file is
-#     incomplete.
+# The failure this file prevents: an incomplete list means the system treats a
+# market holiday as a normal trading day. It runs the pre-market pipeline,
+# finds no data, and either fails loudly (best case) or computes indicators
+# across a phantom session (worse). `doctor.py` warns while it is unverified.
 #
-#     Weekends are handled in code and do NOT need listing here.
+# Weekends are handled in code and do NOT need listing here. The four
+# weekend-falling holidays are listed anyway, commented, so that a future
+# reader comparing this file against the circular finds every line accounted
+# for rather than wondering what was dropped.
+#
+# Source: https://www.nseindia.com/resources/exchange-communication-holidays
 # ===========================================================================
 
 meta:
-  # Set to true once the full NSE circular has been transcribed and checked.
-  verified_against_nse_circular: false
-  source: "PLACEHOLDER - fixed-date holidays only"
-  last_updated: "2026-08-04"
+  verified_against_nse_circular: true
+  source: "NSE 2026 trading holiday list, cross-checked across three publications"
+  last_updated: "2026-08-24"
+  # Renew EVERY YEAR. The list is published in the preceding December and this
+  # file covers 2026 only; `doctor.py` fails when the current date runs past
+  # the last covered year rather than letting an empty list read as "no
+  # holidays this year", which would look exactly like a working calendar.
+  covers_years: [2026]
 
 holidays:
-  # --- Fixed-date national holidays (high confidence) ---
+  # --- January ---
+  - 2026-01-15   # Municipal Corporation Elections, Maharashtra (special closure)
   - 2026-01-26   # Republic Day
+
+  # --- March ---
+  - 2026-03-03   # Holi
+  - 2026-03-26   # Shri Ram Navami
+  - 2026-03-31   # Shri Mahavir Jayanti
+
+  # --- April ---
+  - 2026-04-03   # Good Friday
+  - 2026-04-14   # Dr. Baba Saheb Ambedkar Jayanti
+
+  # --- May ---
   - 2026-05-01   # Maharashtra Day
-  - 2026-10-02   # Gandhi Jayanti
+  - 2026-05-28   # Bakri Id
+
+  # --- June ---
+  - 2026-06-26   # Muharram
+
+  # --- September ---
+  - 2026-09-14   # Ganesh Chaturthi
+
+  # --- October ---
+  - 2026-10-02   # Mahatma Gandhi Jayanti
+  - 2026-10-20   # Dussehra
+
+  # --- November ---
+  - 2026-11-10   # Diwali — Balipratipada
+  - 2026-11-24   # Prakash Gurpurb Sri Guru Nanak Dev
+
+  # --- December ---
   - 2026-12-25   # Christmas
 
-  # --- Computable from the ecclesiastical calendar ---
-  - 2026-04-03   # Good Friday (Easter Sunday 2026 falls on 05 Apr)
+  # --- Falling on a weekend in 2026; listed for completeness only ---
+  # Weekend handling in code already excludes these. They are here so this
+  # file can be diffed line-for-line against the circular.
+  - 2026-02-15   # Mahashivratri (Sunday)
+  - 2026-03-21   # Id-Ul-Fitr / Ramzan Id (Saturday)
+  - 2026-08-15   # Independence Day (Saturday)
 
-  # --- STILL MISSING: lunar-calendar festivals ---
-  # These shift annually and MUST come from the NSE circular. Typically:
-  #   Holi · Ram Navami · Mahavir Jayanti · Id-ul-Fitr (Ramzan Id) ·
-  #   Bakri Id · Muharram · Ganesh Chaturthi · Dussehra ·
-  #   Diwali Laxmi Pujan (special muhurat session) · Diwali Balipratipada ·
-  #   Guru Nanak Jayanti
-  #
-  # Note also that Diwali Muhurat trading is a SPECIAL SESSION on a day that
-  # is otherwise a holiday - decide explicitly whether to trade it. The
-  # system's default is to treat it as a holiday and stand down.
-
-# Days that are holidays but carry a special trading session.
-# Listed separately so they are a deliberate decision, not an accident.
-special_sessions: []
+# ---------------------------------------------------------------------------
+# Days that are otherwise closed but carry a special trading session.
+#
+# Muhurat trading is a real session on a SUNDAY. Anything that reasons
+# "weekend implies closed" is wrong on this one date. It is listed separately
+# rather than merged into `holidays` so that trading it stays a deliberate
+# decision: the system's default is to stand down, because a one-hour
+# ceremonial session has different liquidity and different spreads from the
+# sessions every strategy was validated against.
+# ---------------------------------------------------------------------------
+special_sessions:
+  - date: 2026-11-08          # Sunday
+    name: "Diwali Laxmi Pujan — Muhurat Trading"
+    trade: false              # stand down unless deliberately changed

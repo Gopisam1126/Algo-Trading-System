@@ -89,12 +89,38 @@ class MarketCalendar:
     sessions are defined in local time, then back to UTC for storage.
     """
 
-    def __init__(self, holidays: frozenset[date] | None = None) -> None:
+    def __init__(
+        self,
+        holidays: frozenset[date] | None = None,
+        *,
+        covers_years: frozenset[int] | None = None,
+    ) -> None:
         self._holidays = holidays if holidays is not None else _FALLBACK_HOLIDAYS_2026
+        #: Years the holiday list actually describes. Empty means "unknown",
+        #: which is how the fallback and hand-built calendars in tests behave.
+        self._covers_years = covers_years or frozenset()
 
     # -- Trading days -------------------------------------------------------
 
+    def covers(self, d: date) -> bool:
+        return not self._covers_years or d.year in self._covers_years
+
     def is_trading_day(self, d: date) -> bool:
+        """Whether the market is open on ``d``.
+
+        Raises when asked about a year the loaded holiday list does not cover.
+        The holiday list is published one year at a time, so a 2026 file knows
+        nothing about 2027 — and answering "no holidays in 2027" is a calendar
+        that looks entirely healthy right up to the moment it schedules a
+        pre-market run on Republic Day.
+        """
+        if not self.covers(d):
+            raise HolidayDataError(
+                f"the loaded holiday list covers "
+                f"{sorted(self._covers_years)} and was asked about {d}. "
+                f"Publish the NSE circular for {d.year} into "
+                f"{DEFAULT_HOLIDAY_FILE} before trading that year."
+            )
         return d.weekday() not in WEEKEND and d not in self._holidays
 
     def next_trading_day(self, d: date) -> date:
@@ -275,7 +301,7 @@ class HolidayCalendarStatus:
     pre-market cycle against data that will never arrive.
     """
 
-    __slots__ = ("count", "dates", "path", "source", "verified")
+    __slots__ = ("count", "covers_years", "dates", "path", "source", "verified")
 
     def __init__(
         self,
@@ -284,12 +310,23 @@ class HolidayCalendarStatus:
         verified: bool,
         source: str,
         path: str | None,
+        covers_years: frozenset[int] = frozenset(),
     ) -> None:
         self.dates = dates
         self.verified = verified
         self.source = source
         self.path = path
         self.count = len(dates)
+        #: Which calendar years this file actually describes. A holiday list is
+        #: published one year at a time, so a 2026 file says NOTHING about
+        #: 2027 — and an empty answer for 2027 is indistinguishable from "no
+        #: holidays that year", which is a working-looking calendar that trades
+        #: on Republic Day.
+        self.covers_years = covers_years
+
+    def covers(self, d: date) -> bool:
+        """Whether this list has anything to say about ``d``'s year."""
+        return not self.covers_years or d.year in self.covers_years
 
     @property
     def is_trustworthy(self) -> bool:
@@ -334,11 +371,18 @@ def load_holidays_with_status(path: str | None = None) -> HolidayCalendarStatus:
         parsed.add(entry if isinstance(entry, date) else date.fromisoformat(str(entry)))
 
     meta = raw.get("meta") or {}
+    covers = frozenset(int(y) for y in (meta.get("covers_years") or []))
+    if not covers and parsed:
+        # Infer from the data rather than assuming universal coverage. A file
+        # that forgot to declare its years still must not imply it covers all
+        # of them.
+        covers = frozenset(d.year for d in parsed)
     return HolidayCalendarStatus(
         frozenset(parsed),
         verified=bool(meta.get("verified_against_nse_circular", False)),
         source=str(meta.get("source", path)),
         path=path,
+        covers_years=covers,
     )
 
 
