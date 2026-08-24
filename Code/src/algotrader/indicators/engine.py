@@ -20,6 +20,7 @@ when a new indicator is added and its ``snapshot`` forgets a field.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -60,6 +61,26 @@ def default_indicators() -> dict[str, Indicator]:
     }
 
 
+#: Indicators whose PAST values a strategy can ask about.
+#:
+#: Two DSL primitives cannot be answered from a point-in-time snapshot at all.
+#: ``ma_crossover`` means "fast crossed slow ON THIS BAR", which is a statement
+#: about two bars; ``ma_slope_positive`` compares an MA against itself N bars
+#: ago. Without history the first degrades into "fast is above slow" — a
+#: different, far weaker condition that fires on every bar of a trend instead
+#: of once at its start — and the second cannot be expressed.
+#:
+#: Kept only for the moving averages, because they are the only inputs those
+#: two primitives take. Storing history for all nine indicators would triple
+#: the cost for values nothing reads.
+HISTORICAL_INDICATORS: frozenset[str] = frozenset({"ema_20", "ema_50", "ema_200"})
+
+#: ``ma_slope_positive`` declares ``lookback`` up to 50, so 51 values are what
+#: it takes to answer the widest legal question. One more than the bound, not a
+#: round number, so the relationship to the DSL is visible.
+HISTORY_DEPTH = 51
+
+
 @dataclass
 class IndicatorSet:
     """Every indicator for one symbol on one timeframe."""
@@ -82,10 +103,45 @@ class IndicatorSet:
         """Which indicators are still warming. For the health panel."""
         return sorted(name for name, i in self.indicators.items() if not i.is_ready)
 
+    #: Recent values for :data:`HISTORICAL_INDICATORS`, newest last. Bounded, so
+    #: a full session cannot grow it.
+    _history: dict[str, deque[float | None]] = field(default_factory=dict, repr=False)
+
     def update(self, bar: Bar) -> None:
         for indicator in self.indicators.values():
             indicator.update(bar)
+        self._record_history()
         self.bars_seen += 1
+
+    def _record_history(self) -> None:
+        for name in HISTORICAL_INDICATORS:
+            indicator = self.indicators.get(name)
+            if indicator is None:
+                continue
+            series = self._history.get(name)
+            if series is None:
+                series = deque(maxlen=HISTORY_DEPTH)
+                self._history[name] = series
+            series.append(indicator.value)
+
+    def value_ago(self, name: str, bars: int) -> float | None:
+        """The value of ``name`` ``bars`` bars ago. ``bars=0`` is the current one.
+
+        ``None`` means "not available" — either the indicator keeps no history,
+        or the session is not that old yet. Callers must treat that as UNKNOWN
+        and refuse to trade on it, never as a zero or as "no change".
+        """
+        if bars < 0:
+            raise ValueError(f"bars must be >= 0, got {bars}")
+        series = self._history.get(name)
+        if series is None or bars >= len(series):
+            return None
+        return series[-1 - bars]
+
+    def history(self, name: str) -> tuple[float | None, ...]:
+        """Recent values, oldest first. Empty when nothing is retained."""
+        series = self._history.get(name)
+        return tuple(series) if series is not None else ()
 
     def warm_up(self, bars: list[Bar]) -> None:
         """Feed history through the same path live updates take."""
@@ -132,6 +188,11 @@ class IndicatorSet:
             "bars_seen": self.bars_seen,
             "stale": self.stale,
             "indicators": {n: i.snapshot() for n, i in self.indicators.items()},
+            # Without this a restored set is blind to ma_crossover and
+            # ma_slope_positive for the next 51 bars — safe, because they
+            # return UNKNOWN rather than a guess, but a restart would silently
+            # disable two primitives for most of a session.
+            "history": {n: list(s) for n, s in self._history.items()},
         }
 
     def restore(self, state: dict[str, Any]) -> None:
@@ -154,6 +215,11 @@ class IndicatorSet:
             indicator.restore(saved[name])
         self.bars_seen = int(state.get("bars_seen", 0))
         self.stale = bool(state.get("stale", False))
+        self._history = {
+            name: deque((None if v is None else float(v) for v in values), maxlen=HISTORY_DEPTH)
+            for name, values in (state.get("history") or {}).items()
+            if name in HISTORICAL_INDICATORS
+        }
 
 
 @dataclass
@@ -164,9 +230,27 @@ class MultiTimeframeSnapshot:
     per_timeframe: dict[Timeframe, dict[str, float | None]]
     all_ready: bool
     not_ready: dict[Timeframe, list[str]] = field(default_factory=dict)
+    #: Recent values per timeframe, oldest first. Only the moving averages
+    #: (:data:`HISTORICAL_INDICATORS`) are retained — see the note there.
+    history: dict[Timeframe, dict[str, tuple[float | None, ...]]] = field(default_factory=dict)
 
     def value(self, timeframe: Timeframe, indicator: str) -> float | None:
         return self.per_timeframe.get(timeframe, {}).get(indicator)
+
+    def value_ago(self, timeframe: Timeframe, indicator: str, bars: int) -> float | None:
+        """The value ``bars`` bars ago, or ``None`` when it is not retained.
+
+        ``None`` is UNKNOWN, never zero and never "unchanged". A caller that
+        treats it as either turns a missing input into a confident answer.
+        """
+        if bars < 0:
+            raise ValueError(f"bars must be >= 0, got {bars}")
+        if bars == 0:
+            return self.value(timeframe, indicator)
+        series = self.history.get(timeframe, {}).get(indicator)
+        if series is None or bars >= len(series):
+            return None
+        return series[-1 - bars]
 
     def trend_agreement(self, fast: str = "ema_20", slow: str = "ema_50") -> int:
         """How many timeframes agree on direction.
@@ -224,6 +308,7 @@ class IndicatorEngine:
         is missing rather than an unexplained refusal.
         """
         per_timeframe: dict[Timeframe, dict[str, float | None]] = {}
+        history: dict[Timeframe, dict[str, tuple[float | None, ...]]] = {}
         not_ready: dict[Timeframe, list[str]] = {}
         ready = True
         for timeframe in self.timeframes:
@@ -233,6 +318,9 @@ class IndicatorEngine:
                 not_ready[timeframe] = ["<no bars yet>"]
                 continue
             per_timeframe[timeframe] = indicator_set.values()
+            history[timeframe] = {
+                name: indicator_set.history(name) for name in HISTORICAL_INDICATORS
+            }
             if not indicator_set.is_ready:
                 ready = False
                 pending = indicator_set.not_ready()
@@ -242,6 +330,7 @@ class IndicatorEngine:
             per_timeframe=per_timeframe,
             all_ready=ready,
             not_ready=not_ready,
+            history=history,
         )
 
     def ready_symbols(self) -> list[str]:
