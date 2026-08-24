@@ -131,3 +131,63 @@ class TestTheInstallSitesAgree:
             if "autobahn" in line and not line.strip().startswith("#")
         ]
         assert not active, f"autobahn declared as a dependency again: {active}"
+
+
+class TestTheBuildEnvironmentIsAudited:
+    """The finding that broke CI was not in anything `constraints.txt`
+    describes.
+
+    `actions/setup-python` ships setuptools in the 65-68 range, which carries
+    eight advisories, and `pip install --upgrade pip` leaves it exactly where
+    it was. The project's own pinned set audited clean the whole time — the
+    vulnerable package was the BUILD backend, which nothing pins and nothing
+    was looking at.
+
+    It was invisible locally for a mundane reason: a recently-created virtualenv
+    already has a current setuptools, so the same command passes on a laptop and
+    fails on a runner. That is the shape of environment defect these tests
+    exist to catch.
+    """
+
+    #: Upgraded rather than pinned. These are the build environment, not the
+    #: application's dependency graph — the correct version is "current".
+    BUILD_BACKEND = ("pip", "setuptools", "wheel")
+
+    @staticmethod
+    def _read(*parts: str) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[2].joinpath(*parts)).read_text(encoding="utf-8")
+
+    def test_every_ci_install_upgrades_the_build_backend(self) -> None:
+        workflow = self._read("..", ".github", "workflows", "ci.yml")
+        upgrades = workflow.count("pip install --upgrade pip setuptools wheel")
+        installs = workflow.count('pip install -c constraints.txt -e ".[dev]"')
+        assert upgrades == installs, (
+            f"{installs} install step(s) but {upgrades} build-backend "
+            f"upgrade(s). A job that skips it audits a setuptools with known "
+            f"advisories and fails for a reason unrelated to this project."
+        )
+
+    def test_the_dockerfile_upgrades_it_too(self) -> None:
+        dockerfile = self._read("ops", "Dockerfile")
+        assert "--upgrade pip setuptools wheel" in dockerfile
+
+    def test_the_locally_installed_build_backend_is_not_vulnerable(self) -> None:
+        """A weak local check — it cannot see the runner's versions — but it
+        catches a developer whose environment has drifted far enough to
+        reproduce the CI failure."""
+        import importlib.metadata as md
+
+        stale = []
+        for name in self.BUILD_BACKEND:
+            try:
+                version = md.version(name)
+            except md.PackageNotFoundError:
+                continue
+            if name == "setuptools" and _version_tuple(version) < (78, 1, 1):
+                stale.append(f"{name}=={version}")
+        assert not stale, (
+            f"build backend carries known advisories: {stale}. "
+            f"Run: pip install --upgrade pip setuptools wheel"
+        )

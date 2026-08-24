@@ -50,7 +50,13 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --upgrade pip
+          # setuptools AND wheel, not just pip. actions/setup-python ships
+          # setuptools in the 65-68 range, which carries eight advisories,
+          # and `--upgrade pip` alone leaves it there. That is what made the
+          # dependency audit fail while the project's own pinned set was
+          # clean — the finding was in the BUILD environment, not in
+          # anything constraints.txt describes.
+          python -m pip install --upgrade pip setuptools wheel
           pip install -c constraints.txt -e ".[dev]"
           # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
           # floor in our own dependencies is unsatisfiable — resolution has to
@@ -91,7 +97,13 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --upgrade pip
+          # setuptools AND wheel, not just pip. actions/setup-python ships
+          # setuptools in the 65-68 range, which carries eight advisories,
+          # and `--upgrade pip` alone leaves it there. That is what made the
+          # dependency audit fail while the project's own pinned set was
+          # clean — the finding was in the BUILD environment, not in
+          # anything constraints.txt describes.
+          python -m pip install --upgrade pip setuptools wheel
           pip install -c constraints.txt -e ".[dev]"
           # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
           # floor in our own dependencies is unsatisfiable — resolution has to
@@ -138,7 +150,13 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --upgrade pip
+          # setuptools AND wheel, not just pip. actions/setup-python ships
+          # setuptools in the 65-68 range, which carries eight advisories,
+          # and `--upgrade pip` alone leaves it there. That is what made the
+          # dependency audit fail while the project's own pinned set was
+          # clean — the finding was in the BUILD environment, not in
+          # anything constraints.txt describes.
+          python -m pip install --upgrade pip setuptools wheel
           pip install -c constraints.txt -e ".[dev]"
           # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
           # floor in our own dependencies is unsatisfiable — resolution has to
