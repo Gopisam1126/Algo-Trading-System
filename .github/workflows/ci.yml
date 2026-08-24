@@ -52,6 +52,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -c constraints.txt -e ".[dev]"
+          # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
+          # floor in our own dependencies is unsatisfiable — resolution has to
+          # succeed first, then the package is replaced. --no-deps because the
+          # graph is already solved and we are only swapping one node.
+          pip install --no-deps --upgrade "autobahn==26.7.1"
 
       - name: ruff check
         run: ruff check .
@@ -88,6 +93,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -c constraints.txt -e ".[dev]"
+          # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
+          # floor in our own dependencies is unsatisfiable — resolution has to
+          # succeed first, then the package is replaced. --no-deps because the
+          # graph is already solved and we are only swapping one node.
+          pip install --no-deps --upgrade "autobahn==26.7.1"
 
       - name: Pre-pull datastore images
         # Pulled explicitly so a slow registry shows up as a pull step rather
@@ -130,6 +140,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -c constraints.txt -e ".[dev]"
+          # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
+          # floor in our own dependencies is unsatisfiable — resolution has to
+          # succeed first, then the package is replaced. --no-deps because the
+          # graph is already solved and we are only swapping one node.
+          pip install --no-deps --upgrade "autobahn==26.7.1"
 
       - name: Safety invariants and pen-test suite
         run: pytest tests/security/ -q

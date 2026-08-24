@@ -35,7 +35,10 @@ COPY src ./src
 # was tested, and a breaking upstream release would land silently.
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir -c constraints.txt .
+    && /opt/venv/bin/pip install --no-cache-dir -c constraints.txt . \
+    # B7 / CVE-2020-35678 — see pyproject.toml. kiteconnect's autobahn pin is
+    # replaced after resolution rather than constrained during it.
+    && /opt/venv/bin/pip install --no-cache-dir --no-deps --upgrade "autobahn==26.7.1"
 
 # --- Stage 2: runtime ------------------------------------------------------
 FROM python:3.11-slim-bookworm AS runtime

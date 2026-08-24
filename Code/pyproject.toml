@@ -61,9 +61,19 @@ dependencies = [
     #
     # Verified empirically: kiteconnect 5.2.1 imports, constructs, builds a
     # login URL and exposes market_protection/algo_id under autobahn 26.7.1,
-    # and the full test suite passes. pip resolves this with a conflict WARNING
-    # rather than an error, so the floor below is what actually holds it.
-    "autobahn>=20.12.3",       # override kiteconnect's vulnerable pin — see above
+    # and the full test suite passes.
+    #
+    # It is NOT declared as a dependency here. `==19.11.2` is a hard pin, so any
+    # floor of ours is unsatisfiable and pip fails with ResolutionImpossible —
+    # which is exactly what broke CI when it was first attempted. The
+    # replacement happens as an explicit post-install step:
+    #
+    #     pip install --no-deps --upgrade "autobahn==26.7.1"
+    #
+    # applied in ci.yml, ops/Dockerfile and the Makefile. Forgetting it in a
+    # new install site is caught by
+    # tests/security/test_dependency_hygiene.py, which fails on a vulnerable
+    # autobahn — the enforcement is the test, not the documentation.
 
     # --- AI ---
     "anthropic>=0.40",
