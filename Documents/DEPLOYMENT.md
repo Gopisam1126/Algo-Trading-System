@@ -66,11 +66,25 @@ Two design decisions worth knowing:
   containers here as well would mean CI tests a *different* version from the one
   production runs — exactly the drift that reading the pin from compose was
   designed to prevent.
-- **`pip-audit` does not fail the build.** One finding is known, tracked as
-  blocker **B7** (`kiteconnect` pins `autobahn 19.11.2`, CVE-2020-35678) and
-  cannot be fixed locally. A permanently red check trains everyone to ignore it,
-  which is worse than no check. The report is published as an artifact and
-  reviewed each sprint.
+- **`pip-audit` and `bandit` are HARD gates** (since 24 Aug 2026). The audit
+  was advisory while blocker B7 was open — `kiteconnect` pins
+  `autobahn 19.11.2` (CVE-2020-35678) and a permanently red check trains
+  everyone to ignore it, which is worse than no check.
+
+  B7 is now closed. The pin turned out to be *declarative* rather than a
+  runtime requirement, `kiteconnect` 5.2.1 works under `autobahn 26.7.1`, and
+  `pyproject.toml` floors it at `>=20.12.3`. With the known finding gone,
+  "advisory" only means the next CVE arrives silently, so the check blocks.
+
+  Two details worth keeping:
+  - Use `--skip-editable`, **not** `--strict`. `--strict` treats a *skipped*
+    dependency as an error, and the local editable `algotrader` package is
+    always skipped because it is not on PyPI — so `--strict` fails every run
+    for a reason unrelated to vulnerabilities.
+  - `bandit` is gated at **MEDIUM severity and MEDIUM confidence**. Every LOW
+    in this codebase is an `assert` used for type narrowing behind an explicit
+    guard, and nothing runs under `python -O`. Gating on LOW would be noise,
+    and noisy gates get muted.
 
 ---
 

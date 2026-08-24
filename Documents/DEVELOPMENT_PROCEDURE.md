@@ -1,5 +1,17 @@
 # DEVELOPMENT PROCEDURE
 
+> ## ⚠️ SUPERSEDED by `ENGINEERING_STANDARD.md` (24 Aug 2026)
+>
+> **Follow `ENGINEERING_STANDARD.md` instead.** It is a strict superset of this
+> file: everything here is carried forward, plus the verification ladder
+> (property-based and mutation testing), the six-role review, the STRIDE-lite
+> security pass, the research-triangulation standard, the promotion readiness
+> review, and a considerably longer anti-pattern catalogue.
+>
+> This file is kept because its §12 lessons table is referenced from commit
+> messages and because the phase numbering appears in older tracker rows. It is
+> **not** maintained. Where the two disagree, the standard wins.
+
 **The mandatory sequence for every backlog item in this project.**
 
 This is not a style guide. It is the procedure that stands between a change and

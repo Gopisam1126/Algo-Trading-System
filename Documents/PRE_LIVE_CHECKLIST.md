@@ -17,7 +17,9 @@ Open questions that must be answered before anything else on this list matters.
 |---|---|---|---|
 | B1 | **Confirm the Algo-ID attachment mechanic with Zerodha** — does the developer supply it via the order `tag` field, or does the broker inject it? | Sources disagree. One line of code either way, but an order rejected for a missing Algo-ID on day one is an avoidable failure. | You → Zerodha |
 | B2 | **Verify the installed `kiteconnect` exposes `market_protection`** | 5.1.0 on PyPI omits it (zerodha/pykiteconnect#225). Without it MARKET and SL-M orders are rejected — including the square-off exit, which means positions do not close. `make doctor` now checks this. | You |
-| B3 | **Populate `config/nse_holidays.yaml` from the NSE circular** | Currently fixed-date holidays only. Lunar festivals are missing, so the system treats them as trading days — a silent failure, not an error. `make doctor` warns. | You |
+| ~~B3~~ | ~~Populate `config/nse_holidays.yaml`~~ | ✅ **CLOSED 24 Aug 2026.** Full 2026 list, cross-checked against three publications of the circular; 19 dates, 245 trading sessions, `verified_against_nse_circular: true`. `make doctor` now reports it verified. **Renew every December** — the list is published one year at a time and the calendar refuses to answer for an uncovered year. | Done |
+| B6 | **Procure an India-hosted VPS with a static IP, and whitelist it at developers.kite.trade** | Applies to **order endpoints only** — market data, order book and positions work from any address, so this does not block development. One IP per app; orders from an unregistered IP are rejected outright. Also resolves B8. | You |
+| B8 | **Run `python scripts/check_data_reachability.py` on that host** | NSE blocks *overseas* access rather than programmatic access as such. The probe is read-only, needs no credentials, and is safe during market hours. Exit 0 means E03/E04 can proceed. | You, after B6 |
 | B4 | **Confirm historical data pricing and entitlement** | The pre-market engine reads ~3 years of multi-timeframe history across ~200 symbols every morning. If it is a paid add-on, that is a recurring cost and an access dependency. | You → Zerodha |
 | B5 | **Decide the daily login procedure** | Zerodha's redirect auth cannot complete unattended. Accepted as a manual step — confirm the mechanism (phone link → callback → token stored) actually works end to end. | You |
 
@@ -42,7 +44,11 @@ Open questions that must be answered before anything else on this list matters.
 - [ ] All chaos scenarios pass (LOW_LEVEL_ARCHITECTURE.md §12.3)
 - [ ] Duplicate-order prevention verified by **simulated timeout + reconnect**
 - [ ] Every position confirmed to exit before the broker's per-stock deadline
-- [ ] Holiday calendar verified — a known holiday is correctly excluded
+- [x] Holiday calendar verified — 2026 list checked against three publications;
+      Republic Day, Holi, Bakri Id, Dussehra, Diwali and Guru Nanak Jayanti all excluded
+- [ ] Holiday calendar **renewed for the coming year** (December task; the
+      calendar raises rather than guessing for an uncovered year)
+- [ ] `python scripts/check_data_reachability.py` exits 0 on the production host
 - [ ] Corporate-action adjustment verified against a known split
 
 ## 3. Security

@@ -128,17 +128,63 @@ Never commit a `.env`, a credential, or anything under `data/`.
 
 ## Current state
 
-Phase 0 complete: domain models, config with hard bounds, secrets, logging with
-redaction, NSE calendar, broker protocol (Zerodha Kite Connect primary), strategy
-DSL with 27 primitives. Services are stubs. Nothing trades.
+**The deterministic path is built from tick to `Trigger`. Nothing trades, and
+nothing can — there is no risk engine and no order placement.**
 
-E01 (persistence and data layer) is built: TimescaleDB schema with the BR-1..BR-20
-constraints, async repositories, the hash-chained audit log, Redis primitives,
-archive/restore, and CI with gated promotion to QA. **360 passing tests.**
+Built and tested (**1,059 tests, 90% coverage**):
 
-The corporate action adjustment engine landed 11 Aug 2026 and resolves what was
-`E03-S02`'s blocking design conflict. The rule it enforces is worth knowing before
-touching `ohlcv`:
+- **Foundations** — domain models, config with hard bounds, `SecretString`,
+  redacting logging, NSE calendar, broker protocol, strategy DSL.
+- **E01 persistence** — TimescaleDB schema with BR-1..BR-20 as constraints,
+  async repositories, hash-chained audit log, Redis primitives,
+  archive/restore, CI with gated promotion to QA.
+- **E02 broker** — Kite auth and daily re-auth scheduling, read-only/trading
+  split, error taxonomy, instrument sync, live margin, rate limiter capped at
+  5 OPS.
+- **E05 ingestion** — WebSocket client built on `websockets` against the
+  documented binary protocol, reconnection with an explicit `FeedGap`, tick
+  validation, dedup, outlier filter, session-aligned bars, quote state.
+- **E06 indicators** — incremental EMA/SMA/RSI/ATR/MACD/Bollinger/VWAP/
+  VolumeRatio verified against TA-Lib, warm-up orchestration, multi-timeframe
+  snapshot, pivots and opening range.
+- **Strategy runtime** — the 27 primitives now execute.
+
+**Empty (`__init__.py` only):** `signals/`, `execution/`, `orchestrator/`,
+`premarket/`, `api/`, `notifier/`, `ai/`, `macro/`.
+
+### The architectural fact to keep in mind
+
+**Nothing composes the packages that are built.** No module in `src/` imports
+both `ingest` and `indicators`. The 1,059 tests are claims about *components*;
+there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
+written deliberately to find what component tests cannot — and it found a
+HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
+exists, treat every "it works" as scoped to a part.
+
+### Things that turned out to be false
+
+Recorded because each was believed, written down, and wrong.
+
+- **"The 27 primitives are implemented."** They were `PrimitiveSpec` records —
+  name, category, parameter bounds — with no function behind any of them, while
+  `compile_strategy`'s docstring promised a runtime evaluator that did not
+  exist. A strategy would validate, hash, persist, activate, and never fire.
+  Now implemented, with a test asserting declared and implemented are the same
+  set.
+- **"`autobahn` is never imported."** `kiteconnect/__init__.py` imports
+  `.ticker` unconditionally, so autobahn and Twisted load into every process
+  that touches the broker layer whether or not a ticker is constructed. *Not
+  using a package is not the same as not having it.* B7 was closed by
+  upgrading to 26.7.1 — the `==19.11.2` pin is declarative, not a runtime
+  requirement.
+- **"`Applicability` gates the strategy."** It was parsed, validated and folded
+  into the content hash, then read by nothing. A TRENDING-only strategy fired
+  freely in a rangebound market.
+- **"Coverage means the tests would catch it."** Mutation testing injected 15
+  plausible defects; two survived, both because the tests exercised a helper
+  directly rather than the path that calls it.
+
+### Corporate actions — read before touching `ohlcv`
 
 - **Raw OHLC is immutable (BR-15).** Adjusted price = `raw * price_adj_factor`,
   applied by the repository on read. Never adjust a stored price in place — the
@@ -150,23 +196,30 @@ touching `ohlcv`:
   `raw_bars_for_audit()` is the deliberate exception and nothing in the trading
   path may call it.
 
-Two of the three long-standing open items closed on 7 Aug 2026, both by
-inspecting the installed SDK rather than the docs:
+### Blockers
 
-- **`market_protection` — RESOLVED.** kiteconnect **5.2.1** exposes it on
-  `place_order()`; the gap was in 5.1.0, which the design documents were written
-  against. Its accepted values (`-1`, or 1–100) match `OrderRequest`'s validator
-  exactly. `pyproject.toml` now floors the dependency at 5.2.1.
-- **Algo-ID mechanic — RESOLVED.** `place_order()` takes an `algo_id`
-  parameter, so the ID is **client-supplied per order**, not broker-injected —
-  which is what `BrokerConfig.algo_id` already assumed. What remains is a
-  paperwork question (*which* generic ID to send), not a design one.
-- **NSE holiday list — still incomplete.** Fixed-date entries only.
+| | State |
+|---|---|
+| B2 `market_protection` | ✅ Closed — present in kiteconnect 5.2.1 |
+| B4 historical data pricing | ✅ Closed — Connect ₹500/mo bundles WebSocket + historical |
+| B7 `autobahn` CVE-2020-35678 | ✅ Closed 24 Aug 2026 — upgraded to 26.7.1 |
+| B3 NSE holiday list | ✅ Closed 24 Aug 2026 — 2026 verified, 245 sessions. **Renew each December** |
+| B1 Algo-ID | 🔍 Mechanic understood; broker assigns it at registration. Paperwork with Zerodha |
+| B5 daily login | ⚠️ Needs real credentials |
+| B6 static IP | 🔍 **Order endpoints only** — does not block development |
+| B8 NSE data access | 🔍 Same fix as B6; `scripts/check_data_reachability.py` answers it in one command |
 
-`make doctor` checks all three at runtime. A new finding replaces them:
-`kiteconnect` hard-pins `autobahn==19.11.2`, which carries CVE-2020-35678 in
-the WebSocket market-data path — tracked as blocker B7, not fixable locally.
+`make doctor` reports all of this at runtime.
 
-Next up is Phase 1 — broker authentication with daily re-login, WebSocket
-ingestion, tick cleaning, and bar construction. `INDIA_FEATURES_AND_CONFIG.md §3`
-has the broker comparison; `LOW_LEVEL_ARCHITECTURE.md §5.1–5.2` has the design.
+### Next
+
+The keystone is gone, so E12 (backtest harness, gauntlet) and E13 (signal
+loop) are unblocked. The highest-value next step is **E14, the risk engine** —
+9 P0 stories, entirely pure computation, no credentials and no external data,
+with its input contract (`Recommendation`), output contract (`RiskDecision`,
+`SizingResult`), config bounds, `decision_log` table and `ATR.as_decimal()`
+all already in place. After that, a vertical slice through paper trading is
+the first thing that would be evidence about the system rather than its parts.
+
+**Follow `Documents/ENGINEERING_STANDARD.md` for any development or research
+work.** It is the mandatory process, and it encodes the failures above.
