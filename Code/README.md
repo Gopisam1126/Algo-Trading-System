@@ -5,13 +5,15 @@ market data, computes technical indicators across multiple timeframes, monitors
 news and macro conditions, uses AI for pattern synthesis and reasoning, and
 executes risk-gated trades across multiple stocks concurrently.
 
-> **Status: Phase 0 complete, E01 (persistence & data layer) built.** The
-> safety-critical primitives (domain models, config validation, secrets,
-> calendar, strategy DSL) and the full data layer (TimescaleDB schema, async
-> repositories, hash-chained audit log, Redis primitives, retention, corporate
-> action adjustment) are built and tested — **379 tests passing**, CI green.
-> The services that would use them are not yet implemented.
-> **Nothing trades yet.**
+> **Status: the deterministic path is built from tick to Trigger.** The
+> safety-critical primitives, the full data layer, the Kite broker adapter,
+> WebSocket ingestion, the technical-analysis engine and the strategy runtime
+> are built and tested — **1,059 tests passing at 90% coverage**, CI green.
+>
+> What is *not* built is the assembly: `signals/`, `execution/`,
+> `orchestrator/`, `premarket/`, `api/`, `notifier/`, `ai/` and `macro/` are
+> one line each. There is no risk engine and no order placement.
+> **Nothing trades yet, and nothing can.**
 
 ---
 
@@ -29,6 +31,7 @@ Read these before changing anything. They are in [`../Documents/`](../Documents/
 | 5 | `STRATEGY_ENGINE.md` | Strategy DSL, AI generation, overfitting defence |
 | 6 | `VERIFICATION_REPORT.md` | Cross-document audit |
 | 7 | `PRE_LIVE_CHECKLIST.md` | **The gate before real capital** |
+| 8 | **`ENGINEERING_STANDARD.md`** | **The mandatory process for all development and research** |
 
 ---
 

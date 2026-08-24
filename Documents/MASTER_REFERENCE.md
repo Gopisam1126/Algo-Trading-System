@@ -5,7 +5,7 @@
 this should understand what the system is, how it is built, why each significant
 decision was made, what exists today, what does not, and what to do next.
 
-**Version:** 1.0 · **Date:** 2026-08-04 · **Status:** Phase 0 complete — nothing trades yet
+**Version:** 1.3 · **Date:** 2026-08-24 · **Status:** Phases 0–1 built through the strategy runtime — nothing trades yet
 **Repository:** github.com/Gopisam1126/Algo-Trading-System · Active branch: `DEV`
 
 ---
@@ -103,17 +103,30 @@ resolve to "no trade" rather than a forced decision.
 
 ## 2. Current Status — What Exists, What Doesn't
 
-### 2.1 Status: Phase 0 complete, E01 (persistence & data layer) built
+### 2.1 Status: data layer, broker layer, ingestion, indicators and the strategy runtime are built
 
 | Metric | Value |
 |---|---|
-| Python code | 8,256 lines (`src/`) + 5,427 lines of tests |
-| Design documentation | 11,559 lines across 12 documents |
-| Tests | **379 passing** |
-| Database migrations | 4, forward and reverse verified |
-| Strategy primitives | 27 registered |
-| Git commits | 22, on branch `DEV` |
+| Python code | 14,415 lines (`src/`, 66 modules) + 13,208 lines of tests (45 files) |
+| Design documentation | ~11,600 lines across 13 documents |
+| Tests | **1,059 passing** — 245 of them security tests |
+| Test coverage | **90%** statement/branch across `src/` |
+| Mutation testing | 15 injected defects on the safety-critical paths, **15 killed** |
+| Database migrations | 5, forward and reverse verified |
+| Strategy primitives | 27 registered **and 27 implemented** (see §2.4) |
+| Git commits | 36, on branch `DEV` |
 | **Trades placed** | **Zero. Nothing trades.** |
+
+Package sizes, which say more than a total:
+
+| Package | Lines | |
+|---|---|---|
+| `common/` | 7,359 | config, secrets, logging, calendar, audit, 16 tables, 6 repositories, Redis, events |
+| `strategy/` | 2,136 | DSL, 27 primitive specs **and their evaluators**, tri-state runtime |
+| `broker/` | 1,988 | Kite auth, market data, trading, error taxonomy, instruments, rate limit |
+| `ingest/` | 1,526 | WebSocket protocol and client, cleaning, bars, quotes |
+| `indicators/` | 1,395 | incremental framework, engine, levels |
+| `signals/` `execution/` `orchestrator/` `premarket/` `api/` `notifier/` `ai/` `macro/` | 1 each | **empty — `__init__.py` only** |
 
 ### 2.2 What is BUILT and tested
 
@@ -134,30 +147,54 @@ resolve to "no trade" rather than a forced decision.
 | **Redis layer** | ✅ Complete | Typed state, slot locks, token bucket, timer ZSET, event streams |
 | **Retention** | ✅ Complete | Parquet archive, verified before any purge, self-healing restore |
 | **Corporate actions** | ✅ Complete | Raw prices immutable; adjustment stored as factors (BR-15/16/19) |
-| **CI/CD** | ✅ Complete | GitHub Actions, gated promotion to QA |
+| **CI/CD** | ✅ Complete | GitHub Actions, gated promotion to QA; pip-audit and bandit are **hard gates** |
+| **Kite broker adapter** | ✅ Complete | Auth + daily re-auth scheduling, read-only/trading split, error taxonomy, instrument sync, live margin, rate limiter capped at 5 OPS |
+| **Market data ingestion** | ✅ Complete | WebSocket client on the documented binary protocol, reconnection with a `FeedGap` signal, tick validation, dedup, outlier filter, session-aligned bars, quote state |
+| **Technical analysis** | ✅ Complete | Incremental EMA/SMA/RSI/ATR/MACD/Bollinger/VWAP/VolumeRatio verified against TA-Lib, warm-up orchestration, multi-timeframe snapshot, pivots and opening range |
+| **Strategy runtime** | ✅ Complete | The 27 primitives now **execute**; tri-state (True/False/UNKNOWN) composition, capability verification at load, tick-snapped stops |
+| **NSE holiday calendar** | ✅ Complete | Full 2026 list, cross-checked across three publications; 245 trading days; refuses to answer for an uncovered year |
 
 ### 2.3 What is NOT built
 
-Every service directory exists with an `__init__.py` and nothing else:
-
 | Service | Status |
 |---|---|
-| `ingest/` | ❌ Stub — no WebSocket client |
-| `indicators/` | ❌ Stub — no TI engine |
-| `macro/` | ❌ Stub — no news pipeline |
-| `premarket/` | ❌ Stub — no daily pipeline |
-| `signals/` | ❌ Stub — no strategy evaluation |
-| `execution/` | ❌ Stub — **no risk engine, no order placement** |
-| `orchestrator/` | ❌ Stub — no scheduler |
-| `api/` | ❌ Stub — no dashboard |
-| `notifier/` | ❌ Stub — no Telegram |
-| `ai/` | ❌ Stub — no Anthropic client |
+| `signals/` | ❌ Empty — the evaluation **loop** (the evaluator it would drive exists) |
+| `execution/` | ❌ Empty — **no risk engine, no order placement, no sizing** |
+| `orchestrator/` | ❌ Empty — no scheduler |
+| `premarket/` | ❌ Empty — no daily pipeline |
+| `macro/` | ❌ Empty — no news or macro pipeline |
+| `api/` | ❌ Empty — no dashboard |
+| `notifier/` | ❌ Empty — no Telegram |
+| `ai/` | ❌ Empty — no Anthropic client |
 | Strategy validation gauntlet | ❌ Designed, not implemented |
 
-The **data layer underneath them is built** (§2.2). What is missing is the
-services that would use it: there is a repository ready to store bars and no
-ingester to produce them, an audit chain ready to record decisions and nothing
-that decides. The corporate action *engine* is complete; its *feed* is not.
+### 2.3.1 The honest architectural summary
+
+**Eight service packages are one line each, and nothing composes the five that
+are built.** No module in `src/` imports both `ingest` and `indicators`. That
+is on plan — assembly is E11's pre-market pipeline and E13's signal loop — but
+it changes what the test count means: 1,059 tests are claims about
+*components*. There is exactly one test of the *system*
+(`tests/integration/test_tick_to_trigger.py`), and it was written deliberately
+to find what component tests cannot. It found a HIGH-severity defect
+immediately: the evaluator traded straight through a simulated feed gap
+because nothing consulted `all_ready`.
+
+Read that as the standing risk. Every remaining integration defect lives in
+the seams, and the seams are what has not been built.
+
+### 2.4 The gap that had been invisible
+
+`registry.py` declared 27 strategy primitives — name, category, parameter
+bounds — and **none of them had an implementation**. `compile_strategy`'s own
+docstring promised that "the runtime evaluator walks the validated tree"; no
+such evaluator existed. A strategy could be authored, validated, hashed,
+persisted and activated, and would then never fire. Nothing raised. The
+symptom was an absence of trades, which is indistinguishable from a quiet
+market.
+
+It is now implemented, and the test that would have caught it exists: declared
+primitives and implemented primitives must be the same set.
 
 ### 2.4 Honest assessment
 
@@ -170,13 +207,18 @@ handling, per-stock square-off deadlines, secret handling — are done and verif
 of the MVP by effort. The remainder is service implementation, which is more code
 but less dangerous, because the invariants that constrain it are already in place.
 
-**What QA has actually caught here.** Seven security findings and two pre-flight
-defects, none of which a code read would have found — a hash chain that could be
-forged through delimiter ambiguity, a redactor with no pattern for connection
-URIs, adjustment factors that were only approximately order-independent, and a
-`doctor` that validated the wrong broker's credentials entirely. The lesson
-recorded in `DEVELOPMENT_PROCEDURE.md §12` is the one that keeps paying: run the
-probe, do not read the code and conclude.
+**What QA has actually caught here.** Twenty-seven security findings and a long
+tail of QA defects, none of which a code read would have found — a hash chain
+forgeable through delimiter ambiguity, a redactor with no pattern for connection
+URIs, adjustment factors only approximately order-independent, a `doctor` that
+validated the wrong broker's credentials, an evaluator that traded straight
+through a feed gap, and a vocabulary of 27 strategy primitives with no
+implementation behind any of them.
+
+The lesson that keeps paying is the first law of
+`ENGINEERING_STANDARD.md`: **run the probe, do not read the code and conclude.**
+Its §11 catalogue records every one of these with the mechanism that let it
+survive review.
 
 ---
 
@@ -633,7 +675,7 @@ Algo-Trading-System/
     │
     ├── config/
     │   ├── system.yaml          Main config — version controlled, no secrets
-    │   ├── nse_holidays.yaml    Trading holidays (INCOMPLETE — see §22)
+    │   ├── nse_holidays.yaml    Trading holidays (2026 VERIFIED — 19 dates, 245 sessions)
     │   └── strategies/
     │       └── orb_classic.yaml Reference strategy in the DSL
     │
@@ -1322,19 +1364,58 @@ passing tests. Cheap now, annoying to retrofit.
 
 | # | Item | Status | Blocks |
 |---|---|---|---|
-| B1 | **Algo-ID attachment mechanic** | ❌ Unconfirmed | Live trading |
-| B2 | **`kiteconnect` lacks `market_protection`** | ⚠️ Known, `doctor` checks | Market orders |
-| B3 | **NSE holiday list incomplete** | ⚠️ Fixed dates only, `doctor` warns | Correct calendar |
-| B4 | Historical data pricing | ❌ Unconfirmed | Budget |
-| B5 | Daily login procedure | ⚠️ Manual accepted, mechanism untested | Unattended operation |
+| B1 | **Algo-ID attachment mechanic** | 🔍 Mechanic understood, registration needs you | Live trading |
+| B2 | `kiteconnect` lacks `market_protection` | ✅ **Closed** — present in 5.2.1 | — |
+| B3 | NSE holiday list incomplete | ✅ **Closed 24 Aug 2026** | — |
+| B4 | Historical data pricing | ✅ **Closed** — Connect ₹500/mo bundles WebSocket + historical | — |
+| B5 | Daily login procedure | ⚠️ Needs your credentials | Unattended operation |
+| B6 | Static IP not procured | 🔍 Research done, procurement needs you | **Order endpoints only** |
+| B7 | `kiteconnect` pins a vulnerable `autobahn` | ✅ **Closed 24 Aug 2026** | — |
+| B8 | NSE blocks programmatic access | 🔍 Same fix as B6 | E03-S01, all of E04 |
 | D1 | Secrets backend (SOPS → Vault) | Deferred | — |
 | D2 | Equity only, or F&O? | **Recommend equity first** | Scope |
 | D3 | Capital amount | ₹5L assumed | Slot sizing |
-| D4 | Static IP hosting provider | Not procured | Live trading |
 | D5 | How long in approval mode? | Recommend weeks across regimes | Autonomy |
 
-**The blocking three:** B1, B2, B3. All are cheap to resolve and expensive to
-discover at 09:20 on a live day.
+### 22.1 What closed, and the lesson in each
+
+**B7 — `autobahn` CVE-2020-35678.** Closed by upgrading to 26.7.1.
+`kiteconnect`'s `autobahn[twisted]==19.11.2` pin is *declarative*, not a
+runtime requirement, and 5.2.1 imports and works fine under the modern
+release.
+
+The lesson is the part worth keeping. This blocker was previously recorded as
+mitigated on the grounds that the live feed runs on `websockets` rather than
+`KiteTicker`, so autobahn was "never imported". **That was false.**
+`kiteconnect/__init__.py` imports `.ticker` unconditionally, so autobahn and
+Twisted load into every process that touches the broker layer regardless.
+*Not using a package is not the same as not having it*, and only `pip-audit`
+said so — which is why that check is now a hard CI gate rather than advisory.
+
+**B3 — NSE holiday list.** Closed by transcribing the full 2026 list. It took
+three independent publications because the first two disagreed: one omitted
+24 Nov (Guru Nanak Jayanti), the other 15 Jan. The explanation mattered —
+15 Jan is a *separate special closure* for the Maharashtra municipal
+elections, not part of the annual circular. Both are real. **When sources
+disagree, the disagreement usually encodes something; resolve it rather than
+picking a side.**
+
+### 22.2 B6 and B8 are one problem
+
+What NSE blocks is **overseas** access, not programmatic access as such. SEBI
+already requires the order path to originate from a single static,
+broker-whitelisted, India-hosted IP — so one host answers both the compliance
+requirement and the data-reachability question. `scripts/check_data_reachability.py`
+makes that a one-command check on the day there is a host.
+
+Confirmed from Zerodha's developer forum, and it unblocks a great deal:
+**the static IP applies to ORDER ENDPOINTS ONLY.** WebSocket market data, the
+order book, positions and every other endpoint remain reachable from any
+address. E03, E04, E05, E06 and all strategy work need no static IP.
+
+Also confirmed there: the 10 OPS limit is **account-wide** across every app
+for a client ID (we cap at 5); market protection of `0` is rejected including
+for SL-M; order slicing is capped at 10 slices.
 
 ---
 

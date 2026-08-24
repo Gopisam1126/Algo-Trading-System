@@ -34,6 +34,7 @@ reasoning, not aspirations — the code is expected to match.
 | 5 | [STRATEGY_ENGINE.md](Documents/STRATEGY_ENGINE.md) | Strategy DSL, AI generation, overfitting defence |
 | 6 | [VERIFICATION_REPORT.md](Documents/VERIFICATION_REPORT.md) | Cross-document audit |
 | 7 | [PRE_LIVE_CHECKLIST.md](Documents/PRE_LIVE_CHECKLIST.md) | **The gate before real capital** |
+| 8 | **[ENGINEERING_STANDARD.md](Documents/ENGINEERING_STANDARD.md)** | **The mandatory process for all development and research** |
 
 ---
 
