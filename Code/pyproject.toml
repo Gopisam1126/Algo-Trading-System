@@ -21,6 +21,11 @@ dependencies = [
 
     # --- Data fabric ---
     "redis[hiredis]>=5.1",
+    # Used DIRECTLY by ingest/kite_ws.py, not just transitively via uvicorn.
+    # Declared because depending on a transitive dependency is how a build
+    # breaks when the intermediate package drops it — and this one carries the
+    # market data feed.
+    "websockets>=13.0",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "psycopg[binary,pool]>=3.2",
