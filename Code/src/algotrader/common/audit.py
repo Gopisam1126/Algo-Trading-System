@@ -285,7 +285,16 @@ class AuditWriter:
         two writers observe the same ``prev_hash`` and fork the chain — and a
         forked chain fails verification without any tampering having occurred.
         """
-        assert entry.ts is not None
+        if entry.ts is None:
+            # NOT an assert. `AuditEntry.ts` defaults to None, so this check is
+            # load-bearing rather than type narrowing — and `python -O` strips
+            # asserts. A stripped check here would write a NULL timestamp into
+            # a hash-chained audit log, which is the one table whose whole
+            # purpose is being trustworthy after the fact.
+            raise AuditError(
+                "audit entry reached _insert without a timestamp; the caller "
+                "must stamp it before the chain lock is taken"
+            )
         session = self._factory()
         try:
             async with session.begin():

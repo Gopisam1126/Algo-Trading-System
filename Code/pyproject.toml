@@ -47,6 +47,23 @@ dependencies = [
     # SEBI-required Algo-ID is attached (client-supplied per order).
     # `make doctor` re-verifies both against the installed signature.
     "kiteconnect>=5.2.1",      # Zerodha Kite Connect (primary)
+    # kiteconnect hard-pins autobahn[twisted]==19.11.2, which carries
+    # CVE-2020-35678 (redirect header injection). That pin is DECLARATIVE, not
+    # a runtime requirement: the only kiteconnect module importing autobahn is
+    # `ticker`, we never construct a KiteTicker, and the whole live feed runs
+    # on `websockets` against the documented binary protocol instead.
+    #
+    # It cannot simply be ignored, though. `kiteconnect/__init__.py` imports
+    # `.ticker` unconditionally, so autobahn AND twisted are loaded into every
+    # process that touches the broker layer — "we do not use it" is not the
+    # same as "it is not there", and pip-audit is right to flag a vulnerable
+    # package that is present and importable.
+    #
+    # Verified empirically: kiteconnect 5.2.1 imports, constructs, builds a
+    # login URL and exposes market_protection/algo_id under autobahn 26.7.1,
+    # and the full test suite passes. pip resolves this with a conflict WARNING
+    # rather than an error, so the floor below is what actually holds it.
+    "autobahn>=20.12.3",       # override kiteconnect's vulnerable pin — see above
 
     # --- AI ---
     "anthropic>=0.40",
@@ -66,6 +83,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "bandit>=1.9",            # SAST, gated at MEDIUM in CI
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",

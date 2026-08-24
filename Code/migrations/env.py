@@ -41,7 +41,17 @@ from algotrader.common.db.eventloop import configure_event_loop_policy
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False is NOT cosmetic. fileConfig defaults to
+    # True, which reaches into every logger that already exists and switches it
+    # off. Alembic runs in-process here — the scaffold helper and the test
+    # suite both call it — so the default would let a migration silently kill
+    # application logging for the rest of the process. A trading system that
+    # stops logging without failing is the worst possible outcome: it keeps
+    # trading and there is no record of what it did.
+    #
+    # Found because it broke pytest's caplog for every test that ran after a
+    # migration, which is the same defect wearing a smaller hat.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

@@ -13,11 +13,10 @@ before the VPS exists.
 
 **Live ticks are not here.** ``subscribe`` deliberately raises. The Kite
 WebSocket is E05's story, and it will be built directly on the documented wire
-protocol rather than on ``KiteTicker`` — the SDK's ticker drags in
-``autobahn==19.11.2`` (CVE-2020-35678) and a Twisted reactor that has to be
-bridged into asyncio. Implementing the protocol avoids both. Raising here keeps
-that decision visible instead of letting someone wire up the vulnerable path by
-reflex.
+protocol rather than on ``KiteTicker`` — the SDK's ticker drags a Twisted
+reactor into an asyncio process that would have to be bridged. Implementing the
+protocol avoids that. Raising here keeps the decision visible instead of letting
+someone wire up the Twisted path by reflex.
 """
 
 from __future__ import annotations
@@ -198,7 +197,7 @@ class KiteReads:
         raise NotImplementedError(
             "live tick streaming is E05-S01 and will be built on the documented "
             "Kite WebSocket protocol, not on KiteTicker. KiteTicker pulls in "
-            "autobahn 19.11.2 (CVE-2020-35678) and a Twisted reactor; the wire "
+            "a Twisted reactor bridged into asyncio; the wire "
             "protocol is fully specified, so neither is necessary."
         )
 

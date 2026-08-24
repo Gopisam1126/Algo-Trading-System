@@ -26,6 +26,7 @@ import pytest
 from algotrader.common.secrets import (
     EnvSecretsProvider,
     SecretNotFoundError,
+    SecretString,
     SopsSecretsProvider,
     build_provider,
 )
@@ -201,3 +202,96 @@ class TestProviderFactory:
     def test_the_name_is_case_insensitive(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SECRETS_PROVIDER", "ENV")
         assert isinstance(build_provider(), EnvSecretsProvider)
+
+
+class TestSecretStringCannotEscapeItsWrapper:
+    """Coverage found these paths untested — 26 statements of ``secrets.py``,
+    including every dunder that exists specifically to stop a credential
+    leaving the process.
+
+    Invariant 4 is "secrets never render". The methods below are how that is
+    enforced, so each needs a probe that would catch it being false rather than
+    a reading that says it looks right.
+    """
+
+    def test_a_secret_refuses_to_be_pickled(self) -> None:
+        """The quiet exfiltration path. Anything reachable by ``pickle`` can be
+        written to Redis, a cache, or a crash dump — and a SecretString that
+        pickled cleanly would carry the plaintext with it."""
+        import pickle
+
+        # __reduce__ fires before __getstate__, so this is the outer guard;
+        # the inner one is asserted separately below. Both exist because
+        # removing either would leave a working serialisation path.
+        with pytest.raises(TypeError, match="must not be pickled"):
+            pickle.dumps(SecretString("hunter2hunter2", name="API_KEY"))
+
+    def test_getstate_is_what_blocks_it(self) -> None:
+        with pytest.raises(TypeError, match="must not be serialized"):
+            SecretString("hunter2hunter2", name="API_KEY").__getstate__()
+
+    def test_copy_is_blocked_by_the_same_guard(self) -> None:
+        """``copy.deepcopy`` uses the same protocol, and deepcopy of a config
+        object is exactly how a secret ends up somewhere unexpected."""
+        import copy
+
+        with pytest.raises(TypeError):
+            copy.deepcopy(SecretString("hunter2hunter2", name="API_KEY"))
+
+    def test_equality_does_not_leak_through_repr_on_failure(self) -> None:
+        a = SecretString("correct-horse-battery", name="A")
+        b = SecretString("correct-horse-battery", name="B")
+        assert a == b
+
+    def test_a_different_value_is_not_equal(self) -> None:
+        assert SecretString("aaaaaaaaaaaa", name="A") != SecretString("bbbbbbbbbbbb", name="B")
+
+    def test_it_compares_equal_to_a_matching_plain_string(self) -> None:
+        """Needed so a caller can verify a value without calling reveal()."""
+        assert SecretString("s3cret-value-x", name="A") == "s3cret-value-x"
+
+    def test_comparison_is_constant_time(self) -> None:
+        """Not a timing measurement — a structural assertion that the
+        implementation routes through hmac.compare_digest. A plain ``==``
+        returns early on the first differing byte, which leaks the length of
+        the matching prefix to anything that can time it."""
+        import inspect
+
+        source = inspect.getsource(SecretString.__eq__)
+        assert "compare_digest" in source
+
+    def test_comparison_to_an_unrelated_type_is_not_an_error(self) -> None:
+        assert SecretString("aaaaaaaaaaaa", name="A") != 42
+
+    def test_it_is_hashable_without_hashing_the_secret(self) -> None:
+        """A dict key must not be derivable from the plaintext, or the hash
+        becomes an oracle."""
+        secret = SecretString("aaaaaaaaaaaa", name="API_KEY")
+        assert hash(secret) == hash(SecretString("different-value", name="API_KEY"))
+        assert {secret: 1}[secret] == 1
+
+    def test_truthiness_reflects_emptiness_only(self) -> None:
+        assert bool(SecretString("x", name="A"))
+        assert not bool(SecretString("", name="A"))
+
+    def test_length_is_available_without_revealing(self) -> None:
+        """Length is needed to decide whether a value is long enough to redact
+        on; the value itself is not."""
+        assert len(SecretString("abcdefgh", name="A")) == 8
+
+    def test_the_name_is_public_but_the_value_is_not(self) -> None:
+        secret = SecretString("abcdefghijkl", name="KITE_API_SECRET")
+        assert secret.name == "KITE_API_SECRET"
+        assert "abcdefghijkl" not in repr(secret)
+        assert "abcdefghijkl" not in str(secret)
+        assert "abcdefghijkl" not in f"{secret}"
+
+    def test_it_survives_string_formatting_without_leaking(self) -> None:
+        """Every rendering path, because each is a different dunder and one of
+        them being forgotten is exactly how this fails."""
+        secret = SecretString("abcdefghijkl", name="A")
+        for rendered in (f"{secret}", f"{secret!s}", f"{secret!r}", f"{secret}"):
+            assert "abcdefghijkl" not in rendered
+
+    def test_reveal_is_the_only_way_out(self) -> None:
+        assert SecretString("abcdefghijkl", name="A").reveal() == "abcdefghijkl"

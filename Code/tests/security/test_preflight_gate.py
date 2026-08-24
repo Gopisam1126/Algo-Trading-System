@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -29,6 +30,7 @@ from unittest.mock import patch
 import pytest
 
 from algotrader.broker.profiles import PROFILES, get_profile
+from algotrader.common import calendar as calendar_mod
 from algotrader.common.enums import SystemMode
 
 CODE_ROOT = Path(__file__).resolve().parents[2]
@@ -115,11 +117,36 @@ class TestCredentialCheckFollowsTheConfiguredBroker:
 
 
 class TestHolidayCalendarBlocksLiveTrading:
-    """BR-20 — verified against the NSE circular before live trading."""
+    """BR-20 — verified against the NSE circular before live trading.
+
+    These originally relied on the SHIPPED holiday file being incomplete, which
+    made them pass for the wrong reason: they asserted the gate fires, using a
+    real defect as the fixture. Closing blocker B3 removed the defect and the
+    tests failed — correctly, and usefully. The bad condition is now
+    constructed deliberately, so the gate is tested rather than the bug.
+    """
+
+    @staticmethod
+    def _unverified() -> calendar_mod.HolidayCalendarStatus:
+        # Non-empty on purpose: an EMPTY list takes doctor's "NO holiday list
+        # loaded" branch, which is a different failure. The condition under
+        # test is a list that exists and has not been checked against the
+        # circular — the fixed-date-only state B3 described.
+        return calendar_mod.HolidayCalendarStatus(
+            frozenset({date(2026, 1, 26), date(2026, 12, 25)}),
+            verified=False,
+            source="test: deliberately unverified",
+            path="config/nse_holidays.yaml",
+        )
 
     def test_an_unverified_calendar_fails_in_live_mode(self) -> None:
         r = doctor.Report()
-        with patch("algotrader.common.config.load_config", return_value=_Cfg(SystemMode.LIVE)):
+        with (
+            patch("algotrader.common.config.load_config", return_value=_Cfg(SystemMode.LIVE)),
+            patch.object(
+                calendar_mod, "load_holidays_with_status", return_value=self._unverified()
+            ),
+        ):
             doctor.check_market_calendar(r)
 
         assert any("INCOMPLETE" in f and "LIVE" in f for f in r.failures), (
@@ -130,11 +157,26 @@ class TestHolidayCalendarBlocksLiveTrading:
     def test_the_same_calendar_only_warns_in_paper_mode(self) -> None:
         """Development must stay usable — the gate is for live capital."""
         r = doctor.Report()
-        with patch("algotrader.common.config.load_config", return_value=_Cfg(SystemMode.PAPER)):
+        with (
+            patch("algotrader.common.config.load_config", return_value=_Cfg(SystemMode.PAPER)),
+            patch.object(
+                calendar_mod, "load_holidays_with_status", return_value=self._unverified()
+            ),
+        ):
             doctor.check_market_calendar(r)
 
         assert not r.failures, f"paper mode should not be blocked: {r.failures}"
         assert any("INCOMPLETE" in w for w in r.warnings)
+
+    def test_the_shipped_calendar_now_passes_the_live_gate(self) -> None:
+        """The other half, and the reason the two above needed rewriting: with
+        B3 closed the real file must satisfy BR-20 rather than merely warn."""
+        r = doctor.Report()
+        with patch("algotrader.common.config.load_config", return_value=_Cfg(SystemMode.LIVE)):
+            doctor.check_market_calendar(r)
+        assert not any("INCOMPLETE" in f for f in r.failures), (
+            f"the shipped holiday list should now pass BR-20: {r.failures}"
+        )
 
 
 class TestProfileCredentialsAreCoherent:
