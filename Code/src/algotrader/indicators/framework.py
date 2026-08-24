@@ -27,6 +27,7 @@ what :meth:`Indicator.snapshot` captured — asserted in the tests, not assumed.
 
 from __future__ import annotations
 
+import logging
 import math
 from abc import ABC, abstractmethod
 from collections import deque
@@ -35,6 +36,8 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from algotrader.common.models.market import Bar
+
+log = logging.getLogger(__name__)
 
 
 class IndicatorError(RuntimeError):
@@ -77,6 +80,18 @@ def to_decimal(value: float | None, places: int = 4) -> Decimal | None:
     through this.
     """
     if value is None:
+        return None
+    if not math.isfinite(value):
+        # NaN and the infinities are not money. They arrive from a corrupted
+        # snapshot (Python's json emits and accepts bare NaN) or from a
+        # degenerate computation, and Decimal("NaN") does not raise on
+        # construction — it raises later, on the first COMPARISON, which puts
+        # the failure in whichever caller happened to compare first rather
+        # than here.
+        log.error(
+            "refusing to convert non-finite indicator value %r to Decimal; treating it as absent",
+            value,
+        )
         return None
     return Decimal(repr(value)).quantize(Decimal(10) ** -places, rounding=ROUND_HALF_UP)
 

@@ -1,4 +1,12 @@
-"""Walking a validated strategy tree (E13-S01).
+"""Walking a validated strategy tree.
+
+This closes the implementation half of **E00-S08** — "strategy DSL with vetted
+primitive registry", which is marked Closed and delivered only the declarations
+— and unblocks **E12-S03** (whose acceptance criterion is that the *real*
+strategy code runs in backtest) and **E13-S01** (which must "evaluate runnable
+strategies"). It is not itself E13-S01: that story is the signal LOOP, which
+also needs the plan symbols from E07 and the strategy registry from E12-S01.
+
 
 This is what ``compile_strategy``'s docstring has always promised: *"the runtime
 evaluator walks the validated tree; there is no code generation step at any
@@ -30,18 +38,19 @@ import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from algotrader.common.enums import Direction, Timeframe
 from algotrader.common.models.trading import Trigger
 from algotrader.indicators.engine import HISTORICAL_INDICATORS, IndicatorEngine, default_indicators
 from algotrader.strategy.context import EvalContext
-from algotrader.strategy.dsl import Condition, ConditionGroup, StrategyDocument
+from algotrader.strategy.dsl import REGISTRY, Condition, ConditionGroup, StrategyDocument
 from algotrader.strategy.primitives.evaluators import (
     CONDITION_EVALUATORS,
     DEFERRED_TO_POSITION_MANAGER,
     STOP_EVALUATORS,
     PrimitiveError,
+    directional_agreement,
     parse_regimes,
     parse_timeframe,
     r_multiple_target,
@@ -151,6 +160,17 @@ def verify_condition(condition: Condition, caps: Capabilities = DEFAULT_CAPABILI
             f"primitive {name!r} is registered in the DSL but has no evaluator. "
             f"A strategy using it would validate and then never fire."
         )
+
+    # Re-validate against the registry's declared bounds. compile_strategy
+    # already does this, but nothing STRUCTURALLY guarantees a document reached
+    # the evaluator through compilation — and the bounds are what stop a
+    # threshold of -1e999 from making an "above this" gate pass
+    # unconditionally. Checking here means holding an evaluator is proof the
+    # parameters are in range, not just that the primitive names exist.
+    try:
+        REGISTRY.get(name).validate_params(dict(params))
+    except ValueError as exc:
+        raise UnevaluableStrategyError(f"{name}: {exc}") from exc
 
     def period(param: str, default: int | None = None) -> int | None:
         value = params.get(param, default)
@@ -366,6 +386,14 @@ def evaluate_target(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ApplicabilityCheck:
+    """Whether a strategy is even in scope for this symbol right now."""
+
+    applies: bool
+    reason: str | None = None
+
+
 @dataclass
 class StrategyEvaluator:
     """One strategy, verified against this deployment, ready to run.
@@ -384,6 +412,45 @@ class StrategyEvaluator:
     def strategy_id(self) -> str:
         return self.document.id
 
+    def applies_to(self, ctx: EvalContext) -> ApplicabilityCheck:
+        """Is this strategy in scope at all, before any condition is read?
+
+        ``Applicability`` was parsed, hashed into the content hash, and then
+        consulted by nothing — a strategy declaring "TRENDING only, above 100
+        rupees" had both ignored, so a trend strategy would fire freely in a
+        rangebound market. This is the one place that block is enforced.
+
+        An UNKNOWN regime does not apply. The strategy was validated against a
+        named set of regimes; running it when the regime cannot be established
+        is running it outside the conditions its backtest covers.
+        """
+        applicability = self.document.applicability
+
+        if ctx.timeframe is not applicability.timeframe:
+            return ApplicabilityCheck(
+                False,
+                f"strategy is for {applicability.timeframe.value}, "
+                f"evaluated on {ctx.timeframe.value}",
+            )
+        if ctx.last_price < applicability.min_price:
+            return ApplicabilityCheck(
+                False,
+                f"price {ctx.last_price} is below the strategy's floor {applicability.min_price}",
+            )
+        if ctx.regime is None:
+            return ApplicabilityCheck(
+                False,
+                "regime is unknown; the strategy is only validated for "
+                f"{[r.value for r in applicability.regimes]}",
+            )
+        if ctx.regime not in applicability.regimes:
+            return ApplicabilityCheck(
+                False,
+                f"regime {ctx.regime.value} is not in the strategy's "
+                f"{[r.value for r in applicability.regimes]}",
+            )
+        return ApplicabilityCheck(True)
+
     def evaluate(self, ctx: EvalContext) -> EntryDecision:
         """Entry conditions only. Does not decide whether to trade."""
         if ctx.direction is not self.document.direction:
@@ -395,15 +462,45 @@ class StrategyEvaluator:
             )
         return evaluate_group(self.document.entry, ctx)
 
-    def fire(self, ctx: EvalContext, *, correlation_id: UUID | None = None) -> Trigger | None:
+    def fire(self, ctx: EvalContext, *, correlation_id: UUID) -> Trigger | None:
         """A full firing: conditions, stop, and the resulting :class:`Trigger`.
 
-        Returns None when the strategy did not fire OR when it fired but the
-        stop could not be computed. The second case deserves the same answer as
+        ``correlation_id`` is REQUIRED rather than generated here. Minting a
+        UUID inside the evaluator would put randomness in the strategy path,
+        which the conventions forbid for a concrete reason: replaying the same
+        context twice must produce the same answer, and a backtest that cannot
+        compare two Trigger objects for equality cannot assert that the
+        decision sequence matched. The caller owns the identity; the evaluator
+        stays a pure function.
+
+        Returns None when the indicators are not ready, when the strategy is
+        out of its declared applicability, when it did not fire, OR when it
+        fired but the stop could not be computed. The second case deserves the same answer as
         the first: an entry whose protective stop is unknown is exactly what
         the "every position has a stop" invariant exists to prevent, and a
         Trigger without a valid stop would not construct anyway.
         """
+        if not ctx.snapshot.all_ready:
+            # E13-S01 criterion 3, and "data stale -> block entries". This is
+            # the gate a feed gap acts through: mark_stale sets IndicatorSet
+            # .stale, which clears is_ready, which clears all_ready. Without
+            # this check the evaluator happily traded through a twelve-minute
+            # hole in the feed on indicators computed from the wrong bars —
+            # and a strategy reading only a warm ema_20 would never notice
+            # that the 200-EMA beside it was built from forty bars.
+            log.warning(
+                "%s: refusing to evaluate %s — indicators are not ready: %s",
+                ctx.symbol,
+                self.strategy_id,
+                {tf.value: names for tf, names in ctx.snapshot.not_ready.items()},
+            )
+            return None
+
+        scope = self.applies_to(ctx)
+        if not scope.applies:
+            log.debug("%s: %s does not apply — %s", ctx.symbol, self.strategy_id, scope.reason)
+            return None
+
         decision = self.evaluate(ctx)
         if not decision.fired:
             return None
@@ -434,13 +531,13 @@ class StrategyEvaluator:
             return None
 
         return Trigger(
-            correlation_id=correlation_id or uuid4(),
+            correlation_id=correlation_id,
             symbol=ctx.symbol,
             strategy_id=self.strategy_id,
             direction=self.document.direction,
             trigger_price=ctx.last_price,
             suggested_stop=stop,
-            timeframe_agreement=abs(ctx.snapshot.trend_agreement()),
+            timeframe_agreement=directional_agreement(ctx),
             fired_at=ctx.now,
         )
 

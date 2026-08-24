@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 
@@ -243,7 +244,7 @@ class TestMissingDataNeverBecomesPermission:
     def test_an_empty_snapshot_fires_nothing(self) -> None:
         empty = MultiTimeframeSnapshot(symbol="INFY", per_timeframe={}, all_ready=False)
         doc = compile_strategy(load_strategy_yaml(_MINIMAL_STRATEGY))
-        assert StrategyEvaluator(doc).fire(_ctx(snapshot=empty)) is None
+        assert StrategyEvaluator(doc).fire(_ctx(snapshot=empty), correlation_id=uuid4()) is None
 
     def test_every_condition_unknown_means_no_trade(self) -> None:
         group = ConditionGroup(

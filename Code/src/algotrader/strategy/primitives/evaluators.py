@@ -1,4 +1,4 @@
-"""What each of the 27 primitives actually computes (E13-S01).
+"""What each of the 27 primitives actually computes (completes E00-S08).
 
 ``registry.py`` declares the vocabulary — names, parameters, bounds. This is
 the other half: the function behind each name. Until it existed a strategy
@@ -71,9 +71,18 @@ def _num(params: Mapping[str, Any], name: str, default: Any = None) -> Decimal:
     if value is None:
         raise PrimitiveError(f"missing required numeric parameter {name!r}")
     try:
-        return Decimal(str(value))
+        number = Decimal(str(value))
     except (ArithmeticError, ValueError) as exc:
         raise PrimitiveError(f"parameter {name!r} is not numeric: {_echo(value)}") from exc
+    if not number.is_finite():
+        # Decimal("NaN") and Decimal("Infinity") CONSTRUCT happily and fail
+        # only on comparison, so without this the error surfaces as an
+        # uncaught InvalidOperation deep in the signal loop. Worse,
+        # -Infinity does not fail at all: it makes any "above this
+        # threshold" gate pass unconditionally, which is a filter bypass a
+        # strategy author can write in one word.
+        raise PrimitiveError(f"parameter {name!r} must be a finite number, got {_echo(value)}")
+    return number
 
 
 def _int(params: Mapping[str, Any], name: str, default: Any = None) -> int:
@@ -302,6 +311,19 @@ def volume_ratio_above(ctx: EvalContext, p: Mapping[str, Any]) -> bool | None:
 # ---------------------------------------------------------------------------
 # multiframe
 # ---------------------------------------------------------------------------
+
+
+def directional_agreement(ctx: EvalContext) -> int:
+    """How many timeframes agree with the STRATEGY'S direction.
+
+    Not ``abs(trend_agreement())``. That counts timeframes where the fast MA is
+    above the slow one and then discards the sign, so a long trade against a
+    unanimously bearish tape scores 3 — maximum confluence for a trade every
+    timeframe contradicts. The number reaches ``Recommendation`` and the AI
+    review, where "3 of 3 timeframes agree" is exactly the wrong thing to tell
+    a confirmation step.
+    """
+    return sum(1 for tf in ctx.snapshot.per_timeframe if _trend_on(ctx, tf) is True)
 
 
 def _trend_on(ctx: EvalContext, timeframe: Timeframe) -> bool | None:

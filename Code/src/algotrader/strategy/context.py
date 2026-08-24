@@ -1,4 +1,4 @@
-"""The read-only view a primitive is allowed to see (E13-S01).
+"""The read-only view a primitive is allowed to see (completes E00-S08).
 
 ``compile_strategy`` has always ended with "the runtime evaluator walks the
 validated tree". This module and :mod:`algotrader.strategy.runtime` are that
@@ -21,6 +21,8 @@ default would let "we don't know the VIX" silently become "the VIX is fine".
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import math
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -28,6 +30,26 @@ from algotrader.common.enums import Direction, Regime, Timeframe
 from algotrader.common.models.market import Bar
 from algotrader.indicators.engine import MultiTimeframeSnapshot
 from algotrader.indicators.levels import LevelSet, OpeningRange
+
+log = logging.getLogger(__name__)
+
+
+def _finite(value: float | None) -> float | None:
+    """Non-finite indicator values are absent, not extreme.
+
+    A NaN compares False against everything, so ``price_above_ma`` would answer
+    a confident "no" rather than declining; an infinity compares True against
+    everything, so a band check would pass unconditionally. Both are silent.
+    They reach here from a corrupted snapshot — Python's ``json`` emits and
+    accepts bare ``NaN`` — or from a degenerate computation, so filtering at
+    the one place every primitive reads through covers all 27 at once.
+    """
+    if value is None:
+        return None
+    if not math.isfinite(value):
+        log.warning("indicator value %r is not finite; treating it as absent", value)
+        return None
+    return value
 
 
 class ContextError(ValueError):
@@ -112,12 +134,12 @@ class EvalContext:
 
     def indicator(self, name: str, timeframe: Timeframe | None = None) -> float | None:
         """Current value, or ``None`` when the indicator is not carried."""
-        return self.snapshot.value(timeframe or self.timeframe, name)
+        return _finite(self.snapshot.value(timeframe or self.timeframe, name))
 
     def indicator_ago(
         self, name: str, bars: int, timeframe: Timeframe | None = None
     ) -> float | None:
-        return self.snapshot.value_ago(timeframe or self.timeframe, name, bars)
+        return _finite(self.snapshot.value_ago(timeframe or self.timeframe, name, bars))
 
     def named_level(self, name: str) -> Decimal | None:
         """Resolve a DSL level name to a price.

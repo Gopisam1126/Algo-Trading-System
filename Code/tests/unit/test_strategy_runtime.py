@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import random
 from decimal import Decimal
+from uuid import UUID
 
 import pytest
 
@@ -57,6 +58,7 @@ primitive_registry.install()
 
 BASE = dt.datetime(2026, 8, 20, 3, 45, tzinfo=dt.UTC)
 NOW = dt.datetime(2026, 8, 20, 5, 0, tzinfo=dt.UTC)  # 10:30 IST
+CID = UUID("11111111-2222-3333-4444-555555555555")
 
 
 def _bars(n: int, tf: Timeframe = Timeframe.M5, symbol: str = "INFY", drift: float = 0.0006):
@@ -109,6 +111,10 @@ def ctx(snapshot: MultiTimeframeSnapshot, opening_range: OpeningRange):
             "last_price": Decimal("1200.00"),
             "snapshot": snapshot,
             "opening_range": opening_range,
+            # The strategy under test declares TRENDING/RISK_ON applicability,
+            # which fire() now enforces. Tests that care about a missing or
+            # wrong regime override this explicitly.
+            "regime": Regime.TRENDING,
         }
         base.update(overrides)
         return EvalContext(**base)
@@ -639,14 +645,17 @@ class TestStopsAreRealPlaceablePrices:
 
 class TestFiringProducesATrigger:
     def test_a_met_strategy_produces_a_trigger(self, document, ctx) -> None:
-        trigger = StrategyEvaluator(document).fire(ctx())
+        trigger = StrategyEvaluator(document).fire(ctx(), correlation_id=CID)
         assert trigger is not None
         assert trigger.symbol == "INFY"
         assert trigger.suggested_stop < trigger.trigger_price
         assert trigger.strategy_id == "orb_long_v1"
 
     def test_an_unmet_strategy_produces_nothing(self, document, ctx) -> None:
-        assert StrategyEvaluator(document).fire(ctx(last_price=Decimal("1100"))) is None
+        assert (
+            StrategyEvaluator(document).fire(ctx(last_price=Decimal("1100")), correlation_id=CID)
+            is None
+        )
 
     def test_it_refuses_to_fire_when_the_stop_cannot_be_computed(self, document, ctx) -> None:
         """'Every position has a stop' is an invariant, so an entry whose
@@ -656,12 +665,12 @@ class TestFiringProducesATrigger:
             per_timeframe={Timeframe.M5: {"ema_20": 100.0, "atr_14": None}},
             all_ready=True,
         )
-        assert StrategyEvaluator(document).fire(ctx(snapshot=bare)) is None
+        assert StrategyEvaluator(document).fire(ctx(snapshot=bare), correlation_id=CID) is None
 
     def test_timeframe_agreement_is_reported_as_a_magnitude(self, document, ctx) -> None:
         """``Trigger`` bounds it 0..3 while ``trend_agreement`` is signed -3..3;
         passing the signed value straight through would raise on any short."""
-        trigger = StrategyEvaluator(document).fire(ctx())
+        trigger = StrategyEvaluator(document).fire(ctx(), correlation_id=CID)
         assert trigger is not None and 0 <= trigger.timeframe_agreement <= 3
 
     def test_a_direction_mismatch_is_refused(self, document, ctx) -> None:
@@ -670,12 +679,22 @@ class TestFiringProducesATrigger:
         with pytest.raises(UnevaluableStrategyError, match="direction"):
             StrategyEvaluator(document).evaluate(ctx(direction=Direction.SHORT))
 
-    def test_a_correlation_id_can_be_supplied(self, document, ctx) -> None:
+    def test_the_correlation_id_must_be_supplied_by_the_caller(self, document, ctx) -> None:
+        """Minting a UUID inside the evaluator would put randomness in the
+        strategy path. A backtest could then never compare two Triggers for
+        equality, so it could not assert that the decision SEQUENCE matched —
+        which is E12-S03's whole acceptance criterion."""
         from uuid import uuid4
 
         wanted = uuid4()
         trigger = StrategyEvaluator(document).fire(ctx(), correlation_id=wanted)
         assert trigger is not None and trigger.correlation_id == wanted
+
+    def test_firing_twice_on_the_same_context_is_identical(self, document, ctx) -> None:
+        ev, context = StrategyEvaluator(document), ctx()
+        first = ev.fire(context, correlation_id=CID)
+        second = ev.fire(context, correlation_id=CID)
+        assert first == second, "the evaluator is not a pure function"
 
 
 class TestCapabilityIsVerifiedAtLoadTime:
@@ -726,7 +745,9 @@ class TestCapabilityIsVerifiedAtLoadTime:
         from algotrader.strategy.runtime import verify_condition
 
         with pytest.raises(UnevaluableStrategyError, match="not faster"):
-            verify_condition(_cond("ma_crossover", fast=200, slow=50, direction="bullish"))
+            # Both periods are inside the registry's declared bounds and both
+            # indicators exist, so only the ordering check can catch this.
+            verify_condition(_cond("ma_crossover", fast=50, slow=20, direction="bullish"))
 
     def test_one_bad_strategy_does_not_block_the_others(self, document) -> None:
         bad = compile_strategy(
@@ -788,3 +809,193 @@ class TestTheContextRefusesIncoherentInput:
                 tick_size=Decimal("0"),
                 snapshot=snapshot,
             )
+
+
+class TestApplicabilityIsEnforcedNotDecorative:
+    """Found by reading the story against the code as a BA would.
+
+    ``Applicability`` was parsed, validated, and folded into the content hash —
+    and then consulted by nothing. A strategy declaring "TRENDING only, above
+    100 rupees" had both ignored, so a trend strategy would fire freely in a
+    rangebound market and on a penny stock. The declaration existed purely to
+    make the document look complete.
+    """
+
+    def test_the_declared_regime_is_honoured(self, document, ctx) -> None:
+        ev = StrategyEvaluator(document)
+        assert ev.applies_to(ctx(regime=Regime.TRENDING)).applies is True
+        assert ev.applies_to(ctx(regime=Regime.RANGEBOUND)).applies is False
+
+    def test_an_unknown_regime_does_not_apply(self, document, ctx) -> None:
+        """The strategy was validated for a named set of regimes. Running it
+        when the regime cannot be established runs it outside the conditions
+        its backtest covers."""
+        check = StrategyEvaluator(document).applies_to(ctx(regime=None))
+        assert check.applies is False
+        assert "unknown" in (check.reason or "")
+
+    def test_the_price_floor_is_honoured(self, document, ctx) -> None:
+        ev = StrategyEvaluator(document)
+        low = ctx(regime=Regime.TRENDING, last_price=Decimal("50"))
+        assert ev.applies_to(low).applies is False
+
+    def test_the_declared_timeframe_is_honoured(self, document, ctx) -> None:
+        ev = StrategyEvaluator(document)
+        wrong = ctx(regime=Regime.TRENDING, timeframe=Timeframe.H1)
+        assert ev.applies_to(wrong).applies is False
+
+    def test_the_reason_is_specific_enough_to_act_on(self, document, ctx) -> None:
+        check = StrategyEvaluator(document).applies_to(ctx(regime=Regime.RANGEBOUND))
+        assert "RANGEBOUND" in (check.reason or "")
+
+    def test_firing_is_blocked_outside_applicability(self, document, ctx) -> None:
+        """The guarantee has to be structural: conditions that would otherwise
+        fire must not produce a Trigger out of scope."""
+        ev = StrategyEvaluator(document)
+        assert ev.evaluate(ctx(regime=Regime.RANGEBOUND)).fired is True
+        assert ev.fire(ctx(regime=Regime.RANGEBOUND), correlation_id=CID) is None
+
+    def test_firing_succeeds_inside_applicability(self, document, ctx) -> None:
+        assert (
+            StrategyEvaluator(document).fire(ctx(regime=Regime.TRENDING), correlation_id=CID)
+            is not None
+        )
+
+
+class TestTimeframeAgreementCarriesDirection:
+    """Found by reading fire() as an architect.
+
+    It reported ``abs(snapshot.trend_agreement())``. ``trend_agreement`` counts
+    timeframes where the fast MA is above the slow one and the sign carries
+    direction, so discarding the sign turns maximum DISAGREEMENT into maximum
+    CONFLUENCE: a long trade against a unanimously bearish tape scored 3 of 3.
+    That number reaches ``Recommendation.timeframe_agreement`` and the AI
+    confirmation prompt, where it is exactly the wrong thing to say.
+    """
+
+    def _tape(self, fast: float, slow: float) -> MultiTimeframeSnapshot:
+        return MultiTimeframeSnapshot(
+            symbol="INFY",
+            all_ready=True,
+            per_timeframe={
+                tf: {"ema_20": fast, "ema_50": slow, "atr_14": 2.0}
+                for tf in (Timeframe.M5, Timeframe.M15, Timeframe.H1)
+            },
+        )
+
+    def test_a_long_against_a_bearish_tape_scores_zero(self, ctx) -> None:
+        from algotrader.strategy.primitives.evaluators import directional_agreement
+
+        bearish = ctx(snapshot=self._tape(fast=90.0, slow=100.0), direction=Direction.LONG)
+        assert directional_agreement(bearish) == 0
+
+    def test_a_long_with_a_bullish_tape_scores_three(self, ctx) -> None:
+        from algotrader.strategy.primitives.evaluators import directional_agreement
+
+        bullish = ctx(snapshot=self._tape(fast=110.0, slow=100.0), direction=Direction.LONG)
+        assert directional_agreement(bullish) == 3
+
+    def test_a_short_with_a_bearish_tape_scores_three(self, ctx) -> None:
+        """The mirror: for a short, falling averages ARE agreement."""
+        from algotrader.strategy.primitives.evaluators import directional_agreement
+
+        bearish = ctx(snapshot=self._tape(fast=90.0, slow=100.0), direction=Direction.SHORT)
+        assert directional_agreement(bearish) == 3
+
+    def test_the_old_absolute_value_would_have_said_three(self) -> None:
+        """Pins the defect so it cannot come back as a 'simplification'."""
+        bearish = self._tape(fast=90.0, slow=100.0)
+        assert abs(bearish.trend_agreement()) == 3, "this is what fire() used to report"
+
+    def test_a_flat_timeframe_is_not_agreement(self, ctx) -> None:
+        from algotrader.strategy.primitives.evaluators import directional_agreement
+
+        flat = ctx(snapshot=self._tape(fast=100.0, slow=100.0))
+        assert directional_agreement(flat) == 0
+
+
+class TestNonFiniteValuesAreNeitherTrustedNorFatal:
+    """Found as a pentester, probing what a corrupted snapshot can do.
+
+    Python's ``json`` emits and accepts a bare ``NaN``, so an indicator
+    snapshot round-tripping through Redis can carry one. NaN compares False
+    against everything, so ``price_above_ma`` answered a confident "no" instead
+    of declining; an infinity compares True against everything, so a band check
+    passed unconditionally. And ``Decimal("NaN")`` constructs happily and
+    raises only on the first COMPARISON — surfacing as an uncaught
+    InvalidOperation deep in the signal loop rather than at the boundary.
+    """
+
+    def _tainted(self, value: float) -> MultiTimeframeSnapshot:
+        return MultiTimeframeSnapshot(
+            symbol="INFY",
+            all_ready=True,
+            per_timeframe={Timeframe.M5: {"ema_20": value, "ema_50": 99.0, "atr_14": value}},
+        )
+
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"]
+    )
+    def test_a_tainted_indicator_reads_as_absent_not_as_an_answer(self, ctx, value) -> None:
+        result = evaluate_condition(
+            _cond("price_above_ma", period=20), ctx(snapshot=self._tainted(value))
+        )
+        assert result.outcome is None
+
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"]
+    )
+    def test_a_tainted_atr_yields_no_stop_rather_than_crashing(self, ctx, value) -> None:
+        from algotrader.strategy.primitives.evaluators import atr_stop
+
+        stop = atr_stop(ctx(snapshot=self._tainted(value)), {"multiplier": 1.5, "period": 14})
+        assert stop is None
+
+    @pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+    def test_a_non_finite_parameter_is_refused(self, ctx, bad: str) -> None:
+        """``-Infinity`` is the dangerous one: it makes any 'above this
+        threshold' gate pass unconditionally, and a strategy author can write
+        it in one word."""
+        with pytest.raises(PrimitiveError, match="finite"):
+            evaluate_condition(_cond("news_score_above", threshold=bad), ctx(news_score=0.5))
+
+    def test_the_money_boundary_refuses_non_finite(self) -> None:
+        from algotrader.indicators.framework import to_decimal
+
+        assert to_decimal(float("nan")) is None
+        assert to_decimal(float("inf")) is None
+        assert to_decimal(1.5) == Decimal("1.5000")
+
+    def test_ordinary_values_are_untouched(self, ctx) -> None:
+        """The control: the guard must not reject real numbers."""
+        assert evaluate_condition(_cond("price_above_ma", period=20), ctx()).outcome is True
+
+
+class TestRegistryBoundsHoldAtLoadTime:
+    """Defence in depth. compile_strategy validates parameter bounds, but
+    nothing structurally guaranteed a document reached the evaluator through
+    compilation — and those bounds are what stop a threshold of -1e999 from
+    making a gate pass unconditionally. ``Decimal("-1e999")`` is FINITE, so the
+    non-finite guard does not catch it; only the declared range does."""
+
+    def test_an_out_of_range_threshold_is_refused_at_load(self) -> None:
+        from algotrader.strategy.runtime import verify_condition
+
+        # Decimal("-1e999") is FINITE — Decimal has an arbitrary exponent
+        # range — so the non-finite guard does not see it. Only the declared
+        # -1..1 range stops it from making the gate pass unconditionally.
+        huge = Decimal("-1e999")
+        assert huge.is_finite(), "the point of this test is that it is finite"
+        with pytest.raises(UnevaluableStrategyError, match="below minimum"):
+            verify_condition(_cond("news_score_above", threshold=huge))
+
+    def test_an_unknown_parameter_is_refused_at_load(self) -> None:
+        from algotrader.strategy.runtime import verify_condition
+
+        with pytest.raises(UnevaluableStrategyError, match="unknown parameter"):
+            verify_condition(_cond("news_score_above", threshold=0.5, shell=True))
+
+    def test_a_valid_condition_still_passes(self) -> None:
+        from algotrader.strategy.runtime import verify_condition
+
+        verify_condition(_cond("news_score_above", threshold=0.5))
