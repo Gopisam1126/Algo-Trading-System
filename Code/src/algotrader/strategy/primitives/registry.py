@@ -184,18 +184,28 @@ PRIMITIVES: list[PrimitiveSpec] = [
         name="timeframe_agreement_at_least",
         category="multiframe",
         description="At least N of the given timeframes agree on direction — "
-        "the confluence measure.",
+        "the confluence measure. Timeframes must be ones the indicator engine "
+        "carries (5m, 15m, 1h); daily and weekly are not computed live.",
         params=[
             _p("count", "int", lo="1", hi="3"),
-            _p("of", "str", required=False, default="1h,1d,1w"),
+            # Was "1h,1d,1w", which no deployment could answer: the engine
+            # carries 5m/15m/1h, so a strategy omitting this parameter got a
+            # default referring to two timeframes that do not exist and could
+            # never fire. Found when the evaluator was written and the
+            # declared vocabulary was checked against the engine for the first
+            # time.
+            _p("of", "str", required=False, default="5m,15m,1h"),
         ],
     ),
     PrimitiveSpec(
         name="higher_tf_trend_is",
         category="multiframe",
-        description="A specific higher timeframe is trending in the given direction.",
+        description="A specific higher timeframe is trending in the given "
+        "direction. Restricted to the timeframes the engine computes live.",
         params=[
-            _p("timeframe", "enum", choices=["1h", "1d", "1w"]),
+            # 1d and 1w were offered and are not computed by IndicatorEngine,
+            # so any strategy naming them validated and then never fired.
+            _p("timeframe", "enum", choices=["15m", "1h"]),
             _p("direction", "enum", choices=["up", "down"]),
         ],
     ),

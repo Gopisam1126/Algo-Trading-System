@@ -299,3 +299,60 @@ class TestTheLevelSet:
             ]
         )
         assert any(lv.kind == "resistance" for lv in ls.all_levels())
+
+
+class TestAnInvertedOpeningRangeIsRefused:
+    """Found by probing the evaluator's inputs as a developer would.
+
+    ``update`` maintains high >= low by construction, so this cannot arise from
+    ticks — but the dataclass is also built directly, from a restored snapshot
+    or from stored bars, and nothing checked. An inverted range reported a
+    NEGATIVE range_pct and gave ``breakout_direction`` a window in which every
+    price is at once above the high and below the low. ``classic_pivots``
+    already refused high < low; the two halves of the module disagreed.
+    """
+
+    def _inverted(self) -> OpeningRange:
+        return OpeningRange(
+            symbol="INFY",
+            trade_date=dt.date(2026, 8, 20),
+            high=Decimal("90"),
+            low=Decimal("110"),
+            sealed=True,
+        )
+
+    def test_it_is_not_usable(self) -> None:
+        assert self._inverted().is_usable is False
+
+    def test_range_pct_is_none_rather_than_negative(self) -> None:
+        assert self._inverted().range_pct is None
+
+    def test_width_is_none_rather_than_negative(self) -> None:
+        """A negative width would reach a sizing calculation as a real one."""
+        assert self._inverted().width is None
+
+    def test_breakout_direction_refuses_to_answer(self) -> None:
+        assert self._inverted().breakout_direction(Decimal("100")) is None
+
+    def test_a_coherent_range_is_unaffected(self) -> None:
+        good = OpeningRange(
+            symbol="INFY",
+            trade_date=dt.date(2026, 8, 20),
+            high=Decimal("110"),
+            low=Decimal("90"),
+            sealed=True,
+        )
+        assert good.is_usable
+        assert good.width == Decimal("20")
+        assert good.breakout_direction(Decimal("115")) == "up"
+
+    def test_a_single_price_range_is_still_valid(self) -> None:
+        """high == low is a symbol that printed once, not an error."""
+        flat = OpeningRange(
+            symbol="INFY",
+            trade_date=dt.date(2026, 8, 20),
+            high=Decimal("100"),
+            low=Decimal("100"),
+            sealed=True,
+        )
+        assert flat.is_usable and flat.width == 0

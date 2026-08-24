@@ -113,12 +113,35 @@ class OpeningRange:
 
     @property
     def is_usable(self) -> bool:
-        """Sealed AND populated. An empty range is not a narrow one."""
-        return self.sealed and self.high is not None and self.low is not None
+        """Sealed, populated, AND coherent. An empty range is not a narrow one.
+
+        The coherence check is not theoretical. ``update`` maintains
+        ``high >= low`` by construction, but this dataclass is also built
+        directly — from a restored snapshot, or by a caller assembling one from
+        stored bars — and nothing rejected an inverted pair. An inverted range
+        reports a NEGATIVE ``range_pct`` and hands ``breakout_direction`` a
+        window where every price is simultaneously above the high and below the
+        low. ``classic_pivots`` already refuses ``high < low``; this is the same
+        rule applied to the other half of the module.
+        """
+        if not self.sealed or self.high is None or self.low is None:
+            return False
+        if self.high < self.low:
+            log.error(
+                "%s: opening range is inverted (high=%s < low=%s) and will not be "
+                "used. Levels derived from it would put stops on the wrong side.",
+                self.symbol,
+                self.high,
+                self.low,
+            )
+            return False
+        return True
 
     @property
     def width(self) -> Decimal | None:
-        if self.high is None or self.low is None:
+        """None rather than a negative number for an inverted range — a
+        negative width would flow into a sizing calculation as a real one."""
+        if self.high is None or self.low is None or self.high < self.low:
             return None
         return self.high - self.low
 
@@ -130,7 +153,7 @@ class OpeningRange:
         sitting at one edge of the range, which would make the same range look
         wider or narrower depending on which way it went.
         """
-        if self.high is None or self.low is None:
+        if self.high is None or self.low is None or self.high < self.low:
             return None
         mid = (self.high + self.low) / 2
         if mid <= 0:
