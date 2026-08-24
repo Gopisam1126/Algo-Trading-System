@@ -50,8 +50,19 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --upgrade pip
+          # setuptools AND wheel, not just pip. actions/setup-python ships
+          # setuptools in the 65-68 range, which carries eight advisories,
+          # and `--upgrade pip` alone leaves it there. That is what made the
+          # dependency audit fail while the project's own pinned set was
+          # clean — the finding was in the BUILD environment, not in
+          # anything constraints.txt describes.
+          python -m pip install --upgrade pip setuptools wheel
           pip install -c constraints.txt -e ".[dev]"
+          # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
+          # floor in our own dependencies is unsatisfiable — resolution has to
+          # succeed first, then the package is replaced. --no-deps because the
+          # graph is already solved and we are only swapping one node.
+          pip install --no-deps --upgrade "autobahn==26.7.1"
 
       - name: ruff check
         run: ruff check .
@@ -86,8 +97,19 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --upgrade pip
+          # setuptools AND wheel, not just pip. actions/setup-python ships
+          # setuptools in the 65-68 range, which carries eight advisories,
+          # and `--upgrade pip` alone leaves it there. That is what made the
+          # dependency audit fail while the project's own pinned set was
+          # clean — the finding was in the BUILD environment, not in
+          # anything constraints.txt describes.
+          python -m pip install --upgrade pip setuptools wheel
           pip install -c constraints.txt -e ".[dev]"
+          # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
+          # floor in our own dependencies is unsatisfiable — resolution has to
+          # succeed first, then the package is replaced. --no-deps because the
+          # graph is already solved and we are only swapping one node.
+          pip install --no-deps --upgrade "autobahn==26.7.1"
 
       - name: Pre-pull datastore images
         # Pulled explicitly so a slow registry shows up as a pull step rather
@@ -128,8 +150,19 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --upgrade pip
+          # setuptools AND wheel, not just pip. actions/setup-python ships
+          # setuptools in the 65-68 range, which carries eight advisories,
+          # and `--upgrade pip` alone leaves it there. That is what made the
+          # dependency audit fail while the project's own pinned set was
+          # clean — the finding was in the BUILD environment, not in
+          # anything constraints.txt describes.
+          python -m pip install --upgrade pip setuptools wheel
           pip install -c constraints.txt -e ".[dev]"
+          # B7 / CVE-2020-35678. kiteconnect hard-pins autobahn==19.11.2, so a
+          # floor in our own dependencies is unsatisfiable — resolution has to
+          # succeed first, then the package is replaced. --no-deps because the
+          # graph is already solved and we are only swapping one node.
+          pip install --no-deps --upgrade "autobahn==26.7.1"
 
       - name: Safety invariants and pen-test suite
         run: pytest tests/security/ -q
@@ -138,8 +171,9 @@ jobs:
         # HARD GATE as of 24 Aug 2026. This was advisory while B7 was open —
         # kiteconnect pins autobahn 19.11.2 (CVE-2020-35678) and a permanently
         # red check trains people to ignore it. B7 is now closed: the pin is
-        # declarative, kiteconnect works under autobahn 26.7.1, and
-        # pyproject floors it at >=20.12.3.
+        # declarative and kiteconnect works under autobahn 26.7.1, which the
+        # Install step above applies AFTER resolution. A floor in pyproject
+        # cannot work — `==19.11.2` makes it unsatisfiable and pip fails.
         #
         # With the known finding gone, "advisory" only means the next CVE
         # arrives silently. The audit is clean, so it can and must block.
@@ -149,7 +183,19 @@ jobs:
         # reason that has nothing to do with vulnerabilities. Without it,
         # pip-audit still exits non-zero when it actually finds one, which is
         # the behaviour this gate wants.
-        run: pip-audit --desc --skip-editable --format=json --output=pip-audit.json
+        run: |
+          set -uo pipefail
+          # Human-readable to the LOG first. Writing only JSON to a file made
+          # this gate fail with an empty console, which meant a red build said
+          # nothing about what was wrong — the findings were in an artifact
+          # that needs credentials to download. A gate that cannot explain
+          # itself gets disabled rather than fixed.
+          pip-audit --desc --skip-editable | tee pip-audit.txt
+          status=${PIPESTATUS[0]}
+          pip-audit --skip-editable --format=json --output=pip-audit.json || true
+          echo "--- versions of interest ---"
+          python -c "import importlib.metadata as m;[print(' ',n,m.version(n)) for n in ('autobahn','kiteconnect','setuptools','bandit','pip')]"
+          exit "$status"
 
       - name: Static application security testing
         # Fails on MEDIUM and above only. Every LOW in this codebase is an

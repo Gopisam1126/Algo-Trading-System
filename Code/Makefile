@@ -26,10 +26,20 @@ venv:  ## Create the virtualenv
 install:  ## Install runtime + dev dependencies
 	$(PY) -m pip install --upgrade pip
 	$(PY) -m pip install -e ".[dev]"
+	$(MAKE) patch-deps
 
 .PHONY: install-research
 install-research:  ## Install backtesting / research extras
 	$(PY) -m pip install -e ".[dev,research]"
+	$(MAKE) patch-deps
+
+.PHONY: patch-deps
+patch-deps:  ## Replace kiteconnect's vulnerable autobahn pin (B7 / CVE-2020-35678)
+	@# kiteconnect hard-pins autobahn==19.11.2, so a floor in pyproject is
+	@# unsatisfiable and pip fails outright. Resolution has to succeed first,
+	@# then the package is swapped. Enforced by
+	@# tests/security/test_dependency_hygiene.py.
+	$(PY) -m pip install --no-deps --upgrade "autobahn==26.7.1"
 
 # --- Quality ---------------------------------------------------------------
 

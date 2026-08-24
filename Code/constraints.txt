@@ -49,7 +49,10 @@ anyio==4.14.2
 APScheduler==3.11.3
 ast_serialize==0.8.0
 attrs==26.1.0
-autobahn==26.7.1
+# B7: kiteconnect pins this exactly, so this is what RESOLUTION produces.
+# The install then replaces it with 26.7.1 via --no-deps (CVE-2020-35678).
+# See pyproject.toml and tests/security/test_dependency_hygiene.py.
+autobahn==19.11.2
 Automat==25.4.16
 boolean.py==5.0
 build==1.5.0
