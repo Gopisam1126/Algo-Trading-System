@@ -187,6 +187,15 @@ class SizingResult(_Frozen):
 
 
 class RiskDecision(_Frozen):
+    """The only thing downstream is allowed to turn into an order.
+
+    ``checks_passed`` is not decoration. E14-S01's acceptance criterion is that
+    any rejection is explainable from the audit log, and "rejected by
+    daily_loss" is only half an explanation — the other half is which checks it
+    got through first, because that is what distinguishes "blocked immediately"
+    from "blocked at the last gate".
+    """
+
     approved: bool
     reason: RejectReason | None = None
     detail: str | None = None
@@ -205,6 +214,60 @@ class RiskDecision(_Frozen):
         if not self.approved and self.reason is None:
             raise ValueError("a rejected decision must carry a reject reason")
         return self
+
+    @classmethod
+    def approve(
+        cls,
+        sizing: SizingResult,
+        *,
+        checks_passed: list[str],
+        now: datetime,
+    ) -> RiskDecision:
+        """Named constructor, so approval is greppable.
+
+        ``LOW_LEVEL_ARCHITECTURE.md §5.7`` writes the engine in terms of
+        ``RiskDecision.approve(...)`` / ``.reject(...)``; those did not exist,
+        and the spec's pseudocode was the only place they appeared. Adding them
+        makes every approval in the codebase findable by name — which is how
+        the "no order path bypasses the pipeline" criterion is checked, by a
+        test that asserts nothing outside the engine constructs one.
+        """
+        # `list(...)` is belt-and-braces: Pydantic already builds a new list
+        # when it validates a `list[str]` field, so a caller mutating its own
+        # list afterwards cannot rewrite a recorded decision either way.
+        # Verified, not assumed — and mutation testing flagged the redundancy
+        # rather than a gap. Kept because the guarantee should not depend on a
+        # validation detail that a future field-type change could remove.
+        return cls(
+            approved=True,
+            sizing=sizing,
+            checks_passed=list(checks_passed),
+            evaluated_at=now,
+        )
+
+    @classmethod
+    def reject(
+        cls,
+        reason: RejectReason,
+        *,
+        detail: str,
+        checks_passed: list[str],
+        now: datetime,
+    ) -> RiskDecision:
+        """``detail`` is required, not optional.
+
+        A ``RejectReason`` alone says the category; the audit log needs the
+        instance — which symbol, which limit, what the observed value was.
+        Making it required means a check cannot log a rejection nobody can act
+        on.
+        """
+        return cls(
+            approved=False,
+            reason=reason,
+            detail=detail,
+            checks_passed=list(checks_passed),
+            evaluated_at=now,
+        )
 
 
 # ---------------------------------------------------------------------------
