@@ -45,7 +45,13 @@ if GIT is None:  # pragma: no cover - git is a hard prerequisite
 #: A path listed here must not be read by any test or workflow that runs on
 #: that branch — `test_promotion_hygiene.py` asserts that.
 EXCLUDED: dict[str, tuple[str, ...]] = {
-    "QA": ("Documents",),
+    # `scripts/tracker` goes with `Documents` rather than being a separate
+    # judgement call: it exists only to turn the tracker workbook into the
+    # live artifact, and it reads `Documents/BACKLOG_Tracker.xlsx`. Leaving it
+    # on a branch that has no `Documents/` would ship a script that cannot run
+    # — the exact class of latent breakage `test_promotion_hygiene.py` exists
+    # to catch, one directory over.
+    "QA": ("Documents", "scripts/tracker"),
 }
 
 

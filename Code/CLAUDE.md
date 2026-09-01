@@ -221,5 +221,18 @@ with its input contract (`Recommendation`), output contract (`RiskDecision`,
 all already in place. After that, a vertical slice through paper trading is
 the first thing that would be evidence about the system rather than its parts.
 
-**Follow `Documents/ENGINEERING_STANDARD.md` for any development or research
-work.** It is the mandatory process, and it encodes the failures above.
+### How to do the work
+
+**`/sdlc` is the driver.** Invoked with no argument it means: find the next
+item, take it through business analysis, research, architecture, development,
+four rounds of QA, promotion to the QA branch and SIT — then stop. With an
+argument (`/sdlc E14-S02`) it means that item.
+See `.claude/skills/sdlc/SKILL.md`.
+
+**`Documents/ENGINEERING_STANDARD.md` is the reference** it calls into: the
+invariants, the verification ladder, and the anti-pattern catalogue that
+encodes the failures above.
+
+**PROD is never promoted without explicit permission**, asked for and given in
+the conversation. `promote.yml` carries an unconditional `exit 1` on that path;
+it stays.
