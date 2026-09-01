@@ -50,7 +50,7 @@ class TestNothingRunningOnQaReadsAStrippedPath:
     def test_the_exclusion_list_is_what_we_expect(self) -> None:
         """Pins the rule so widening it is a deliberate edit that shows up in a
         diff, not a quiet change of behaviour."""
-        assert _excluded_for("QA") == ("Documents",)
+        assert _excluded_for("QA") == ("Documents", "scripts/tracker")
 
     @pytest.mark.parametrize("subdir", ["src", "tests", "scripts", "migrations"])
     def test_no_python_under_code_reads_an_excluded_path(self, subdir: str) -> None:

@@ -6,6 +6,12 @@ project.**
 > **Invocation.** When this file is named — "follow the engineering standard",
 > "per ENGINEERING_STANDARD" — it means: execute this document, in order, for
 > the work at hand. Not as inspiration. As a procedure with gates.
+>
+> **`/sdlc` is the driver that calls into this.** The skill at
+> `.claude/skills/sdlc/SKILL.md` sequences the phases and their exit gates,
+> adds SIT after promotion, and stops hard before PROD. This file stays the
+> reference for *how* to do each phase well; where the two disagree on
+> process, this one wins and the skill is corrected.
 
 **Version 1.0 · 24 August 2026 · Supersedes `DEVELOPMENT_PROCEDURE.md`**
 

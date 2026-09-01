@@ -92,3 +92,11 @@ desktop.ini
 # --- OneDrive sync artefacts ---
 *.tmp
 ~$*
+
+# --- tracker build outputs -------------------------------------------------
+# Regenerated from Documents/BACKLOG_Tracker.xlsx by
+# scripts/tracker/export_workbook.py then build_tracker.py. The workbook is the
+# source of truth; committing a 300 KB derived HTML would just create a second
+# one that drifts.
+scripts/tracker/tracker_data.json
+scripts/tracker/tracker.html
