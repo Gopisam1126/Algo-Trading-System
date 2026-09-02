@@ -120,6 +120,7 @@ risk:
     max_daily_loss_pct: 3.0       # -> halts at -Rs 15,000
     max_sector_exposure_pct: 40
     max_correlated_positions: 2
+    correlation_threshold: 0.7   # |rho| of daily log returns, 60 sessions
     max_net_directional_exposure_pct: 60
     consecutive_loss_halt: 3
 

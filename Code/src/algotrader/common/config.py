@@ -333,6 +333,18 @@ class PortfolioRisk(_Model):
     max_daily_loss_pct: Decimal = Field(default=Decimal("3.0"), gt=0)
     max_sector_exposure_pct: Pct = Decimal("40")
     max_correlated_positions: int = Field(default=2, ge=1)
+    #: What counts as "correlated" for :func:`build_correlation_check`, compared
+    #: against the ABSOLUTE correlation of daily log returns over 60 sessions.
+    #:
+    #: Added for E14-S04, which found that ``max_correlated_positions`` had no
+    #: companion threshold — the count of correlated names was configurable and
+    #: the definition of correlated was not. ``StrategyValidationConfig.
+    #: max_correlation_to_active`` looks like it would serve, and must not:
+    #: that one is about whether a new STRATEGY duplicates an active strategy
+    #: in the overfitting gauntlet. Two unrelated concepts sharing one number
+    #: would couple a portfolio limit to a research limit, so that tuning
+    #: either would silently move the other.
+    correlation_threshold: Decimal = Field(default=Decimal("0.7"), gt=0, le=1)
     max_net_directional_exposure_pct: Pct = Decimal("60")
     consecutive_loss_halt: int = Field(default=3, ge=1)
 

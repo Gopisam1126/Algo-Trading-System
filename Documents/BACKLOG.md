@@ -1768,6 +1768,22 @@ Symbol tradable (re-verified at order time) · slot available · not already hel
 ### E14-S04 · Portfolio exposure checks (8–10)
 `P0` `Phase 5` `🔴` `FEAT` · **2 days** · deps: E14-S01
 
+> **Sector is the primary control, correlation the secondary one.** Four PSU
+> banks can show only *moderate* pairwise correlation and still be one bet, so
+> a correlation guard alone would let them through.
+>
+> **Window and frequency, answered 2 Sep 2026:** Pearson correlation of daily
+> log returns over 60 trading sessions, recomputed pre-market and never
+> intraday. Daily rather than intraday because a correlation estimated from
+> high-frequency samples of two separately-traded names is biased *toward
+> zero* — their prints are not synchronous — which would understate exactly
+> the linkage this guard exists to catch. 60 sessions is a judgement, not a
+> derived fact: shorter flaps, longer misses regime change.
+>
+> **These checks cannot make the caps binding** — they run before sizing, so
+> they cannot know the candidate's notional, and §5.7's sizing formula has no
+> sector or net-directional clamp. See **E14-S10**.
+
 **Tasks**
 - [ ] Correlation guard — reject N correlated names
 - [ ] Rolling correlation matrix over the watchlist
@@ -1845,6 +1861,29 @@ Daily loss limit → halt · consecutive loss limit → halt.
 - 🔴 Open positions are not blindly market-closed
 
 ---
+---
+
+### E14-S10 · Sizer clamps to exposure headroom
+`P0` `Phase 5` `🔴` `FEAT` · **0.5 days** · deps: E14-S04, E14-S07
+
+> Raised 2 Sep 2026 while building E14-S04, which found the gap.
+> `max_sector_exposure_pct` (40) and `max_net_directional_exposure_pct` (60)
+> are configured and **enforced by nothing**. The risk checks run before
+> sizing, so they can only refuse a book already at a cap; the sizer clamps on
+> position value, slot capital and broker margin, and not on these.
+
+**Tasks**
+- [ ] Sector headroom joins the sizing clamp set
+- [ ] Net-directional headroom joins the sizing clamp set
+- [ ] `binding_constraint` records which of them bound
+
+**Acceptance**
+- 🔴 A position sized into a sector at 35% of capital, cap 40%, is clamped so
+  the resulting book is at or below 40% — not merely allowed because 35 < 40
+- 🔴 The same for net directional exposure
+- `binding_constraint` names the clamp, so a small position is explainable
+- **(control)** A position with ample headroom is unaffected by either clamp
+
 ---
 
 # EPIC 15 — EXECUTION & POSITIONS 🔴

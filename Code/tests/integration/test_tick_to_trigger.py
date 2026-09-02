@@ -41,11 +41,14 @@ from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import AIReview, Recommendation
 from algotrader.execution.risk.checks import (
     ELIGIBILITY_ORDER,
+    EXPOSURE_ORDER,
     PRECONDITION_ORDER,
     build_eligibility_checks,
+    build_exposure_checks,
     build_precondition_checks,
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext
+from algotrader.execution.risk.correlation import correlations_against
 from algotrader.execution.risk.framework import RiskEngine
 from algotrader.indicators.engine import IndicatorEngine, warm_up_symbols
 from algotrader.indicators.levels import OpeningRange
@@ -682,3 +685,247 @@ class TestTheTriggerMeetsSymbolEligibility:
         assert written[0]["stage"] == "symbol_tradable"
         assert written[0]["correlation_id"] == CID
         assert written[0]["payload"]["checks_passed"] == list(PRECONDITION_ORDER)
+
+
+class TestTheTriggerMeetsPortfolioExposure:
+    """QA-2 for E14-S04: checks 8-10 behind the six that precede them, against
+    a REAL Trigger.
+
+    The seam that only exists here: `ctx.correlations` and
+    `ctx.open_positions` are keyed by SYMBOL, and the symbol the guard looks up
+    is the one the pipeline emitted. The unit tests build both sides from the
+    same string, so they agree by construction. If the pipeline ever emitted a
+    symbol in a different form than the pre-market matrix keys, every lookup
+    would miss -- and a miss is 'unknown', which now refuses, so the failure
+    would be loud rather than silent. This asserts that loudness.
+    """
+
+    @staticmethod
+    def _review() -> AIReview:
+        return AIReview(
+            verdict=AIVerdict.CONFIRM,
+            confidence=Decimal("0.80"),
+            timeframe_agreement=3,
+            thesis_alignment="aligned",
+            rationale="exposure seam probe",
+            model_used="test-harness",
+            latency_ms=0,
+        )
+
+    def _recommendation(self, run, evaluator) -> Recommendation:
+        trigger = evaluator.fire(run.context(), correlation_id=CID)
+        assert trigger is not None, "the pipeline must fire for this seam to be testable"
+        return Recommendation.build(trigger, self._review(), now=run.context().now)
+
+    @staticmethod
+    def _calendar() -> MarketCalendar:
+        status = load_holidays_with_status(
+            str(Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml")
+        )
+        return MarketCalendar(status.dates, covers_years=status.covers_years)
+
+    def _engine(self, audit=None) -> RiskEngine:
+        """All ten built checks, in their real order."""
+        return RiskEngine(
+            checks=[
+                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+            ],
+            audit=audit,
+        )
+
+    @staticmethod
+    def _risk_ctx(**overrides) -> RiskContext:
+        base: dict = {
+            "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
+            "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
+            "capital": Decimal("500000"),
+            "slots_total": 5,
+            "slots_used": 0,
+            "symbol_restrictions": (),
+            "symbol_sector": "IT",
+        }
+        base.update(overrides)
+        return RiskContext(**base)
+
+    @staticmethod
+    def _held(symbol: str, notional: str, sector: str, direction=Direction.LONG):
+        price = Decimal("100")
+        return OpenPosition(
+            symbol=symbol,
+            direction=direction,
+            quantity=int(Decimal(notional) / price),
+            entry_price=price,
+            stop_price=Decimal("95") if direction is Direction.LONG else Decimal("105"),
+            sector=sector,
+        )
+
+    def test_a_clean_real_trigger_clears_all_ten(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(self._recommendation(run, evaluator), self._risk_ctx())
+        assert decision.checks_passed == [
+            *PRECONDITION_ORDER,
+            *ELIGIBILITY_ORDER,
+            *EXPOSURE_ORDER,
+        ]
+
+    def test_a_correlated_book_stops_a_real_trigger(self, run, evaluator) -> None:
+        rec = self._recommendation(run, evaluator)
+        ctx = self._risk_ctx(
+            slots_used=2,
+            open_positions=(
+                self._held("PNB", "50000", "PSU_BANK"),
+                self._held("CANBK", "50000", "PSU_BANK"),
+            ),
+            correlations={"PNB": Decimal("0.91"), "CANBK": Decimal("0.88")},
+        )
+        decision = self._engine().evaluate(rec, ctx)
+        assert decision.reason is RejectReason.CORRELATION_LIMIT
+
+    def test_a_missing_correlation_for_a_held_name_stops_a_real_trigger(
+        self, run, evaluator
+    ) -> None:
+        """The state a failed pre-market matrix job leaves. It must refuse, and
+        it must refuse as a FAULT rather than as a business rejection."""
+        rec = self._recommendation(run, evaluator)
+        ctx = self._risk_ctx(
+            slots_used=1,
+            open_positions=(self._held("PNB", "50000", "PSU_BANK"),),
+            correlations={},
+        )
+        decision = self._engine().evaluate(rec, ctx)
+        assert not decision.approved
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_a_saturated_sector_stops_a_real_trigger(self, run, evaluator) -> None:
+        rec = self._recommendation(run, evaluator)
+        ctx = self._risk_ctx(
+            symbol_sector="IT",
+            slots_used=1,
+            open_positions=(self._held("TCS", "200000", "IT"),),
+            correlations={"TCS": Decimal("0.2")},
+        )
+        decision = self._engine().evaluate(rec, ctx)
+        assert decision.reason is RejectReason.SECTOR_EXPOSURE_LIMIT
+
+    def test_an_unclassified_held_position_stops_a_real_trigger(self, run, evaluator) -> None:
+        """The hole from the far side: a position with no sector contributes
+        nothing to any sector total, so the cap would never bind."""
+        rec = self._recommendation(run, evaluator)
+        ctx = self._risk_ctx(
+            slots_used=1,
+            open_positions=(self._held("MYSTERY", "400000", None),),  # type: ignore[arg-type]
+            correlations={"MYSTERY": Decimal("0.1")},
+        )
+        decision = self._engine().evaluate(rec, ctx)
+        assert not decision.approved
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_a_one_sided_book_stops_a_real_trigger(self, run, evaluator) -> None:
+        rec = self._recommendation(run, evaluator)
+        ctx = self._risk_ctx(
+            symbol_sector="PHARMA",
+            slots_used=2,
+            open_positions=(
+                self._held("TCS", "160000", "IT"),
+                self._held("RELIANCE", "160000", "ENERGY"),
+            ),
+            correlations={"TCS": Decimal("0.1"), "RELIANCE": Decimal("0.2")},
+        )
+        decision = self._engine().evaluate(rec, ctx)
+        assert decision.reason is RejectReason.NET_EXPOSURE_LIMIT
+
+    def test_a_hedged_book_of_the_same_size_does_not(self, run, evaluator) -> None:
+        """The control for the test above. Same gross exposure, opposite sides:
+        that is not a directional bet, and the check that measures direction
+        must not refuse it."""
+        rec = self._recommendation(run, evaluator)
+        ctx = self._risk_ctx(
+            symbol_sector="PHARMA",
+            slots_used=2,
+            open_positions=(
+                self._held("TCS", "160000", "IT"),
+                self._held("RELIANCE", "160000", "ENERGY", Direction.SHORT),
+            ),
+            correlations={"TCS": Decimal("0.1"), "RELIANCE": Decimal("0.2")},
+        )
+        decision = self._engine().evaluate(rec, ctx)
+        assert decision.checks_passed == [
+            *PRECONDITION_ORDER,
+            *ELIGIBILITY_ORDER,
+            *EXPOSURE_ORDER,
+        ]
+
+    def test_an_earlier_group_still_wins(self, run, evaluator) -> None:
+        """Order across all three groups. With a blackout, a banned symbol AND
+        a saturated sector, an operator must see the blackout."""
+        rec = self._recommendation(run, evaluator)
+        ctx = self._risk_ctx(
+            now=_dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
+            symbol_restrictions=("T2T",),
+            symbol_sector="IT",
+            slots_used=1,
+            open_positions=(self._held("TCS", "300000", "IT"),),
+            correlations={"TCS": Decimal("0.95")},
+        )
+        assert self._engine().evaluate(rec, ctx).reason is RejectReason.NO_TRADE_WINDOW
+
+    def test_eligibility_still_wins_over_exposure(self, run, evaluator) -> None:
+        rec = self._recommendation(run, evaluator)
+        ctx = self._risk_ctx(
+            symbol_restrictions=("GSM_3",),
+            symbol_sector="IT",
+            slots_used=1,
+            open_positions=(self._held("TCS", "300000", "IT"),),
+            correlations={"TCS": Decimal("0.95")},
+        )
+        assert self._engine().evaluate(rec, ctx).reason is RejectReason.SYMBOL_NOT_TRADABLE
+
+    def test_the_audit_records_which_exposure_check_stopped_it(self, run, evaluator) -> None:
+        written: list[dict] = []
+        self._engine(audit=written.append).evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(
+                symbol_sector="IT",
+                slots_used=1,
+                open_positions=(self._held("TCS", "250000", "IT"),),
+                correlations={"TCS": Decimal("0.2")},
+            ),
+        )
+        assert len(written) == 1
+        assert written[0]["stage"] == "sector_exposure"
+        assert written[0]["correlation_id"] == CID
+        assert written[0]["payload"]["checks_passed"] == [
+            *PRECONDITION_ORDER,
+            *ELIGIBILITY_ORDER,
+            "correlation",
+        ]
+
+    def test_the_matrix_computed_from_real_bars_feeds_the_guard(self, run, evaluator) -> None:
+        """The other seam, and the one that closes the loop: the correlation
+        module's OUTPUT is the guard's INPUT. Built here from the pipeline's
+        own bars rather than from hand-written numbers, so the two halves meet
+        the way they will in production.
+        """
+        rec = self._recommendation(run, evaluator)
+        # The warm-up history the indicators were built from -- real bars from
+        # this test's own pipeline, not numbers written to make the test pass.
+        closes = [b.close for b in _history(260, Timeframe.M5)]
+        book = {rec.symbol: closes, "TWIN": closes}
+        matrix = correlations_against(rec.symbol, book, against=["TWIN"])
+        assert matrix["TWIN"] == pytest.approx(Decimal("1"), abs=Decimal("0.0001")), (
+            "a symbol against a copy of itself must correlate at 1"
+        )
+        ctx = self._risk_ctx(
+            slots_used=1,
+            open_positions=(self._held("TWIN", "50000", "IT"),),
+            correlations=matrix,
+        )
+        # One correlated name, limit is 2 -> allowed, and that is the point:
+        # the values flow through and mean what the guard thinks they mean.
+        assert self._engine().evaluate(rec, ctx).checks_passed[-1] == "net_exposure"
