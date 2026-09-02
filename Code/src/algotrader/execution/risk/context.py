@@ -17,10 +17,18 @@ the check that reads it is required to reject rather than assume — see
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import TypeVar
 
 from algotrader.common.enums import Direction
+
+#: `require` is generic so a narrowed type comes back, rather than `object`
+#: plus an `assert isinstance(...)` at every call site. Those asserts vanish
+#: under `python -O`, which would leave the narrowing unchecked in exactly the
+#: build most likely to run unattended.
+T = TypeVar("T")
 
 
 class RiskContextError(ValueError):
@@ -79,10 +87,26 @@ class RiskContext:
     slots_used: int = 0
 
     # -- the symbol under consideration -------------------------------------
-    #: T2T / ASM / GSM / F&O-ban flags, re-verified at ORDER time rather than
-    #: trusted from the pre-market snapshot — a symbol can enter a ban list
-    #: intraday.
-    symbol_tradable: bool | None = None
+    #: Restrictions that BLOCK trading this symbol — T2T, ASM, GSM, F&O ban —
+    #: re-verified at ORDER time rather than trusted from the pre-market
+    #: snapshot, because a symbol can enter a ban list intraday.
+    #:
+    #: Three states, and the difference between two of them is the whole point:
+    #:
+    #: * ``None``  — eligibility was never established. A **rejection**, never
+    #:   read as "no restrictions found". This is the state an unwired E04
+    #:   leaves, so the safe reading is the one that refuses.
+    #: * ``()``    — checked, and clean.
+    #: * non-empty — checked, and blocked. The labels reach the rejection
+    #:   detail, because "not tradable" without the reason tells an operator
+    #:   nothing they can act on.
+    #:
+    #: **The contract E04 must meet:** put here only what BLOCKS. Deciding
+    #: which surveillance flags qualify belongs where the data is, not in a
+    #: risk check that would have to encode NSE's surveillance rules to read a
+    #: flag. A single ``bool`` plus a parallel reasons tuple was rejected for
+    #: making ``tradable=True`` alongside ``("BAN",)`` representable.
+    symbol_restrictions: tuple[str, ...] | None = None
     symbol_sector: str | None = None
     atr: Decimal | None = None
     #: Per-share margin the broker will demand. Separate from `available_margin`
@@ -91,7 +115,23 @@ class RiskContext:
     #: Correlation of the candidate against each open position, by symbol.
     correlations: dict[str, Decimal] = field(default_factory=dict)
 
+    #: Fields typed as tuples that a caller can still hand a list. `frozen=True`
+    #: freezes the *binding*, not what it points at, so a list here would let a
+    #: caller keep a reference and mutate the context between checks — making
+    #: the outcome depend on check order in exactly the way the docstring above
+    #: says it must not. Deserialised input (JSON has no tuples) is the
+    #: realistic route in.
+    _SEQUENCE_FIELDS = ("unhealthy_services", "open_positions", "symbol_restrictions")
+
     def __post_init__(self) -> None:
+        for name in self._SEQUENCE_FIELDS:
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, tuple):
+                if isinstance(value, str) or not isinstance(value, Sequence):
+                    raise RiskContextError(
+                        f"{name} must be a sequence of values, got {type(value).__name__}"
+                    )
+                object.__setattr__(self, name, tuple(value))
         if self.now.tzinfo is None:
             raise RiskContextError("RiskContext.now must be timezone-aware")
         if self.squareoff_deadline.tzinfo is None:
@@ -134,7 +174,7 @@ class RiskContext:
             return Decimal(0)
         return sum((p.notional for p in self.open_positions if p.sector == sector), Decimal(0))
 
-    def require(self, value: object, what: str) -> object:
+    def require(self, value: T | None, what: str) -> T:
         """Read a value that must be present, or say precisely what was missing.
 
         The alternative — a check quietly treating ``None`` as zero — is the

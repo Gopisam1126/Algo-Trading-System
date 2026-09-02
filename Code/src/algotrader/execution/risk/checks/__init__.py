@@ -6,6 +6,17 @@ eligibility asks about this instrument, portfolio checks ask about the book,
 and loss/margin checks ask about capital.
 """
 
+from algotrader.execution.risk.checks.eligibility import (
+    ELIGIBILITY_ORDER,
+    MAX_RESTRICTIONS_NAMED,
+    NOT_ALREADY_HELD_CHECK,
+    SLOT_AVAILABLE_CHECK,
+    SYMBOL_TRADABLE_CHECK,
+    build_eligibility_checks,
+    check_slot_available,
+    check_symbol_not_already_held,
+    check_symbol_tradable,
+)
 from algotrader.execution.risk.checks.preconditions import (
     HEALTH_GATE_CHECK,
     KILL_SWITCH_CHECK,
@@ -19,13 +30,22 @@ from algotrader.execution.risk.checks.preconditions import (
 )
 
 __all__ = [
+    "ELIGIBILITY_ORDER",
     "HEALTH_GATE_CHECK",
     "KILL_SWITCH_CHECK",
+    "MAX_RESTRICTIONS_NAMED",
+    "NOT_ALREADY_HELD_CHECK",
     "PRECONDITION_ORDER",
+    "SLOT_AVAILABLE_CHECK",
+    "SYMBOL_TRADABLE_CHECK",
+    "build_eligibility_checks",
     "build_no_trade_window_check",
     "build_precondition_checks",
     "build_trading_window_check",
     "check_health_gate",
     "check_kill_switch",
+    "check_slot_available",
+    "check_symbol_not_already_held",
+    "check_symbol_tradable",
     "validate_no_trade_windows",
 ]

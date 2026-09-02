@@ -1725,9 +1725,43 @@ Kill switch · health gate · trading window · no-trade window.
 ---
 
 ### E14-S03 · Symbol eligibility checks (5–7)
-`P0` `Phase 5` `🔴` `FEAT` · **1 day** · deps: E14-S01, E04
+`P0` `Phase 5` `🔴` `FEAT` · **1 day** · deps: E14-S01
 
 Symbol tradable (re-verified at order time) · slot available · not already held.
+
+> Dependency corrected 2 Sep 2026. It read `E14-S01, E04`, which blocks the
+> whole story behind an epic of data fetchers. Every value these three checks
+> read is already on `RiskContext`. E04 is what *populates* check 5's input in
+> production — runtime wiring, not a build dependency. Building the check
+> first is also the safer order: with eligibility unknown it fails closed, so
+> until E04 exists the system refuses unverified symbols rather than trading
+> blind.
+
+**Tasks**
+- [ ] `check_symbol_tradable` — reads `ctx.symbol_restrictions`; UNKNOWN rejects
+- [ ] `check_slot_available` — `ctx.slots_available > 0`
+- [ ] `check_symbol_not_already_held` — `ctx.holds()`, either direction
+- [ ] `build_eligibility_checks` + `ELIGIBILITY_ORDER`, after the pre-conditions
+
+**Acceptance**
+- 🔴 AC1 Any blocking restriction rejects with `SYMBOL_NOT_TRADABLE`, and the
+  detail **names** the restrictions
+- 🔴 AC2 Eligibility never established **rejects**. "Not checked" must never
+  read as "no restrictions" — fail closed
+- AC3 A symbol checked and found clean passes
+- 🔴 AC4 No free slot rejects with `NO_SLOT_AVAILABLE`; the detail gives
+  used/total, because contention and misconfiguration need different responses
+- 🔴 AC5 A symbol already held rejects with `ALREADY_HOLDING` regardless of the
+  direction held — a reversal is not an entry
+- AC6 **(control)** A clean symbol, a free slot and a flat book pass all three
+- AC7 Order is symbol_tradable, slot_available, symbol_not_already_held, and
+  the set runs **after** the four pre-conditions
+
+> **The contract E04 must meet.** `ctx.symbol_restrictions` carries only what
+> BLOCKS trading. Which surveillance flags qualify is E04's decision, made
+> where the data is — a risk check should not have to encode NSE's
+> surveillance rules to read a flag. Three states: `None` never checked
+> (reject), `()` checked and clean, non-empty blocked.
 
 ---
 

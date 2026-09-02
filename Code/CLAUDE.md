@@ -129,10 +129,10 @@ Never commit a `.env`, a credential, or anything under `data/`.
 ## Current state
 
 **The deterministic path is built from tick to a `RiskDecision`. Nothing
-trades, and nothing can — ten of the fourteen risk checks are unwritten and
+trades, and nothing can — seven of the fourteen risk checks are unwritten and
 there is no sizing and no order placement.**
 
-Built and tested (**1,212 tests, 82% coverage** — 965 pass locally, 247 need
+Built and tested (**1,316 tests, 82% coverage** — 1,069 pass locally, 247 need
 Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -151,10 +151,11 @@ Docker):
   snapshot, pivots and opening range.
 - **Strategy runtime** — the 27 primitives now execute.
 - **E14 risk engine, partial** — the ordered fail-fast check pipeline
-  (E14-S01) and pre-condition checks 1–4 (E14-S02: kill switch, health gate,
-  trading window, no-trade window). A check that *raises* is a REJECTION, not
-  a skip, reported as `RISK_ENGINE_FAULT` — the one `RejectReason` that means
-  "the system is broken" rather than "the answer is no". Checks 5–14 are not
+  (E14-S01), pre-conditions 1–4 (E14-S02: kill switch, health gate, trading
+  window, no-trade window) and symbol eligibility 5–7 (E14-S03: tradable, slot
+  available, not already held). A check that *raises* is a REJECTION, not a
+  skip, reported as `RISK_ENGINE_FAULT` — the one `RejectReason` that means
+  "the system is broken" rather than "the answer is no". Checks 8–14 are not
   written, so the engine cannot yet approve anything and there is nothing
   downstream of it.
 
@@ -165,7 +166,7 @@ nothing else — no sizer, no order manager.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,212 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,316 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -193,6 +194,25 @@ Recorded because each was believed, written down, and wrong.
 - **"Coverage means the tests would catch it."** Mutation testing injected 15
   plausible defects; two survived, both because the tests exercised a helper
   directly rather than the path that calls it.
+- **"Validating the untrusted field fixes log forgery."** It fixes it for
+  *that field*. Log forgery has now been found three times — QA-SEC-16 on
+  `OrderRequest.symbol`, QA-SEC-28 on `Trigger`/`Recommendation`, QA-SEC-30 on
+  E14-S03's surveillance-restriction labels, which come from a different
+  source entirely. The pattern is **any untrusted string interpolated into a
+  rejection detail forges a log line**, and fourteen checks are each free to
+  interpolate whatever they read. The rule now lives in `CheckOutcome`, where
+  details are constructed, so a check written next year gets it for free.
+  When a defect recurs a third time, fix the class, not the instance.
+- **"Capping the count bounds the output."** It does not. `MAX_RESTRICTIONS_
+  NAMED = 8` still allowed an 80,054-character detail from eight long labels
+  — written one story after QA-SEC-29, in a comment that cited QA-SEC-29.
+  Bound the thing that reaches the log and the database, not the thing you
+  happened to be counting.
+- **"`frozen=True` makes the context immutable."** It freezes the *binding*,
+  not what it points at. `RiskContext` accepted a `list` for a `tuple`-typed
+  field, leaving the caller holding a live reference into state the checks
+  were about to read. JSON has no tuples, so any deserialised context is the
+  route in. QA-SEC-32.
 - **"The symbol validator is applied."** It was — on `OrderRequest`, and only
   there. The same untrusted broker value reaches `Trigger` and
   `Recommendation` first, and the risk engine logs it on every rejection. A
@@ -247,12 +267,12 @@ Recorded because each was believed, written down, and wrong.
 
 The keystone is gone, so E12 (backtest harness, gauntlet) and E13 (signal
 loop) are unblocked. **E14, the risk engine, is in progress** — S01 (the
-framework) and S02 (pre-conditions 1–4) are delivered; S03 symbol eligibility
-(5–7), S04 portfolio exposure (8–10) and S05 loss/margin (11–14) are next, and
-they are what the engine needs before it can approve anything. All of it is
-pure computation with no credentials and no external data. After that, a
-vertical slice through paper trading is the first thing that would be evidence
-about the system rather than its parts.
+framework), S02 (pre-conditions 1–4) and S03 (eligibility 5–7) are delivered;
+S04 portfolio exposure (8–10), S05 loss limits (11–12) and S06 margin and
+timing (13–14) are next, and they are what the engine needs before it can
+approve anything. All of it is pure computation with no credentials and no
+external data. After that, a vertical slice through paper trading is the first
+thing that would be evidence about the system rather than its parts.
 
 ### How to do the work
 

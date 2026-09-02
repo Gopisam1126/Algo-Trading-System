@@ -109,9 +109,9 @@ resolve to "no trade" rather than a forced decision.
 |---|---|
 | Python code | 15,427 lines (`src/`, 72 modules) + 15,046 lines of tests (52 files) |
 | Design documentation | ~11,600 lines across 13 documents |
-| Tests | **1,212** — 303 of them security tests. Locally 965 pass and 247 are Docker-gated; CI runs the container tests too |
+| Tests | **1,316** — 328 of them security tests. Locally 1,069 pass and 247 are Docker-gated; CI runs the container tests too |
 | Test coverage | **82%** statement/branch across `src/`, measured with the container tests skipped |
-| Mutation testing | 45 injected defects across the safety-critical paths, **44 killed, 1 verified benign** |
+| Mutation testing | 61 injected defects across the safety-critical paths, **60 killed, 1 verified benign** |
 | Database migrations | 5, forward and reverse verified |
 | Strategy primitives | 27 registered **and 27 implemented** (see §2.4) |
 | Git commits | 43, on branch `DEV` |
@@ -159,7 +159,7 @@ Package sizes, which say more than a total:
 | Service | Status |
 |---|---|
 | `signals/` | ❌ Empty — the evaluation **loop** (the evaluator it would drive exists) |
-| `execution/` | 🟡 **Risk engine started** (E14-S01 framework, E14-S02 pre-conditions 1–4). Still **no order placement and no sizing** — ten of the fourteen checks are unwritten, so nothing can approve anything |
+| `execution/` | 🟡 **Risk engine started** (E14-S01 framework, E14-S02 pre-conditions 1–4, E14-S03 eligibility 5–7). Still **no order placement and no sizing** — seven of the fourteen checks are unwritten, so nothing can approve anything |
 | `orchestrator/` | ❌ Empty — no scheduler |
 | `premarket/` | ❌ Empty — no daily pipeline |
 | `macro/` | ❌ Empty — no news or macro pipeline |

@@ -40,10 +40,12 @@ from algotrader.common.enums import AIVerdict, Direction, Regime, RejectReason, 
 from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import AIReview, Recommendation
 from algotrader.execution.risk.checks import (
+    ELIGIBILITY_ORDER,
     PRECONDITION_ORDER,
+    build_eligibility_checks,
     build_precondition_checks,
 )
-from algotrader.execution.risk.context import RiskContext
+from algotrader.execution.risk.context import OpenPosition, RiskContext
 from algotrader.execution.risk.framework import RiskEngine
 from algotrader.indicators.engine import IndicatorEngine, warm_up_symbols
 from algotrader.indicators.levels import OpeningRange
@@ -450,6 +452,9 @@ class TestTheTriggerReachesARiskDecision:
             "capital": Decimal("500000"),
             "slots_total": 5,
             "slots_used": 0,
+            # E14-S03. `()` means "checked, and clean" -- NOT None, which means
+            # eligibility was never established and must reject.
+            "symbol_restrictions": (),
         }
         base.update(overrides)
         return RiskContext(**base)
@@ -522,3 +527,158 @@ class TestTheTriggerReachesARiskDecision:
         assert len(written) == 1
         assert written[0]["correlation_id"] == CID
         assert written[0]["stage"] == "kill_switch"
+
+
+class TestTheTriggerMeetsSymbolEligibility:
+    """QA-2 for E14-S03: checks 5-7 against a REAL Trigger, wired behind the
+    real pre-conditions.
+
+    The seam this exercises is the one the unit tests structurally cannot see:
+    the symbol the risk engine tests for eligibility is the symbol the
+    *pipeline* produced, carried through cleaning, bars, indicators, the
+    strategy runtime and `Recommendation.build`. A mismatch anywhere in that
+    chain -- a renamed field, a symbol normalised on one side and not the
+    other -- makes `ctx.holds(rec.symbol)` quietly answer False forever, and
+    the already-held gate stops being a gate while every unit test still
+    passes.
+    """
+
+    @staticmethod
+    def _review() -> AIReview:
+        return AIReview(
+            verdict=AIVerdict.CONFIRM,
+            confidence=Decimal("0.80"),
+            timeframe_agreement=3,
+            thesis_alignment="aligned",
+            rationale="eligibility seam probe",
+            model_used="test-harness",
+            latency_ms=0,
+        )
+
+    def _recommendation(self, run, evaluator) -> Recommendation:
+        trigger = evaluator.fire(run.context(), correlation_id=CID)
+        assert trigger is not None, "the pipeline must fire for this seam to be testable"
+        return Recommendation.build(trigger, self._review(), now=run.context().now)
+
+    @staticmethod
+    def _calendar() -> MarketCalendar:
+        status = load_holidays_with_status(
+            str(Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml")
+        )
+        return MarketCalendar(status.dates, covers_years=status.covers_years)
+
+    def _engine(self, audit=None) -> RiskEngine:
+        """All seven built checks, in their real order."""
+        return RiskEngine(
+            checks=[
+                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+            ],
+            audit=audit,
+        )
+
+    @staticmethod
+    def _risk_ctx(**overrides) -> RiskContext:
+        base: dict = {
+            "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
+            "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
+            "capital": Decimal("500000"),
+            "slots_total": 5,
+            "slots_used": 0,
+            "symbol_restrictions": (),
+        }
+        base.update(overrides)
+        return RiskContext(**base)
+
+    def test_a_clean_real_trigger_clears_all_seven(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(self._recommendation(run, evaluator), self._risk_ctx())
+        assert decision.checks_passed == [*PRECONDITION_ORDER, *ELIGIBILITY_ORDER]
+
+    def test_a_restricted_symbol_stops_a_real_trigger(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(symbol_restrictions=("T2T",)),
+        )
+        assert decision.reason is RejectReason.SYMBOL_NOT_TRADABLE
+        assert "T2T" in (decision.detail or "")
+
+    def test_unverified_eligibility_stops_a_real_trigger(self, run, evaluator) -> None:
+        """The state an unwired E04 leaves. The pipeline fired, the strategy is
+        happy, and the risk layer refuses because nobody established whether
+        this instrument may be traded today."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(symbol_restrictions=None),
+        )
+        assert not decision.approved
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_a_full_book_stops_a_real_trigger(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(slots_total=5, slots_used=5),
+        )
+        assert decision.reason is RejectReason.NO_SLOT_AVAILABLE
+
+    def test_the_symbol_the_pipeline_produced_is_the_one_matched_as_held(
+        self, run, evaluator
+    ) -> None:
+        """The real point of doing this at the seam.
+
+        The held position is built from `rec.symbol` -- whatever the pipeline
+        actually emitted -- rather than from the SYMBOL constant. If the two
+        ever diverge, this still holds, whereas a test that hardcoded the
+        constant would pass while the gate silently matched nothing.
+        """
+        rec = self._recommendation(run, evaluator)
+        held = OpenPosition(
+            symbol=rec.symbol,
+            direction=Direction.LONG,
+            quantity=40,
+            entry_price=rec.trigger_price,
+            stop_price=rec.suggested_stop,
+        )
+        decision = self._engine().evaluate(rec, self._risk_ctx(open_positions=(held,)))
+        assert decision.reason is RejectReason.ALREADY_HOLDING
+        assert rec.symbol in (decision.detail or "")
+
+    def test_holding_a_different_name_does_not_block_this_one(self, run, evaluator) -> None:
+        """The control. A gate matching on the wrong thing -- or on nothing --
+        would reject here too, and the test above alone could not tell."""
+        rec = self._recommendation(run, evaluator)
+        other = OpenPosition(
+            symbol="SOMETHINGELSE",
+            direction=Direction.LONG,
+            quantity=10,
+            entry_price=Decimal("100"),
+            stop_price=Decimal("95"),
+        )
+        decision = self._engine().evaluate(
+            rec, self._risk_ctx(slots_used=1, open_positions=(other,))
+        )
+        assert decision.checks_passed == [*PRECONDITION_ORDER, *ELIGIBILITY_ORDER]
+
+    def test_a_precondition_still_wins_over_an_eligibility_failure(self, run, evaluator) -> None:
+        """Order across the two groups, at the seam. With both a blackout and a
+        banned symbol, an operator must see the blackout -- the more
+        fundamental reason, and the one that explains every other candidate
+        being refused at the same moment."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(
+                now=_dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
+                symbol_restrictions=("T2T",),
+            ),
+        )
+        assert decision.reason is RejectReason.NO_TRADE_WINDOW
+
+    def test_the_audit_records_which_eligibility_check_stopped_it(self, run, evaluator) -> None:
+        written: list[dict] = []
+        self._engine(audit=written.append).evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(symbol_restrictions=("GSM_3",)),
+        )
+        assert len(written) == 1
+        assert written[0]["stage"] == "symbol_tradable"
+        assert written[0]["correlation_id"] == CID
+        assert written[0]["payload"]["checks_passed"] == list(PRECONDITION_ORDER)
