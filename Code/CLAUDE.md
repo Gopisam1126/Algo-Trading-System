@@ -128,10 +128,12 @@ Never commit a `.env`, a credential, or anything under `data/`.
 
 ## Current state
 
-**The deterministic path is built from tick to `Trigger`. Nothing trades, and
-nothing can — there is no risk engine and no order placement.**
+**The deterministic path is built from tick to a `RiskDecision`. Nothing
+trades, and nothing can — ten of the fourteen risk checks are unwritten and
+there is no sizing and no order placement.**
 
-Built and tested (**1,059 tests, 90% coverage**):
+Built and tested (**1,212 tests, 82% coverage** — 965 pass locally, 247 need
+Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
   redacting logging, NSE calendar, broker protocol, strategy DSL.
@@ -148,14 +150,20 @@ Built and tested (**1,059 tests, 90% coverage**):
   VolumeRatio verified against TA-Lib, warm-up orchestration, multi-timeframe
   snapshot, pivots and opening range.
 - **Strategy runtime** — the 27 primitives now execute.
+- **E14 risk engine, partial** — the ordered fail-fast check pipeline
+  (E14-S01) and pre-condition checks 1–4 (E14-S02: kill switch, health gate,
+  trading window, no-trade window). A check that *raises* is a REJECTION, not
+  a skip. Checks 5–14 are not written, so the engine cannot yet approve
+  anything and there is nothing downstream of it.
 
-**Empty (`__init__.py` only):** `signals/`, `execution/`, `orchestrator/`,
-`premarket/`, `api/`, `notifier/`, `ai/`, `macro/`.
+**Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
+`api/`, `notifier/`, `ai/`, `macro/`. `execution/` now holds `risk/` and
+nothing else — no sizer, no order manager.
 
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,059 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,212 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -183,6 +191,20 @@ Recorded because each was believed, written down, and wrong.
 - **"Coverage means the tests would catch it."** Mutation testing injected 15
   plausible defects; two survived, both because the tests exercised a helper
   directly rather than the path that calls it.
+- **"The symbol validator is applied."** It was — on `OrderRequest`, and only
+  there. The same untrusted broker value reaches `Trigger` and
+  `Recommendation` first, and the risk engine logs it on every rejection. A
+  newline in a symbol forged two lines reading *"CRITICAL kill switch disarmed
+  by operator"* into the log an incident would be reconstructed from. A
+  validator applied to one of three boundaries is not a validator: define it
+  once, above the first model that needs it.
+- **"`"integration" in item.keywords` checks the marker."** It also matches
+  every ancestor *node name*, so it matched the `tests/integration/`
+  **directory**. The only system-level test in the repo — which uses no
+  container at all — was gated on Docker and had been reporting as skipped on
+  a suite that called itself green. Use `item.get_closest_marker(...)`. A test
+  that quietly stops running is worse than one that fails, because nothing
+  asks why.
 
 ### Corporate actions — read before touching `ohlcv`
 
@@ -214,12 +236,13 @@ Recorded because each was believed, written down, and wrong.
 ### Next
 
 The keystone is gone, so E12 (backtest harness, gauntlet) and E13 (signal
-loop) are unblocked. The highest-value next step is **E14, the risk engine** —
-9 P0 stories, entirely pure computation, no credentials and no external data,
-with its input contract (`Recommendation`), output contract (`RiskDecision`,
-`SizingResult`), config bounds, `decision_log` table and `ATR.as_decimal()`
-all already in place. After that, a vertical slice through paper trading is
-the first thing that would be evidence about the system rather than its parts.
+loop) are unblocked. **E14, the risk engine, is in progress** — S01 (the
+framework) and S02 (pre-conditions 1–4) are delivered; S03 symbol eligibility
+(5–7), S04 portfolio exposure (8–10) and S05 loss/margin (11–14) are next, and
+they are what the engine needs before it can approve anything. All of it is
+pure computation with no credentials and no external data. After that, a
+vertical slice through paper trading is the first thing that would be evidence
+about the system rather than its parts.
 
 ### How to do the work
 

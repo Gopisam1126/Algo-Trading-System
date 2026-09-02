@@ -56,6 +56,27 @@ def _require_utc(v: datetime) -> datetime:
 # ---------------------------------------------------------------------------
 
 
+#: Instrument symbols arrive from the broker's daily dump — external data this
+#: system does not author — and flow into log lines, broker payloads and Redis
+#: keys. QA-SEC-16 closed the log-forgery hole on ``OrderRequest`` and stopped
+#: there; the SAME value reaches ``Trigger`` and ``Recommendation`` first, and a
+#: newline in either forges a line in the log an incident is reconstructed
+#: from. Defined here, above the first model that needs it, so every boundary
+#: shares one definition of what a symbol may contain.
+_SAFE_SYMBOL = re.compile(r"[A-Za-z0-9_\-&.]{1,64}")
+
+
+def _validate_symbol(value: str) -> str:
+    if _SAFE_SYMBOL.fullmatch(value) is None:
+        shown = value[:32]
+        raise ValueError(
+            f"symbol {shown!r} is not a valid instrument symbol. Allowed: letters, "
+            f"digits and _ - & . (1-64 chars). A newline here forges a log line; "
+            f"a ':' collides with another Redis key."
+        )
+    return value
+
+
 class Trigger(_Frozen):
     """A deterministic strategy firing.  No AI involvement at this point."""
 
@@ -69,6 +90,7 @@ class Trigger(_Frozen):
     fired_at: datetime
 
     _utc = field_validator("fired_at")(_require_utc)
+    _symbol = field_validator("symbol")(_validate_symbol)
 
     @model_validator(mode="after")
     def _stop_on_correct_side(self) -> Trigger:
@@ -136,6 +158,7 @@ class Recommendation(_Frozen):
     emitted_at: datetime
 
     _utc = field_validator("emitted_at")(_require_utc)
+    _symbol = field_validator("symbol")(_validate_symbol)
 
     @classmethod
     def build(
@@ -286,20 +309,6 @@ class RiskDecision(_Frozen):
 #: Same allowlist as ``common/redis/keys._SAFE_COMPONENT``, deliberately: one
 #: definition of what a symbol may contain, applied wherever untrusted symbol
 #: text crosses a boundary.
-_SAFE_SYMBOL = re.compile(r"[A-Za-z0-9_\-&.]{1,64}")
-
-
-def _validate_symbol(value: str) -> str:
-    if _SAFE_SYMBOL.fullmatch(value) is None:
-        shown = value[:32]
-        raise ValueError(
-            f"symbol {shown!r} is not a valid instrument symbol. Allowed: letters, "
-            f"digits and _ - & . (1-64 chars). A newline here forges a log line; "
-            f"a ':' collides with another Redis key."
-        )
-    return value
-
-
 class OrderRequest(_Frozen):
     """An order about to be sent to the broker.
 

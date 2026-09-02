@@ -1667,7 +1667,12 @@ AI flags when the day's premise has broken; system stops new entries.
 *Phase 5 · 9 stories · 14 days · **Highest-risk epic. 100% coverage required.***
 
 ### E14-S01 · Risk check framework
-`P0` `Phase 5` `🔴` `FEAT` · **1.5 days** · deps: E13-S04
+`P0` `Phase 5` `🔴` `FEAT` · **1.5 days** · deps: E00-S02
+
+> Dependency corrected 25 Aug 2026. It read `E13-S04` (Recommendation
+> emission), which taken literally chained the deterministic risk engine
+> behind the entire AI layer. This story needs the `Recommendation` *type*,
+> not the thing that emits it.
 
 **Tasks**
 - [ ] Ordered, fail-fast check pipeline
@@ -1685,6 +1690,37 @@ AI flags when the day's premise has broken; system stops new entries.
 `P0` `Phase 5` `🔴` `FEAT` · **1 day** · deps: E14-S01
 
 Kill switch · health gate · trading window · no-trade window.
+
+**Tasks**
+- [ ] `check_kill_switch` (C8) — reads `ctx.kill_switch_active`; E14-S09 owns
+      the switch itself, so this check cannot clear what it tests
+- [ ] `check_health_gate` — any unhealthy service rejects, detail names which
+- [ ] `check_trading_window` — `MarketCalendar.is_market_open(ctx.now)`
+- [ ] `check_no_trade_window` — `config.execution.no_trade_windows`
+- [ ] A factory building the four in order, closing over calendar and config
+
+**Acceptance**
+- 🔴 AC1 An active kill switch rejects with `KILL_SWITCH_ACTIVE`, and does so
+  **first** — no later check runs
+- 🔴 AC2 Any unhealthy service rejects with `HEALTH_GATE_FAILED`, detail names it
+- AC3 Outside continuous trading — weekend, holiday, pre-open, post-close —
+  rejects with `OUTSIDE_TRADING_WINDOW`
+- AC4 Inside a configured `no_trade_window`, rejects with `NO_TRADE_WINDOW` and
+  the detail names **which** window matched
+- AC5 **(control)** A normal mid-session moment, switch off and all services
+  healthy, passes all four. Without this, four checks that rejected everything
+  would satisfy AC1–AC4 perfectly
+- AC6 Registration order is kill_switch, health_gate, trading_window,
+  no_trade_window — cheapest and most absolute first
+- AC7 An uncovered holiday year makes the calendar **raise**, which the
+  framework turns into a rejection rather than a pass (fail closed)
+
+> The trading window and the no-trade windows both describe "when not to
+> trade" and overlap at the open. They are split on **source**, not time:
+> `trading_window` asks the calendar whether the market is open at all;
+> `no_trade_window` asks config whether we are choosing to sit a period out.
+> Overlap is then harmless, and the two rejections mean different things to
+> an operator.
 
 ---
 

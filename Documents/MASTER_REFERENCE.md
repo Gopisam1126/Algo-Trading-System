@@ -107,14 +107,14 @@ resolve to "no trade" rather than a forced decision.
 
 | Metric | Value |
 |---|---|
-| Python code | 14,415 lines (`src/`, 66 modules) + 13,208 lines of tests (45 files) |
+| Python code | 15,427 lines (`src/`, 72 modules) + 15,046 lines of tests (52 files) |
 | Design documentation | ~11,600 lines across 13 documents |
-| Tests | **1,059 passing** — 245 of them security tests |
-| Test coverage | **90%** statement/branch across `src/` |
-| Mutation testing | 15 injected defects on the safety-critical paths, **15 killed** |
+| Tests | **1,212** — 303 of them security tests. Locally 965 pass and 247 are Docker-gated; CI runs the container tests too |
+| Test coverage | **82%** statement/branch across `src/`, measured with the container tests skipped |
+| Mutation testing | 42 injected defects across the safety-critical paths, **41 killed, 1 verified benign** |
 | Database migrations | 5, forward and reverse verified |
 | Strategy primitives | 27 registered **and 27 implemented** (see §2.4) |
-| Git commits | 36, on branch `DEV` |
+| Git commits | 43, on branch `DEV` |
 | **Trades placed** | **Zero. Nothing trades.** |
 
 Package sizes, which say more than a total:
@@ -159,7 +159,7 @@ Package sizes, which say more than a total:
 | Service | Status |
 |---|---|
 | `signals/` | ❌ Empty — the evaluation **loop** (the evaluator it would drive exists) |
-| `execution/` | ❌ Empty — **no risk engine, no order placement, no sizing** |
+| `execution/` | 🟡 **Risk engine started** (E14-S01 framework, E14-S02 pre-conditions 1–4). Still **no order placement and no sizing** — ten of the fourteen checks are unwritten, so nothing can approve anything |
 | `orchestrator/` | ❌ Empty — no scheduler |
 | `premarket/` | ❌ Empty — no daily pipeline |
 | `macro/` | ❌ Empty — no news or macro pipeline |
@@ -173,7 +173,7 @@ Package sizes, which say more than a total:
 **Eight service packages are one line each, and nothing composes the five that
 are built.** No module in `src/` imports both `ingest` and `indicators`. That
 is on plan — assembly is E11's pre-market pipeline and E13's signal loop — but
-it changes what the test count means: 1,059 tests are claims about
+it changes what the test count means: 1,212 tests are claims about
 *components*. There is exactly one test of the *system*
 (`tests/integration/test_tick_to_trigger.py`), and it was written deliberately
 to find what component tests cannot. It found a HIGH-severity defect

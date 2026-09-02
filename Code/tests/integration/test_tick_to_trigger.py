@@ -22,16 +22,29 @@ ATR computed on cleaned ticks must still be a placeable NSE price.
 
 from __future__ import annotations
 
+# --- E14-S02: the chain continues into the risk engine ---------------------
+import datetime as _dt
 import datetime as dt
 import random
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
-from algotrader.common.calendar import MarketCalendar
-from algotrader.common.enums import Direction, Regime, Timeframe
+from algotrader.common.calendar import (
+    MarketCalendar,
+    load_holidays_with_status,
+)
+from algotrader.common.enums import AIVerdict, Direction, Regime, RejectReason, Timeframe
 from algotrader.common.models.market import Bar
+from algotrader.common.models.trading import AIReview, Recommendation
+from algotrader.execution.risk.checks import (
+    PRECONDITION_ORDER,
+    build_precondition_checks,
+)
+from algotrader.execution.risk.context import RiskContext
+from algotrader.execution.risk.framework import RiskEngine
 from algotrader.indicators.engine import IndicatorEngine, warm_up_symbols
 from algotrader.indicators.levels import OpeningRange
 from algotrader.ingest import cleaning
@@ -41,6 +54,12 @@ from algotrader.strategy.context import EvalContext
 from algotrader.strategy.dsl import compile_strategy, load_strategy_yaml
 from algotrader.strategy.primitives import registry as primitive_registry
 from algotrader.strategy.runtime import StrategyEvaluator
+
+#: What system.yaml configures.
+NO_TRADE_WINDOWS = (
+    (_dt.time(9, 15), _dt.time(9, 20)),
+    (_dt.time(15, 0), _dt.time(15, 30)),
+)
 
 primitive_registry.install()
 
@@ -367,3 +386,139 @@ class TestBadDataDoesNotReachTheStrategy:
             cold.feed(raw)
         cold.seal_opening_range()
         assert evaluator.fire(cold.context(), correlation_id=CID) is None
+
+
+# ---------------------------------------------------------------------------
+# E14-S02 — the chain now continues into the risk engine
+# ---------------------------------------------------------------------------
+
+
+class TestTheTriggerReachesARiskDecision:
+    """QA-2 for E14-S02: the pre-condition checks against a REAL Trigger.
+
+    The unit tests build a Recommendation by hand. This one takes the trigger
+    that came out of the actual pipeline -- cleaned ticks, real bars, warmed
+    indicators, a compiled strategy -- and puts it through the engine with the
+    real calendar and the real configured windows.
+
+    That matters because the seam has two sides. A hand-built recommendation
+    agrees with whatever the test author imagined; this one carries the
+    timestamps, prices and correlation id the system actually produced, and a
+    mismatch in any of them shows up here rather than in production.
+    """
+
+    #: The AI review is constructed directly -- E10 does not exist yet, and
+    #: E13-S03 is what will produce one for real. Everything else on this path
+    #: is the genuine article.
+    @staticmethod
+    def _review() -> AIReview:
+        return AIReview(
+            verdict=AIVerdict.CONFIRM,
+            confidence=Decimal("0.80"),
+            timeframe_agreement=3,
+            thesis_alignment="aligned",
+            rationale="integration probe",
+            model_used="test-harness",
+            latency_ms=0,
+        )
+
+    def _recommendation(self, run, evaluator) -> Recommendation:
+        trigger = evaluator.fire(run.context(), correlation_id=CID)
+        assert trigger is not None, "the pipeline must fire for this seam to be testable"
+        return Recommendation.build(trigger, self._review(), now=run.context().now)
+
+    @staticmethod
+    def _calendar() -> MarketCalendar:
+        status = load_holidays_with_status(
+            str(Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml")
+        )
+        return MarketCalendar(status.dates, covers_years=status.covers_years)
+
+    def _engine(self, audit=None) -> RiskEngine:
+        return RiskEngine(
+            checks=build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+            audit=audit,
+        )
+
+    @staticmethod
+    def _risk_ctx(**overrides) -> RiskContext:
+        # 2026-08-20 is a Thursday and not a holiday. 05:00 UTC is 10:30 IST --
+        # mid-session, clear of both configured blackouts.
+        base: dict = {
+            "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
+            "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
+            "capital": Decimal("500000"),
+            "slots_total": 5,
+            "slots_used": 0,
+        }
+        base.update(overrides)
+        return RiskContext(**base)
+
+    def test_a_real_trigger_becomes_a_recommendation(self, run, evaluator) -> None:
+        rec = self._recommendation(run, evaluator)
+        assert rec.symbol == SYMBOL
+        assert rec.correlation_id == CID
+
+    def test_the_recommendation_still_carries_no_sizing(self, run, evaluator) -> None:
+        """Invariant 1, checked at the seam rather than on the type. Sizing
+        arrives downstream in E14-S07; if it ever appeared here the
+        AI/deterministic boundary would have moved without anyone deciding to."""
+        rec = self._recommendation(run, evaluator)
+        banned = {"quantity", "capital_at_risk", "stop_price", "notional"}
+        assert not (set(type(rec).model_fields) & banned)
+
+    def test_a_clean_session_clears_all_four_preconditions(self, run, evaluator) -> None:
+        """The control for the whole seam."""
+        decision = self._engine().evaluate(self._recommendation(run, evaluator), self._risk_ctx())
+        assert decision.checks_passed == list(PRECONDITION_ORDER)
+        # No sizer configured, so the engine correctly refuses at the last gate
+        # rather than approving. That IS the fail-closed behaviour.
+        assert not decision.approved
+        assert "no sizer" in (decision.detail or "")
+
+    def test_the_kill_switch_stops_a_real_trigger(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(kill_switch_active=True)
+        )
+        assert decision.reason is RejectReason.KILL_SWITCH_ACTIVE
+        assert decision.checks_passed == []
+
+    def test_a_dead_feed_service_stops_a_real_trigger(self, run, evaluator) -> None:
+        """The degraded-dependency case the strategy layer cannot see: the
+        evaluator fired happily, and the risk layer refuses because a component
+        it depends on is down."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(unhealthy_services=("ingest-svc",)),
+        )
+        assert decision.reason is RejectReason.HEALTH_GATE_FAILED
+        assert "ingest-svc" in (decision.detail or "")
+
+    def test_the_same_trigger_is_refused_after_hours(self, run, evaluator) -> None:
+        """Same recommendation, different clock. The strategy has no opinion
+        about the session; the risk layer does."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(now=_dt.datetime(2026, 8, 20, 11, 0, tzinfo=_dt.UTC)),
+        )
+        assert decision.reason is RejectReason.OUTSIDE_TRADING_WINDOW
+
+    def test_the_same_trigger_is_refused_in_the_closing_blackout(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(now=_dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC)),
+        )
+        assert decision.reason is RejectReason.NO_TRADE_WINDOW
+        assert "15:00-15:30" in (decision.detail or "")
+
+    def test_every_decision_is_audited_with_the_correlation_id(self, run, evaluator) -> None:
+        """The audit chain has to survive the whole way. Without the id the risk
+        decision cannot be joined to the tick sequence that caused it."""
+        written: list[dict] = []
+        engine = self._engine(audit=written.append)
+        engine.evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(kill_switch_active=True)
+        )
+        assert len(written) == 1
+        assert written[0]["correlation_id"] == CID
+        assert written[0]["stage"] == "kill_switch"
