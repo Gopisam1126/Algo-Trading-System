@@ -51,7 +51,12 @@ EXCLUDED: dict[str, tuple[str, ...]] = {
     # on a branch that has no `Documents/` would ship a script that cannot run
     # — the exact class of latent breakage `test_promotion_hygiene.py` exists
     # to catch, one directory over.
-    "QA": ("Documents", "scripts/tracker"),
+    # `.claude` is the development process itself — the /sdlc lifecycle
+    # driver. It governs how work gets BUILT, which is a question the QA
+    # branch does not ask. Same reasoning as `Documents`: QA carries what
+    # the system needs to run and be tested, not the material describing
+    # how it came to be.
+    "QA": ("Documents", "scripts/tracker", ".claude"),
 }
 
 
