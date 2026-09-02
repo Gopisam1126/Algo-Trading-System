@@ -162,7 +162,19 @@ class TestABrokenCheckIsARefusalNotASkip:
         engine = RiskEngine(checks=[RiskCheck("explodes", self._exploding)], sizer=_sizer())
         decision = engine.evaluate(_rec(), _ctx())
         assert not decision.approved
-        assert decision.reason is RejectReason.HEALTH_GATE_FAILED
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_a_raising_check_is_not_reported_as_a_business_rejection(self) -> None:
+        """SIT-001. This frame used to borrow HEALTH_GATE_FAILED for an engine
+        fault, so a broken check looked on the dashboard exactly like a service
+        being down — and an operator would go and check a healthy service.
+
+        signals_rejected_total{reason} is the metric that turns "why isn't it
+        trading?" into a glance; a wrong label there costs the glance."""
+        engine = RiskEngine(checks=[RiskCheck("explodes", self._exploding)], sizer=_sizer())
+        decision = engine.evaluate(_rec(), _ctx())
+        assert decision.reason is not RejectReason.HEALTH_GATE_FAILED
+        assert "explodes" in (decision.detail or "")
 
     def test_a_raising_check_does_not_let_the_pipeline_continue(self) -> None:
         """The dangerous alternative: log-and-continue means the pipeline keeps
@@ -234,6 +246,12 @@ class TestSizingIsTheLastGate:
         decision = engine.evaluate(_rec(), _ctx())
         assert not decision.approved
         assert "ZeroDivisionError" in (decision.detail or "")
+        # SIT-001. Mutation M16 survived the first run because this test
+        # asserted the refusal and the detail but not the LABEL — so flipping
+        # the reason back to HEALTH_GATE_FAILED changed nothing any assertion
+        # could see. The refusal is the safety property; the label is the
+        # operational one, and both are worth pinning.
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
 
     def test_a_zero_quantity_is_a_refusal_carrying_the_binding_constraint(self) -> None:
         """Not an error — every clamp applied and nothing fitted. The binding

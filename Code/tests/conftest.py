@@ -119,12 +119,29 @@ _SKIP_REASON = (
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip anything marked ``integration`` when Docker is unreachable."""
+    """Skip anything MARKED ``integration`` when Docker is unreachable.
+
+    ``get_closest_marker`` rather than ``"integration" in item.keywords``. The
+    keyword form looks equivalent and is not: ``item.keywords`` also contains
+    every ancestor node name, so the DIRECTORY ``tests/integration/`` matched
+    it — and every test underneath was gated on Docker whether or not it
+    touched a container.
+
+    That silently disabled ``test_tick_to_trigger.py``, which uses no fixture
+    from this file at all. It is the only system-level test in the repository,
+    added because component tests cannot see what it sees, and it found a
+    HIGH-severity fail-open on its first run. A machine without Docker Desktop
+    reported it as skipped and the suite as green.
+
+    Every genuinely container-backed file declares
+    ``pytestmark = [pytest.mark.integration]``, so the marker is the honest
+    signal and the path never was.
+    """
     if DOCKER_AVAILABLE:
         return
     skip = pytest.mark.skip(reason=_SKIP_REASON)
     for item in items:
-        if "integration" in item.keywords:
+        if item.get_closest_marker("integration") is not None:
             item.add_marker(skip)
 
 
