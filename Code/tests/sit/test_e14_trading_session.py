@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 import logging
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -33,9 +34,14 @@ from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_s
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
 from algotrader.common.metrics import reset_metrics_for_testing
 from algotrader.common.models.trading import Recommendation
-from algotrader.execution.risk.checks import PRECONDITION_ORDER, build_precondition_checks
-from algotrader.execution.risk.context import RiskContext
-from algotrader.execution.risk.framework import RiskEngine
+from algotrader.execution.risk.checks import (
+    ELIGIBILITY_ORDER,
+    PRECONDITION_ORDER,
+    build_eligibility_checks,
+    build_precondition_checks,
+)
+from algotrader.execution.risk.context import OpenPosition, RiskContext
+from algotrader.execution.risk.framework import RiskCheck, RiskEngine
 
 # --------------------------------------------------------------------------
 # The session under test
@@ -118,13 +124,26 @@ class Session:
     can be made over the WHOLE run rather than over one decision.
     """
 
-    def __init__(self, calendar: MarketCalendar, day: dt.date, **ctx_overrides: object):
+    def __init__(
+        self,
+        calendar: MarketCalendar,
+        day: dt.date,
+        *,
+        checks: Sequence[RiskCheck] | None = None,
+        **ctx_overrides: object,
+    ):
         self.day = day
         self.audit: list[dict[str, object]] = []
-        self.engine = RiskEngine(
-            checks=build_precondition_checks(calendar, NO_TRADE_WINDOWS),
-            audit=self.audit.append,
+        built = (
+            tuple(checks)
+            if checks is not None
+            else build_precondition_checks(calendar, NO_TRADE_WINDOWS)
         )
+        #: What "cleared everything" means for THIS engine. Derived from the
+        #: checks actually registered rather than hardcoded, so a walk with the
+        #: seven-check pipeline and a walk with four are both expressible.
+        self.expected_order = tuple(c.id for c in built)
+        self.engine = RiskEngine(checks=built, audit=self.audit.append)
         self.ctx_overrides = ctx_overrides
         self.decisions: dict[dt.time, object] = {}
         self.log_text = ""
@@ -151,6 +170,9 @@ class Session:
                     "capital": Decimal("500000"),
                     "slots_total": 5,
                     "slots_used": 0,
+                    # `()` is "checked, and clean" -- NOT None, which means
+                    # eligibility was never established and must reject.
+                    "symbol_restrictions": (),
                 }
                 kwargs.update(self.ctx_overrides)
                 if mutate is not None:
@@ -166,15 +188,32 @@ class Session:
 
     # -- views over the run -------------------------------------------------
 
-    def cleared_all_preconditions(self) -> list[dt.time]:
-        """Minutes where all four gates passed. With no sizer configured the
-        engine then refuses, so 'cleared' is read from checks_passed, not from
-        approval — which is the honest reading of a half-built engine."""
+    def fully_cleared(self) -> list[dt.time]:
+        """Minutes where every registered gate passed. With no sizer configured
+        the engine then refuses, so 'cleared' is read from checks_passed rather
+        than from approval — the honest reading of a half-built engine."""
         return sorted(
             t
             for t, d in self.decisions.items()
-            if list(d.checks_passed) == list(PRECONDITION_ORDER)  # type: ignore[attr-defined]
+            if list(d.checks_passed) == list(self.expected_order)  # type: ignore[attr-defined]
         )
+
+    def stopped_by(self) -> dict[dt.time, str]:
+        """Which check actually refused each minute, from the audit `stage`.
+
+        The reason code alone is not enough to answer this. With no sizer
+        configured a fully-cleared candidate is refused by the sizer, which
+        carries RISK_ENGINE_FAULT -- the same code a raising check produces.
+        Filtering a session walk on the reason therefore sweeps up every clean
+        minute as well, which is what this view exists to avoid.
+
+        Audit entries are appended in evaluation order, one per decision, so
+        they zip with the decisions in insertion order.
+        """
+        return {
+            moment: str(entry["stage"])
+            for moment, entry in zip(self.decisions, self.audit, strict=True)
+        }
 
     def reasons(self) -> dict[dt.time, RejectReason | None]:
         return {t: d.reason for t, d in self.decisions.items()}  # type: ignore[attr-defined]
@@ -189,7 +228,7 @@ class TestSit1TheShapeOfTheTradingDay:
     def test_the_tradable_window_is_contiguous_with_no_hole(self, session: Session) -> None:
         """The claim no piecewise test makes. If two gates left a gap anywhere
         in the middle of the day, this is what would see it."""
-        cleared = session.cleared_all_preconditions()
+        cleared = session.fully_cleared()
         assert cleared, "no minute of an ordinary session was tradable"
         first, last = cleared[0], cleared[-1]
         expected_run = []
@@ -202,7 +241,7 @@ class TestSit1TheShapeOfTheTradingDay:
         )
 
     def test_the_window_starts_and_ends_where_it_should(self, session: Session) -> None:
-        cleared = session.cleared_all_preconditions()
+        cleared = session.fully_cleared()
         assert cleared[0] == EXPECTED_FIRST_TRADABLE
         assert cleared[-1] == EXPECTED_LAST_TRADABLE
 
@@ -211,7 +250,7 @@ class TestSit1TheShapeOfTheTradingDay:
     ) -> None:
         """09:20 to 15:00 exclusive. Stated as a count because an off-by-one at
         either boundary changes it and nothing else would."""
-        assert len(session.cleared_all_preconditions()) == 340
+        assert len(session.fully_cleared()) == 340
 
     @pytest.mark.parametrize(
         ("hour", "minute", "expected"),
@@ -271,7 +310,7 @@ class TestSit2WhenSomethingBreaksMidSession:
         }
         expected = {dt.time(11, m) for m in range(0, 30)}
         assert blocked == expected, f"unexpected: {blocked ^ expected}"
-        assert dt.time(11, 30) in session.cleared_all_preconditions(), (
+        assert dt.time(11, 30) in session.fully_cleared(), (
             "the health gate did not release after the service recovered"
         )
 
@@ -279,7 +318,7 @@ class TestSit2WhenSomethingBreaksMidSession:
         session = Session(calendar, TRADING_DAY, kill_switch_active=True).run(
             start=(9, 20), end=(9, 30)
         )
-        assert session.cleared_all_preconditions() == []
+        assert session.fully_cleared() == []
         assert all(
             d.reason is RejectReason.KILL_SWITCH_ACTIVE  # type: ignore[attr-defined]
             for d in session.decisions.values()
@@ -387,7 +426,7 @@ class TestSit3DaysThatAreNotOrdinary:
         self, calendar, day: dt.date, label: str
     ) -> None:
         session = Session(calendar, day).run()
-        assert session.cleared_all_preconditions() == [], f"{label} was tradable"
+        assert session.fully_cleared() == [], f"{label} was tradable"
         assert all(
             d.reason is RejectReason.OUTSIDE_TRADING_WINDOW  # type: ignore[attr-defined]
             for d in session.decisions.values()
@@ -396,7 +435,7 @@ class TestSit3DaysThatAreNotOrdinary:
     def test_the_ordinary_day_is_the_control(self, calendar) -> None:
         """Without this, a calendar that called every day closed would pass
         every test above."""
-        assert Session(calendar, TRADING_DAY).run().cleared_all_preconditions()
+        assert Session(calendar, TRADING_DAY).run().fully_cleared()
 
 
 # --------------------------------------------------------------------------
@@ -468,7 +507,7 @@ class TestSit5ReplayAndRestart:
         first = Session(calendar, TRADING_DAY).run()
         second = Session(calendar, TRADING_DAY).run()
         assert first.reasons() == second.reasons()
-        assert first.cleared_all_preconditions() == second.cleared_all_preconditions()
+        assert first.fully_cleared() == second.fully_cleared()
 
     def test_a_restarted_engine_agrees_with_one_that_has_run_all_day(self, calendar) -> None:
         """The restart case. A gate that accumulated state — a cached calendar
@@ -483,3 +522,202 @@ class TestSit5ReplayAndRestart:
                 list(decision.checks_passed)  # type: ignore[attr-defined]
                 == list(all_day.decisions[moment].checks_passed)  # type: ignore[attr-defined]
             ), moment
+
+
+# --------------------------------------------------------------------------
+# SIT-6 — eligibility across a session (E14-S03)
+# --------------------------------------------------------------------------
+
+
+def _seven(calendar) -> tuple[RiskCheck, ...]:
+    """The full built pipeline: four pre-conditions then three eligibility."""
+    return (
+        *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+        *build_eligibility_checks(),
+    )
+
+
+class TestSit6EligibilityAcrossASession:
+    """Checks 5-7 walked through a whole day, alongside the four that precede
+    them. The question these ask that the unit tests cannot: does adding three
+    gates change the SHAPE of the trading day, and do they release when the
+    condition that tripped them clears?"""
+
+    def test_adding_three_gates_did_not_narrow_the_trading_day(self, calendar) -> None:
+        """The composition property. A clean candidate must clear all seven on
+        exactly the minutes it cleared four — if eligibility silently shaved a
+        minute off either end, that is a gate interacting with the clock, which
+        none of these three has any business doing."""
+        four = Session(calendar, TRADING_DAY).run()
+        seven = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run()
+        assert seven.fully_cleared() == four.fully_cleared()
+        assert len(seven.fully_cleared()) == 340
+
+    def test_a_symbol_banned_mid_session_blocks_from_that_minute_on(self, calendar) -> None:
+        """The case the design exists for: eligibility is re-read at order time
+        precisely because a symbol can enter a ban list intraday. The plan
+        built at 09:00 was right when it was built."""
+
+        def bans_at_noon(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(12, 0):
+                kwargs["symbol_restrictions"] = ("ASM_ST_1",)
+
+        session = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run(mutate=bans_at_noon)
+        cleared = session.fully_cleared()
+        assert cleared[-1] == dt.time(11, 59), "trading continued past the ban"
+        assert cleared[0] == dt.time(9, 20), "the morning was affected too"
+        assert session.decisions[dt.time(12, 0)].reason is RejectReason.SYMBOL_NOT_TRADABLE
+
+    def test_eligibility_going_unavailable_blocks_and_then_releases(self, calendar) -> None:
+        """Both halves. A fetcher that dropped out for half an hour must stop
+        trading for exactly that half hour — and must not leave the gate stuck
+        closed for the rest of the day once it returns."""
+
+        def outage(ist_time: dt.time, kwargs: dict) -> None:
+            if dt.time(11, 0) <= ist_time < dt.time(11, 30):
+                kwargs["symbol_restrictions"] = None
+
+        session = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run(mutate=outage)
+        blocked = {
+            moment for moment, stage in session.stopped_by().items() if stage == "symbol_tradable"
+        }
+        assert blocked == {dt.time(11, m) for m in range(30)}
+        assert dt.time(11, 30) in session.fully_cleared()
+        # And it is a FAULT, not a business rejection -- the fetcher is down,
+        # the symbol is not banned.
+        assert session.decisions[dt.time(11, 0)].reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_unavailable_eligibility_is_not_reported_as_an_untradable_symbol(
+        self, calendar
+    ) -> None:
+        """SIT-001's distinction holding at session scale. "This symbol is
+        banned" is normal operation; "we could not find out" means a fetcher is
+        down, and an operator seeing the first would never go looking for the
+        second."""
+        engine = RiskEngine(checks=_seven(calendar))
+        now = _at(TRADING_DAY, 10, 0)
+        base = {
+            "now": now,
+            "squareoff_deadline": _at(TRADING_DAY, 15, 10),
+            "capital": Decimal("500000"),
+            "slots_total": 5,
+            "slots_used": 0,
+        }
+        unknown = engine.evaluate(
+            _recommendation(now), RiskContext(**base, symbol_restrictions=None)
+        )
+        banned = engine.evaluate(
+            _recommendation(now), RiskContext(**base, symbol_restrictions=("T2T",))
+        )
+        assert banned.reason is RejectReason.SYMBOL_NOT_TRADABLE
+        assert unknown.reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_the_book_filling_up_stops_trading_and_frees_again(self, calendar) -> None:
+        def fills_then_frees(ist_time: dt.time, kwargs: dict) -> None:
+            if dt.time(10, 0) <= ist_time < dt.time(14, 0):
+                kwargs["slots_used"] = 5
+
+        session = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run(
+            mutate=fills_then_frees
+        )
+        blocked = {
+            t for t, d in session.decisions.items() if d.reason is RejectReason.NO_SLOT_AVAILABLE
+        }
+        assert min(blocked) == dt.time(10, 0)
+        assert max(blocked) == dt.time(13, 59)
+        assert dt.time(14, 0) in session.fully_cleared()
+
+    def test_a_position_opened_mid_session_blocks_re_entry_for_the_rest_of_it(
+        self, calendar
+    ) -> None:
+        """The 2x-risk case, walked. Every per-trade limit still reads as
+        satisfied while the name would carry twice its intended risk, which is
+        what makes this worth a gate of its own."""
+        held = OpenPosition(
+            symbol="INFY",
+            direction=Direction.LONG,
+            quantity=40,
+            entry_price=Decimal("1200"),
+            stop_price=Decimal("1186"),
+        )
+
+        def opens_at_eleven(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(11, 0):
+                kwargs["open_positions"] = (held,)
+                kwargs["slots_used"] = 1
+
+        session = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run(
+            mutate=opens_at_eleven
+        )
+        cleared = session.fully_cleared()
+        assert cleared[-1] == dt.time(10, 59)
+        assert session.decisions[dt.time(11, 0)].reason is RejectReason.ALREADY_HOLDING
+        # And it never releases, because the position is still open at 15:00.
+        assert session.decisions[dt.time(14, 59)].reason is RejectReason.ALREADY_HOLDING
+
+    def test_holding_a_different_name_leaves_the_day_untouched(self, calendar) -> None:
+        """The control for the test above. A gate matching on the wrong thing
+        would block the whole afternoon here too."""
+        other = OpenPosition(
+            symbol="SOMETHINGELSE",
+            direction=Direction.LONG,
+            quantity=10,
+            entry_price=Decimal("100"),
+            stop_price=Decimal("95"),
+        )
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_seven(calendar),
+            open_positions=(other,),
+            slots_used=1,
+        ).run()
+        assert len(session.fully_cleared()) == 340
+
+    def test_a_precondition_still_wins_across_the_whole_day(self, calendar) -> None:
+        """Order across the two groups, at every minute rather than one. With a
+        banned symbol all day, every rejection outside the session must still
+        name the session — the more fundamental reason."""
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_seven(calendar),
+            symbol_restrictions=("T2T",),
+        ).run()
+        assert session.decisions[dt.time(8, 0)].reason is RejectReason.OUTSIDE_TRADING_WINDOW
+        assert session.decisions[dt.time(9, 17)].reason is RejectReason.NO_TRADE_WINDOW
+        assert session.decisions[dt.time(10, 0)].reason is RejectReason.SYMBOL_NOT_TRADABLE
+        assert session.fully_cleared() == []
+
+    def test_every_decision_is_still_audited_with_all_seven_registered(self, calendar) -> None:
+        session = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run()
+        assert len(session.audit) == len(session.decisions)
+        for entry in session.audit:
+            assert len(str(entry["stage"])) <= 28, entry["stage"]
+
+    def test_a_hostile_restriction_label_cannot_forge_a_line_across_a_session(
+        self, calendar
+    ) -> None:
+        """QA-SEC-30 at session scale. An hour of rejections carrying a
+        newline-bearing label must still produce exactly one line each."""
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_seven(calendar),
+            symbol_restrictions=("T2T\nCRITICAL kill switch disarmed by operator",),
+        ).run(start=(10, 0), end=(11, 0))
+        lines = [line for line in session.log_text.splitlines() if line.strip()]
+        assert len(lines) == 60, f"60 rejections produced {len(lines)} log lines"
+
+    def test_the_seven_check_day_replays_identically(self, calendar) -> None:
+        first = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run()
+        second = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run()
+        assert first.reasons() == second.reasons()
+        assert first.fully_cleared() == second.fully_cleared()
+
+    def test_the_full_order_is_what_a_cleared_minute_records(self, calendar) -> None:
+        session = Session(calendar, TRADING_DAY, checks=_seven(calendar)).run(
+            start=(10, 0), end=(10, 5)
+        )
+        decision = session.decisions[dt.time(10, 0)]
+        assert list(decision.checks_passed) == [*PRECONDITION_ORDER, *ELIGIBILITY_ORDER]

@@ -74,6 +74,47 @@ class RiskCheckError(RuntimeError):
     """A check could not reach a verdict. Always becomes a rejection."""
 
 
+#: A rejection detail is one line, and no longer than this.
+#:
+#: Both halves are enforced at construction rather than at the log call,
+#: because the log call is not the only consumer — the detail also reaches the
+#: `decision_log.payload` JSONB — and because a rule enforced where the value
+#: is BUILT cannot be forgotten by the fifteenth check somebody adds.
+MAX_DETAIL = 512
+
+#: Control characters that must never survive into a detail. C0 plus DEL.
+_CONTROL = {c: f"\\x{c:02x}" for c in [*range(0x20), 0x7F]}
+_CONTROL.update({0x0A: "\\n", 0x0D: "\\r", 0x09: "\\t"})
+_CONTROL_TABLE = str.maketrans({chr(k): v for k, v in _CONTROL.items()})
+
+
+def _one_safe_line(detail: str) -> str:
+    """Escape control characters and bound the length.
+
+    **This is the third time this defect has been found**, which is why the fix
+    is here rather than at a third source. QA-SEC-16 closed log forgery on
+    ``OrderRequest.symbol``; QA-SEC-28 found the same untrusted symbol reaching
+    ``Trigger`` and ``Recommendation``; QA-SEC-30 found it again in E14-S03's
+    surveillance-restriction labels, which come from NSE data by way of E04.
+
+    The pattern behind all three: *any untrusted string interpolated into a
+    rejection detail forges a log line*. Validating each new source in turn is
+    whack-a-mole with a growing board — fourteen checks, each free to
+    interpolate whatever it reads. Escaping where the detail is CONSTRUCTED is
+    one rule covering every check that exists or will exist.
+
+    Escaping rather than rejecting: the detail is diagnostic text, not a
+    security decision. Refusing to build the outcome would turn an accurate
+    ``SYMBOL_NOT_TRADABLE`` into a generic engine fault and lose the reason an
+    operator needs, which is a worse outcome than a visible ``\\n``.
+    """
+    escaped = detail.translate(_CONTROL_TABLE)
+    if len(escaped) > MAX_DETAIL:
+        keep = MAX_DETAIL - 24
+        escaped = f"{escaped[:keep]}... [{len(escaped) - keep} more chars]"
+    return escaped
+
+
 @dataclass(frozen=True, slots=True)
 class CheckOutcome:
     """One check's verdict.
@@ -84,6 +125,10 @@ class CheckOutcome:
     return UNKNOWN. The strategy layer declines to trade on missing data; the
     risk layer must actively refuse it, and collapsing those two into one
     vocabulary would make "I don't know" look like "no objection".
+
+    The detail is normalised at construction — one line, bounded length — so
+    that no check can emit text that forges a log line or floods the audit
+    payload. See :func:`_one_safe_line`.
     """
 
     passed: bool
@@ -98,6 +143,10 @@ class CheckOutcome:
                 "a failing check must carry a detail — the reason code is the "
                 "category, the detail is what an operator acts on"
             )
+        if self.detail:
+            # frozen dataclass: normalise through object.__setattr__, so every
+            # construction path gets it rather than only the `fail` classmethod.
+            object.__setattr__(self, "detail", _one_safe_line(self.detail))
 
     @classmethod
     def ok(cls) -> CheckOutcome:
