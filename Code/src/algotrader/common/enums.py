@@ -262,6 +262,14 @@ class RejectReason(StrEnum):
 
     KILL_SWITCH_ACTIVE = "KILL_SWITCH_ACTIVE"
     HEALTH_GATE_FAILED = "HEALTH_GATE_FAILED"
+    #: The risk engine itself could not do its job — a check raised, or
+    #: sizing was unavailable or raised. Distinct from every other member
+    #: here, which say "the system worked and the answer is no". This one
+    #: says "the system is broken, and refusing is the safe reading of
+    #: that". SIT-001 found the framework borrowing HEALTH_GATE_FAILED for
+    #: these, which sent an operator looking for a downed service that was
+    #: perfectly healthy.
+    RISK_ENGINE_FAULT = "RISK_ENGINE_FAULT"
     OUTSIDE_TRADING_WINDOW = "OUTSIDE_TRADING_WINDOW"
     NO_TRADE_WINDOW = "NO_TRADE_WINDOW"
     SYMBOL_NOT_TRADABLE = "SYMBOL_NOT_TRADABLE"

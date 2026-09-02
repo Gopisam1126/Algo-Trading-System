@@ -30,6 +30,15 @@ being a check — the pipeline keeps approving, with one fewer gate, and nothing
 in the output says so. Errors are counted on their own metric so a fault never
 hides inside the rejection rate.
 
+*An engine fault is not a business rejection.* Every ``RejectReason`` except
+one means "the system worked and the answer is no". ``RISK_ENGINE_FAULT``
+means "the system is broken, and refusing is the safe reading of that" — a
+check raised, or sizing was unavailable or raised. The distinction is not
+cosmetic: ``signals_rejected_total{reason}`` is the dashboard an operator
+glances at to answer "why isn't it trading?", and SIT-001 found this frame
+reporting those three faults as ``HEALTH_GATE_FAILED``, which sends someone
+looking for a downed service that is perfectly healthy.
+
 *Check IDs are short and stable, not function names.* ``decision_log.stage`` is
 ``String(28)`` and three of the spec's fourteen names are longer than that —
 ``check_time_to_squareoff_deadline`` is 32 characters. Using the function name
@@ -207,7 +216,7 @@ class RiskEngine:
                 rec.symbol,
             )
             return CheckOutcome.fail(
-                RejectReason.HEALTH_GATE_FAILED,
+                RejectReason.RISK_ENGINE_FAULT,
                 f"check {check.id!r} raised {type(exc).__name__}: {exc}"[:400],
             )
 
@@ -216,7 +225,7 @@ class RiskEngine:
         metrics = get_metrics()
         if self.sizer is None:
             decision = RiskDecision.reject(
-                RejectReason.HEALTH_GATE_FAILED,
+                RejectReason.RISK_ENGINE_FAULT,
                 detail=(
                     "every risk check passed but no sizer is configured, so no "
                     "quantity can be computed. Refusing rather than defaulting."
@@ -234,7 +243,7 @@ class RiskEngine:
             metrics.check_errored("sizer")
             log.exception("position sizing raised for %s; refusing the trade", rec.symbol)
             decision = RiskDecision.reject(
-                RejectReason.HEALTH_GATE_FAILED,
+                RejectReason.RISK_ENGINE_FAULT,
                 detail=f"sizing raised {type(exc).__name__}: {exc}"[:400],
                 checks_passed=passed,
                 now=ctx.now,

@@ -111,7 +111,7 @@ resolve to "no trade" rather than a forced decision.
 | Design documentation | ~11,600 lines across 13 documents |
 | Tests | **1,212** — 303 of them security tests. Locally 965 pass and 247 are Docker-gated; CI runs the container tests too |
 | Test coverage | **82%** statement/branch across `src/`, measured with the container tests skipped |
-| Mutation testing | 42 injected defects across the safety-critical paths, **41 killed, 1 verified benign** |
+| Mutation testing | 45 injected defects across the safety-critical paths, **44 killed, 1 verified benign** |
 | Database migrations | 5, forward and reverse verified |
 | Strategy primitives | 27 registered **and 27 implemented** (see §2.4) |
 | Git commits | 43, on branch `DEV` |

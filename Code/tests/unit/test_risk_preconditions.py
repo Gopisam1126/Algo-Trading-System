@@ -311,8 +311,27 @@ class TestAC7AnUncoveredYearFailsClosed:
         )
         decision = engine.evaluate(_rec(), future)
         assert not decision.approved
-        assert decision.reason is RejectReason.HEALTH_GATE_FAILED
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
         assert "HolidayDataError" in (decision.detail or "")
+
+    def test_a_lapsed_holiday_list_reads_as_a_fault_not_a_sick_service(self, calendar) -> None:
+        """SIT-001. A lapsed holiday list is the realistic version of this —
+        the file has to be renewed each December — and it is a fault in what
+        the engine needs, not a component being down. Reporting it as
+        HEALTH_GATE_FAILED would send whoever is on call to check services
+        that are all fine, in the first week of January, while the actual fix
+        is a one-line config renewal."""
+        engine = RiskEngine(checks=build_precondition_checks(calendar, WINDOWS))
+        lapsed = engine.evaluate(
+            _rec(),
+            _ctx(
+                now=_ist(10, 0).replace(year=2027),
+                squareoff_deadline=DEADLINE.replace(year=2027),
+            ),
+        )
+        sick = engine.evaluate(_rec(), _ctx(unhealthy_services=("ingest-svc",)))
+        assert sick.reason is RejectReason.HEALTH_GATE_FAILED
+        assert lapsed.reason is not sick.reason
 
     def test_it_does_not_silently_pass(self, calendar) -> None:
         """The failure that would matter: an uncovered year treated as 'no

@@ -153,8 +153,10 @@ Docker):
 - **E14 risk engine, partial** — the ordered fail-fast check pipeline
   (E14-S01) and pre-condition checks 1–4 (E14-S02: kill switch, health gate,
   trading window, no-trade window). A check that *raises* is a REJECTION, not
-  a skip. Checks 5–14 are not written, so the engine cannot yet approve
-  anything and there is nothing downstream of it.
+  a skip, reported as `RISK_ENGINE_FAULT` — the one `RejectReason` that means
+  "the system is broken" rather than "the answer is no". Checks 5–14 are not
+  written, so the engine cannot yet approve anything and there is nothing
+  downstream of it.
 
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/`. `execution/` now holds `risk/` and
@@ -198,6 +200,14 @@ Recorded because each was believed, written down, and wrong.
   by operator"* into the log an incident would be reconstructed from. A
   validator applied to one of three boundaries is not a validator: define it
   once, above the first model that needs it.
+- **"`HEALTH_GATE_FAILED` means the health gate failed."** It also meant
+  "a check raised", "no sizer is configured" and "sizing raised", because
+  `RejectReason` had no member for an engine fault and the nearest plausible
+  neighbour got borrowed. SIT found it by walking a whole session: 340
+  tradable minutes all rejected as HEALTH_GATE_FAILED with every service
+  healthy. `signals_rejected_total{reason}` is the metric that turns "why
+  isn't it trading?" into a glance, so a wrong label there costs exactly the
+  glance it exists to provide. Now `RISK_ENGINE_FAULT`. See SIT-001.
 - **"`"integration" in item.keywords` checks the marker."** It also matches
   every ancestor *node name*, so it matched the `tests/integration/`
   **directory**. The only system-level test in the repo — which uses no
