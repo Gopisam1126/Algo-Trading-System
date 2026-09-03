@@ -16,10 +16,12 @@ the check that reads it is required to reject rather than assume — see
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from types import MappingProxyType
 from typing import TypeVar
 
 from algotrader.common.enums import Direction
@@ -113,25 +115,56 @@ class RiskContext:
     #: because the sizing cap needs both.
     margin_per_share: Decimal | None = None
     #: Correlation of the candidate against each open position, by symbol.
-    correlations: dict[str, Decimal] = field(default_factory=dict)
+    #:
+    #: A symbol that is ABSENT means "unknown", and the correlation guard
+    #: refuses on it. It must never be present as 0, which would read as
+    #: "uncorrelated" and admit the fourth PSU bank. See
+    #: :func:`~algotrader.execution.risk.correlation.correlations_against`,
+    #: which omits what it cannot compute rather than fabricating a zero.
+    #:
+    #: Typed ``Mapping`` because it is frozen at construction — see
+    #: :meth:`_freeze_mutable_fields`.
+    correlations: Mapping[str, Decimal] = field(default_factory=dict)
 
-    #: Fields typed as tuples that a caller can still hand a list. `frozen=True`
-    #: freezes the *binding*, not what it points at, so a list here would let a
-    #: caller keep a reference and mutate the context between checks — making
-    #: the outcome depend on check order in exactly the way the docstring above
-    #: says it must not. Deserialised input (JSON has no tuples) is the
-    #: realistic route in.
-    _SEQUENCE_FIELDS = ("unhealthy_services", "open_positions", "symbol_restrictions")
+    def _freeze_mutable_fields(self) -> None:
+        """Make every container field immutable, whatever the caller passed.
+
+        ``frozen=True`` freezes the *binding*, not what it points at, so a
+        caller who passes a list or dict keeps a live reference into state the
+        checks are about to read — and can change it between checks, which is
+        precisely what the class docstring says must not happen. JSON has
+        neither tuples nor frozen mappings, so any deserialised context is the
+        realistic route in.
+
+        **Derived from the dataclass fields rather than a hand-written list.**
+        The first version of this (QA-SEC-32) named three fields explicitly and
+        missed ``correlations``, because that one is a dict rather than a
+        sequence and did not match the shape being looked for. A list of names
+        has to be remembered every time a field is added; iterating the fields
+        cannot be forgotten.
+        """
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            if value is None or isinstance(value, tuple | MappingProxyType):
+                continue
+            if isinstance(value, Mapping):
+                object.__setattr__(self, f.name, MappingProxyType(dict(value)))
+            elif isinstance(value, str | bytes):
+                continue  # a string is a Sequence, and is already immutable
+            elif isinstance(value, Sequence | set | frozenset):
+                object.__setattr__(self, f.name, tuple(value))
 
     def __post_init__(self) -> None:
-        for name in self._SEQUENCE_FIELDS:
+        for name in ("unhealthy_services", "open_positions", "symbol_restrictions"):
             value = getattr(self, name)
-            if value is not None and not isinstance(value, tuple):
-                if isinstance(value, str) or not isinstance(value, Sequence):
-                    raise RiskContextError(
-                        f"{name} must be a sequence of values, got {type(value).__name__}"
-                    )
-                object.__setattr__(self, name, tuple(value))
+            if value is not None and isinstance(value, str | bytes):
+                raise RiskContextError(
+                    f"{name} must be a sequence of values, got "
+                    f"{type(value).__name__}. A bare string would be split into "
+                    f"characters — 'T2T' becoming three restrictions that do "
+                    f"not exist."
+                )
+        self._freeze_mutable_fields()
         if self.now.tzinfo is None:
             raise RiskContextError("RiskContext.now must be timezone-aware")
         if self.squareoff_deadline.tzinfo is None:
@@ -169,10 +202,31 @@ class RiskContext:
     def gross_exposure(self) -> Decimal:
         return sum((p.notional for p in self.open_positions), Decimal(0))
 
-    def sector_exposure(self, sector: str | None) -> Decimal:
-        if sector is None:
-            return Decimal(0)
+    def sector_exposure(self, sector: str) -> Decimal:
+        """Notional held in one sector.
+
+        Takes ``str``, not ``str | None``. The earlier signature accepted None
+        and returned ``Decimal(0)``, which reads as "no exposure in that
+        sector" and is the ``or 0`` failure the module docstring warns about:
+        an instrument with no sector classification would have sailed past the
+        sector cap, and the sector cap is the PRIMARY control against four PSU
+        banks taking four slots. Callers must resolve the unknown case — see
+        :func:`~algotrader.execution.risk.checks.exposure.check_sector_exposure`,
+        which rejects.
+        """
         return sum((p.notional for p in self.open_positions if p.sector == sector), Decimal(0))
+
+    def positions_missing_a_sector(self) -> tuple[str, ...]:
+        """Held symbols whose sector is unknown.
+
+        The other half of the same hole. A position with ``sector=None``
+        matches no sector, so its notional silently escapes every sector
+        total — four PSU banks with unclassified sectors would each contribute
+        nothing and the cap would never bind. A sector total computed while any
+        position is unclassified is not trustworthy, so the check refuses
+        rather than reporting a number it cannot stand behind.
+        """
+        return tuple(p.symbol for p in self.open_positions if p.sector is None)
 
     def require(self, value: T | None, what: str) -> T:
         """Read a value that must be present, or say precisely what was missing.

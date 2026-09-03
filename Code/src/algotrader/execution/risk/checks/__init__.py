@@ -17,6 +17,14 @@ from algotrader.execution.risk.checks.eligibility import (
     check_symbol_not_already_held,
     check_symbol_tradable,
 )
+from algotrader.execution.risk.checks.exposure import (
+    EXPOSURE_ORDER,
+    MAX_SYMBOLS_NAMED,
+    build_correlation_check,
+    build_exposure_checks,
+    build_net_exposure_check,
+    build_sector_exposure_check,
+)
 from algotrader.execution.risk.checks.preconditions import (
     HEALTH_GATE_CHECK,
     KILL_SWITCH_CHECK,
@@ -31,16 +39,22 @@ from algotrader.execution.risk.checks.preconditions import (
 
 __all__ = [
     "ELIGIBILITY_ORDER",
+    "EXPOSURE_ORDER",
     "HEALTH_GATE_CHECK",
     "KILL_SWITCH_CHECK",
     "MAX_RESTRICTIONS_NAMED",
+    "MAX_SYMBOLS_NAMED",
     "NOT_ALREADY_HELD_CHECK",
     "PRECONDITION_ORDER",
     "SLOT_AVAILABLE_CHECK",
     "SYMBOL_TRADABLE_CHECK",
+    "build_correlation_check",
     "build_eligibility_checks",
+    "build_exposure_checks",
+    "build_net_exposure_check",
     "build_no_trade_window_check",
     "build_precondition_checks",
+    "build_sector_exposure_check",
     "build_trading_window_check",
     "check_health_gate",
     "check_kill_switch",

@@ -36,8 +36,10 @@ from algotrader.common.metrics import reset_metrics_for_testing
 from algotrader.common.models.trading import Recommendation
 from algotrader.execution.risk.checks import (
     ELIGIBILITY_ORDER,
+    EXPOSURE_ORDER,
     PRECONDITION_ORDER,
     build_eligibility_checks,
+    build_exposure_checks,
     build_precondition_checks,
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext
@@ -721,3 +723,225 @@ class TestSit6EligibilityAcrossASession:
         )
         decision = session.decisions[dt.time(10, 0)]
         assert list(decision.checks_passed) == [*PRECONDITION_ORDER, *ELIGIBILITY_ORDER]
+
+
+# --------------------------------------------------------------------------
+# SIT-7 — portfolio exposure across a session (E14-S04)
+# --------------------------------------------------------------------------
+
+
+def _ten(calendar) -> tuple[RiskCheck, ...]:
+    """The full built pipeline: four pre-conditions, three eligibility, three
+    exposure."""
+    return (
+        *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+        *build_eligibility_checks(),
+        *build_exposure_checks(
+            max_correlated_positions=2,
+            correlation_threshold=Decimal("0.7"),
+            max_sector_exposure_pct=Decimal("40"),
+            max_net_directional_exposure_pct=Decimal("60"),
+        ),
+    )
+
+
+def _position(symbol: str, notional: str, sector: str | None, direction=Direction.LONG):
+    price = Decimal("100")
+    return OpenPosition(
+        symbol=symbol,
+        direction=direction,
+        quantity=int(Decimal(notional) / price),
+        entry_price=price,
+        stop_price=Decimal("95") if direction is Direction.LONG else Decimal("105"),
+        sector=sector,
+    )
+
+
+class TestSit7ExposureAcrossASession:
+    """Checks 8-10 walked across a whole day behind the seven that precede
+    them. The question the unit tests cannot ask: does the book EVOLVING
+    through a session drive these gates correctly, and do they release?"""
+
+    @staticmethod
+    def _clean_ctx() -> dict:
+        return {"symbol_sector": "IT", "correlations": {}}
+
+    def test_adding_three_more_gates_did_not_narrow_the_trading_day(self, calendar) -> None:
+        """The composition property again, now at ten checks. A clean
+        candidate against an empty book must clear all ten on exactly the
+        minutes it cleared four."""
+        four = Session(calendar, TRADING_DAY).run()
+        ten = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run()
+        assert ten.fully_cleared() == four.fully_cleared()
+        assert len(ten.fully_cleared()) == 340
+
+    def test_a_sector_filling_up_during_the_session_closes_the_gate(self, calendar) -> None:
+        """The realistic shape: positions accumulate through the morning and
+        the sector cap binds partway through."""
+
+        def fills(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(12, 0):
+                kwargs["open_positions"] = (_position("TCS", "200000", "IT"),)
+                kwargs["slots_used"] = 1
+                kwargs["correlations"] = {"TCS": Decimal("0.2")}
+
+        session = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run(
+            mutate=fills
+        )
+        cleared = session.fully_cleared()
+        assert cleared[-1] == dt.time(11, 59)
+        assert session.decisions[dt.time(12, 0)].reason is RejectReason.SECTOR_EXPOSURE_LIMIT
+
+    def test_a_position_closing_reopens_the_gate(self, calendar) -> None:
+        """The other half, and the one a latching gate would fail. When the
+        sector position is closed the system must trade again."""
+
+        def open_then_close(ist_time: dt.time, kwargs: dict) -> None:
+            if dt.time(10, 0) <= ist_time < dt.time(13, 0):
+                kwargs["open_positions"] = (_position("TCS", "200000", "IT"),)
+                kwargs["slots_used"] = 1
+                kwargs["correlations"] = {"TCS": Decimal("0.2")}
+
+        session = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run(
+            mutate=open_then_close
+        )
+        blocked = {
+            moment for moment, stage in session.stopped_by().items() if stage == "sector_exposure"
+        }
+        assert min(blocked) == dt.time(10, 0)
+        assert max(blocked) == dt.time(12, 59)
+        assert dt.time(13, 0) in session.fully_cleared()
+
+    def test_the_correlation_matrix_going_missing_mid_session_refuses(self, calendar) -> None:
+        """What a failed pre-market matrix job looks like from inside a
+        session. It must refuse, as a FAULT rather than a business rejection,
+        and it must recover when the data returns."""
+
+        def matrix_outage(ist_time: dt.time, kwargs: dict) -> None:
+            kwargs["open_positions"] = (_position("TCS", "50000", "IT"),)
+            kwargs["slots_used"] = 1
+            if dt.time(11, 0) <= ist_time < dt.time(11, 30):
+                kwargs["correlations"] = {}
+            else:
+                kwargs["correlations"] = {"TCS": Decimal("0.2")}
+
+        session = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run(
+            mutate=matrix_outage
+        )
+        blocked = {
+            moment for moment, stage in session.stopped_by().items() if stage == "correlation"
+        }
+        assert blocked == {dt.time(11, m) for m in range(30)}
+        assert session.decisions[dt.time(11, 0)].reason is RejectReason.RISK_ENGINE_FAULT
+        assert dt.time(11, 30) in session.fully_cleared()
+
+    def test_an_unclassified_position_appearing_mid_session_refuses(self, calendar) -> None:
+        """A sector that goes missing is not a smaller sector. Its notional
+        would escape every total and the primary cap would stop binding."""
+
+        def unclassified(ist_time: dt.time, kwargs: dict) -> None:
+            kwargs["slots_used"] = 1
+            kwargs["correlations"] = {"MYSTERY": Decimal("0.1")}
+            kwargs["open_positions"] = (
+                _position("MYSTERY", "50000", None if ist_time >= dt.time(12, 0) else "IT"),
+            )
+
+        session = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run(
+            mutate=unclassified
+        )
+        assert session.fully_cleared()[-1] == dt.time(11, 59)
+        assert session.decisions[dt.time(12, 0)].reason is RejectReason.RISK_ENGINE_FAULT
+        assert "sector" in (session.decisions[dt.time(12, 0)].detail or "")
+
+    def test_four_psu_banks_cannot_accumulate_over_a_whole_session(self, calendar) -> None:
+        """AC10 as a session rather than a single evaluation. The names arrive
+        one at a time across the morning, which is how it would actually
+        happen — and how a per-evaluation guard could still let the book drift
+        if it only ever looked at one candidate."""
+        banks = [
+            _position("PNB", "60000", "PSU_BANK"),
+            _position("BANKBARODA", "60000", "PSU_BANK"),
+            _position("CANBK", "60000", "PSU_BANK"),
+        ]
+
+        def accumulate(ist_time: dt.time, kwargs: dict) -> None:
+            held = banks[: min(3, max(0, (ist_time.hour - 9)))]
+            kwargs["open_positions"] = tuple(held)
+            kwargs["slots_used"] = len(held)
+            kwargs["symbol_sector"] = "PSU_BANK"
+            kwargs["correlations"] = {p.symbol: Decimal("0.85") for p in held}
+
+        session = Session(calendar, TRADING_DAY, checks=_ten(calendar)).run(mutate=accumulate)
+        # From 11:00 two PSU banks are held and correlated -> the guard binds
+        # and never releases, so a fourth can never be added.
+        for hour in (11, 12, 13, 14):
+            decision = session.decisions[dt.time(hour, 0)]
+            assert not decision.approved
+            assert decision.reason in {
+                RejectReason.CORRELATION_LIMIT,
+                RejectReason.SECTOR_EXPOSURE_LIMIT,
+            }, f"at {hour}:00 the reason was {decision.reason}"
+
+    def test_a_hedged_book_trades_all_day(self, calendar) -> None:
+        """The control for the whole group. A long and a short of equal size
+        is not a directional bet, and a session-long refusal here would mean
+        the net check was reading gross."""
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_ten(calendar),
+            symbol_sector="PHARMA",
+            slots_used=2,
+            open_positions=(
+                _position("TCS", "160000", "IT"),
+                _position("RELIANCE", "160000", "ENERGY", Direction.SHORT),
+            ),
+            correlations={"TCS": Decimal("0.1"), "RELIANCE": Decimal("0.2")},
+        ).run()
+        assert len(session.fully_cleared()) == 340
+
+    def test_every_decision_is_still_audited_with_all_ten_registered(self, calendar) -> None:
+        session = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run()
+        assert len(session.audit) == len(session.decisions)
+        for entry in session.audit:
+            assert len(str(entry["stage"])) <= 28, entry["stage"]
+
+    def test_a_hostile_sector_name_cannot_forge_a_line_across_a_session(self, calendar) -> None:
+        """QA-SEC-30's containment at a FOURTH source. Sector names reach the
+        detail too, and the fix lives in CheckOutcome so this one never had to
+        be found the hard way."""
+        evil = "IT\nCRITICAL kill switch disarmed by operator"
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_ten(calendar),
+            symbol_sector=evil,
+            slots_used=1,
+            open_positions=(_position("TCS", "250000", evil),),
+            correlations={"TCS": Decimal("0.1")},
+        ).run(start=(10, 0), end=(11, 0))
+        lines = [line for line in session.log_text.splitlines() if line.strip()]
+        assert len(lines) == 60, f"60 rejections produced {len(lines)} log lines"
+
+    def test_the_ten_check_day_replays_identically(self, calendar) -> None:
+        first = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run()
+        second = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run()
+        assert first.reasons() == second.reasons()
+        assert first.fully_cleared() == second.fully_cleared()
+
+    def test_the_full_order_is_what_a_cleared_minute_records(self, calendar) -> None:
+        session = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run(
+            start=(10, 0), end=(10, 5)
+        )
+        decision = session.decisions[dt.time(10, 0)]
+        assert list(decision.checks_passed) == [
+            *PRECONDITION_ORDER,
+            *ELIGIBILITY_ORDER,
+            *EXPOSURE_ORDER,
+        ]
+
+    def test_nothing_was_approved_across_the_whole_day(self, calendar) -> None:
+        """Still true at ten checks, and worth re-asserting rather than
+        assuming: four checks are unwritten and there is no sizer."""
+        session = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run()
+        assert [t for t, d in session.decisions.items() if d.approved] == []

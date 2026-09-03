@@ -30,18 +30,26 @@ character detail from eight long ones. Bound the output, not the input count.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import decimal
 import io
 import logging
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
+from types import MappingProxyType
 from uuid import UUID
 
 import pytest
 
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
 from algotrader.common.models.trading import Recommendation
-from algotrader.execution.risk.checks import build_eligibility_checks
-from algotrader.execution.risk.context import RiskContext, RiskContextError
+from algotrader.execution.risk.checks import (
+    EXPOSURE_ORDER,
+    build_eligibility_checks,
+    build_exposure_checks,
+)
+from algotrader.execution.risk.context import OpenPosition, RiskContext, RiskContextError
 from algotrader.execution.risk.framework import (
     MAX_DETAIL,
     CheckOutcome,
@@ -68,6 +76,17 @@ def _rec(symbol: str = "INFY") -> Recommendation:
     )
 
 
+def _pos(symbol: str, sector: str | None = "PSU_BANK") -> OpenPosition:
+    return OpenPosition(
+        symbol=symbol,
+        direction=Direction.LONG,
+        quantity=500,
+        entry_price=Decimal("100"),
+        stop_price=Decimal("95"),
+        sector=sector,
+    )
+
+
 def _ctx(**overrides) -> RiskContext:
     base: dict = {
         "now": NOW,
@@ -76,6 +95,7 @@ def _ctx(**overrides) -> RiskContext:
         "slots_total": 5,
         "slots_used": 0,
         "symbol_restrictions": (),
+        "symbol_sector": "PSU_BANK",
     }
     base.update(overrides)
     return RiskContext(**base)
@@ -226,3 +246,128 @@ class TestTheContextCannotBeMutatedAfterConstruction:
         that would convert "we never looked" into "checked and clean", which is
         the exact failure E14-S03's AC2 exists to prevent."""
         assert _ctx(symbol_restrictions=None).symbol_restrictions is None
+
+
+class TestEveryContainerFieldIsFrozen:
+    """QA-SEC-33: the same defect as QA-SEC-32, one field over.
+
+    QA-SEC-32 froze ``unhealthy_services``, ``open_positions`` and
+    ``symbol_restrictions`` — named explicitly, in a hand-written tuple. It
+    missed ``correlations``, which was already on the class, because that one
+    is a *dict* and the code was looking for sequences.
+
+    A hand-written list of fields has to be remembered every time a field is
+    added or its type changes. So the freezing is now derived from
+    ``dataclasses.fields`` and these tests assert the *general* property rather
+    than three names, because a test that also lists the fields by hand would
+    have the same hole as the code it guards.
+    """
+
+    @staticmethod
+    def _every_container_field(ctx: RiskContext) -> list[str]:
+        return [
+            f.name
+            for f in dataclasses.fields(ctx)
+            if isinstance(getattr(ctx, f.name), Mapping | Sequence)
+            and not isinstance(getattr(ctx, f.name), str | bytes)
+        ]
+
+    def test_no_container_field_is_mutable(self) -> None:
+        """The general property. Every container on the context, whatever it
+        is called and whenever it was added."""
+        ctx = _ctx(
+            unhealthy_services=["a"],
+            open_positions=[_pos("PNB")],
+            symbol_restrictions=["T2T"],
+            correlations={"PNB": Decimal("0.5")},
+        )
+        checked = self._every_container_field(ctx)
+        assert len(checked) >= 4, f"expected several containers, found {checked}"
+        for name in checked:
+            value = getattr(ctx, name)
+            assert isinstance(value, tuple | MappingProxyType), (
+                f"{name} is a {type(value).__name__}, which a caller can mutate after construction"
+            )
+
+    def test_a_caller_who_keeps_the_dict_cannot_change_the_context(self) -> None:
+        """The concrete attack QA-SEC-33 found: hand in a dict, keep the
+        reference, change a correlation between checks."""
+        source = {"PNB": Decimal("0.1")}
+        ctx = _ctx(open_positions=(_pos("PNB"),), correlations=source)
+        source["PNB"] = Decimal("0.99")
+        assert ctx.correlations["PNB"] == Decimal("0.1")
+
+    def test_a_caller_who_keeps_the_list_cannot_change_the_context(self) -> None:
+        source = [_pos("PNB")]
+        ctx = _ctx(open_positions=source)
+        source.append(_pos("CANBK"))
+        assert len(ctx.open_positions) == 1
+
+    def test_the_stored_mapping_itself_refuses_writes(self) -> None:
+        """Not merely copied — actually immutable. A copy stops the caller;
+        a proxy also stops anything that reaches the context later."""
+        ctx = _ctx(open_positions=(_pos("PNB"),), correlations={"PNB": Decimal("0.1")})
+        with pytest.raises(TypeError):
+            ctx.correlations["PNB"] = Decimal("0.9")  # type: ignore[index]
+
+    def test_a_bare_string_is_still_refused_for_a_sequence_field(self) -> None:
+        """Kept from QA-SEC-32. `symbol_restrictions="T2T"` would otherwise
+        freeze into ('T','2','T') — three restrictions that do not exist."""
+        with pytest.raises(RiskContextError, match="symbol_restrictions"):
+            _ctx(symbol_restrictions="T2T")
+
+    def test_none_is_still_none_and_not_an_empty_container(self) -> None:
+        """The freezing must not convert the unknown state into a known one:
+        `None` means eligibility was never established, `()` means checked and
+        clean, and collapsing them would undo E14-S03's AC2."""
+        assert _ctx(symbol_restrictions=None).symbol_restrictions is None
+
+
+class TestCorrelationInputsCannotBeQuietlyWrong:
+    """QA-SEC-34. A correlation that is not a finite number fails closed either
+    way — but only one of the two ways tells an operator what happened."""
+
+    @pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+    def test_a_non_finite_correlation_is_refused_with_a_usable_message(self, bad: str) -> None:
+        engine = RiskEngine(
+            checks=build_exposure_checks(
+                max_correlated_positions=2,
+                correlation_threshold=Decimal("0.7"),
+                max_sector_exposure_pct=Decimal("40"),
+                max_net_directional_exposure_pct=Decimal("60"),
+            )
+        )
+        decision = engine.evaluate(
+            _rec(),
+            _ctx(open_positions=(_pos("PNB"),), correlations={"PNB": Decimal(bad)}),
+        )
+        assert not decision.approved
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+        assert "PNB" in (decision.detail or ""), "the detail must name the pair"
+        assert "finite" in (decision.detail or "")
+
+    def test_without_the_guard_the_message_would_be_useless(self) -> None:
+        """Why this is worth a check of its own rather than leaving it to the
+        framework. `Decimal('NaN') >= threshold` raises InvalidOperation, whose
+        message is '[<class 'decimal.InvalidOperation'>]' — a rejection that
+        cannot be explained from the audit log, which is precisely what
+        E14-S01's acceptance criterion forbids."""
+        with pytest.raises(decimal.InvalidOperation):
+            _ = abs(Decimal("NaN")) >= Decimal("0.7")
+
+    def test_a_finite_correlation_is_unaffected(self) -> None:
+        """The control. A guard that rejected every correlation would satisfy
+        the tests above."""
+        engine = RiskEngine(
+            checks=build_exposure_checks(
+                max_correlated_positions=2,
+                correlation_threshold=Decimal("0.7"),
+                max_sector_exposure_pct=Decimal("40"),
+                max_net_directional_exposure_pct=Decimal("60"),
+            )
+        )
+        decision = engine.evaluate(
+            _rec(),
+            _ctx(open_positions=(_pos("PNB"),), correlations={"PNB": Decimal("0.1")}),
+        )
+        assert decision.checks_passed == list(EXPOSURE_ORDER)
