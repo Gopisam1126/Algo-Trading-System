@@ -1798,6 +1798,32 @@ Symbol tradable (re-verified at order time) · slot available · not already hel
 ### E14-S05 · Loss limit checks (11–12)
 `P0` `Phase 5` `🔴` `FEAT` · **1 day** · deps: E14-S01
 
+> **A pure predicate over the live figures un-halts itself**, and §8.1 forbids
+> that: *"HALTED is terminal for the day and is only exited by explicit
+> operator action. There is no automatic un-halt."* A daily loss limit trips
+> precisely when losing positions are open; one closing at a profit lifts
+> `realised_pnl_today` back over the threshold. `consecutive_losses` is worse
+> — one winning close resets it to zero.
+>
+> So each check rejects if **either** the live figure breaches **or** a latch
+> is set. Neither half alone is enough: the live figure auto-un-halts, and the
+> latch has a window before it is written. This story READS the latches;
+> setting them is **E14-S09**, exactly as check 1 reads `kill_switch_active`.
+>
+> Scoped to **new entries** (§1136, §1373) — a loss limit that also blocked
+> square-off would strand losing positions overnight.
+
+**Acceptance**
+- 🔴 A realised loss at or beyond `max_daily_loss_pct` of capital rejects
+- 🔴 A **profit** of the same magnitude does not. A sign inversion would halt
+  on good days and trade freely on bad ones
+- 🔴 A breached day does not resume when losses partly recover
+- 🔴 `consecutive_losses` at the limit rejects
+- 🔴 The streak halt does not clear when a win resets the counter to zero
+- **(control)** A flat or profitable day with no streak passes both
+- The threshold uses **configured** capital, so 3% is the same rupees at 15:00
+  as at 09:20
+
 Daily loss limit → halt · consecutive loss limit → halt.
 
 ---

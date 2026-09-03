@@ -42,9 +42,11 @@ from algotrader.common.models.trading import AIReview, Recommendation
 from algotrader.execution.risk.checks import (
     ELIGIBILITY_ORDER,
     EXPOSURE_ORDER,
+    LOSS_ORDER,
     PRECONDITION_ORDER,
     build_eligibility_checks,
     build_exposure_checks,
+    build_loss_checks,
     build_precondition_checks,
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext
@@ -929,3 +931,156 @@ class TestTheTriggerMeetsPortfolioExposure:
         # One correlated name, limit is 2 -> allowed, and that is the point:
         # the values flow through and mean what the guard thinks they mean.
         assert self._engine().evaluate(rec, ctx).checks_passed[-1] == "net_exposure"
+
+
+class TestTheTriggerMeetsTheLossLimits:
+    """QA-2 for E14-S05: checks 11-12 behind the ten that precede them, against
+    a REAL Trigger.
+
+    The seam these add is different in kind from the earlier ones. Checks 1-10
+    ask about the market, the instrument and the book; these ask about the
+    SESSION'S HISTORY. They are the first checks whose answer depends on what
+    the system already did today, which means they are the first that can be
+    wrong in a way a single evaluation cannot reveal.
+    """
+
+    @staticmethod
+    def _review() -> AIReview:
+        return AIReview(
+            verdict=AIVerdict.CONFIRM,
+            confidence=Decimal("0.80"),
+            timeframe_agreement=3,
+            thesis_alignment="aligned",
+            rationale="loss limit seam probe",
+            model_used="test-harness",
+            latency_ms=0,
+        )
+
+    def _recommendation(self, run, evaluator) -> Recommendation:
+        trigger = evaluator.fire(run.context(), correlation_id=CID)
+        assert trigger is not None, "the pipeline must fire for this seam to be testable"
+        return Recommendation.build(trigger, self._review(), now=run.context().now)
+
+    @staticmethod
+    def _calendar() -> MarketCalendar:
+        status = load_holidays_with_status(
+            str(Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml")
+        )
+        return MarketCalendar(status.dates, covers_years=status.covers_years)
+
+    def _engine(self, audit=None) -> RiskEngine:
+        """All TWELVE built checks, in their real order."""
+        return RiskEngine(
+            checks=[
+                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(
+                    max_daily_loss_pct=Decimal("3.0"),
+                    consecutive_loss_halt=3,
+                ),
+            ],
+            audit=audit,
+        )
+
+    @staticmethod
+    def _risk_ctx(**overrides) -> RiskContext:
+        base: dict = {
+            "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
+            "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
+            "capital": Decimal("500000"),
+            "slots_total": 5,
+            "slots_used": 0,
+            "symbol_restrictions": (),
+            "symbol_sector": "IT",
+        }
+        base.update(overrides)
+        return RiskContext(**base)
+
+    def test_a_clean_real_trigger_clears_all_twelve(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(self._recommendation(run, evaluator), self._risk_ctx())
+        assert decision.checks_passed == [
+            *PRECONDITION_ORDER,
+            *ELIGIBILITY_ORDER,
+            *EXPOSURE_ORDER,
+            *LOSS_ORDER,
+        ]
+
+    def test_a_breached_daily_loss_stops_a_real_trigger(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(realised_pnl_today=Decimal("-16000")),
+        )
+        assert decision.reason is RejectReason.DAILY_LOSS_LIMIT
+
+    def test_a_profitable_day_of_the_same_size_does_not(self, run, evaluator) -> None:
+        """The control, at the seam. A sign inversion would halt the system on
+        its best days, and every one of the loss tests above would still pass."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(realised_pnl_today=Decimal("16000")),
+        )
+        assert decision.checks_passed[-1] == "consecutive_loss"
+
+    def test_a_latched_halt_stops_a_real_trigger_that_would_otherwise_pass(
+        self, run, evaluator
+    ) -> None:
+        """Everything else about this candidate is fine and the live P&L has
+        recovered. Only the latch stands between it and an entry on a day a
+        risk limit already fired."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(realised_pnl_today=Decimal("-500"), daily_loss_halted=True),
+        )
+        assert decision.reason is RejectReason.DAILY_LOSS_LIMIT
+        assert "already" in (decision.detail or "")
+
+    def test_a_consecutive_streak_stops_a_real_trigger(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(consecutive_losses=3)
+        )
+        assert decision.reason is RejectReason.CONSECUTIVE_LOSS_LIMIT
+
+    def test_the_loss_checks_run_last(self, run, evaluator) -> None:
+        """Position in the pipeline. A blocked symbol on a losing day must
+        report the symbol -- the more specific reason -- not the loss."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(
+                symbol_restrictions=("T2T",),
+                realised_pnl_today=Decimal("-20000"),
+                consecutive_losses=5,
+            ),
+        )
+        assert decision.reason is RejectReason.SYMBOL_NOT_TRADABLE
+
+    def test_the_audit_records_which_loss_check_stopped_it(self, run, evaluator) -> None:
+        written: list[dict] = []
+        self._engine(audit=written.append).evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(consecutive_losses=4),
+        )
+        assert len(written) == 1
+        assert written[0]["stage"] == "consecutive_loss"
+        assert written[0]["correlation_id"] == CID
+        assert written[0]["payload"]["checks_passed"] == [
+            *PRECONDITION_ORDER,
+            *ELIGIBILITY_ORDER,
+            *EXPOSURE_ORDER,
+            "daily_loss",
+        ]
+
+    def test_the_loss_limits_never_look_at_the_candidate(self, run, evaluator) -> None:
+        """These are session-wide conditions. Whatever the pipeline produced,
+        a halted day halts it -- and the rejection must not name the symbol as
+        if the symbol were the problem."""
+        rec = self._recommendation(run, evaluator)
+        decision = self._engine().evaluate(
+            rec, self._risk_ctx(realised_pnl_today=Decimal("-16000"))
+        )
+        assert rec.symbol not in (decision.detail or "")
