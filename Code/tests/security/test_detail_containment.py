@@ -371,3 +371,91 @@ class TestCorrelationInputsCannotBeQuietlyWrong:
             _ctx(open_positions=(_pos("PNB"),), correlations={"PNB": Decimal("0.1")}),
         )
         assert decision.checks_passed == list(EXPOSURE_ORDER)
+
+
+class TestNoNonFiniteNumberReachesACheck:
+    """QA-SEC-35. Every ``Decimal`` on the context is a number some check will
+    compare against a limit, and a non-finite value breaks the comparison in
+    one of two ways — both of which read as normal operation.
+
+    * ``NaN`` makes every comparison ``False``. ``loss >= limit`` is False and
+      the day trades on. Where it raises instead, the message is
+      ``InvalidOperation`` and names neither the field nor the cause.
+    * ``Infinity`` compares cleanly and is nonsense. An infinite *profit*
+      sailed past the daily loss limit without comment.
+
+    Rejected at construction rather than in each check, so the fourteen checks
+    do not each have to remember — and found by iterating the dataclass rather
+    than a hand-written list, which is what QA-SEC-33 paid for.
+    """
+
+    @pytest.mark.parametrize("bad", ["NaN", "sNaN", "Infinity", "-Infinity"])
+    @pytest.mark.parametrize(
+        "field", ["realised_pnl_today", "capital", "available_margin", "atr", "margin_per_share"]
+    )
+    def test_no_decimal_field_accepts_a_non_finite_value(self, field: str, bad: str) -> None:
+        with pytest.raises(RiskContextError, match=field):
+            _ctx(**{field: Decimal(bad)})
+
+    def test_the_error_names_the_field_and_the_value(self) -> None:
+        """An operator reading this needs to know WHICH number was corrupt.
+        'InvalidOperation' — what the raw comparison produced — names nothing."""
+        with pytest.raises(RiskContextError) as excinfo:
+            _ctx(realised_pnl_today=Decimal("NaN"))
+        message = str(excinfo.value)
+        assert "realised_pnl_today" in message
+        assert "NaN" in message
+
+    def test_the_check_is_derived_from_the_fields_not_a_list(self) -> None:
+        """The property QA-SEC-33 established. Every Decimal field is covered,
+        including ones no check reads yet, because the guard iterates
+        dataclasses.fields rather than naming them."""
+        decimal_fields = [
+            f.name
+            for f in dataclasses.fields(_ctx())
+            if isinstance(getattr(_ctx(), f.name), Decimal)
+        ]
+        assert len(decimal_fields) >= 2
+        for name in decimal_fields:
+            with pytest.raises(RiskContextError, match=name):
+                _ctx(**{name: Decimal("NaN")})
+
+    def test_ordinary_values_are_unaffected(self) -> None:
+        """The control. A guard that rejected every Decimal would pass every
+        test above and stop the system dead."""
+        ctx = _ctx(
+            realised_pnl_today=Decimal("-5000"),
+            available_margin=Decimal("250000"),
+            atr=Decimal("13.5"),
+            margin_per_share=Decimal("240"),
+        )
+        assert ctx.realised_pnl_today == Decimal("-5000")
+        assert ctx.atr == Decimal("13.5")
+
+    def test_none_is_still_allowed_where_the_field_is_optional(self) -> None:
+        """`None` means "the broker did not answer", which is a rejection the
+        reading check makes — quite different from a corrupt number, and the
+        finiteness guard must not collapse the two."""
+        ctx = _ctx(available_margin=None, atr=None, margin_per_share=None)
+        assert ctx.available_margin is None
+
+
+class TestACorruptLossCounterDoesNotReadAsACleanStreak:
+    """QA-SEC-36. `consecutive_losses = -5` passed the streak check, because
+    -5 < 3 is true. A negative count is not 'fewer losses' — it means whatever
+    maintains the counter is broken, and a broken counter reading as a clean
+    streak is the same unknown-becomes-fine shape this codebase keeps finding."""
+
+    @pytest.mark.parametrize("bad", [-1, -5, -1000])
+    def test_a_negative_streak_is_refused_at_construction(self, bad: int) -> None:
+        with pytest.raises(RiskContextError, match="consecutive_losses"):
+            _ctx(consecutive_losses=bad)
+
+    def test_the_error_explains_why_a_smaller_number_is_not_safer(self) -> None:
+        with pytest.raises(RiskContextError) as excinfo:
+            _ctx(consecutive_losses=-1)
+        assert "broken" in str(excinfo.value)
+
+    def test_zero_and_positive_counts_are_the_control(self) -> None:
+        assert _ctx(consecutive_losses=0).consecutive_losses == 0
+        assert _ctx(consecutive_losses=7).consecutive_losses == 7

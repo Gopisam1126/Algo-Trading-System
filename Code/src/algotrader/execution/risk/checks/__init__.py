@@ -25,6 +25,12 @@ from algotrader.execution.risk.checks.exposure import (
     build_net_exposure_check,
     build_sector_exposure_check,
 )
+from algotrader.execution.risk.checks.loss import (
+    LOSS_ORDER,
+    build_consecutive_loss_check,
+    build_daily_loss_check,
+    build_loss_checks,
+)
 from algotrader.execution.risk.checks.preconditions import (
     HEALTH_GATE_CHECK,
     KILL_SWITCH_CHECK,
@@ -42,15 +48,19 @@ __all__ = [
     "EXPOSURE_ORDER",
     "HEALTH_GATE_CHECK",
     "KILL_SWITCH_CHECK",
+    "LOSS_ORDER",
     "MAX_RESTRICTIONS_NAMED",
     "MAX_SYMBOLS_NAMED",
     "NOT_ALREADY_HELD_CHECK",
     "PRECONDITION_ORDER",
     "SLOT_AVAILABLE_CHECK",
     "SYMBOL_TRADABLE_CHECK",
+    "build_consecutive_loss_check",
     "build_correlation_check",
+    "build_daily_loss_check",
     "build_eligibility_checks",
     "build_exposure_checks",
+    "build_loss_checks",
     "build_net_exposure_check",
     "build_no_trade_window_check",
     "build_precondition_checks",

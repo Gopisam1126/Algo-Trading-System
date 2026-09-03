@@ -80,8 +80,30 @@ class RiskContext:
     kill_switch_active: bool = False
     #: Services that have missed their heartbeat. Non-empty means degraded.
     unhealthy_services: tuple[str, ...] = ()
+    #: Closed-trade P&L for the session. **Negative is a loss.** Open positions
+    #: are not in it — the name is the contract.
     realised_pnl_today: Decimal = Decimal(0)
     consecutive_losses: int = 0
+
+    #: Latches for the two loss limits (E14-S05).
+    #:
+    #: These exist because a check that is a pure predicate over the two fields
+    #: above **un-halts itself**. A daily loss limit trips precisely when
+    #: losing positions are open; one of them closing at a profit lifts
+    #: ``realised_pnl_today`` back over the threshold and trading silently
+    #: resumes. ``consecutive_losses`` is worse — a single winning close resets
+    #: it to zero.
+    #:
+    #: ``LOW_LEVEL_ARCHITECTURE.md §8.1``: *"HALTED is terminal for the day and
+    #: is only exited by explicit operator action. There is no automatic
+    #: un-halt — if a risk limit tripped, a human decides whether resuming is
+    #: appropriate."* A predicate cannot express "terminal"; a latch can.
+    #:
+    #: **Set by E14-S09**, which owns arming and persisting halts, exactly as
+    #: it owns ``kill_switch_active`` while check 1 only reads it. Two fields
+    #: rather than one shared flag so each rejection keeps its own reason code.
+    daily_loss_halted: bool = False
+    consecutive_loss_halted: bool = False
 
     # -- portfolio ----------------------------------------------------------
     open_positions: tuple[OpenPosition, ...] = ()
@@ -154,6 +176,34 @@ class RiskContext:
             elif isinstance(value, Sequence | set | frozenset):
                 object.__setattr__(self, f.name, tuple(value))
 
+    def _reject_non_finite_numbers(self) -> None:
+        """No ``Decimal`` on this context may be NaN or an infinity.
+
+        Every one of these is a number a check will compare against a limit,
+        and a non-finite value breaks the comparison in one of two ways, both
+        bad:
+
+        * ``NaN`` makes every comparison ``False``, so ``loss >= limit`` is
+          False and the day trades on — or raises ``InvalidOperation``, whose
+          message names neither the field nor the cause (QA-SEC-34).
+        * ``Infinity`` compares cleanly and is nonsense: an infinite *profit*
+          passes the daily loss limit without comment.
+
+        Rejecting here rather than in each check makes the state unrepresentable
+        instead of guarded — the fourteen checks do not each have to remember —
+        and the fields are found by iterating the dataclass rather than by a
+        hand-written list, which is the lesson QA-SEC-33 paid for.
+        """
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, Decimal) and not value.is_finite():
+                raise RiskContextError(
+                    f"{f.name} is {value}, which is not a finite number. A risk "
+                    f"check would compare it against a limit, and NaN makes "
+                    f"every comparison False while an infinity makes the limit "
+                    f"meaningless."
+                )
+
     def __post_init__(self) -> None:
         for name in ("unhealthy_services", "open_positions", "symbol_restrictions"):
             value = getattr(self, name)
@@ -169,8 +219,16 @@ class RiskContext:
             raise RiskContextError("RiskContext.now must be timezone-aware")
         if self.squareoff_deadline.tzinfo is None:
             raise RiskContextError("squareoff_deadline must be timezone-aware")
+        self._reject_non_finite_numbers()
         if self.capital <= 0:
             raise RiskContextError(f"capital must be positive, got {self.capital}")
+        if self.consecutive_losses < 0:
+            raise RiskContextError(
+                f"consecutive_losses is {self.consecutive_losses}. A negative "
+                f"count is not 'fewer losses' — it means whatever maintains "
+                f"the counter is broken, and a broken counter must not read as "
+                f"a clean streak."
+            )
         if self.slots_used > self.slots_total:
             raise RiskContextError(
                 f"slots_used {self.slots_used} exceeds slots_total "
