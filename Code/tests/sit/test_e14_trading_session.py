@@ -37,9 +37,11 @@ from algotrader.common.models.trading import Recommendation
 from algotrader.execution.risk.checks import (
     ELIGIBILITY_ORDER,
     EXPOSURE_ORDER,
+    LOSS_ORDER,
     PRECONDITION_ORDER,
     build_eligibility_checks,
     build_exposure_checks,
+    build_loss_checks,
     build_precondition_checks,
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext
@@ -944,4 +946,183 @@ class TestSit7ExposureAcrossASession:
         """Still true at ten checks, and worth re-asserting rather than
         assuming: four checks are unwritten and there is no sizer."""
         session = Session(calendar, TRADING_DAY, checks=_ten(calendar), **self._clean_ctx()).run()
+        assert [t for t, d in session.decisions.items() if d.approved] == []
+
+
+# --------------------------------------------------------------------------
+# SIT-8 — loss limits across a session (E14-S05)
+# --------------------------------------------------------------------------
+
+
+def _twelve(calendar) -> tuple[RiskCheck, ...]:
+    """Every built check: four pre-conditions, three eligibility, three
+    exposure, two loss limits."""
+    return (
+        *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+        *build_eligibility_checks(),
+        *build_exposure_checks(
+            max_correlated_positions=2,
+            correlation_threshold=Decimal("0.7"),
+            max_sector_exposure_pct=Decimal("40"),
+            max_net_directional_exposure_pct=Decimal("60"),
+        ),
+        *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+    )
+
+
+class TestSit8LossLimitsAcrossASession:
+    """The latch is the thing a session walk can test and a single evaluation
+    cannot. Every other check in this pipeline answers from the state in front
+    of it; these two have to remember something."""
+
+    @staticmethod
+    def _clean() -> dict:
+        return {"symbol_sector": "IT", "correlations": {}}
+
+    def test_adding_the_loss_checks_did_not_narrow_a_healthy_day(self, calendar) -> None:
+        four = Session(calendar, TRADING_DAY).run()
+        twelve = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run()
+        assert twelve.fully_cleared() == four.fully_cleared()
+        assert len(twelve.fully_cleared()) == 340
+
+    def test_the_day_stops_when_the_loss_limit_is_reached(self, calendar) -> None:
+        def loses(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(12, 0):
+                kwargs["realised_pnl_today"] = Decimal("-16000")
+
+        session = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run(
+            mutate=loses
+        )
+        assert session.fully_cleared()[-1] == dt.time(11, 59)
+        assert session.decisions[dt.time(12, 0)].reason is RejectReason.DAILY_LOSS_LIMIT
+
+    def test_a_recovery_does_not_restart_the_day_when_the_latch_is_set(self, calendar) -> None:
+        """The scenario the latch exists for, walked minute by minute.
+
+        The limit trips at noon. Losing positions then close -- one at a
+        profit -- and realised P&L climbs back well inside the limit. Without
+        the latch the afternoon trades again, on a day a risk limit already
+        stopped.
+        """
+
+        def breach_then_recover(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(12, 0):
+                kwargs["daily_loss_halted"] = True
+            if ist_time >= dt.time(13, 0):
+                kwargs["realised_pnl_today"] = Decimal("-1000")  # recovered
+            elif ist_time >= dt.time(12, 0):
+                kwargs["realised_pnl_today"] = Decimal("-16000")
+
+        session = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run(
+            mutate=breach_then_recover
+        )
+
+        assert session.fully_cleared()[-1] == dt.time(11, 59), (
+            "trading resumed after the daily loss limit halted the day"
+        )
+        for hour in (12, 13, 14):
+            decision = session.decisions[dt.time(hour, 0)]
+            assert decision.reason is RejectReason.DAILY_LOSS_LIMIT, (
+                f"at {hour}:00 the day was trading again after a halt"
+            )
+
+    def test_without_the_latch_the_recovery_would_have_resumed_trading(self, calendar) -> None:
+        """The counterfactual, stated as a test so the latch's value is
+        demonstrated rather than asserted. Same session, latch never set: the
+        afternoon trades again."""
+
+        def breach_then_recover_unlatched(ist_time: dt.time, kwargs: dict) -> None:
+            if dt.time(12, 0) <= ist_time < dt.time(13, 0):
+                kwargs["realised_pnl_today"] = Decimal("-16000")
+            elif ist_time >= dt.time(13, 0):
+                kwargs["realised_pnl_today"] = Decimal("-1000")
+
+        session = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run(
+            mutate=breach_then_recover_unlatched
+        )
+        assert dt.time(13, 0) in session.fully_cleared(), (
+            "this is what the latch prevents -- if this ever fails, the live "
+            "figure alone has started behaving as a latch and the test above "
+            "has stopped proving anything"
+        )
+
+    def test_a_streak_halt_survives_a_winning_exit(self, calendar) -> None:
+        """The consecutive counter resets to zero on any win, so the latch is
+        doing all the work here."""
+
+        def streak_then_win(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(11, 0):
+                kwargs["consecutive_loss_halted"] = True
+                kwargs["consecutive_losses"] = 0 if ist_time >= dt.time(12, 0) else 3
+
+        session = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run(
+            mutate=streak_then_win
+        )
+        assert session.fully_cleared()[-1] == dt.time(10, 59)
+        assert session.decisions[dt.time(13, 0)].reason is RejectReason.CONSECUTIVE_LOSS_LIMIT
+
+    def test_a_profitable_session_trades_all_day(self, calendar) -> None:
+        """The control for the whole group. A sign inversion would turn this
+        into a session that halts at noon on its best day."""
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_twelve(calendar),
+            realised_pnl_today=Decimal("25000"),
+            **self._clean(),
+        ).run()
+        assert len(session.fully_cleared()) == 340
+
+    def test_a_losing_but_within_limit_session_trades_all_day(self, calendar) -> None:
+        """Down 2.8% on a 3% limit. The system must keep working on a bad day
+        that has not reached its limit -- otherwise the limit is effectively
+        tighter than configured."""
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_twelve(calendar),
+            realised_pnl_today=Decimal("-14000"),
+            **self._clean(),
+        ).run()
+        assert len(session.fully_cleared()) == 340
+
+    def test_the_loss_limits_come_last_across_a_whole_day(self, calendar) -> None:
+        """With the day halted AND a banned symbol, every minute must report
+        the symbol -- the more specific reason."""
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_twelve(calendar),
+            symbol_restrictions=("T2T",),
+            realised_pnl_today=Decimal("-20000"),
+            **{"symbol_sector": "IT", "correlations": {}},
+        ).run(start=(10, 0), end=(11, 0))
+        for stage in session.stopped_by().values():
+            assert stage == "symbol_tradable"
+
+    def test_every_decision_is_audited_with_all_twelve_registered(self, calendar) -> None:
+        session = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run()
+        assert len(session.audit) == len(session.decisions)
+        for entry in session.audit:
+            assert len(str(entry["stage"])) <= 28, entry["stage"]
+
+    def test_the_full_order_is_what_a_cleared_minute_records(self, calendar) -> None:
+        session = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run(
+            start=(10, 0), end=(10, 5)
+        )
+        assert list(session.decisions[dt.time(10, 0)].checks_passed) == [
+            *PRECONDITION_ORDER,
+            *ELIGIBILITY_ORDER,
+            *EXPOSURE_ORDER,
+            *LOSS_ORDER,
+        ]
+
+    def test_the_twelve_check_day_replays_identically(self, calendar) -> None:
+        first = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run()
+        second = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run()
+        assert first.reasons() == second.reasons()
+        assert first.fully_cleared() == second.fully_cleared()
+
+    def test_nothing_was_approved_across_the_whole_day(self, calendar) -> None:
+        session = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run()
         assert [t for t, d in session.decisions.items() if d.approved] == []
