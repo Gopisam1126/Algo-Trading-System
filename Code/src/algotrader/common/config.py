@@ -371,6 +371,26 @@ class RiskConfig(_Model):
     per_trade: PerTradeRisk = Field(default_factory=PerTradeRisk)
     portfolio: PortfolioRisk = Field(default_factory=PortfolioRisk)
     exit_buffer_minutes: int = Field(default=5, ge=MIN_EXIT_BUFFER_MINUTES)
+    #: How much runway a NEW entry must have before this stock's square-off
+    #: deadline (E14-S06, check 14).
+    #:
+    #: Not the same thing as ``exit_buffer_minutes``, which is already
+    #: subtracted when the deadline is computed and protects against the
+    #: BROKER's forced square-off. This one asks whether the trade has time to
+    #: work at all: entering at 15:04 against a 15:05 CAS deadline is a
+    #: position that will be closed at whatever the price happens to be.
+    #:
+    #: Nor is it redundant with the 15:00-15:30 no-trade window. A CAS stock's
+    #: deadline is 15:10 minus the buffer = 15:05, so at 14:59 — still inside
+    #: the tradable window — the runway is six minutes.
+    #:
+    #: **30 is a judgement, not a derived number.** It is two bars of the
+    #: slowest supported interval (15m), which is thin; a 15-minute strategy
+    #: arguably wants 45. It is generous for a 1-minute one. The effective
+    #: interval is adaptive and not known at check time, so a single configured
+    #: floor is the honest mechanism — revisit if the system settles on one
+    #: timeframe.
+    min_minutes_to_squareoff: int = Field(default=30, ge=1)
     square_off_times: SquareOffTimes = Field(default_factory=SquareOffTimes)
 
     @field_validator("position_slots")

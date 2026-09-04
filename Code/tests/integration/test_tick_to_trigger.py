@@ -44,9 +44,11 @@ from algotrader.execution.risk.checks import (
     EXPOSURE_ORDER,
     LOSS_ORDER,
     PRECONDITION_ORDER,
+    all_check_ids,
     build_eligibility_checks,
     build_exposure_checks,
     build_loss_checks,
+    build_margin_timing_checks,
     build_precondition_checks,
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext
@@ -1084,3 +1086,167 @@ class TestTheTriggerMeetsTheLossLimits:
             rec, self._risk_ctx(realised_pnl_today=Decimal("-16000"))
         )
         assert rec.symbol not in (decision.detail or "")
+
+
+class TestTheTriggerMeetsAllFourteenChecks:
+    """QA-2 for E14-S06, and the first time the WHOLE risk pipeline has existed.
+
+    Every previous seam class ran a partial engine because the remaining checks
+    were unwritten. This one runs all fourteen against the Trigger the pipeline
+    actually produced, which makes it the first test that can answer: does a
+    real candidate survive the complete gauntlet, and in the right order?
+    """
+
+    @staticmethod
+    def _review() -> AIReview:
+        return AIReview(
+            verdict=AIVerdict.CONFIRM,
+            confidence=Decimal("0.80"),
+            timeframe_agreement=3,
+            thesis_alignment="aligned",
+            rationale="full pipeline probe",
+            model_used="test-harness",
+            latency_ms=0,
+        )
+
+    def _recommendation(self, run, evaluator) -> Recommendation:
+        trigger = evaluator.fire(run.context(), correlation_id=CID)
+        assert trigger is not None, "the pipeline must fire for this seam to be testable"
+        return Recommendation.build(trigger, self._review(), now=run.context().now)
+
+    @staticmethod
+    def _calendar() -> MarketCalendar:
+        status = load_holidays_with_status(
+            str(Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml")
+        )
+        return MarketCalendar(status.dates, covers_years=status.covers_years)
+
+    def _engine(self, audit=None) -> RiskEngine:
+        """All FOURTEEN checks, in LOW_LEVEL_ARCHITECTURE 5.7's order."""
+        return RiskEngine(
+            checks=[
+                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            audit=audit,
+        )
+
+    @staticmethod
+    def _risk_ctx(**overrides) -> RiskContext:
+        base: dict = {
+            "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),  # 10:30 IST
+            "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 35, tzinfo=_dt.UTC),
+            "capital": Decimal("500000"),
+            "slots_total": 5,
+            "slots_used": 0,
+            "symbol_restrictions": (),
+            "symbol_sector": "IT",
+            "available_margin": Decimal("250000"),
+            "margin_per_share": Decimal("240"),
+        }
+        base.update(overrides)
+        return RiskContext(**base)
+
+    def test_a_clean_real_trigger_clears_all_fourteen(self, run, evaluator) -> None:
+        """The claim the whole epic has been building toward: a candidate the
+        strategy produced from real ticks survives every risk gate."""
+        decision = self._engine().evaluate(self._recommendation(run, evaluator), self._risk_ctx())
+        assert decision.checks_passed == list(all_check_ids())
+        assert len(decision.checks_passed) == 14
+
+    def test_it_is_still_not_approved_because_there_is_no_sizer(self, run, evaluator) -> None:
+        """Clearing fourteen checks is not an approval. The honest state of the
+        system: E14-S07 does not exist, so the engine refuses rather than
+        defaulting a quantity -- and it refuses as a FAULT, not as a business
+        rejection, because a missing sizer is a broken engine."""
+        decision = self._engine().evaluate(self._recommendation(run, evaluator), self._risk_ctx())
+        assert not decision.approved
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+        assert "no sizer" in (decision.detail or "")
+
+    def test_unknown_margin_stops_a_real_trigger(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(available_margin=None)
+        )
+        assert not decision.approved
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_an_account_that_cannot_afford_one_share_stops_a_real_trigger(
+        self, run, evaluator
+    ) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(available_margin=Decimal("10"), margin_per_share=Decimal("240")),
+        )
+        assert decision.reason is RejectReason.INSUFFICIENT_MARGIN
+
+    def test_too_little_runway_stops_a_real_trigger(self, run, evaluator) -> None:
+        """14:45 IST against a 15:05 deadline: twenty minutes, inside the
+        thirty-minute minimum, and still inside the tradable session."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(now=_dt.datetime(2026, 8, 20, 9, 15, tzinfo=_dt.UTC)),
+        )
+        assert decision.reason is RejectReason.TOO_CLOSE_TO_SQUAREOFF
+
+    def test_the_runway_check_catches_what_the_no_trade_window_does_not(
+        self, run, evaluator
+    ) -> None:
+        """The case that justifies check 14 existing alongside check 4. At
+        14:59 IST the blackout has not started -- so the no-trade window
+        passes -- and a CAS name has six minutes of runway."""
+        at_1459 = _dt.datetime(2026, 8, 20, 9, 29, tzinfo=_dt.UTC)
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(now=at_1459)
+        )
+        assert decision.reason is RejectReason.TOO_CLOSE_TO_SQUAREOFF
+        assert "no_trade_window" in decision.checks_passed, (
+            "the blackout had not started, so check 4 must have passed -- "
+            "otherwise this test is not exercising what it claims"
+        )
+
+    def test_an_earlier_group_still_wins_over_the_last_two(self, run, evaluator) -> None:
+        """Order across all five groups. Everything is wrong at once; the
+        operator must see the kill switch."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(
+                kill_switch_active=True,
+                symbol_restrictions=("T2T",),
+                realised_pnl_today=Decimal("-20000"),
+                available_margin=Decimal("1"),
+                now=_dt.datetime(2026, 8, 20, 9, 30, tzinfo=_dt.UTC),
+            ),
+        )
+        assert decision.reason is RejectReason.KILL_SWITCH_ACTIVE
+        assert decision.checks_passed == []
+
+    def test_the_audit_records_the_last_check_when_it_is_the_one_that_stops_it(
+        self, run, evaluator
+    ) -> None:
+        written: list[dict] = []
+        self._engine(audit=written.append).evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(now=_dt.datetime(2026, 8, 20, 9, 29, tzinfo=_dt.UTC)),
+        )
+        assert len(written) == 1
+        assert written[0]["stage"] == "time_to_squareoff"
+        assert written[0]["correlation_id"] == CID
+        # Thirteen cleared before the last one refused.
+        assert len(written[0]["payload"]["checks_passed"]) == 13
+
+    def test_every_stage_the_engine_can_write_fits_the_audit_column(self, run, evaluator) -> None:
+        """All fourteen ids against decision_log.stage's String(28), asserted
+        against the ASSEMBLED engine rather than the constants -- so a check
+        registered with an id that does not match its group constant would
+        still be caught."""
+        for check in self._engine().checks:
+            assert len(check.id) <= 28, check.id

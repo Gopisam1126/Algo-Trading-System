@@ -39,9 +39,11 @@ from algotrader.execution.risk.checks import (
     EXPOSURE_ORDER,
     LOSS_ORDER,
     PRECONDITION_ORDER,
+    all_check_ids,
     build_eligibility_checks,
     build_exposure_checks,
     build_loss_checks,
+    build_margin_timing_checks,
     build_precondition_checks,
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext
@@ -148,6 +150,10 @@ class Session:
         #: seven-check pipeline and a walk with four are both expressible.
         self.expected_order = tuple(c.id for c in built)
         self.engine = RiskEngine(checks=built, audit=self.audit.append)
+        #: 15:05 IST — the CAS deadline (15:10) minus the 5-minute exit
+        #: buffer. Overridable, so a non-CAS name's later deadline can be
+        #: walked as its own session.
+        self.deadline = ctx_overrides.pop("squareoff_deadline", None) or _at(day, 15, 5)
         self.ctx_overrides = ctx_overrides
         self.decisions: dict[dt.time, object] = {}
         self.log_text = ""
@@ -170,7 +176,7 @@ class Session:
                 ist_time = moment.astimezone(IST).time()
                 kwargs: dict[str, object] = {
                     "now": moment,
-                    "squareoff_deadline": _at(self.day, 15, 10),
+                    "squareoff_deadline": self.deadline,
                     "capital": Decimal("500000"),
                     "slots_total": 5,
                     "slots_used": 0,
@@ -1126,3 +1132,196 @@ class TestSit8LossLimitsAcrossASession:
     def test_nothing_was_approved_across_the_whole_day(self, calendar) -> None:
         session = Session(calendar, TRADING_DAY, checks=_twelve(calendar), **self._clean()).run()
         assert [t for t, d in session.decisions.items() if d.approved] == []
+
+
+# --------------------------------------------------------------------------
+# SIT-9 — the complete fourteen-check pipeline across a session (E14-S06)
+# --------------------------------------------------------------------------
+
+
+def _fourteen(calendar) -> tuple[RiskCheck, ...]:
+    """Every check the system has, in LOW_LEVEL_ARCHITECTURE 5.7's order."""
+    return (
+        *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+        *build_eligibility_checks(),
+        *build_exposure_checks(
+            max_correlated_positions=2,
+            correlation_threshold=Decimal("0.7"),
+            max_sector_exposure_pct=Decimal("40"),
+            max_net_directional_exposure_pct=Decimal("60"),
+        ),
+        *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+        *build_margin_timing_checks(min_minutes_to_squareoff=30),
+    )
+
+
+class TestSit9TheCompletePipelineAcrossASession:
+    """The whole risk engine, walked minute by minute.
+
+    Every earlier SIT group ran a partial pipeline because the rest was
+    unwritten. This one asks the question that only became askable now: with
+    all fourteen gates in place, what does a trading day actually look like?
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("250000"),
+            "margin_per_share": Decimal("240"),
+        }
+
+    def test_the_fourteen_check_day_is_shorter_than_the_four_check_day(self, calendar) -> None:
+        """The first time adding checks legitimately NARROWS the session, and
+        the reason is check 14 rather than a bug.
+
+        Every previous group asserted the tradable window was unchanged,
+        because none of those gates had an opinion about the clock. The runway
+        check does: a CAS deadline of 15:05 with a 30-minute minimum ends
+        entries at 14:35, not 15:00.
+        """
+        four = Session(calendar, TRADING_DAY).run()
+        fourteen = Session(
+            calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()
+        ).run()
+        assert len(four.fully_cleared()) == 340
+        assert fourteen.fully_cleared()[0] == dt.time(9, 20)
+        assert fourteen.fully_cleared()[-1] == dt.time(14, 35), (
+            "entries should stop 30 minutes before the 15:05 deadline"
+        )
+        assert len(fourteen.fully_cleared()) == 316
+
+    def test_the_narrowing_is_the_runway_check_and_nothing_else(self, calendar) -> None:
+        """Names the cause rather than inferring it. If a different gate ever
+        starts closing the afternoon, this fails instead of quietly agreeing."""
+        session = Session(
+            calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()
+        ).run()
+        stages = session.stopped_by()
+        for minute in (dt.time(14, 36), dt.time(14, 45), dt.time(14, 59)):
+            assert stages[minute] == "time_to_squareoff", (
+                f"at {minute} the day was closed by {stages[minute]}, not the runway"
+            )
+
+    def test_the_window_is_contiguous_with_no_hole(self, calendar) -> None:
+        session = Session(
+            calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()
+        ).run()
+        cleared = session.fully_cleared()
+        expected, moment = [], dt.datetime.combine(TRADING_DAY, cleared[0])
+        while moment.time() <= cleared[-1]:
+            expected.append(moment.time())
+            moment += dt.timedelta(minutes=1)
+        assert cleared == expected
+
+    def test_margin_running_out_mid_session_stops_the_day(self, calendar) -> None:
+        """The realistic shape: earlier fills consume margin until the next
+        candidate is unaffordable."""
+
+        def spends(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(12, 0):
+                kwargs["available_margin"] = Decimal("10")
+
+        session = Session(calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()).run(
+            mutate=spends
+        )
+        assert session.fully_cleared()[-1] == dt.time(11, 59)
+        assert session.decisions[dt.time(12, 0)].reason is RejectReason.INSUFFICIENT_MARGIN
+
+    def test_the_broker_going_dark_mid_session_is_a_fault_and_recovers(self, calendar) -> None:
+        """Unknown margin is not zero margin. It must read as a FAULT — the
+        broker is unreachable, which is an outage — and it must release when
+        the broker answers again."""
+
+        def broker_outage(ist_time: dt.time, kwargs: dict) -> None:
+            if dt.time(11, 0) <= ist_time < dt.time(11, 30):
+                kwargs["available_margin"] = None
+
+        session = Session(calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()).run(
+            mutate=broker_outage
+        )
+        blocked = {
+            moment for moment, stage in session.stopped_by().items() if stage == "margin_sufficient"
+        }
+        assert blocked == {dt.time(11, m) for m in range(30)}
+        assert session.decisions[dt.time(11, 0)].reason is RejectReason.RISK_ENGINE_FAULT
+        assert dt.time(11, 30) in session.fully_cleared()
+
+    def test_an_empty_account_is_a_business_rejection_not_a_fault(self, calendar) -> None:
+        """The control for the test above, and the distinction SIT-001 exists
+        to protect. Zero margin is an ANSWER; absent margin is the lack of one,
+        and Decimal(0) is falsy so the two are easy to conflate."""
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_fourteen(calendar),
+            **{**self._healthy(), "available_margin": Decimal(0)},
+        ).run(start=(10, 0), end=(10, 5))
+        decision = session.decisions[dt.time(10, 0)]
+        assert decision.reason is RejectReason.INSUFFICIENT_MARGIN
+        assert decision.reason is not RejectReason.RISK_ENGINE_FAULT
+
+    def test_a_non_cas_stock_trades_later_than_a_cas_one(self, calendar) -> None:
+        """The per-stock deadline, walked. A non-CAS name squares off at 15:20
+        rather than 15:10, so with the same buffer and minimum it keeps
+        trading ten minutes longer. A global deadline would make these two
+        sessions identical."""
+        cas = Session(calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()).run()
+        non_cas = Session(
+            calendar,
+            TRADING_DAY,
+            checks=_fourteen(calendar),
+            squareoff_deadline=_at(TRADING_DAY, 15, 15),
+            **self._healthy(),
+        ).run()
+        assert cas.fully_cleared()[-1] == dt.time(14, 35)
+        assert non_cas.fully_cleared()[-1] == dt.time(14, 45)
+
+    def test_nothing_is_approved_on_any_minute_of_the_day(self, calendar) -> None:
+        """Now the strongest form of this assertion: all fourteen gates exist,
+        a clean candidate clears every one of them on 316 minutes, and the
+        engine still approves nothing because there is no sizer."""
+        session = Session(
+            calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()
+        ).run()
+        assert session.fully_cleared(), "the day must have tradable minutes to be a test"
+        assert [t for t, d in session.decisions.items() if d.approved] == []
+        cleared_minute = session.decisions[session.fully_cleared()[0]]
+        assert cleared_minute.reason is RejectReason.RISK_ENGINE_FAULT
+        assert "no sizer" in (cleared_minute.detail or "")
+
+    def test_a_cleared_minute_records_all_fourteen_in_spec_order(self, calendar) -> None:
+        session = Session(calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()).run(
+            start=(10, 0), end=(10, 5)
+        )
+        assert list(session.decisions[dt.time(10, 0)].checks_passed) == list(all_check_ids())
+
+    def test_every_decision_is_audited_with_all_fourteen_registered(self, calendar) -> None:
+        session = Session(
+            calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()
+        ).run()
+        assert len(session.audit) == len(session.decisions)
+        for entry in session.audit:
+            assert len(str(entry["stage"])) <= 28, entry["stage"]
+            assert isinstance(entry["ts"], dt.datetime)
+
+    def test_the_fourteen_check_day_replays_identically(self, calendar) -> None:
+        first = Session(calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()).run()
+        second = Session(calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()).run()
+        assert first.reasons() == second.reasons()
+        assert first.fully_cleared() == second.fully_cleared()
+
+    def test_no_credential_reached_the_log_across_a_full_pipeline_day(self, calendar) -> None:
+        """Re-asserted now that every check exists — the margin checks are the
+        first to carry broker-derived numbers into a rejection detail."""
+        import re
+
+        session = Session(
+            calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()
+        ).run()
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
