@@ -37,6 +37,7 @@ from algotrader.common.enums import (
     Side,
 )
 from algotrader.common.models.market import Price
+from algotrader.common.text import one_safe_line
 
 Confidence = Annotated[Decimal, Field(ge=0, le=1, decimal_places=3)]
 
@@ -227,6 +228,15 @@ class RiskDecision(_Frozen):
     evaluated_at: datetime
 
     _utc = field_validator("evaluated_at")(_require_utc)
+
+    @field_validator("detail")
+    @classmethod
+    def _one_line(cls, v: str | None) -> str | None:
+        """QA-SEC-38. ``CheckOutcome`` sanitises the details CHECKS produce;
+        this is the other door into the same field, and the sizer writes
+        through it carrying a ``binding_constraint`` that ``CheckOutcome``
+        never sees. One rule, both constructors."""
+        return None if v is None else one_safe_line(v)
 
     @model_validator(mode="after")
     def _coherent(self) -> RiskDecision:

@@ -48,6 +48,7 @@ from algotrader.execution.risk.checks import (
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext
 from algotrader.execution.risk.framework import RiskCheck, RiskEngine
+from algotrader.execution.sizer import SizingPolicy, build_sizer
 
 # --------------------------------------------------------------------------
 # The session under test
@@ -1320,6 +1321,188 @@ class TestSit9TheCompletePipelineAcrossASession:
         session = Session(
             calendar, TRADING_DAY, checks=_fourteen(calendar), **self._healthy()
         ).run()
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
+
+
+# --------------------------------------------------------------------------
+# SIT-10 — a session that can APPROVE (E14-S07)
+# --------------------------------------------------------------------------
+
+
+def _sizing_policy() -> SizingPolicy:
+    return SizingPolicy(
+        risk_pct=Decimal("1.0"),
+        atr_multiplier_stop=Decimal("1.5"),
+        max_position_pct=Decimal("20"),
+        capital_per_slot_pct=Decimal("20"),
+        target_r_multiple=Decimal("2.0"),
+    )
+
+
+class TestSit10ASessionThatCanApprove:
+    """Every previous SIT group asserted that NOTHING was ever approved,
+    because there was no sizer. That assertion has been true for six stories
+    and is now false by design — so it is replaced rather than reused, and
+    what replaces it is the harder question: on a day the system CAN trade,
+    does it stay inside its risk budget on every single minute?
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    def test_the_system_now_approves_on_a_normal_day(self, calendar) -> None:
+        """The assertion six SIT groups made in the negative, finally
+        positive."""
+        session = self._session(calendar).run()
+        approved = [t for t, d in session.decisions.items() if d.approved]
+        assert approved, "the system approved nothing on an ordinary session"
+        assert len(approved) == 316, "approvals should span exactly the tradable window"
+
+    def test_it_approves_on_exactly_the_minutes_it_used_to_merely_clear(self, calendar) -> None:
+        """The sizer must not narrow the day further. Before this story those
+        316 minutes cleared fourteen checks and were refused for want of a
+        sizer; now they are approvals, and the set must be identical."""
+        session = self._session(calendar).run()
+        approved = sorted(t for t, d in session.decisions.items() if d.approved)
+        assert approved == session.fully_cleared()
+
+    def test_every_approval_across_the_whole_day_is_inside_the_risk_budget(self, calendar) -> None:
+        """AC1 as a SESSION property rather than a per-call one. 316 sized
+        positions, every one of them within 1% of capital -- which is what
+        'risk 1% per trade' has to mean to be worth configuring."""
+        session = self._session(calendar).run()
+        budget = Decimal("500000") * Decimal("1.0") / 100
+        sized = [d.sizing for d in session.decisions.values() if d.approved]
+        assert sized
+        for sizing in sized:
+            assert sizing is not None
+            assert sizing.capital_at_risk <= budget
+
+    def test_every_approval_carries_a_quantity_and_a_stop(self, calendar) -> None:
+        """An approval with no quantity, or a stop at the entry price, would
+        reach the order gateway and do something indefensible."""
+        session = self._session(calendar).run()
+        for decision in session.decisions.values():
+            if not decision.approved:
+                continue
+            assert decision.sizing is not None
+            assert decision.sizing.quantity > 0
+            assert decision.sizing.stop_price < decision.sizing.entry_price
+            assert decision.sizing.binding_constraint
+
+    def test_a_halted_day_approves_nothing(self, calendar) -> None:
+        """The control the previous groups gave for free and this one must
+        state: the sizer runs only after every gate passes, so a kill switch
+        still produces no position at any minute."""
+        session = self._session(calendar, kill_switch_active=True).run()
+        assert [t for t, d in session.decisions.items() if d.approved] == []
+
+    def test_the_loss_limit_stops_approvals_mid_session(self, calendar) -> None:
+        """A halt has to stop the thing that actually costs money, not merely
+        change a reason code."""
+
+        def breach(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(12, 0):
+                kwargs["daily_loss_halted"] = True
+
+        session = self._session(calendar).run(mutate=breach)
+        approved = sorted(t for t, d in session.decisions.items() if d.approved)
+        assert approved[-1] == dt.time(11, 59)
+
+    def test_a_volatile_session_sizes_smaller_all_day(self, calendar) -> None:
+        """The point of ATR sizing, walked. Four times the volatility, smaller
+        positions on every minute, and both inside the same budget."""
+        quiet = self._session(calendar, atr=Decimal("5.0000")).run()
+        volatile = self._session(calendar, atr=Decimal("50.0000")).run()
+        budget = Decimal("500000") * Decimal("1.0") / 100
+        q = [d.sizing.quantity for d in quiet.decisions.values() if d.approved]
+        v = [d.sizing.quantity for d in volatile.decisions.values() if d.approved]
+        assert q and v
+        assert min(q) > max(v), "a quieter instrument must size larger throughout"
+        for d in list(quiet.decisions.values()) + list(volatile.decisions.values()):
+            if d.approved:
+                assert d.sizing.capital_at_risk <= budget
+
+    def test_the_audit_carries_a_quantity_on_every_approval(self, calendar) -> None:
+        """The number that becomes an order has to be reconstructable."""
+        session = self._session(calendar).run()
+        approvals = [e for e in session.audit if e["outcome"] == "approved"]
+        assert len(approvals) == 316
+        for entry in approvals:
+            assert entry["stage"] == "risk_approved"
+            assert entry["payload"]["quantity"] > 0
+            assert entry["payload"]["binding_constraint"]
+
+    def test_the_sized_day_replays_identically(self, calendar) -> None:
+        """Sizing is arithmetic over Decimals; if it ever drifted between runs,
+        an incident could not be reconstructed."""
+        first = self._session(calendar).run()
+        second = self._session(calendar).run()
+        assert [
+            (t, d.approved, d.sizing.quantity if d.sizing else None)
+            for t, d in first.decisions.items()
+        ] == [
+            (t, d.approved, d.sizing.quantity if d.sizing else None)
+            for t, d in second.decisions.items()
+        ]
+
+    def test_the_quantity_is_the_same_on_every_approved_minute(self, calendar) -> None:
+        """Nothing in the context changes across the day except the clock, and
+        sizing must not read the clock. A drifting quantity would mean it does.
+        """
+        session = self._session(calendar).run()
+        quantities = {d.sizing.quantity for d in session.decisions.values() if d.approved}
+        assert len(quantities) == 1, f"quantity varied across the day: {sorted(quantities)}"
+
+    def test_no_approval_survives_a_missing_atr(self, calendar) -> None:
+        """The sizer's own fail-closed path at session scale."""
+        session = self._session(calendar, atr=None).run()
+        assert [t for t, d in session.decisions.items() if d.approved] == []
+        assert session.decisions[dt.time(10, 0)].reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_no_credential_reached_the_log_on_a_day_that_placed_orders(self, calendar) -> None:
+        """Re-asserted now that the log carries approvals and quantities."""
+        import re
+
+        session = self._session(calendar).run()
         assert not re.search(
             r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
             session.log_text,

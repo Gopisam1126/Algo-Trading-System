@@ -128,12 +128,11 @@ Never commit a `.env`, a credential, or anything under `data/`.
 
 ## Current state
 
-**The deterministic path is built from tick to a `RiskDecision`, and all
-fourteen risk checks now exist. Nothing trades, and nothing can — there is no
-sizing and no order placement, so a candidate that clears all fourteen is
-refused rather than approved.**
+**The deterministic path runs from tick to an APPROVED `RiskDecision`
+carrying a quantity and an executable stop. Nothing trades, and nothing can —
+there is no order placement, so nothing turns that decision into an order.**
 
-Built and tested (**1,580 tests, 83% coverage** — 1,333 pass locally, 247 need
+Built and tested (**1,662 tests, 83% coverage** — 1,415 pass locally, 247 need
 Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -161,8 +160,12 @@ Docker):
   **All fourteen exist**; `all_check_ids()` is the list, derived from the
   group constants so it cannot drift. A check that *raises* is a REJECTION,
   not a skip, reported as `RISK_ENGINE_FAULT` — the one `RejectReason` that
-  means "the system is broken" rather than "the answer is no". There is no
-  sizer, so clearing all fourteen still ends in a refusal.
+  means "the system is broken" rather than "the answer is no".
+- **E14-S07 sizing** — `execution/sizer.py`. Risk budget over an ATR-derived
+  stop distance, clamped by position value, slot capital and broker margin,
+  then **floored** to a whole lot. Flooring is what makes "risk never exceeds
+  `risk_pct`" true; rounding to nearest breaks it on every round-up. The
+  binding clamp is recorded, so a surprisingly small position is explainable.
 
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/`. `execution/` now holds `risk/` and
@@ -171,7 +174,7 @@ nothing else — no sizer, no order manager.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,580 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,662 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -213,6 +216,13 @@ Recorded because each was believed, written down, and wrong.
   — written one story after QA-SEC-29, in a comment that cited QA-SEC-29.
   Bound the thing that reaches the log and the database, not the thing you
   happened to be counting.
+- **"Moving the rule to where the value is constructed closes the hole."** It
+  closes it for *that* constructor. QA-SEC-30 put log-forgery escaping in
+  `CheckOutcome`, which covers every detail a CHECK produces — and missed
+  `RiskDecision`, the second constructor for the same field, which the sizer
+  writes through. Fourth occurrence of one defect. The definition now lives in
+  `common/text.py` and both use it; a test asserts they hold the same function
+  object. QA-SEC-38.
 - **"A safety gate that is present is a safety gate that works."** A
   square-off deadline on any day but today passed the runway check, so check
   14 silently stopped gating — while still appearing in every log line and
@@ -293,11 +303,11 @@ Recorded because each was believed, written down, and wrong.
 
 The keystone is gone, so E12 (backtest harness, gauntlet) and E13 (signal
 loop) are unblocked. **E14, the risk engine, is in progress** — S01 (the
-framework) through S06 (margin and timing 13–14) are all delivered, so the
-fourteen checks are complete. **E14-S07, ATR-based sizing, is the next thing
-the engine needs** — it is what turns fourteen passes into an order, and
-E14-S10 then makes the sector and net-directional caps binding. S08 (slots)
-and S09 (kill switch) are also ready.
+framework) through S07 (ATR sizing) are all delivered, so the engine can
+now approve. **E14-S10 is unblocked** and makes the sector and net-directional
+caps binding, which they are not yet. S08 (slots) and S09 (kill switch) are
+also ready. After E14, order placement is what stands between an approved
+decision and a real order.
 **E14-S10 was raised while building S04**: the sector and net-directional caps
 are configured but binding on nothing, because checks run before sizing and
 the sizer has no clamp for them. All of it is pure computation with no credentials and no

@@ -257,11 +257,21 @@ class TestSizingIsTheLastGate:
         """Not an error — every clamp applied and nothing fitted. The binding
         constraint is the explanation, so a surprisingly small position can be
         read rather than investigated."""
-        engine = RiskEngine(checks=[], sizer=_sizer(quantity=0, binding="broker_margin"))
+        engine = RiskEngine(checks=[], sizer=_sizer(quantity=0, binding="margin_cap"))
         decision = engine.evaluate(_rec(), _ctx())
         assert not decision.approved
         assert decision.reason is RejectReason.INSUFFICIENT_MARGIN
-        assert "broker_margin" in (decision.detail or "")
+        assert "margin_cap" in (decision.detail or "")
+
+    def test_a_zero_that_margin_did_not_cause_says_so_instead(self) -> None:
+        """E14-S07 AC2. The position cap or lot rounding can take a quantity to
+        zero on an account with plenty of margin, and reporting THAT as
+        INSUFFICIENT_MARGIN sends an operator to look at funds that are fine —
+        the SIT-001 conflation. The reason follows the binding clamp."""
+        engine = RiskEngine(checks=[], sizer=_sizer(quantity=0, binding="lot_rounding"))
+        decision = engine.evaluate(_rec(), _ctx())
+        assert decision.reason is RejectReason.POSITION_TOO_SMALL
+        assert "lot_rounding" in (decision.detail or "")
 
     def test_the_control_a_clean_pipeline_approves(self) -> None:
         """Every restrictive test needs its opposite, or a frame that rejected

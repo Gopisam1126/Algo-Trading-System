@@ -132,7 +132,21 @@ class RiskContext:
     #: making ``tradable=True`` alongside ``("BAN",)`` representable.
     symbol_restrictions: tuple[str, ...] | None = None
     symbol_sector: str | None = None
+    #: ATR for the MONEY path — always via ``ATR.as_decimal()``, never
+    #: ``.value``. Sizing multiplies it by the stop multiplier and divides it
+    #: into the risk budget, so float representation error reaches the
+    #: quantity.
+    #:
+    #: Non-positive is **unrepresentable** (see ``__post_init__``): the stop
+    #: distance is the divisor, so zero is an infinite quantity and negative is
+    #: a stop on the wrong side of entry.
     atr: Decimal | None = None
+    #: Tradable unit. 1 for NSE equity; F&O contracts are not.
+    #:
+    #: Sizing floors to a whole multiple of this, which is what keeps realised
+    #: risk inside the budget — rounding to nearest would exceed it by up to
+    #: one lot's worth of stop distance on every round-up.
+    lot_size: int = 1
     #: Per-share margin the broker will demand. Separate from `available_margin`
     #: because the sizing cap needs both.
     margin_per_share: Decimal | None = None
@@ -255,6 +269,18 @@ class RiskContext:
         if self.capital <= 0:
             raise RiskContextError(f"capital must be positive, got {self.capital}")
         self._reject_a_deadline_on_another_day()
+        if self.lot_size < 1:
+            raise RiskContextError(
+                f"lot_size is {self.lot_size}; a tradable unit below 1 share is "
+                f"not a thing, and sizing floors to a multiple of it"
+            )
+        if self.atr is not None and self.atr <= 0:
+            raise RiskContextError(
+                f"atr is {self.atr}. Stop distance is ATR x multiplier and the "
+                f"risk budget is divided by it, so zero is an infinite quantity "
+                f"and negative is a stop on the wrong side of entry. A name "
+                f"with no measured range belongs behind check 5, not here."
+            )
         if self.margin_per_share is not None and self.margin_per_share <= 0:
             raise RiskContextError(
                 f"margin_per_share is {self.margin_per_share}. The sizer divides "
