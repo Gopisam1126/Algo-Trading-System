@@ -125,6 +125,7 @@ risk:
     consecutive_loss_halt: 3
 
   exit_buffer_minutes: 5          # exit before the broker's auto square-off
+  min_minutes_to_squareoff: 30    # a NEW entry needs this much runway
   square_off_times:               # PER-STOCK — see calendar.py
     cas_stocks: "15:10"           # CAS regime, live since 2026-08-03
     non_cas_stocks: "15:20"

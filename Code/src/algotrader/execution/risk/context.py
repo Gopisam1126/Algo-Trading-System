@@ -204,6 +204,38 @@ class RiskContext:
                     f"meaningless."
                 )
 
+    def _reject_a_deadline_on_another_day(self) -> None:
+        """The square-off deadline must fall on the same IST day as ``now``.
+
+        This system is intraday: invariant 5 gives every position a time exit,
+        and ``MarketCalendar.squareoff_deadline()`` computes it for the trading
+        date in question. A deadline on any other date did not come from that
+        calculation, which means it is wrong.
+
+        Why it matters rather than being merely untidy: check 14 is the last
+        time-based gate, and it compares ``now`` against this value. A deadline
+        years in the future reads as unlimited runway and the gate silently
+        stops gating — found by probing E14-S06, where a 2030 deadline sailed
+        through. Refusing here makes an impossible deadline unrepresentable,
+        which is a stronger guarantee than any check reading it could give.
+
+        Compared in **IST** because that is the day the market keeps. In UTC,
+        an evening moment and the next morning's deadline share a date more
+        often than they should.
+        """
+        from algotrader.common.calendar import IST
+
+        now_ist = self.now.astimezone(IST)
+        deadline_ist = self.squareoff_deadline.astimezone(IST)
+        if now_ist.date() != deadline_ist.date():
+            raise RiskContextError(
+                f"squareoff_deadline is {deadline_ist:%Y-%m-%d %H:%M} IST but "
+                f"now is {now_ist:%Y-%m-%d %H:%M} IST. An intraday deadline is "
+                f"always the same day; a different one did not come from "
+                f"MarketCalendar.squareoff_deadline(), and would make the "
+                f"runway check read as unlimited time."
+            )
+
     def __post_init__(self) -> None:
         for name in ("unhealthy_services", "open_positions", "symbol_restrictions"):
             value = getattr(self, name)
@@ -222,6 +254,14 @@ class RiskContext:
         self._reject_non_finite_numbers()
         if self.capital <= 0:
             raise RiskContextError(f"capital must be positive, got {self.capital}")
+        self._reject_a_deadline_on_another_day()
+        if self.margin_per_share is not None and self.margin_per_share <= 0:
+            raise RiskContextError(
+                f"margin_per_share is {self.margin_per_share}. The sizer divides "
+                f"available margin by it, so zero is a crash and a negative "
+                f"value is a negative quantity — an order to sell what we were "
+                f"trying to buy."
+            )
         if self.consecutive_losses < 0:
             raise RiskContextError(
                 f"consecutive_losses is {self.consecutive_losses}. A negative "

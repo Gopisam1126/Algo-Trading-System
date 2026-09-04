@@ -42,12 +42,14 @@ from uuid import UUID
 
 import pytest
 
+from algotrader.common.calendar import IST
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
 from algotrader.common.models.trading import Recommendation
 from algotrader.execution.risk.checks import (
     EXPOSURE_ORDER,
     build_eligibility_checks,
     build_exposure_checks,
+    build_margin_timing_checks,
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext, RiskContextError
 from algotrader.execution.risk.framework import (
@@ -90,7 +92,7 @@ def _pos(symbol: str, sector: str | None = "PSU_BANK") -> OpenPosition:
 def _ctx(**overrides) -> RiskContext:
     base: dict = {
         "now": NOW,
-        "squareoff_deadline": NOW + dt.timedelta(hours=4),
+        "squareoff_deadline": dt.datetime(2026, 8, 25, 9, 35, tzinfo=dt.UTC),
         "capital": Decimal("500000"),
         "slots_total": 5,
         "slots_used": 0,
@@ -459,3 +461,87 @@ class TestACorruptLossCounterDoesNotReadAsACleanStreak:
     def test_zero_and_positive_counts_are_the_control(self) -> None:
         assert _ctx(consecutive_losses=0).consecutive_losses == 0
         assert _ctx(consecutive_losses=7).consecutive_losses == 7
+
+
+class TestASquareOffDeadlineIsAlwaysToday:
+    """QA-SEC-37. A deadline years in the future PASSED the runway check, which
+    silently turned the last time-based gate into a no-op.
+
+    Found by probing E14-S06: `squareoff_deadline` of 2030 gave effectively
+    unlimited runway, so check 14 stopped gating and nothing said so. The gate
+    would look present in every log and every test that used a sane deadline.
+
+    This system is intraday — invariant 5 gives every position a time exit —
+    so a deadline on any date but today did not come from
+    `MarketCalendar.squareoff_deadline()` and is wrong at its source. Refusing
+    it at construction makes the state unrepresentable, which is stronger than
+    any check reading the value could manage.
+    """
+
+    @staticmethod
+    def _at(day: int, hour: int, minute: int = 0) -> dt.datetime:
+        return dt.datetime(2026, 8, day, hour, minute, tzinfo=dt.UTC)
+
+    @pytest.mark.parametrize(
+        ("label", "deadline"),
+        [
+            ("years in the future", dt.datetime(2030, 1, 1, 4, 0, tzinfo=dt.UTC)),
+            ("yesterday", dt.datetime(2026, 8, 24, 9, 35, tzinfo=dt.UTC)),
+            ("tomorrow", dt.datetime(2026, 8, 26, 9, 35, tzinfo=dt.UTC)),
+            ("years in the past", dt.datetime(2020, 6, 1, 9, 35, tzinfo=dt.UTC)),
+        ],
+    )
+    def test_a_deadline_on_another_day_is_refused(self, label: str, deadline: dt.datetime) -> None:
+        with pytest.raises(RiskContextError, match="intraday deadline"):
+            _ctx(squareoff_deadline=deadline)
+
+    def test_the_error_gives_both_moments_in_ist(self) -> None:
+        """An operator debugging this needs to see the two dates side by side;
+        UTC would make an evening/next-morning pair look adjacent."""
+        with pytest.raises(RiskContextError) as excinfo:
+            _ctx(squareoff_deadline=dt.datetime(2026, 8, 26, 9, 35, tzinfo=dt.UTC))
+        message = str(excinfo.value)
+        assert "IST" in message
+        assert "2026-08-26" in message
+        assert "2026-08-25" in message
+
+    def test_the_comparison_is_in_ist_not_utc(self) -> None:
+        """The day the market keeps. 19:00 UTC on the 24th is 00:30 IST on the
+        25th — the same IST day as a 15:05 IST deadline on the 25th, and a
+        DIFFERENT UTC day. Comparing UTC dates would refuse a legitimate
+        context."""
+        ist_midnight_ish = dt.datetime(2026, 8, 24, 19, 0, tzinfo=dt.UTC)
+        ctx = _ctx(now=ist_midnight_ish)
+        assert ctx.now.astimezone(IST).date() == ctx.squareoff_deadline.astimezone(IST).date()
+
+    @pytest.mark.parametrize(
+        ("label", "now"),
+        [
+            ("pre-open 08:00 IST", dt.datetime(2026, 8, 25, 2, 30, tzinfo=dt.UTC)),
+            ("mid-session 10:00 IST", dt.datetime(2026, 8, 25, 4, 30, tzinfo=dt.UTC)),
+            ("post-close 16:00 IST", dt.datetime(2026, 8, 25, 10, 30, tzinfo=dt.UTC)),
+        ],
+    )
+    def test_every_legitimate_moment_of_the_day_still_constructs(
+        self, label: str, now: dt.datetime
+    ) -> None:
+        """The control, and it matters: a guard that refused post-close
+        contexts would break the square-off path, and one that refused
+        pre-open would break the plan build."""
+        assert _ctx(now=now).now == now
+
+    def test_the_same_instant_expressed_in_ist_is_accepted(self) -> None:
+        """Both fields are tz-aware, and the guard must compare instants rather
+        than the tzinfo they happen to carry."""
+        utc = _ctx()
+        ist = _ctx(now=utc.now.astimezone(IST))
+        assert ist.minutes_to_squareoff == utc.minutes_to_squareoff
+
+    def test_the_runway_check_can_no_longer_be_handed_unlimited_time(self) -> None:
+        """The end-to-end property. Before the guard, this context existed and
+        check 14 passed on it."""
+        engine = RiskEngine(checks=list(build_margin_timing_checks(min_minutes_to_squareoff=30)))
+        with pytest.raises(RiskContextError):
+            engine.evaluate(
+                _rec(), _ctx(squareoff_deadline=dt.datetime(2030, 1, 1, 4, 0, tzinfo=dt.UTC))
+            )

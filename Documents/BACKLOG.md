@@ -1831,6 +1831,42 @@ Daily loss limit → halt · consecutive loss limit → halt.
 ### E14-S06 · Margin and timing checks (13–14)
 `P0` `Phase 5` `🔴` `FEAT` · **1 day** · deps: E02-S07
 
+> **Staleness is E02-S07's job, not this check's.** `margin_for_sizing()`
+> raises on a snapshot older than its TTL, closing the
+> time-of-check/time-of-use gap — margin falls after every fill, so a stale
+> reading can authorise a position the account cannot carry. By the time a
+> number reaches `RiskContext.available_margin` it is **fresh or absent**;
+> this check rejects absent. Re-implementing the TTL here would give two
+> places to disagree about how old is too old.
+>
+> **Check 13 runs before sizing**, so it cannot verify margin for "the
+> intended position" — there is no quantity yet. It refuses when margin is
+> unknown, or will not cover a single share. Unlike the sector caps, the
+> proportional limit is *not* missing: §5.7's formula already clamps on
+> `available_margin / margin_per_share`, so E14-S07 completes it.
+>
+> **New config: `risk.min_minutes_to_squareoff` (30).** Not the same as
+> `exit_buffer_minutes`, which is already subtracted when the deadline is
+> computed. And not redundant with the 15:00 blackout: a CAS name's deadline
+> is 15:05, so at 14:59 — inside the tradable window — six minutes remain.
+> 30 is a judgement (two bars of the slowest supported interval), recorded as
+> an assumption rather than presented as derived.
+
+**Acceptance**
+- 🔴 Margin that is **unknown** rejects — as a fault, not a business rejection
+- 🔴 Margin below the cost of one share rejects with `INSUFFICIENT_MARGIN`
+- 🔴 An unknown `margin_per_share` rejects; affordability is a ratio
+- 🔴 A non-positive `margin_per_share` is refused at **construction** — the
+  sizer divides by it, so zero is a crash and negative is a negative quantity
+- 🔴 Less runway than configured rejects with `TOO_CLOSE_TO_SQUAREOFF`
+- 🔴 A deadline already **passed** rejects
+- **(control)** Known margin, an affordable share and ample runway pass both
+- Order is margin then timing, per §5.7, running last
+
+> **This story completes the fourteen.** `all_check_ids()` is the full list,
+> derived from the group constants so it cannot drift. A real pipeline trigger
+> clears all fourteen — and is still refused, because there is no sizer.
+
 **Tasks**
 - [ ] Live broker margin sufficient for the intended position
 - [ ] Enough runway before the per-stock square-off deadline

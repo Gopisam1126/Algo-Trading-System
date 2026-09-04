@@ -128,11 +128,12 @@ Never commit a `.env`, a credential, or anything under `data/`.
 
 ## Current state
 
-**The deterministic path is built from tick to a `RiskDecision`. Nothing
-trades, and nothing can — two of the fourteen risk checks are unwritten and
-there is no sizing and no order placement.**
+**The deterministic path is built from tick to a `RiskDecision`, and all
+fourteen risk checks now exist. Nothing trades, and nothing can — there is no
+sizing and no order placement, so a candidate that clears all fourteen is
+refused rather than approved.**
 
-Built and tested (**1,508 tests, 83% coverage** — 1,261 pass locally, 247 need
+Built and tested (**1,580 tests, 83% coverage** — 1,333 pass locally, 247 need
 Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -155,12 +156,13 @@ Docker):
   window, no-trade window), symbol eligibility 5–7 (E14-S03: tradable, slot
   available, not already held) and portfolio exposure 8–10 (E14-S04:
   correlation, sector, net directional, plus the rolling correlation matrix)
-  and loss limits 11–12 (E14-S05: daily loss, consecutive losses, each with a
-  latch so a halt cannot clear itself). A check that *raises* is a REJECTION,
+  loss limits 11–12 (E14-S05: daily loss, consecutive losses, each with a
+  latch so a halt cannot clear itself) and margin and timing 13–14 (E14-S06).
+  **All fourteen exist**; `all_check_ids()` is the list, derived from the
+  group constants so it cannot drift. A check that *raises* is a REJECTION,
   not a skip, reported as `RISK_ENGINE_FAULT` — the one `RejectReason` that
-  means "the system is broken" rather than "the answer is no". Checks 13–14
-  are not written, so the engine cannot yet approve anything and there is
-  nothing downstream of it.
+  means "the system is broken" rather than "the answer is no". There is no
+  sizer, so clearing all fourteen still ends in a refusal.
 
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/`. `execution/` now holds `risk/` and
@@ -169,7 +171,7 @@ nothing else — no sizer, no order manager.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,508 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,580 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -211,6 +213,12 @@ Recorded because each was believed, written down, and wrong.
   — written one story after QA-SEC-29, in a comment that cited QA-SEC-29.
   Bound the thing that reaches the log and the database, not the thing you
   happened to be counting.
+- **"A safety gate that is present is a safety gate that works."** A
+  square-off deadline on any day but today passed the runway check, so check
+  14 silently stopped gating — while still appearing in every log line and
+  every test that used a sane deadline. A control that is present and inert is
+  worse than one that is absent, because nothing prompts anyone to look.
+  QA-SEC-37; now unrepresentable at construction.
 - **"A risk check can be a pure predicate over current state."** Not when the
   state is a running total. A daily loss limit trips precisely when losing
   positions are open; one of them closing at a profit lifts
@@ -285,10 +293,11 @@ Recorded because each was believed, written down, and wrong.
 
 The keystone is gone, so E12 (backtest harness, gauntlet) and E13 (signal
 loop) are unblocked. **E14, the risk engine, is in progress** — S01 (the
-framework), S02 (pre-conditions 1–4), S03 (eligibility 5–7), S04 (exposure
-8–10) and S05 (loss limits 11–12) are delivered; **S06 margin and timing
-(13–14)** is the last check story, and then S07 sizing is what the engine needs
-before it can approve anything.
+framework) through S06 (margin and timing 13–14) are all delivered, so the
+fourteen checks are complete. **E14-S07, ATR-based sizing, is the next thing
+the engine needs** — it is what turns fourteen passes into an order, and
+E14-S10 then makes the sector and net-directional caps binding. S08 (slots)
+and S09 (kill switch) are also ready.
 **E14-S10 was raised while building S04**: the sector and net-directional caps
 are configured but binding on nothing, because checks run before sizing and
 the sizer has no clamp for them. All of it is pure computation with no credentials and no

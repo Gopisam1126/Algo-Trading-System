@@ -81,14 +81,29 @@ def _rec(symbol: str = "INFY") -> Recommendation:
 
 
 def _ctx(**overrides) -> RiskContext:
+    """A context whose deadline always belongs to the same IST day as `now`.
+
+    It used to pin the deadline to 25 Aug regardless, which meant the holiday
+    and weekend cases built a January `now` against an August deadline — a
+    state the real system cannot produce, since
+    `MarketCalendar.squareoff_deadline()` computes the deadline for the trading
+    date in question. E14-S06 made that unrepresentable (QA-SEC-37), and these
+    three tests were the ones relying on it.
+    """
+    from algotrader.common.calendar import IST
+
     base: dict = {
         "now": MIDSESSION,
-        "squareoff_deadline": DEADLINE,
         "capital": Decimal("500000"),
         "slots_total": 5,
         "slots_used": 0,
     }
     base.update(overrides)
+    if "squareoff_deadline" not in base:
+        day = base["now"].astimezone(IST).date()
+        base["squareoff_deadline"] = dt.datetime(
+            day.year, day.month, day.day, 15, 5, tzinfo=IST
+        ).astimezone(dt.UTC)
     return RiskContext(**base)
 
 
