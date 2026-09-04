@@ -271,11 +271,31 @@ class TestAC3QuantityAlwaysFloorsToAWholeLot:
     @given(atr=st.decimals(min_value="0.05", max_value="200", places=4))
     def test_it_never_rounds_up(self, atr: Decimal) -> None:
         """The Build Concerns note as a property: the quantity must never
-        exceed what the unrounded budget allowed."""
+        exceed what the budget allowed at the stop that will actually be
+        placed.
+
+        The denominator is the EFFECTIVE stop distance, read back from the
+        result, not `atr × multiplier`. Those differ: the distance is
+        quantised DOWN to four places, and a smaller divisor allows slightly
+        MORE shares. Hypothesis found it at atr=4.4623 — 6.69345 quantises to
+        6.6934, which allows 747 rather than 746.99.
+
+        That is safe only because `capital_at_risk` is computed with the same
+        quantised distance, so 747 × 6.6934 is still inside the budget. Had
+        the code quantised the stop PRICE while keeping the raw distance for
+        the risk figure, the recorded risk would describe a stop that is not
+        the one being placed — which is why the sizer quantises once and uses
+        that single value everywhere.
+        """
         result = _size(atr=atr)
-        stop_distance = atr * POLICY.atr_multiplier_stop
-        raw = (CAPITAL * POLICY.risk_pct / 100) / stop_distance
+        if result.quantity == 0:
+            return
+        effective_distance = result.entry_price - result.stop_price
+        raw = (CAPITAL * POLICY.risk_pct / 100) / effective_distance
         assert Decimal(result.quantity) <= raw
+        # And the two really are the same number, which is the invariant that
+        # makes the above meaningful rather than circular.
+        assert result.capital_at_risk == result.quantity * effective_distance
 
     def test_a_fractional_result_loses_the_fraction(self) -> None:
         """246.9 shares becomes 246, not 247. One share of a 20.25 stop
