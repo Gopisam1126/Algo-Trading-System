@@ -1876,6 +1876,47 @@ Daily loss limit → halt · consecutive loss limit → halt.
 ### E14-S07 · ATR-based position sizing
 `P0` `Phase 5` `🔴` `FEAT` · **2.5 days** · deps: E14-S06
 
+> **Floor, never nearest — and it is what makes the risk bound true.**
+> `raw_qty = risk_amount / stop_distance`, so any `quantity <= raw_qty` gives
+> `quantity × stop_distance <= risk_amount`. Rounding to nearest breaks that
+> on every round-up, by up to one lot's worth of stop distance, and the breach
+> is invisible: the position looks ordinary and the audit records a risk
+> figure that is simply wrong.
+>
+> **The stop is computed here, not taken from the Recommendation.**
+> `suggested_stop` exists and is deliberately not an input — invariant 1 says
+> the executable stop is computed downstream of the AI boundary, and a
+> Recommendation whose suggested stop drove the quantity would be carrying a
+> sizing field under another name.
+>
+> **Tick rounding stays with the order gateway**, and that was verified rather
+> than assumed: `round_to_tick` rounds a BUY down and a SELL up, so a long's
+> stop (a SELL) moves *up* toward entry and a short's (a BUY) moves *down*.
+> Submission-time rounding only ever *reduces* realised risk, so the bound
+> survives it.
+>
+> **At the configured defaults a high-priced name is bound by the position cap,
+> not the risk budget.** 20% of 500,000 buys 83 shares at 1,200, while the risk
+> budget would allow 246. So it risks *less* than the configured 1% — safe, and
+> explainable only because `binding_constraint` says which limit it was.
+
+**Acceptance**
+- 🔴 **Property**: realised risk never exceeds `risk_pct`, for any generated
+  capital, risk percentage, volatility, price or lot size
+- 🔴 **Property**: quantity always floors to a whole lot, never to nearest
+- 🔴 A zero quantity **rejects**, and not as a margin problem when the account
+  has plenty — `POSITION_TOO_SMALL` carries the non-margin case
+- 🔴 Unknown ATR rejects; a non-positive ATR is unrepresentable
+- 🔴 The stop is ATR-derived and sits on the losing side of entry
+- Each clamp names itself: `risk_budget`, `position_cap`, `slot_cap`,
+  `margin_cap`, `lot_rounding`
+- **(control)** An ordinary candidate produces a real position. A sizer that
+  always returned 0 would satisfy both properties perfectly
+
+> **This story closes the chain.** A Trigger from real ticks now clears all
+> fourteen checks and becomes an **approved** decision with a quantity and an
+> executable stop. It unblocks **E14-S10**.
+
 > As a trader, I want position size derived from volatility and risk budget, so
 > that every trade risks the same rupee amount regardless of the stock's price.
 

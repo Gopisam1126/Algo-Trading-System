@@ -281,6 +281,15 @@ class RejectReason(StrEnum):
     DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"
     CONSECUTIVE_LOSS_LIMIT = "CONSECUTIVE_LOSS_LIMIT"
     INSUFFICIENT_MARGIN = "INSUFFICIENT_MARGIN"
+    #: Sizing produced nothing, and margin was not why (E14-S07).
+    #:
+    #: The position cap, the slot cap or lot rounding can each take a
+    #: quantity to zero on an account with plenty of margin. Reporting
+    #: that as INSUFFICIENT_MARGIN sends an operator to look at funds
+    #: that are fine — the SIT-001 conflation, and the reason E14-S07's
+    #: AC2 ("a surprisingly small position is explainable") could not
+    #: otherwise pass. The binding constraint says which clamp it was.
+    POSITION_TOO_SMALL = "POSITION_TOO_SMALL"
     TOO_CLOSE_TO_SQUAREOFF = "TOO_CLOSE_TO_SQUAREOFF"
     AI_LOW_CONFIDENCE = "AI_LOW_CONFIDENCE"
     AI_VETO = "AI_VETO"

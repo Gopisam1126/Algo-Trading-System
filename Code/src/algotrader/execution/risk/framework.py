@@ -57,6 +57,7 @@ from typing import Protocol
 from algotrader.common.enums import RejectReason
 from algotrader.common.metrics import get_metrics
 from algotrader.common.models.trading import Recommendation, RiskDecision, SizingResult
+from algotrader.common.text import one_safe_line
 from algotrader.execution.risk.context import RiskContext
 
 log = logging.getLogger(__name__)
@@ -74,47 +75,6 @@ class RiskCheckError(RuntimeError):
     """A check could not reach a verdict. Always becomes a rejection."""
 
 
-#: A rejection detail is one line, and no longer than this.
-#:
-#: Both halves are enforced at construction rather than at the log call,
-#: because the log call is not the only consumer — the detail also reaches the
-#: `decision_log.payload` JSONB — and because a rule enforced where the value
-#: is BUILT cannot be forgotten by the fifteenth check somebody adds.
-MAX_DETAIL = 512
-
-#: Control characters that must never survive into a detail. C0 plus DEL.
-_CONTROL = {c: f"\\x{c:02x}" for c in [*range(0x20), 0x7F]}
-_CONTROL.update({0x0A: "\\n", 0x0D: "\\r", 0x09: "\\t"})
-_CONTROL_TABLE = str.maketrans({chr(k): v for k, v in _CONTROL.items()})
-
-
-def _one_safe_line(detail: str) -> str:
-    """Escape control characters and bound the length.
-
-    **This is the third time this defect has been found**, which is why the fix
-    is here rather than at a third source. QA-SEC-16 closed log forgery on
-    ``OrderRequest.symbol``; QA-SEC-28 found the same untrusted symbol reaching
-    ``Trigger`` and ``Recommendation``; QA-SEC-30 found it again in E14-S03's
-    surveillance-restriction labels, which come from NSE data by way of E04.
-
-    The pattern behind all three: *any untrusted string interpolated into a
-    rejection detail forges a log line*. Validating each new source in turn is
-    whack-a-mole with a growing board — fourteen checks, each free to
-    interpolate whatever it reads. Escaping where the detail is CONSTRUCTED is
-    one rule covering every check that exists or will exist.
-
-    Escaping rather than rejecting: the detail is diagnostic text, not a
-    security decision. Refusing to build the outcome would turn an accurate
-    ``SYMBOL_NOT_TRADABLE`` into a generic engine fault and lose the reason an
-    operator needs, which is a worse outcome than a visible ``\\n``.
-    """
-    escaped = detail.translate(_CONTROL_TABLE)
-    if len(escaped) > MAX_DETAIL:
-        keep = MAX_DETAIL - 24
-        escaped = f"{escaped[:keep]}... [{len(escaped) - keep} more chars]"
-    return escaped
-
-
 @dataclass(frozen=True, slots=True)
 class CheckOutcome:
     """One check's verdict.
@@ -128,7 +88,9 @@ class CheckOutcome:
 
     The detail is normalised at construction — one line, bounded length — so
     that no check can emit text that forges a log line or floods the audit
-    payload. See :func:`_one_safe_line`.
+    payload. See :func:`~algotrader.common.text.one_safe_line`, which is
+    shared with :class:`RiskDecision` — QA-SEC-38 found that the sizer
+    writes a detail through THAT constructor, never through this one.
     """
 
     passed: bool
@@ -146,7 +108,7 @@ class CheckOutcome:
         if self.detail:
             # frozen dataclass: normalise through object.__setattr__, so every
             # construction path gets it rather than only the `fail` classmethod.
-            object.__setattr__(self, "detail", _one_safe_line(self.detail))
+            object.__setattr__(self, "detail", one_safe_line(self.detail))
 
     @classmethod
     def ok(cls) -> CheckOutcome:
@@ -184,6 +146,15 @@ class RiskCheck:
 
 #: What the engine reports as the stopping check when a check itself raised.
 ERRORED = "check_errored"
+
+#: The one binding-constraint name this frame has to recognise, to tell a
+#: margin-bound zero from any other zero.
+#:
+#: Duplicated as a literal rather than imported from
+#: :mod:`algotrader.execution.sizer`, because the sizer is injected — the
+#: frame must not depend on any particular one. ``test_risk_framework.py``
+#: asserts the two agree, so the duplication cannot drift silently.
+MARGIN_CAP = "margin_cap"
 
 
 @dataclass
@@ -305,8 +276,21 @@ class RiskEngine:
             # Not an error: every clamp applied and the answer was "nothing
             # fits". It is still a refusal, and the binding constraint is the
             # explanation an operator needs.
+            #
+            # The reason code follows WHICH clamp bound. Reporting a zero from
+            # the position cap or from lot rounding as INSUFFICIENT_MARGIN
+            # would send someone to look at funds that are perfectly healthy —
+            # the SIT-001 conflation, and the reason E14-S07's AC2 ("a
+            # surprisingly small position is explainable") needs two codes
+            # rather than one.
+            margin_bound = sizing.binding_constraint == MARGIN_CAP
+            reason = (
+                RejectReason.INSUFFICIENT_MARGIN
+                if margin_bound
+                else RejectReason.POSITION_TOO_SMALL
+            )
             decision = RiskDecision.reject(
-                RejectReason.INSUFFICIENT_MARGIN,
+                reason,
                 detail=(
                     f"sizing produced quantity 0; binding constraint was "
                     f"{sizing.binding_constraint}"
@@ -316,6 +300,17 @@ class RiskEngine:
             )
             metrics.rejected(check="sizer", reason=decision.reason.value)  # type: ignore[union-attr]
             self._audit(rec, decision, stopped_by="sizer", ctx=ctx)
+            # Logged like every other rejection. Without this, the one path
+            # that can refuse a candidate which cleared all fourteen checks is
+            # also the only one that says nothing, and an operator watching the
+            # log sees the system go quiet with no reason given.
+            log.info(
+                "risk REJECTED %s (%s): %s [cleared %d check(s) first]",
+                rec.symbol,
+                decision.reason.value,  # type: ignore[union-attr]
+                decision.detail,
+                len(passed),
+            )
             return decision
 
         decision = RiskDecision.approve(sizing, checks_passed=passed, now=ctx.now)

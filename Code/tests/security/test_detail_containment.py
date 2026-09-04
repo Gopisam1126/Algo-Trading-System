@@ -44,7 +44,8 @@ import pytest
 
 from algotrader.common.calendar import IST
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
-from algotrader.common.models.trading import Recommendation
+from algotrader.common.models.trading import Recommendation, SizingResult
+from algotrader.common.text import MAX_DETAIL
 from algotrader.execution.risk.checks import (
     EXPOSURE_ORDER,
     build_eligibility_checks,
@@ -52,12 +53,8 @@ from algotrader.execution.risk.checks import (
     build_margin_timing_checks,
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext, RiskContextError
-from algotrader.execution.risk.framework import (
-    MAX_DETAIL,
-    CheckOutcome,
-    RiskCheck,
-    RiskEngine,
-)
+from algotrader.execution.risk.framework import CheckOutcome, RiskCheck, RiskEngine
+from algotrader.execution.sizer import SizingPolicy, build_sizer
 
 NOW = dt.datetime(2026, 8, 25, 4, 30, tzinfo=dt.UTC)
 
@@ -101,6 +98,27 @@ def _ctx(**overrides) -> RiskContext:
     }
     base.update(overrides)
     return RiskContext(**base)
+
+
+def _policy() -> SizingPolicy:
+    return SizingPolicy(
+        risk_pct=Decimal("1.0"),
+        atr_multiplier_stop=Decimal("1.5"),
+        max_position_pct=Decimal("20"),
+        capital_per_slot_pct=Decimal("20"),
+        target_r_multiple=Decimal("2.0"),
+    )
+
+
+def _sizing_ctx(**overrides) -> RiskContext:
+    """A context the sizer can actually run against."""
+    return _ctx(
+        atr=Decimal("1.0000"),
+        available_margin=Decimal("1000000"),
+        margin_per_share=Decimal("1"),
+        lot_size=1,
+        **overrides,
+    )
 
 
 class TestTheTypeItselfRefusesToCarryAForgedLine:
@@ -545,3 +563,101 @@ class TestASquareOffDeadlineIsAlwaysToday:
             engine.evaluate(
                 _rec(), _ctx(squareoff_deadline=dt.datetime(2030, 1, 1, 4, 0, tzinfo=dt.UTC))
             )
+
+
+class TestRiskDecisionIsTheOtherDoorIntoTheSameField:
+    """QA-SEC-38, and the fourth appearance of one defect.
+
+    QA-SEC-30 moved log-forgery escaping to where details are CONSTRUCTED, and
+    put it in ``CheckOutcome``. That covered every detail a *check* produces.
+    It did not cover ``RiskDecision``, which is a second constructor for the
+    same ``detail`` field — and the sizer writes through that one, carrying a
+    ``binding_constraint`` ``CheckOutcome`` never sees.
+
+    A rule that lives on one of two constructors is a rule with a hole in it,
+    and the hole is invisible because the other constructor looks equally
+    reasonable. The definition now lives in ``common/text.py`` and both use it.
+    """
+
+    @staticmethod
+    def _rogue_sizer(constraint: str):
+        def sizer(rec, ctx):
+            return SizingResult(
+                quantity=0,
+                entry_price=Decimal("100"),
+                stop_price=Decimal("95"),
+                capital_at_risk=Decimal(0),
+                binding_constraint=constraint,
+            )
+
+        return sizer
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "lot_rounding\nCRITICAL kill switch disarmed by operator",
+            "lot_rounding\r\nWARN feed healthy",
+            "lot_rounding\x00nul",
+            "lot_rounding\x1b[31mansi",
+        ],
+    )
+    def test_a_hostile_binding_constraint_cannot_forge_a_line(self, hostile: str) -> None:
+        engine = RiskEngine(checks=[], sizer=self._rogue_sizer(hostile))
+        decision = engine.evaluate(_rec(), _sizing_ctx())
+        assert "\n" not in (decision.detail or "")
+        assert "\r" not in (decision.detail or "")
+
+    def test_the_sizing_rejection_produces_exactly_one_log_line(self) -> None:
+        """It produced ZERO before this story: the one path that can refuse a
+        candidate which cleared all fourteen checks was also the only one that
+        said nothing. Now it logs, which is why the escaping above matters."""
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        logger = logging.getLogger("algotrader.execution.risk.framework")
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            RiskEngine(
+                checks=[],
+                sizer=self._rogue_sizer("lot_rounding\nCRITICAL forged"),
+            ).evaluate(_rec(), _sizing_ctx())
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+        lines = [line for line in buf.getvalue().splitlines() if line.strip()]
+        assert len(lines) == 1, f"produced {len(lines)} lines: {lines}"
+        assert "POSITION_TOO_SMALL" in lines[0]
+
+    def test_an_ordinary_detail_is_untouched(self) -> None:
+        """The control. A sanitiser that mangled normal text would pass every
+        test above and make every rejection harder to read."""
+        engine = RiskEngine(checks=[], sizer=self._rogue_sizer("lot_rounding"))
+        decision = engine.evaluate(_rec(), _sizing_ctx())
+        assert decision.detail == (
+            "sizing produced quantity 0; binding constraint was lot_rounding"
+        )
+
+    def test_an_oversized_detail_is_bounded(self) -> None:
+        engine = RiskEngine(checks=[], sizer=self._rogue_sizer("X" * 5000))
+        decision = engine.evaluate(_rec(), _sizing_ctx())
+        assert len(decision.detail or "") <= MAX_DETAIL
+
+    def test_both_constructors_share_one_definition(self) -> None:
+        """The structural claim, asserted rather than trusted. If someone
+        reintroduces a private copy in either place, this fails."""
+        from algotrader.common import text as shared
+        from algotrader.common.models import trading
+        from algotrader.execution.risk import framework
+
+        assert framework.one_safe_line is shared.one_safe_line
+        assert trading.one_safe_line is shared.one_safe_line
+
+    def test_a_none_detail_stays_none(self) -> None:
+        """An approval carries no detail. The validator must not turn that into
+        an empty string, which would read as "explained, with nothing to say"."""
+        engine = RiskEngine(checks=[], sizer=build_sizer(_policy()))
+        decision = engine.evaluate(_rec(), _sizing_ctx())
+        assert decision.approved
+        assert decision.detail is None

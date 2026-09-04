@@ -54,6 +54,7 @@ from algotrader.execution.risk.checks import (
 from algotrader.execution.risk.context import OpenPosition, RiskContext
 from algotrader.execution.risk.correlation import correlations_against
 from algotrader.execution.risk.framework import RiskEngine
+from algotrader.execution.sizer import SizingPolicy, build_sizer
 from algotrader.indicators.engine import IndicatorEngine, warm_up_symbols
 from algotrader.indicators.levels import OpeningRange
 from algotrader.ingest import cleaning
@@ -1250,3 +1251,221 @@ class TestTheTriggerMeetsAllFourteenChecks:
         still be caught."""
         for check in self._engine().checks:
             assert len(check.id) <= 28, check.id
+
+
+class TestTheTriggerBecomesAnApprovedOrder:
+    """QA-2 for E14-S07: the first time this pipeline produces an APPROVAL.
+
+    Every earlier seam class ended in a refusal, because there was no sizer and
+    the engine correctly refuses rather than defaulting a quantity. This one
+    closes the chain: ticks -> cleaning -> bars -> indicators -> strategy ->
+    Trigger -> Recommendation -> fourteen checks -> a quantity and a stop.
+
+    The seam that only exists here is the ATR one. The sizer divides the risk
+    budget by an ATR the INDICATOR ENGINE produced, through
+    `ATR.as_decimal()` -- not by a number a test author chose. If that boundary
+    ever returned a float, or the wrong scale, the quantity would be wrong in a
+    way no unit test using a hand-written Decimal could see.
+    """
+
+    @staticmethod
+    def _review() -> AIReview:
+        return AIReview(
+            verdict=AIVerdict.CONFIRM,
+            confidence=Decimal("0.80"),
+            timeframe_agreement=3,
+            thesis_alignment="aligned",
+            rationale="sizing seam probe",
+            model_used="test-harness",
+            latency_ms=0,
+        )
+
+    def _recommendation(self, run, evaluator) -> Recommendation:
+        trigger = evaluator.fire(run.context(), correlation_id=CID)
+        assert trigger is not None, "the pipeline must fire for this seam to be testable"
+        return Recommendation.build(trigger, self._review(), now=run.context().now)
+
+    @staticmethod
+    def _calendar() -> MarketCalendar:
+        status = load_holidays_with_status(
+            str(Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml")
+        )
+        return MarketCalendar(status.dates, covers_years=status.covers_years)
+
+    @staticmethod
+    def _policy() -> SizingPolicy:
+        return SizingPolicy(
+            risk_pct=Decimal("1.0"),
+            atr_multiplier_stop=Decimal("1.5"),
+            max_position_pct=Decimal("20"),
+            capital_per_slot_pct=Decimal("20"),
+            target_r_multiple=Decimal("2.0"),
+        )
+
+    def _engine(self, audit=None) -> RiskEngine:
+        """The complete engine: fourteen checks AND a sizer."""
+        return RiskEngine(
+            checks=[
+                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            sizer=build_sizer(self._policy()),
+            audit=audit,
+        )
+
+    @staticmethod
+    def _atr_from_the_engine(run) -> Decimal:
+        """The ATR the INDICATOR ENGINE computed, through the money-path
+        boundary. Not a number chosen to make the test pass."""
+        atr = run.engine.set_for(SYMBOL, Timeframe.M5).indicators["atr_14"]
+        value = atr.as_decimal()
+        assert value is not None, "the pipeline must have a warmed ATR"
+        return value
+
+    def _risk_ctx(self, run, **overrides) -> RiskContext:
+        base: dict = {
+            "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
+            "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 35, tzinfo=_dt.UTC),
+            "capital": Decimal("500000"),
+            "slots_total": 5,
+            "slots_used": 0,
+            "symbol_restrictions": (),
+            "symbol_sector": "IT",
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": self._atr_from_the_engine(run),
+            "lot_size": 1,
+        }
+        base.update(overrides)
+        return RiskContext(**base)
+
+    def test_a_real_trigger_becomes_an_approved_order(self, run, evaluator) -> None:
+        """The chain closes. Nothing in this system had ever produced an
+        approval before this story."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(run)
+        )
+        assert decision.approved, f"refused: {decision.reason} — {decision.detail}"
+        assert decision.checks_passed == list(all_check_ids())
+        assert decision.sizing is not None
+        assert decision.sizing.quantity > 0
+
+    def test_the_risk_bound_holds_on_a_real_atr(self, run, evaluator) -> None:
+        """AC1 against the indicator engine's own number rather than a chosen
+        one. A units error at the `as_decimal()` boundary -- percent instead of
+        rupees, say -- would blow the bound here and nowhere else."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(run)
+        )
+        assert decision.sizing is not None
+        budget = Decimal("500000") * Decimal("1.0") / 100
+        assert decision.sizing.capital_at_risk <= budget
+
+    def test_the_stop_is_a_placeable_price_on_the_losing_side(self, run, evaluator) -> None:
+        rec = self._recommendation(run, evaluator)
+        decision = self._engine().evaluate(rec, self._risk_ctx(run))
+        assert decision.sizing is not None
+        sizing = decision.sizing
+        assert sizing.stop_price > 0
+        assert sizing.stop_price < sizing.entry_price, "a long's stop must sit below entry"
+        assert -sizing.stop_price.as_tuple().exponent <= 4, "not a valid Price"
+
+    def test_the_entry_is_the_price_the_strategy_triggered_at(self, run, evaluator) -> None:
+        """The seam in the other direction: the sizer's entry price is the
+        Trigger's, carried through Recommendation unchanged."""
+        rec = self._recommendation(run, evaluator)
+        decision = self._engine().evaluate(rec, self._risk_ctx(run))
+        assert decision.sizing is not None
+        assert decision.sizing.entry_price == rec.trigger_price
+
+    def test_the_approval_carries_a_binding_constraint(self, run, evaluator) -> None:
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(run)
+        )
+        assert decision.sizing is not None
+        assert decision.sizing.binding_constraint
+
+    def test_a_failed_check_still_produces_no_sizing(self, run, evaluator) -> None:
+        """The sizer runs only after every gate passes. A rejected candidate
+        must carry no quantity at all -- not a quantity that something
+        downstream might read."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(run, kill_switch_active=True),
+        )
+        assert not decision.approved
+        assert decision.sizing is None
+
+    def test_an_account_that_cannot_afford_one_share_is_refused_by_check_13(
+        self, run, evaluator
+    ) -> None:
+        """Refused before sizing ever runs. The gate exists so the sizer is
+        never asked to divide a budget the account cannot fund."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(run, available_margin=Decimal("100"), margin_per_share=Decimal("240")),
+        )
+        assert not decision.approved
+        assert decision.reason is RejectReason.INSUFFICIENT_MARGIN
+        assert decision.sizing is None
+
+    def test_an_account_that_affords_exactly_one_share_gets_one(self, run, evaluator) -> None:
+        """Recorded because it surprised me: 300 of margin at 240 per share is
+        1.25, which floors to a ONE-share position and is APPROVED. That is
+        correct — the risk bound holds and the margin cap is respected — and it
+        is the honest consequence of flooring. Whether one share is worth the
+        brokerage is a different question, and not this story's."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator),
+            self._risk_ctx(run, available_margin=Decimal("300"), margin_per_share=Decimal("240")),
+        )
+        assert decision.approved
+        assert decision.sizing is not None
+        assert decision.sizing.quantity == 1
+        assert decision.sizing.binding_constraint == "margin_cap"
+
+    def test_a_lot_too_large_to_fill_is_refused_as_a_size_problem(self, run, evaluator) -> None:
+        """The sizer's own zero path, reached with margin to spare — so the
+        rejection must NOT say insufficient margin."""
+        decision = self._engine().evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(run, lot_size=100000)
+        )
+        assert not decision.approved
+        assert decision.reason is RejectReason.POSITION_TOO_SMALL
+        assert "lot_rounding" in (decision.detail or "")
+
+    def test_the_audit_records_the_approval_with_the_quantity(self, run, evaluator) -> None:
+        """The audit chain has to carry the number that becomes an order."""
+        written: list[dict] = []
+        self._engine(audit=written.append).evaluate(
+            self._recommendation(run, evaluator), self._risk_ctx(run)
+        )
+        assert len(written) == 1
+        entry = written[0]
+        assert entry["outcome"] == "approved"
+        assert entry["stage"] == "risk_approved"
+        assert entry["correlation_id"] == CID
+        assert entry["payload"]["quantity"] > 0
+        assert entry["payload"]["binding_constraint"]
+
+    def test_a_volatile_session_sizes_smaller_than_a_quiet_one(self, run, evaluator) -> None:
+        """The whole point of ATR sizing, at the seam: the same risk budget
+        buys fewer shares when the instrument moves more. Both are measured
+        against the SAME budget."""
+        rec = self._recommendation(run, evaluator)
+        real_atr = self._atr_from_the_engine(run)
+        quiet = self._engine().evaluate(rec, self._risk_ctx(run, atr=real_atr / 4))
+        volatile = self._engine().evaluate(rec, self._risk_ctx(run, atr=real_atr * 4))
+        assert quiet.sizing is not None and volatile.sizing is not None
+        assert quiet.sizing.quantity > volatile.sizing.quantity
+        budget = Decimal("500000") * Decimal("1.0") / 100
+        assert quiet.sizing.capital_at_risk <= budget
+        assert volatile.sizing.capital_at_risk <= budget
