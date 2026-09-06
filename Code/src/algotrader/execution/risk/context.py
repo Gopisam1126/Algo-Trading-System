@@ -77,13 +77,34 @@ class RiskContext:
     available_margin: Decimal | None = None
 
     # -- session state ------------------------------------------------------
-    kill_switch_active: bool = False
-    #: Services that have missed their heartbeat. Non-empty means degraded.
-    unhealthy_services: tuple[str, ...] = ()
+    #
+    # Every field in this block is ``| None`` with no permissive default, and
+    # the checks that read them go through :meth:`require`. That is deliberate
+    # and it is the point of the block (AUDIT-005).
+    #
+    # These six values are the session's RISK STATE, and E14-S09 owns all of
+    # them: it reads Redis, decides what is armed, and builds the context. A
+    # plain ``= False`` would mean the answer to "is the kill switch on?" is
+    # *no* whenever the caller failed to ask — so a Redis timeout, a partially
+    # built context, or a field forgotten in a future refactor would each read
+    # as "nothing is halted" and trade. That is a fail-open on the most
+    # absolute control in the system, and invariant 6 is *fail closed*.
+    #
+    # ``available_margin`` above already states the rule this block now
+    # follows: *None means nobody answered, which is a rejection and never an
+    # assumption.* These fields were the ones that did not follow it.
+    #
+    # The cost is that a caller must state the session state explicitly. That
+    # is the intended cost — "I did not look" and "I looked and nothing is
+    # halted" are different claims, and only one of them is safe to trade on.
+    kill_switch_active: bool | None = None
+    #: Services that have missed their heartbeat. Non-empty means degraded;
+    #: **empty is a claim that they were checked**, not that nobody looked.
+    unhealthy_services: tuple[str, ...] | None = None
     #: Closed-trade P&L for the session. **Negative is a loss.** Open positions
     #: are not in it — the name is the contract.
-    realised_pnl_today: Decimal = Decimal(0)
-    consecutive_losses: int = 0
+    realised_pnl_today: Decimal | None = None
+    consecutive_losses: int | None = None
 
     #: Latches for the two loss limits (E14-S05).
     #:
@@ -102,8 +123,8 @@ class RiskContext:
     #: **Set by E14-S09**, which owns arming and persisting halts, exactly as
     #: it owns ``kill_switch_active`` while check 1 only reads it. Two fields
     #: rather than one shared flag so each rejection keeps its own reason code.
-    daily_loss_halted: bool = False
-    consecutive_loss_halted: bool = False
+    daily_loss_halted: bool | None = None
+    consecutive_loss_halted: bool | None = None
 
     # -- portfolio ----------------------------------------------------------
     open_positions: tuple[OpenPosition, ...] = ()
@@ -288,7 +309,7 @@ class RiskContext:
                 f"value is a negative quantity — an order to sell what we were "
                 f"trying to buy."
             )
-        if self.consecutive_losses < 0:
+        if self.consecutive_losses is not None and self.consecutive_losses < 0:
             raise RiskContextError(
                 f"consecutive_losses is {self.consecutive_losses}. A negative "
                 f"count is not 'fewer losses' — it means whatever maintains "

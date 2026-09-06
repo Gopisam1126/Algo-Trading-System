@@ -132,7 +132,7 @@ Never commit a `.env`, a credential, or anything under `data/`.
 carrying a quantity and an executable stop. Nothing trades, and nothing can —
 there is no order placement, so nothing turns that decision into an order.**
 
-Built and tested (**1,691 tests, 83% coverage** — 1,444 pass locally, 247 need
+Built and tested (**1,708 tests, 83% coverage** — 1,461 pass locally, 247 need
 Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -176,7 +176,7 @@ this file means: the system cannot trade, correctly or otherwise.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,691 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,708 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -287,6 +287,17 @@ Recorded because each was believed, written down, and wrong.
   were configured and binding on nothing (E14-S10). The loader now refuses a
   `trade: true` it cannot honour, at load, in the pre-market — not at 13:00 on
   Diwali. AUDIT-003.
+- **"Fail closed" was true of the checks and false of the context they read.**
+  All six fields describing the session's risk state carried a *permissive*
+  default — `kill_switch_active: bool = False`, `unhealthy_services = ()`, both
+  loss latches `False`. So "is the kill switch on?" answered **no** whenever
+  nobody asked, and there was no way to say "I don't know". The fourteen checks
+  were all correct; what they read defaulted to the safe-looking lie. Making
+  the six explicit broke **137 existing tests**, every one of which had been
+  relying on unknown meaning fine — which is the measurement of how invisible
+  this was. The rule they broke was already written on the field directly above
+  them: *"`None` means the broker did not answer, which is a rejection and
+  never an assumption."* AUDIT-005.
 - **"An empty file is an empty file."** `broker/__init__.py` being empty is
   *load-bearing*. `AppConfig` has one upward import — a deferred
   `broker.profiles` — and what makes it cheap is that reaching `profiles`

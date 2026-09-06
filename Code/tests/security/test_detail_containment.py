@@ -88,6 +88,14 @@ def _pos(symbol: str, sector: str | None = "PSU_BANK") -> OpenPosition:
 
 def _ctx(**overrides) -> RiskContext:
     base: dict = {
+        # The session risk state, stated rather than defaulted (AUDIT-005).
+        # "Nothing is halted" is a claim these tests rely on, so they say it.
+        "kill_switch_active": False,
+        "unhealthy_services": (),
+        "realised_pnl_today": Decimal(0),
+        "consecutive_losses": 0,
+        "daily_loss_halted": False,
+        "consecutive_loss_halted": False,
         "now": NOW,
         "squareoff_deadline": dt.datetime(2026, 8, 25, 9, 35, tzinfo=dt.UTC),
         "capital": Decimal("500000"),

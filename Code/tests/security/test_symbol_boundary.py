@@ -76,6 +76,14 @@ def _recommendation(symbol: str) -> Recommendation:
 
 def _context(**overrides: object) -> RiskContext:
     kwargs: dict[str, object] = {
+        # The session risk state, stated rather than defaulted (AUDIT-005).
+        # "Nothing is halted" is a claim these tests rely on, so they say it.
+        "kill_switch_active": False,
+        "unhealthy_services": (),
+        "realised_pnl_today": Decimal(0),
+        "consecutive_losses": 0,
+        "daily_loss_halted": False,
+        "consecutive_loss_halted": False,
         "now": NOW,
         "squareoff_deadline": NOW + dt.timedelta(hours=4),
         "capital": Decimal("500000"),

@@ -81,6 +81,14 @@ def _ctx(**overrides) -> RiskContext:
     """A context that is CLEAN by default, so each test states only the one
     thing it is testing. `symbol_restrictions=()` means checked-and-clean."""
     base: dict = {
+        # The session risk state, stated rather than defaulted (AUDIT-005).
+        # "Nothing is halted" is a claim these tests rely on, so they say it.
+        "kill_switch_active": False,
+        "unhealthy_services": (),
+        "realised_pnl_today": Decimal(0),
+        "consecutive_losses": 0,
+        "daily_loss_halted": False,
+        "consecutive_loss_halted": False,
         "now": MIDSESSION,
         "squareoff_deadline": DEADLINE,
         "capital": Decimal("500000"),

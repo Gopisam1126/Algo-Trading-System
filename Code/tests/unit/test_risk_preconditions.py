@@ -93,6 +93,14 @@ def _ctx(**overrides) -> RiskContext:
     from algotrader.common.calendar import IST
 
     base: dict = {
+        # The session risk state, stated rather than defaulted (AUDIT-005).
+        # "Nothing is halted" is a claim these tests rely on, so they say it.
+        "kill_switch_active": False,
+        "unhealthy_services": (),
+        "realised_pnl_today": Decimal(0),
+        "consecutive_losses": 0,
+        "daily_loss_halted": False,
+        "consecutive_loss_halted": False,
         "now": MIDSESSION,
         "capital": Decimal("500000"),
         "slots_total": 5,

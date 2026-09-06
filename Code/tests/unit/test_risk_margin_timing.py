@@ -70,6 +70,14 @@ def _rec(symbol: str = "INFY") -> Recommendation:
 def _ctx(**overrides) -> RiskContext:
     """Healthy by default: margin known and ample, deadline hours away."""
     base: dict = {
+        # The session risk state, stated rather than defaulted (AUDIT-005).
+        # "Nothing is halted" is a claim these tests rely on, so they say it.
+        "kill_switch_active": False,
+        "unhealthy_services": (),
+        "realised_pnl_today": Decimal(0),
+        "consecutive_losses": 0,
+        "daily_loss_halted": False,
+        "consecutive_loss_halted": False,
         "now": MIDSESSION,
         "squareoff_deadline": CAS_DEADLINE,
         "capital": Decimal("500000"),
