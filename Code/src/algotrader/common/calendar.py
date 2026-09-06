@@ -19,6 +19,7 @@ recurring source of slippage.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -338,6 +339,46 @@ class HolidayCalendarStatus:
         return f"HolidayCalendarStatus({self.count} dates, {state}, {self.source!r})"
 
 
+def _reject_unimplemented_special_sessions(entries: list[Any], path: str) -> None:
+    """Refuse to start if the file asks for a session this code cannot run.
+
+    ``special_sessions`` describes days that are otherwise closed but carry a
+    real session — Muhurat trading, which falls on a **Sunday**. The file
+    carries a ``trade:`` flag per entry, and the recorded decision
+    (SPRINT02 Q5) is to stand down: one ceremonial hour has different liquidity
+    and different spreads from every session the strategies were validated
+    against.
+
+    Standing down is what happens today, but only because ``is_trading_day``
+    sees a Sunday. Nothing reads this block. So an operator who flipped
+    ``trade: true`` — a field that sits right there and describes itself —
+    would change nothing at all, and would have no way to discover that.
+
+    That is the "configuring a limit means the limit is enforced" mistake this
+    project has already made once, with two exposure caps that were configured
+    and binding on nothing. A config field that lies about its own effect is
+    worse than no field: it invites a decision it cannot carry out.
+
+    So the flag is honest in the only way it can be until a Muhurat session is
+    actually supported — asking for it stops the system at load, in the
+    pre-market, with a message saying why, rather than silently not happening.
+    """
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("trade"):
+            when = entry.get("date", "?")
+            raise HolidayDataError(
+                f"{path} asks to TRADE the special session on {when} "
+                f"({entry.get('name', 'unnamed')}), and that is not implemented. "
+                f"The calendar treats the day as closed because it is a Sunday, "
+                f"so setting `trade: true` would change nothing while reading as "
+                f"though it had. Standing down is the recorded decision "
+                f"(SPRINT02 Q5); to trade it, the session's hours have to be "
+                f"modelled first."
+            )
+
+
 def load_holidays_with_status(path: str | None = None) -> HolidayCalendarStatus:
     """Load the NSE holiday list, reporting whether it can be trusted.
 
@@ -369,6 +410,8 @@ def load_holidays_with_status(path: str | None = None) -> HolidayCalendarStatus:
     parsed: set[date] = set()
     for entry in raw.get("holidays") or []:
         parsed.add(entry if isinstance(entry, date) else date.fromisoformat(str(entry)))
+
+    _reject_unimplemented_special_sessions(raw.get("special_sessions") or [], path)
 
     meta = raw.get("meta") or {}
     covers = frozenset(int(y) for y in (meta.get("covers_years") or []))

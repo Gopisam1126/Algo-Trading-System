@@ -324,12 +324,20 @@ class KiteTradingAdapter(KiteReads):
         raw = await self._call(self._client.margins, "equity")
         available = raw.get("available", {}) if isinstance(raw, dict) else {}
         utilised = raw.get("utilised", {}) if isinstance(raw, dict) else {}
+        # AUDIT-001. Every one of these is a number position sizing divides
+        # by or compares against, so a missing field must stop the fetch
+        # rather than become a zero the risk engine reports as an empty
+        # account.
         snapshot = MarginSnapshot(
-            available_cash=Decimal(str(available.get("cash", 0) or 0)),
+            available_cash=Decimal(str(mapping.require_field(available, "cash", what="margin"))),
             available_margin=Decimal(
-                str(available.get("live_balance", available.get("cash", 0)) or 0)
+                str(
+                    mapping.require_field(
+                        available, "live_balance", alias="cash", what="available margin"
+                    )
+                )
             ),
-            used_margin=Decimal(str(utilised.get("debits", 0) or 0)),
+            used_margin=Decimal(str(mapping.require_field(utilised, "debits", what="used margin"))),
             fetched_at=dt.datetime.now(dt.UTC),
         )
         self._margin = snapshot
@@ -375,11 +383,15 @@ class KiteTradingAdapter(KiteReads):
             side=mapping.side_in(str(row["transaction_type"])),
             order_type=mapping.order_type_in(str(row["order_type"])),
             product=mapping.product_in(str(row["product"])),
-            quantity=int(row.get("quantity") or 0),
+            quantity=int(mapping.require_field(row, "quantity", what="an order row")),
             limit_price=Decimal(str(row["price"])) if row.get("price") else None,
             trigger_price=Decimal(str(row["trigger_price"])) if row.get("trigger_price") else None,
             status=mapping.status_in(str(row.get("status") or "")),
-            filled_quantity=int(row.get("filled_quantity") or 0),
+            # AUDIT-002. The documented recovery path queries the broker by
+            # client_order_id and ADOPTS ITS ANSWER; a silent 0 here is an
+            # answer that says "nothing filled", which is how a blind retry
+            # turns one position into two.
+            filled_quantity=int(mapping.require_field(row, "filled_quantity", what="an order row")),
             average_price=Decimal(str(row["average_price"])) if row.get("average_price") else None,
             intent=_intent_from_tag(tag),
             placed_at=mapping.parse_broker_timestamp(row.get("order_timestamp")),

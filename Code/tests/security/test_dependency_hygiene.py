@@ -25,7 +25,11 @@ CVE into a red check.
 
 from __future__ import annotations
 
+import ast
 import importlib.metadata as md
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -190,4 +194,84 @@ class TestTheBuildEnvironmentIsAudited:
         assert not stale, (
             f"build backend carries known advisories: {stale}. "
             f"Run: pip install --upgrade pip setuptools wheel"
+        )
+
+
+class TestLoadingAConfigDoesNotDragInTheBrokerStack:
+    """AUDIT-004, found by the end-to-end audit's import-graph pass.
+
+    ``AppConfig`` has one import that points *upward*: a deferred
+    ``from algotrader.broker.profiles import get_profile`` inside
+    ``_order_rate_within_broker_limit``. Deferring it is correct and
+    deliberate — it breaks a cycle, and ``broker/profiles.py`` is pure data.
+
+    What makes it safe is a second fact that is nowhere written down:
+    ``broker/__init__.py`` is **empty**. Executing the package to reach
+    ``profiles`` therefore costs nothing. Add one convenience re-export there
+    — the most natural edit in the world, and one no reviewer would question —
+    and every process that validates a config starts importing ``kiteconnect``,
+    which imports ``.ticker`` unconditionally, which loads autobahn and
+    Twisted. That is recorded in CLAUDE.md as an already-made mistake:
+    *not using a package is not the same as not having it.*
+
+    The cost is not only startup time. It pulls the one dependency in this
+    project with a CVE history into processes that never touch a broker, and
+    it does so silently: nothing fails, nothing logs, and the existing
+    dependency tests here check autobahn's *version*, never whether it was
+    loaded at all.
+
+    So the emptiness is load-bearing, and this asserts it as behaviour rather
+    than trusting a file to stay empty.
+    """
+
+    #: Third-party packages that must not be reachable from config validation.
+    FORBIDDEN = frozenset({"twisted", "autobahn", "kiteconnect"})
+
+    def test_validating_a_config_loads_no_broker_transport(self) -> None:
+        """Run in a subprocess: the parent's ``sys.modules`` is polluted by
+        every other test in the suite, so an in-process check would pass or
+        fail on import order rather than on the thing being asserted."""
+        program = (
+            "import sys\n"
+            "from algotrader.common.config import AppConfig\n"
+            "AppConfig()\n"
+            "roots = {m.split('.')[0] for m in sys.modules}\n"
+            "print(','.join(sorted(roots & {'twisted', 'autobahn', 'kiteconnect'})))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
+        assert result.returncode == 0, result.stderr
+        loaded = [name for name in result.stdout.strip().split(",") if name]
+        assert not loaded, (
+            f"validating an AppConfig imported {loaded}. Something in the chain "
+            f"algotrader.broker -> algotrader.broker.profiles now pulls in the "
+            f"broker transport. Keep broker/__init__.py free of re-exports."
+        )
+
+    def test_the_deferred_import_is_still_the_only_upward_one(self) -> None:
+        """The control on the assertion above: it is only meaningful while the
+        import is deferred. A module-level ``import`` of anything under
+        ``algotrader.broker`` in ``common/`` would make config validation eager
+        regardless of what this test's subprocess finds today."""
+        common = Path(__file__).resolve().parents[2] / "src" / "algotrader" / "common"
+        offenders: list[str] = []
+        for path in common.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or not node.module:
+                    continue
+                if not node.module.startswith("algotrader.broker"):
+                    continue
+                # col_offset 0 == module level; anything indented is deferred.
+                if node.col_offset == 0:
+                    offenders.append(f"{path.name}:{node.lineno} -> {node.module}")
+        assert not offenders, (
+            f"common/ imports broker at module level: {offenders}. "
+            f"common is the lowest layer; the one permitted upward reference "
+            f"(config's broker-rate validator) is deferred on purpose."
         )

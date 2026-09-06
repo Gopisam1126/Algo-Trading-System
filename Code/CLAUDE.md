@@ -132,7 +132,7 @@ Never commit a `.env`, a credential, or anything under `data/`.
 carrying a quantity and an executable stop. Nothing trades, and nothing can —
 there is no order placement, so nothing turns that decision into an order.**
 
-Built and tested (**1,662 tests, 83% coverage** — 1,415 pass locally, 247 need
+Built and tested (**1,691 tests, 83% coverage** — 1,444 pass locally, 247 need
 Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -168,13 +168,15 @@ Docker):
   binding clamp is recorded, so a surprisingly small position is explainable.
 
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
-`api/`, `notifier/`, `ai/`, `macro/`. `execution/` now holds `risk/` and
-nothing else — no sizer, no order manager.
+`api/`, `notifier/`, `ai/`, `macro/` — seven of thirteen packages.
+`execution/` holds `risk/` and `sizer.py`. **There is no order manager and
+no order placement**, which is the single fact that decides what the rest of
+this file means: the system cannot trade, correctly or otherwise.
 
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,662 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,691 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -264,6 +266,37 @@ Recorded because each was believed, written down, and wrong.
   healthy. `signals_rejected_total{reason}` is the metric that turns "why
   isn't it trading?" into a glance, so a wrong label there costs exactly the
   glance it exists to provide. Now `RISK_ENGINE_FAULT`. See SIT-001.
+- **"`or 0` is a harmless default."** It is the same defect as every entry
+  above, one layer further out — at the boundary where an external number
+  *enters*. `fetch_margins` read `Decimal(str(available.get("cash", 0) or 0))`,
+  so a renamed, missing or explicitly null Kite key produced
+  `available_margin = 0` with no error, no log line and no metric. The risk
+  engine then did its job perfectly and refused the trade as
+  INSUFFICIENT_MARGIN — sending an operator to inspect a fully funded account
+  while the real fault, a changed broker API, went unreported. **A correct
+  downstream check makes an upstream lie more convincing, not less.** The
+  distinction that matters is *the broker said zero* versus *the broker did
+  not say* — `require_field` now refuses to collapse them, and counts an
+  explicit `null` as absent because Kite sends those. AUDIT-001/002.
+- **"A config field describes what the system does."** `nse_holidays.yaml`
+  declares `special_sessions` with a per-entry `trade:` flag. Nothing read the
+  block. Standing down on Muhurat — the recorded decision — happened anyway,
+  because the 2026 date falls on a Sunday. **The behaviour was right by
+  accident**, and an operator who flipped the flag would have changed nothing
+  and had no way to find that out. Same shape as the two exposure caps that
+  were configured and binding on nothing (E14-S10). The loader now refuses a
+  `trade: true` it cannot honour, at load, in the pre-market — not at 13:00 on
+  Diwali. AUDIT-003.
+- **"An empty file is an empty file."** `broker/__init__.py` being empty is
+  *load-bearing*. `AppConfig` has one upward import — a deferred
+  `broker.profiles` — and what makes it cheap is that reaching `profiles`
+  executes nothing. One convenience re-export there, the most natural edit
+  imaginable, and every process that validates a config imports `kiteconnect`,
+  which imports `.ticker` unconditionally, which loads autobahn and Twisted —
+  the one dependency here with a CVE history, pulled into processes that never
+  touch a broker. Nothing would have failed, logged, or asked why. Asserted as
+  behaviour now, in a subprocess, because the parent's `sys.modules` is
+  polluted by the rest of the suite. AUDIT-004.
 - **"`"integration" in item.keywords` checks the marker."** It also matches
   every ancestor *node name*, so it matched the `tests/integration/`
   **directory**. The only system-level test in the repo — which uses no
@@ -271,6 +304,25 @@ Recorded because each was believed, written down, and wrong.
   a suite that called itself green. Use `item.get_closest_marker(...)`. A test
   that quietly stops running is worse than one that fails, because nothing
   asks why.
+
+### What the whole-system audit checked and did not break
+
+Recorded because an audit that lists only its findings reads as though nothing
+else was examined. Verified sound, with probes rather than by reading:
+
+- **The audit hash chain.** Length-prefixed framing, so no pair of adjacent
+  fields can be re-split to forge the same digest; real `prev_hash` chaining;
+  naive timestamps refused; the digest is timezone-invariant.
+- **`SecretString` across twelve rendering paths** — `str`, `repr`, f-string,
+  `format`, `%s`, `json`, `pickle`, `deepcopy`, `__dict__`, an exception
+  message, `__reduce__`, and a traceback. Zero leaks.
+- **Repo hygiene across the whole history.** No credential has ever been
+  committed; the repository is public, so this was checked against every
+  commit, not the working tree.
+- **The SEBI cap.** Configuration can lower `max_orders_per_second`; it cannot
+  raise it above 5. `market_protection: 0` is refused.
+- **Fail-closed behaviour** in the fourteen checks, and audit-write failure —
+  which buffers to disk and logs loudly rather than dropping the record.
 
 ### Corporate actions — read before touching `ohlcv`
 
