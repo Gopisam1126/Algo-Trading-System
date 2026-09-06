@@ -20,7 +20,9 @@ from algotrader.common.calendar import (
     SQUAREOFF_CAS_STOCKS,
     SQUAREOFF_FNO,
     SQUAREOFF_NON_CAS,
+    HolidayDataError,
     MarketCalendar,
+    load_holidays_with_status,
 )
 
 
@@ -386,3 +388,90 @@ class TestAnUncoveredYearIsRefusedNotAnswered:
             frozenset({date(2026, 1, 26)}), verified=True, source="t", path=None
         )
         assert status.covers(date(2026, 5, 1))
+
+
+class TestASpecialSessionFlagCannotLieAboutItsOwnEffect:
+    """AUDIT-003, found by the end-to-end audit.
+
+    ``config/nse_holidays.yaml`` declares a ``special_sessions`` block for
+    Muhurat trading — a real session that falls on a **Sunday** — with a
+    per-entry ``trade:`` flag. The recorded decision (SPRINT02 Q5) is to stand
+    down: one ceremonial hour has different liquidity and different spreads
+    from every session the strategies were validated against.
+
+    Standing down is what happened, but only because ``is_trading_day`` sees a
+    Sunday. **Nothing read the block.** An operator who flipped ``trade: true``
+    — a field sitting right there, describing itself — would have changed
+    nothing, and had no way to find that out.
+
+    That is the "configuring a limit means the limit is enforced" mistake this
+    project already made once, with two exposure caps that were configured and
+    binding on nothing (E14-S10). A config field that lies about its own effect
+    is worse than no field: it invites a decision it cannot carry out.
+    """
+
+    @staticmethod
+    def _write(tmp_path, text: str) -> str:
+        path = tmp_path / "holidays.yaml"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    #: The shipped file, reduced to what this behaviour depends on.
+    BASE = (
+        "meta:\n"
+        "  verified_against_nse_circular: true\n"
+        "  covers_years: [2026]\n"
+        "holidays:\n"
+        "  - 2026-01-26\n"
+        "special_sessions:\n"
+        "  - date: 2026-11-08\n"
+        '    name: "Diwali Laxmi Pujan — Muhurat Trading"\n'
+        "    trade: {flag}\n"
+    )
+
+    def test_the_shipped_default_loads(self, tmp_path) -> None:
+        """`trade: false` is the recorded decision and must keep working."""
+        status = load_holidays_with_status(self._write(tmp_path, self.BASE.format(flag="false")))
+        assert status.dates
+        assert 2026 in status.covers_years
+
+    def test_asking_to_trade_it_stops_the_system_at_load(self, tmp_path) -> None:
+        """Not at 13:00 on Diwali. At load, in the pre-market, with a reason."""
+        with pytest.raises(HolidayDataError, match="not implemented"):
+            load_holidays_with_status(self._write(tmp_path, self.BASE.format(flag="true")))
+
+    def test_the_error_names_the_date_and_the_recorded_decision(self, tmp_path) -> None:
+        with pytest.raises(HolidayDataError) as excinfo:
+            load_holidays_with_status(self._write(tmp_path, self.BASE.format(flag="true")))
+        message = str(excinfo.value)
+        assert "2026-11-08" in message
+        assert "SPRINT02 Q5" in message
+        assert "would change nothing" in message
+
+    def test_a_file_with_no_special_sessions_is_unaffected(self, tmp_path) -> None:
+        """The control. The guard must not require the block to exist."""
+        plain = (
+            "meta:\n"
+            "  verified_against_nse_circular: true\n"
+            "  covers_years: [2026]\n"
+            "holidays:\n"
+            "  - 2026-01-26\n"
+        )
+        assert load_holidays_with_status(self._write(tmp_path, plain)).dates
+
+    def test_the_real_shipped_config_still_loads(self) -> None:
+        """The guard is only useful if it does not fire on what we ship."""
+        path = Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml"
+        status = load_holidays_with_status(str(path))
+        assert status.verified
+        assert len(status.dates) == 19
+
+    def test_muhurat_still_stands_down(self) -> None:
+        """The behaviour the decision asks for, asserted directly rather than
+        inferred from the flag — because the flag is not what produces it."""
+        path = Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml"
+        status = load_holidays_with_status(str(path))
+        calendar = MarketCalendar(status.dates, covers_years=status.covers_years)
+        muhurat = date(2026, 11, 8)
+        assert muhurat.strftime("%A") == "Sunday"
+        assert calendar.is_trading_day(muhurat) is False

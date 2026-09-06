@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from collections.abc import Mapping
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from typing import Any
 
 from algotrader.common.enums import Exchange, OrderStatus, OrderType, Product, Side
 
@@ -32,6 +34,48 @@ _PAISE = Decimal(100)
 
 class MappingError(ValueError):
     """A payload could not be mapped. Never guessed around."""
+
+
+def require_field(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    what: str,
+    alias: str | None = None,
+) -> Any:
+    """Read a field the broker's answer must contain, or refuse to guess.
+
+    ``payload.get(key, 0) or 0`` is the shape this replaces, and it conflates
+    two different situations that need opposite responses:
+
+    * the broker said **zero** — a real answer, and normal operation;
+    * the broker's answer **did not contain the field** — which means the
+      payload is not the shape we think it is, and the only honest response is
+      to stop.
+
+    AUDIT-001 found the first form in ``fetch_margins``: a renamed key produced
+    ``available_margin = 0``, which the risk engine correctly refused as
+    INSUFFICIENT_MARGIN — sending an operator to look at an account that was
+    perfectly funded while the actual fault, a changed broker API, went
+    unreported. It is the same conflation SIT-001 and QA-SEC-34 fixed inside
+    the risk engine, one layer further upstream where the numbers enter.
+
+    ``None`` counts as absent: Kite sends explicit nulls for fields it has no
+    value for, and a null is not a zero.
+    """
+    for candidate in (key, alias):
+        if candidate is None:
+            continue
+        if candidate in payload and payload[candidate] is not None:
+            return payload[candidate]
+    tried = key if alias is None else f"{key!r} (or {alias!r})"
+    raise MappingError(
+        f"the broker payload for {what} has no {tried}. Present keys: "
+        f"{sorted(payload)[:12]}. This is not a zero — it is a payload that "
+        f"is not the shape this code expects, and guessing a number here "
+        f"would be reported downstream as a business condition rather than "
+        f"as the integration fault it is."
+    )
 
 
 def paise_to_rupees(paise: int | str | Decimal) -> Decimal:

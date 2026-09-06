@@ -501,3 +501,99 @@ class TestADuplicateTagIsNeverResolvedByPicking:
         )
         found = await adapter.find_by_client_order_id("a" * 32)
         assert found is not None and found.broker_order_id == "ONE"
+
+
+class TestTheBrokerBoundaryRefusesToGuessANumber:
+    """AUDIT-001 and AUDIT-002, found by the end-to-end audit.
+
+    ``payload.get(key, 0) or 0`` conflates two situations that need opposite
+    responses: the broker said ZERO (a real answer, normal operation), and the
+    broker's answer did not contain the field (the payload is not the shape
+    this code expects).
+
+    It is the same conflation SIT-001, QA-SEC-34 and QA-SEC-38 fixed inside the
+    risk engine — here one layer upstream, where the numbers enter. The
+    downstream cost is specific: a renamed margin key produced
+    ``available_margin = 0``, which check 13 correctly refused as
+    INSUFFICIENT_MARGIN, sending an operator to inspect an account that was
+    perfectly funded while a changed broker API went unreported.
+    """
+
+    @staticmethod
+    def _margin_payloads():
+        return {
+            "a renamed key": {"cash_balance": 250000},
+            "an empty segment": {},
+            "an explicit null": {"cash": None, "live_balance": None},
+        }
+
+    @pytest.mark.parametrize("label", list(_margin_payloads.__func__()))
+    def test_a_margin_payload_missing_the_field_is_refused(self, label: str) -> None:
+        available = self._margin_payloads()[label]
+        with pytest.raises(mapping.MappingError, match="available margin"):
+            mapping.require_field(available, "live_balance", alias="cash", what="available margin")
+
+    def test_a_genuinely_zero_margin_is_still_a_number(self) -> None:
+        """The control, and the whole point of the change. An empty account is
+        a real answer and must keep flowing through as 0 — otherwise the fix
+        would have turned a business condition into an integration error."""
+        assert (
+            mapping.require_field(
+                {"cash": 0, "live_balance": 0},
+                "live_balance",
+                alias="cash",
+                what="available margin",
+            )
+            == 0
+        )
+
+    def test_the_alias_fallback_still_works(self) -> None:
+        """Kite's `live_balance` is preferred and `cash` is the documented
+        fallback. Requiring the field must not break the fallback."""
+        assert (
+            mapping.require_field(
+                {"cash": 1234}, "live_balance", alias="cash", what="available margin"
+            )
+            == 1234
+        )
+
+    def test_the_error_names_the_field_and_what_was_present(self) -> None:
+        """An operator reading this needs to know WHICH field vanished and what
+        the payload did contain — that is what turns it into a fixable
+        integration report rather than a mystery."""
+        with pytest.raises(mapping.MappingError) as excinfo:
+            mapping.require_field({"cash_balance": 1}, "live_balance", what="available margin")
+        message = str(excinfo.value)
+        assert "live_balance" in message
+        assert "cash_balance" in message
+        assert "not a zero" in message
+
+    def test_a_missing_filled_quantity_is_refused(self) -> None:
+        """AUDIT-002. `Order.filled_quantity` is `ge=0`, so unlike `quantity`
+        (which is `gt=0` and fails loudly on its own) a silent 0 here is
+        ACCEPTED by the model and claims nothing filled.
+
+        CLAUDE.md: the recovery path queries the broker by client_order_id and
+        ADOPTS ITS ANSWER, resubmitting only if genuinely absent. An answer
+        that wrongly says "nothing filled" is how a blind retry turns one
+        position into two."""
+        with pytest.raises(mapping.MappingError, match="filled_quantity"):
+            mapping.require_field({"quantity": 100}, "filled_quantity", what="an order row")
+
+    def test_a_genuinely_unfilled_order_is_still_zero(self) -> None:
+        """The control. A freshly placed order really has filled 0, and that
+        must remain expressible."""
+        assert (
+            mapping.require_field(
+                {"quantity": 100, "filled_quantity": 0}, "filled_quantity", what="an order row"
+            )
+            == 0
+        )
+
+    def test_zero_and_absent_are_distinguishable_which_is_the_point(self) -> None:
+        """Stated as one assertion so the DISTINCTION is the claim, rather than
+        two tests that a helper returning a constant could both satisfy."""
+        present = mapping.require_field({"debits": 0}, "debits", what="used margin")
+        assert present == 0
+        with pytest.raises(mapping.MappingError):
+            mapping.require_field({}, "debits", what="used margin")
