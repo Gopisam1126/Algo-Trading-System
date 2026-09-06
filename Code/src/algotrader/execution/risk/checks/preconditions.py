@@ -124,8 +124,14 @@ def check_kill_switch(rec: Recommendation, ctx: RiskContext) -> CheckOutcome:
     This only READS the flag. Arming it, persisting it and auto-demotion are
     E14-S09; keeping them apart means the check has no way to clear the switch
     it is testing.
+
+    Reading it through ``require`` rather than off the attribute is what makes
+    "nobody asked Redis" different from "Redis said no" (AUDIT-005). The first
+    is a broken system and rejects as RISK_ENGINE_FAULT; the second is normal
+    operation and trades. Collapsing them would fail open on the one control
+    that exists to stop everything.
     """
-    if ctx.kill_switch_active:
+    if ctx.require(ctx.kill_switch_active, "the kill switch state"):
         return CheckOutcome.fail(
             RejectReason.KILL_SWITCH_ACTIVE,
             f"the kill switch is engaged; no new risk may be taken "
@@ -149,9 +155,10 @@ def check_health_gate(rec: Recommendation, ctx: RiskContext) -> CheckOutcome:
     is unhealthy — is both simpler and correct. The detail names them so an
     operator does not have to go looking.
     """
-    if ctx.unhealthy_services:
-        total = len(ctx.unhealthy_services)
-        shown = sorted(ctx.unhealthy_services)[:MAX_SERVICES_NAMED]
+    services = ctx.require(ctx.unhealthy_services, "the service health report")
+    if services:
+        total = len(services)
+        shown = sorted(services)[:MAX_SERVICES_NAMED]
         names = ", ".join(shown)
         if total > MAX_SERVICES_NAMED:
             names += f", and {total - MAX_SERVICES_NAMED} more"

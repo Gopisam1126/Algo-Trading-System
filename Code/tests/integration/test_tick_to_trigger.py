@@ -455,6 +455,14 @@ class TestTheTriggerReachesARiskDecision:
         # 2026-08-20 is a Thursday and not a holiday. 05:00 UTC is 10:30 IST --
         # mid-session, clear of both configured blackouts.
         base: dict = {
+            # The session risk state, stated rather than defaulted (AUDIT-005).
+            # "Nothing is halted" is a claim these tests rely on, so they say it.
+            "kill_switch_active": False,
+            "unhealthy_services": (),
+            "realised_pnl_today": Decimal(0),
+            "consecutive_losses": 0,
+            "daily_loss_halted": False,
+            "consecutive_loss_halted": False,
             "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
             "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
             "capital": Decimal("500000"),
@@ -588,6 +596,14 @@ class TestTheTriggerMeetsSymbolEligibility:
     @staticmethod
     def _risk_ctx(**overrides) -> RiskContext:
         base: dict = {
+            # The session risk state, stated rather than defaulted (AUDIT-005).
+            # "Nothing is halted" is a claim these tests rely on, so they say it.
+            "kill_switch_active": False,
+            "unhealthy_services": (),
+            "realised_pnl_today": Decimal(0),
+            "consecutive_losses": 0,
+            "daily_loss_halted": False,
+            "consecutive_loss_halted": False,
             "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
             "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
             "capital": Decimal("500000"),
@@ -748,6 +764,14 @@ class TestTheTriggerMeetsPortfolioExposure:
     @staticmethod
     def _risk_ctx(**overrides) -> RiskContext:
         base: dict = {
+            # The session risk state, stated rather than defaulted (AUDIT-005).
+            # "Nothing is halted" is a claim these tests rely on, so they say it.
+            "kill_switch_active": False,
+            "unhealthy_services": (),
+            "realised_pnl_today": Decimal(0),
+            "consecutive_losses": 0,
+            "daily_loss_halted": False,
+            "consecutive_loss_halted": False,
             "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
             "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
             "capital": Decimal("500000"),
@@ -994,6 +1018,14 @@ class TestTheTriggerMeetsTheLossLimits:
     @staticmethod
     def _risk_ctx(**overrides) -> RiskContext:
         base: dict = {
+            # The session risk state, stated rather than defaulted (AUDIT-005).
+            # "Nothing is halted" is a claim these tests rely on, so they say it.
+            "kill_switch_active": False,
+            "unhealthy_services": (),
+            "realised_pnl_today": Decimal(0),
+            "consecutive_losses": 0,
+            "daily_loss_halted": False,
+            "consecutive_loss_halted": False,
             "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
             "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 40, tzinfo=_dt.UTC),
             "capital": Decimal("500000"),
@@ -1143,6 +1175,14 @@ class TestTheTriggerMeetsAllFourteenChecks:
     @staticmethod
     def _risk_ctx(**overrides) -> RiskContext:
         base: dict = {
+            # The session risk state, stated rather than defaulted (AUDIT-005).
+            # "Nothing is halted" is a claim these tests rely on, so they say it.
+            "kill_switch_active": False,
+            "unhealthy_services": (),
+            "realised_pnl_today": Decimal(0),
+            "consecutive_losses": 0,
+            "daily_loss_halted": False,
+            "consecutive_loss_halted": False,
             "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),  # 10:30 IST
             "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 35, tzinfo=_dt.UTC),
             "capital": Decimal("500000"),
@@ -1332,6 +1372,14 @@ class TestTheTriggerBecomesAnApprovedOrder:
 
     def _risk_ctx(self, run, **overrides) -> RiskContext:
         base: dict = {
+            # The session risk state, stated rather than defaulted (AUDIT-005).
+            # "Nothing is halted" is a claim these tests rely on, so they say it.
+            "kill_switch_active": False,
+            "unhealthy_services": (),
+            "realised_pnl_today": Decimal(0),
+            "consecutive_losses": 0,
+            "daily_loss_halted": False,
+            "consecutive_loss_halted": False,
             "now": _dt.datetime(2026, 8, 20, 5, 0, tzinfo=_dt.UTC),
             "squareoff_deadline": _dt.datetime(2026, 8, 20, 9, 35, tzinfo=_dt.UTC),
             "capital": Decimal("500000"),

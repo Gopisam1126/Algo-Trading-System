@@ -176,6 +176,14 @@ class Session:
             while moment < stop:
                 ist_time = moment.astimezone(IST).time()
                 kwargs: dict[str, object] = {
+                    # The session risk state, stated rather than defaulted (AUDIT-005).
+                    # "Nothing is halted" is a claim these tests rely on, so they say it.
+                    "kill_switch_active": False,
+                    "unhealthy_services": (),
+                    "realised_pnl_today": Decimal(0),
+                    "consecutive_losses": 0,
+                    "daily_loss_halted": False,
+                    "consecutive_loss_halted": False,
                     "now": moment,
                     "squareoff_deadline": self.deadline,
                     "capital": Decimal("500000"),
@@ -351,6 +359,13 @@ class TestSit2WhenSomethingBreaksMidSession:
         decision = engine.evaluate(
             _recommendation(now),
             RiskContext(
+                # Session risk state, stated rather than defaulted (AUDIT-005).
+                kill_switch_active=False,
+                unhealthy_services=(),
+                realised_pnl_today=Decimal(0),
+                consecutive_losses=0,
+                daily_loss_halted=False,
+                consecutive_loss_halted=False,
                 now=now,
                 squareoff_deadline=_at(TRADING_DAY, 15, 10),
                 capital=Decimal("500000"),
@@ -374,6 +389,13 @@ class TestSit2WhenSomethingBreaksMidSession:
 
         now = _at(TRADING_DAY, 10, 0)
         ctx = RiskContext(
+            # Session risk state, stated rather than defaulted (AUDIT-005).
+            kill_switch_active=False,
+            unhealthy_services=(),
+            realised_pnl_today=Decimal(0),
+            consecutive_losses=0,
+            daily_loss_halted=False,
+            consecutive_loss_halted=False,
             now=now,
             squareoff_deadline=_at(TRADING_DAY, 15, 10),
             capital=Decimal("500000"),
@@ -388,6 +410,12 @@ class TestSit2WhenSomethingBreaksMidSession:
         ).evaluate(
             _recommendation(now),
             RiskContext(
+                # Session risk state, stated rather than defaulted (AUDIT-005).
+                kill_switch_active=False,
+                realised_pnl_today=Decimal(0),
+                consecutive_losses=0,
+                daily_loss_halted=False,
+                consecutive_loss_halted=False,
                 now=now,
                 squareoff_deadline=_at(TRADING_DAY, 15, 10),
                 capital=Decimal("500000"),
@@ -409,6 +437,13 @@ class TestSit2WhenSomethingBreaksMidSession:
         decision = engine.evaluate(
             _recommendation(now),
             RiskContext(
+                # Session risk state, stated rather than defaulted (AUDIT-005).
+                kill_switch_active=False,
+                unhealthy_services=(),
+                realised_pnl_today=Decimal(0),
+                consecutive_losses=0,
+                daily_loss_halted=False,
+                consecutive_loss_halted=False,
                 now=now,
                 squareoff_deadline=_at(dt.date(2027, 3, 10), 15, 10),
                 capital=Decimal("500000"),
@@ -608,6 +643,14 @@ class TestSit6EligibilityAcrossASession:
         engine = RiskEngine(checks=_seven(calendar))
         now = _at(TRADING_DAY, 10, 0)
         base = {
+            # The session risk state, stated rather than defaulted (AUDIT-005).
+            # "Nothing is halted" is a claim these tests rely on, so they say it.
+            "kill_switch_active": False,
+            "unhealthy_services": (),
+            "realised_pnl_today": Decimal(0),
+            "consecutive_losses": 0,
+            "daily_loss_halted": False,
+            "consecutive_loss_halted": False,
             "now": now,
             "squareoff_deadline": _at(TRADING_DAY, 15, 10),
             "capital": Decimal("500000"),

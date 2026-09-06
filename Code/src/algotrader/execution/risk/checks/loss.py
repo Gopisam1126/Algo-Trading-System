@@ -83,14 +83,15 @@ def build_daily_loss_check(max_loss_pct: Decimal) -> RiskCheck:
 
     def check(rec: Recommendation, ctx: RiskContext) -> CheckOutcome:
         limit = ctx.capital * max_loss_pct / 100
-        loss = -ctx.realised_pnl_today  # positive when the day is down
+        realised = ctx.require(ctx.realised_pnl_today, "today's realised P&L")
+        loss = -realised  # positive when the day is down
 
-        if ctx.daily_loss_halted:
+        if ctx.require(ctx.daily_loss_halted, "the daily-loss halt latch"):
             return CheckOutcome.fail(
                 RejectReason.DAILY_LOSS_LIMIT,
                 f"the daily loss limit has already halted trading today "
                 f"(limit {max_loss_pct}% = {limit:.2f}; realised "
-                f"{ctx.realised_pnl_today:.2f}). A halt is terminal for the "
+                f"{realised:.2f}). A halt is terminal for the "
                 f"day and only an operator clears it.",
             )
         if loss >= limit:
@@ -128,17 +129,18 @@ def build_consecutive_loss_check(max_streak: int) -> RiskCheck:
         )
 
     def check(rec: Recommendation, ctx: RiskContext) -> CheckOutcome:
-        if ctx.consecutive_loss_halted:
+        if ctx.require(ctx.consecutive_loss_halted, "the consecutive-loss halt latch"):
             return CheckOutcome.fail(
                 RejectReason.CONSECUTIVE_LOSS_LIMIT,
                 f"the consecutive-loss limit of {max_streak} has already "
                 f"halted trading today. A later winning exit resets the "
                 f"counter but does not clear the halt — only an operator does.",
             )
-        if ctx.consecutive_losses >= max_streak:
+        streak = ctx.require(ctx.consecutive_losses, "the consecutive-loss count")
+        if streak >= max_streak:
             return CheckOutcome.fail(
                 RejectReason.CONSECUTIVE_LOSS_LIMIT,
-                f"{ctx.consecutive_losses} consecutive losing trades has "
+                f"{streak} consecutive losing trades has "
                 f"reached the limit of {max_streak}. Repeated losses suggest "
                 f"the session is not behaving as the strategy expects.",
             )
