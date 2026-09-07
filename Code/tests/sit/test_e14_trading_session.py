@@ -48,7 +48,12 @@ from algotrader.execution.risk.checks import (
 )
 from algotrader.execution.risk.context import OpenPosition, RiskContext
 from algotrader.execution.risk.framework import RiskCheck, RiskEngine
-from algotrader.execution.sizer import SizingPolicy, build_sizer
+from algotrader.execution.sizer import (
+    NET_EXPOSURE_CAP,
+    SECTOR_CAP,
+    SizingPolicy,
+    build_sizer,
+)
 
 # --------------------------------------------------------------------------
 # The session under test
@@ -1549,6 +1554,214 @@ class TestSit10ASessionThatCanApprove:
         import re
 
         session = self._session(calendar).run()
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
+
+
+# --------------------------------------------------------------------------
+# SIT-11 — a session whose exposure caps actually bind (E14-S10)
+# --------------------------------------------------------------------------
+
+
+class TestSit11ExposureCapsHoldAcrossAWholeSession:
+    """SIT-10 asked whether every approved minute stayed inside the *per-trade*
+    risk budget. This asks the portfolio question E14-S10 exists for: on a day
+    where the book is already concentrated, does every minute stay inside the
+    *sector* and *net-directional* caps as well?
+
+    The distinction is the whole story. Checks 9 and 10 run before sizing, so
+    across 316 tradable minutes they were asserting only that the book was
+    under its caps when the day began. Nothing asserted where the book ended
+    up — and a component test on one candidate cannot, because the failure
+    mode is a cap that holds on the first minute and is breached by the
+    position sizing would have taken on the second.
+
+    The signed-direction behaviour is deliberately NOT re-tested here. It is a
+    per-decision property, covered exhaustively in ``tests/unit/test_sizer.py``
+    and killed by two mutations; asserting it at session scale would mean
+    reshaping the shared ``Session`` recommendation factory, which is only ever
+    LONG, for no evidence a component test has not already produced.
+    """
+
+    #: 36% of 5,00,000 in the candidate's own sector, against a 40% cap. Chosen
+    #: so the sector clamp — not the ₹1200 position cap — is the smallest
+    #: constraint, and is therefore doing the work on every minute.
+    CONCENTRATED_SECTOR = "180000"
+    #: 2,90,000 net long against a 60% (3,00,000) cap, held OUTSIDE the
+    #: candidate's sector so the two clamps can be observed separately.
+    ONE_SIDED_BOOK = "290000"
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        # Check 8 reads an ABSENT correlation as unknown and refuses, which is
+        # the designed behaviour and would otherwise silence this whole group:
+        # every held name needs a stated, uncorrelated figure so the day
+        # reaches sizing and the CLAMPS are what is under test.
+        held = kwargs.get("open_positions") or ()
+        if held:
+            kwargs["correlations"] = {
+                **{p.symbol: Decimal("0.1") for p in held},
+                **(overrides.get("correlations") or {}),
+            }
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    def test_a_concentrated_sector_still_trades_but_smaller_all_day(self, calendar) -> None:
+        """The behaviour the story is for. A 36%-concentrated sector does not
+        stop the day — it makes every position smaller, on every minute. A
+        clamp that turned into a refusal would be the over-tight design the
+        story explicitly rejected."""
+        held = (_position("TCS", self.CONCENTRATED_SECTOR, "IT"),)
+        clear_q = {
+            d.sizing.quantity
+            for d in self._session(calendar).run().decisions.values()
+            if d.approved
+        }
+        crowded_q = {
+            d.sizing.quantity
+            for d in self._session(calendar, open_positions=held).run().decisions.values()
+            if d.approved
+        }
+        assert clear_q == {83}, "the clear-book size changed; SIT-10's baseline moved"
+        assert crowded_q == {16}, "the sector clamp did not size the day down"
+
+    def test_every_approved_minute_leaves_the_sector_at_or_under_its_cap(self, calendar) -> None:
+        """The session-scale property. 316 sized positions, and the book AFTER
+        any one of them is still inside the 40% cap — not merely inside it
+        before."""
+        held = _position("TCS", self.CONCENTRATED_SECTOR, "IT")
+        session = self._session(calendar, open_positions=(held,)).run()
+        cap_value = Decimal("500000") * Decimal("40") / 100
+        sized = [d.sizing for d in session.decisions.values() if d.approved]
+        assert sized, "nothing was approved, so the property is untested"
+        for sizing in sized:
+            after = held.notional + sizing.quantity * sizing.entry_price
+            assert after <= cap_value, f"sector reached {after} against {cap_value}"
+
+    def test_every_approved_minute_leaves_the_book_at_or_under_the_net_cap(self, calendar) -> None:
+        held = _position("HDFCBANK", self.ONE_SIDED_BOOK, "BANKING")
+        session = self._session(calendar, open_positions=(held,)).run()
+        cap_value = Decimal("500000") * Decimal("60") / 100
+        sized = [d.sizing for d in session.decisions.values() if d.approved]
+        assert sized
+        for sizing in sized:
+            after = held.notional + sizing.quantity * sizing.entry_price
+            assert after <= cap_value, f"net reached {after} against {cap_value}"
+
+    def test_the_two_caps_bind_independently(self, calendar) -> None:
+        """A book concentrated in the candidate's sector and a book merely
+        one-sided are different failures, and must produce different clamps.
+        One clamp shadowing the other would still cap exposure and would make
+        every rejection reason wrong."""
+        crowded = self._session(
+            calendar, open_positions=(_position("TCS", self.CONCENTRATED_SECTOR, "IT"),)
+        ).run()
+        one_sided = self._session(
+            calendar,
+            open_positions=(_position("HDFCBANK", self.ONE_SIDED_BOOK, "BANKING"),),
+        ).run()
+        assert {d.sizing.binding_constraint for d in crowded.decisions.values() if d.approved} == {
+            SECTOR_CAP
+        }
+        assert {
+            d.sizing.binding_constraint for d in one_sided.decisions.values() if d.approved
+        } == {NET_EXPOSURE_CAP}
+
+    def test_a_sector_at_its_cap_refuses_the_whole_day(self, calendar) -> None:
+        """At the cap exactly, check 9 refuses before sizing is reached. That
+        is correct and is what an operator should see — asserted so the check
+        and the clamp are known to agree rather than to disagree quietly."""
+        held = (_position("TCS", "200000", "IT"),)
+        session = self._session(calendar, open_positions=held).run()
+        assert [t for t, d in session.decisions.items() if d.approved] == []
+        reasons = {d.reason for d in session.decisions.values() if d.reason}
+        assert RejectReason.SECTOR_EXPOSURE_LIMIT in reasons
+
+    def test_an_unclassified_position_stops_the_day_as_a_fault(self, calendar) -> None:
+        """Degraded input, which is what SIT is for. One position with no
+        sector makes every sector total untrustworthy, so the honest answer is
+        to refuse the session — and to report it as a FAULT rather than as a
+        business limit, because those send an operator to different places."""
+        held = (_position("TCS", "100000", None),)
+        session = self._session(calendar, open_positions=held).run()
+        assert [t for t, d in session.decisions.items() if d.approved] == []
+        # On a TRADABLE minute. The run spans 08:00-16:00, so minutes outside
+        # the session are correctly refused by check 3 long before the book is
+        # ever read — asserting over the whole day would be asserting that the
+        # trading window has stopped working.
+        assert session.decisions[dt.time(10, 0)].reason is RejectReason.RISK_ENGINE_FAULT
+        assert session.decisions[dt.time(14, 0)].reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_the_audit_records_which_cap_bound_on_every_approval(self, calendar) -> None:
+        """A surprisingly small position has to be explainable from the log
+        alone, without reconstructing the book."""
+        held = (_position("TCS", self.CONCENTRATED_SECTOR, "IT"),)
+        session = self._session(calendar, open_positions=held).run()
+        approvals = [e for e in session.audit if e["outcome"] == "approved"]
+        assert approvals
+        for entry in approvals:
+            assert entry["payload"]["binding_constraint"] == SECTOR_CAP
+            assert entry["payload"]["quantity"] == 16
+
+    def test_the_concentrated_day_replays_identically(self, calendar) -> None:
+        """Two clamps more arithmetic than yesterday, and still no drift — an
+        incident on a concentrated day has to be reconstructable."""
+        first = self._session(
+            calendar, open_positions=(_position("TCS", self.CONCENTRATED_SECTOR, "IT"),)
+        ).run()
+        second = self._session(
+            calendar, open_positions=(_position("TCS", self.CONCENTRATED_SECTOR, "IT"),)
+        ).run()
+        assert [
+            (t, d.approved, d.sizing.quantity if d.sizing else None)
+            for t, d in first.decisions.items()
+        ] == [
+            (t, d.approved, d.sizing.quantity if d.sizing else None)
+            for t, d in second.decisions.items()
+        ]
+
+    def test_no_credential_reached_the_log_on_a_concentrated_day(self, calendar) -> None:
+        """Re-asserted for this session shape, which logs two new clamp names
+        and two new reason codes."""
+        import re
+
+        held = (_position("TCS", self.CONCENTRATED_SECTOR, "IT"),)
+        session = self._session(calendar, open_positions=held).run()
         assert not re.search(
             r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
             session.log_text,
