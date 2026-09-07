@@ -147,14 +147,31 @@ class RiskCheck:
 #: What the engine reports as the stopping check when a check itself raised.
 ERRORED = "check_errored"
 
-#: The one binding-constraint name this frame has to recognise, to tell a
-#: margin-bound zero from any other zero.
+#: The binding-constraint names this frame has to recognise, to tell one kind
+#: of zero from another.
 #:
-#: Duplicated as a literal rather than imported from
+#: Duplicated as literals rather than imported from
 #: :mod:`algotrader.execution.sizer`, because the sizer is injected — the
 #: frame must not depend on any particular one. ``test_risk_framework.py``
-#: asserts the two agree, so the duplication cannot drift silently.
+#: asserts they agree, so the duplication cannot drift silently.
 MARGIN_CAP = "margin_cap"
+SECTOR_CAP = "sector_cap"
+NET_EXPOSURE_CAP = "net_exposure_cap"
+
+#: Which ``RejectReason`` a zero quantity earns, by the clamp that caused it.
+#: Anything absent here is POSITION_TOO_SMALL — the honest default for "every
+#: clamp applied and nothing fit".
+#:
+#: E14-S10 added the last two. Without them a candidate refused because its
+#: sector is full would have been reported as POSITION_TOO_SMALL, which is the
+#: SIT-001 conflation exactly: ``signals_rejected_total{reason}`` is the metric
+#: that turns "why isn't it trading?" into a glance, and a wrong label there
+#: costs precisely the glance it exists to provide.
+_ZERO_QUANTITY_REASONS = {
+    MARGIN_CAP: RejectReason.INSUFFICIENT_MARGIN,
+    SECTOR_CAP: RejectReason.SECTOR_EXPOSURE_LIMIT,
+    NET_EXPOSURE_CAP: RejectReason.NET_EXPOSURE_LIMIT,
+}
 
 
 @dataclass
@@ -283,11 +300,8 @@ class RiskEngine:
             # the SIT-001 conflation, and the reason E14-S07's AC2 ("a
             # surprisingly small position is explainable") needs two codes
             # rather than one.
-            margin_bound = sizing.binding_constraint == MARGIN_CAP
-            reason = (
-                RejectReason.INSUFFICIENT_MARGIN
-                if margin_bound
-                else RejectReason.POSITION_TOO_SMALL
+            reason = _ZERO_QUANTITY_REASONS.get(
+                sizing.binding_constraint, RejectReason.POSITION_TOO_SMALL
             )
             decision = RiskDecision.reject(
                 reason,

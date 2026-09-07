@@ -125,7 +125,37 @@ def pearson(left: Sequence[float], right: Sequence[float]) -> float:
             "Returning 0.0 here would assert independence rather than admit "
             "the absence of an answer."
         )
-    rho = cov / math.sqrt(var_l * var_r)
+    # sqrt EACH variance, then multiply -- never sqrt(var_l * var_r).
+    #
+    # Mathematically identical for non-negative operands; numerically it is the
+    # difference between working and raising. Found by the property test during
+    # E14-S10 (CORR-001): the guard above rejects a variance that is zero, but
+    # the PRODUCT of two strictly positive variances can underflow to 0.0, and
+    # sqrt(0.0) then divides by zero. A real case: var_l 9.667e-293 and var_r
+    # 3.611e-34 are both comfortably positive, and their product is not
+    # representable. Guarding the operands does not guard the expression.
+    #
+    # Taking each root first keeps both factors near 1e-162 in the worst case,
+    # so the product cannot round to zero. The explicit check below is kept
+    # anyway: this function's contract is that it either returns a value in
+    # [-1, 1] or raises CorrelationError, and ZeroDivisionError is neither --
+    # `correlations_against` catches only CorrelationError, so anything else
+    # escapes and loses the whole row instead of the one uncomputable pair.
+    denominator = math.sqrt(var_l) * math.sqrt(var_r)
+    # Unreachable as written, and kept deliberately. Mutation testing removed
+    # this guard and no test noticed, which was verified rather than fixed: for
+    # any two variances above zero the smallest possible product of their roots
+    # is the smallest positive float itself (4.94e-324), so no input can reach
+    # it. It is defence in depth against exactly one future edit — someone
+    # folding the two roots back into `sqrt(var_l * var_r)` for tidiness, which
+    # is the spelling that caused CORR-001.
+    if denominator <= 0:
+        raise CorrelationError(
+            "the correlation denominator underflowed to zero despite both "
+            "series having variance, so no correlation can be reported. "
+            "Absent is the honest answer; a fabricated number is not."
+        )
+    rho = cov / denominator
     # Clamp only floating-point overshoot at the boundaries, never a real value.
     return max(-1.0, min(1.0, rho))
 

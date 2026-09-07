@@ -134,10 +134,36 @@ class TestPearson:
             return  # zero-variance input, correctly refused
         assert -1.0 <= rho <= 1.0
 
+    #: A daily log return, at magnitudes a real one actually takes.
+    #:
+    #: CORR-002. This was ``st.floats(min_value=-0.2, max_value=0.2)``, which
+    #: also admits values like 1e-160 — and a series of those has a variance so
+    #: small that ``rho`` is computed from pure rounding noise. Scaling
+    #: invariance is a real property of the *mathematics* and simply cannot
+    #: hold there: a sweep of the denormal band finds the invariance error
+    #: reaching 1.0, meaning rho flips between 0 and ±1 on a rescale.
+    #:
+    #: The test was therefore asserting a property outside the domain where it
+    #: can hold, and had been falsifiable since it was written — Hypothesis had
+    #: simply not drawn that far into the tail. It surfaced during E14-S10,
+    #: when CORR-001's fix made three times as many of those inputs computable
+    #: instead of refused, which raised the chance of drawing one rather than
+    #: introducing the weakness.
+    #:
+    #: Bounding the strategy is the fix, not loosening the tolerance: a 0.02%
+    #: move is a real market day, a 1e-160 move is not any market day, and a
+    #: tolerance wide enough to accommodate noise would stop catching the
+    #: catastrophic-cancellation bug this test exists to catch.
+    A_REAL_RETURN = st.one_of(
+        st.just(0.0),  # a genuinely flat day, which does happen
+        st.floats(min_value=1e-6, max_value=0.2, allow_nan=False, allow_infinity=False),
+        st.floats(min_value=-0.2, max_value=-1e-6, allow_nan=False, allow_infinity=False),
+    )
+
     @settings(max_examples=100, deadline=None)
     @given(
         st.lists(
-            st.floats(min_value=-0.2, max_value=0.2, allow_nan=False, allow_infinity=False),
+            A_REAL_RETURN,
             min_size=MIN_SESSIONS_FOR_CORRELATION,
             max_size=80,
         ),
@@ -225,3 +251,126 @@ class TestCorrelationsAgainst:
         changes it, this test makes them change the design record too."""
         assert CORRELATION_WINDOW_SESSIONS == 60
         assert MIN_SESSIONS_FOR_CORRELATION == 30
+
+
+class TestTheDenominatorCannotUnderflowToZero:
+    """CORR-001, found by this file's own property test during E14-S10.
+
+    ``pearson`` guards against a flat series::
+
+        if var_l <= 0 or var_r <= 0:
+            raise CorrelationError(...)
+
+    and that guard is correct as far as it goes. But the division below it used
+    ``math.sqrt(var_l * var_r)``, and **the product of two strictly positive
+    variances can underflow to 0.0** even when neither operand does. A real
+    case: ``var_l = 9.667e-293`` and ``var_r = 3.611e-34`` are both comfortably
+    positive; their product is not representable, ``sqrt`` returns 0.0, and the
+    division raises ``ZeroDivisionError``.
+
+    **Guarding the operands does not guard the expression.**
+
+    Why it mattered beyond tidiness: ``correlations_against`` catches
+    ``CorrelationError`` and only that, deliberately — an uncomputable pair is
+    *absent* from the result, and the check reads absence as "unknown" and
+    refuses. A ``ZeroDivisionError`` is not a ``CorrelationError``, so it
+    escaped the whole loop, turning "one pair could not be computed" into "the
+    entire correlation row failed" — reported as RISK_ENGINE_FAULT rather than
+    as the designed refusal, and losing every other pair's answer with it.
+
+    Not reachable from real market data: these are log returns of Decimal
+    closes at four decimal places, and a return of 1e-146 cannot arise from
+    them. It is fixed because the function's contract is that it returns a
+    value in [-1, 1] or raises CorrelationError, and it did neither.
+    """
+
+    #: The exponent band where var_l stays above zero but the PRODUCT does not.
+    #: Verified by sweep: below 1e-146 the product still fits; past 1e-161 the
+    #: variance itself underflows and the existing zero-variance guard catches
+    #: it, which is a different path and not this defect.
+    UNDERFLOW_EXPONENTS = (146, 150, 155, 161)
+
+    @staticmethod
+    def _series(exponent: int) -> tuple[list[float], list[float]]:
+        """One tiny non-zero value against an otherwise flat series — the shape
+        Hypothesis landed on, reproduced deterministically."""
+        xs = [10.0**-exponent] + [0.0] * (MIN_SESSIONS_FOR_CORRELATION - 1)
+        return xs, [x * 2 + 0.01 for x in xs]
+
+    @pytest.mark.parametrize("exponent", UNDERFLOW_EXPONENTS)
+    def test_it_never_raises_zerodivisionerror(self, exponent: int) -> None:
+        xs, ys = self._series(exponent)
+        try:
+            rho = pearson(xs, ys)
+        except CorrelationError:
+            return  # the honest refusal, and an acceptable answer here
+        assert -1.0 <= rho <= 1.0
+
+    @pytest.mark.parametrize("exponent", UNDERFLOW_EXPONENTS)
+    def test_both_variances_really_are_positive(self, exponent: int) -> None:
+        """The test above would pass trivially if these inputs were simply
+        flat — the existing zero-variance guard would catch them and the
+        underflow path would never be reached. This asserts the inputs get
+        PAST that guard, which is what makes them a distinct defect."""
+        xs, ys = self._series(exponent)
+        n = len(xs)
+        mean_l, mean_r = sum(xs) / n, sum(ys) / n
+        var_l = sum((a - mean_l) ** 2 for a in xs)
+        var_r = sum((b - mean_r) ** 2 for b in ys)
+        assert var_l > 0
+        assert var_r > 0
+        assert var_l * var_r == 0.0, "this input no longer underflows; pick a smaller one"
+
+    def test_an_uncomputable_pair_is_absent_rather_than_taking_the_row_down(self) -> None:
+        """The consequence, at the level it is actually felt. One pathological
+        series must cost that one pair, not every correlation in the row."""
+        good = [Decimal("100") + Decimal(i) for i in range(40)]
+        flat = [Decimal("100")] * 40
+        result = correlations_against(
+            "INFY",
+            {
+                "INFY": good,
+                "TCS": [Decimal("100") + Decimal(i) * 2 for i in range(40)],
+                "WIPRO": flat,
+            },
+            against=["TCS", "WIPRO"],
+        )
+        assert "TCS" in result, "a computable pair was lost"
+        assert "WIPRO" not in result, "an uncomputable pair must be absent, not zero"
+
+    def test_a_normal_correlation_is_unchanged_by_the_fix(self) -> None:
+        """The control. sqrt(a)*sqrt(b) and sqrt(a*b) are the same number for
+        ordinary inputs, and the fix must not have moved any real answer."""
+        xs = [float(i % 7) - 3.0 for i in range(40)]
+        ys = [2.0 * x + 1.0 for x in xs]
+        assert pearson(xs, ys) == pytest.approx(1.0, abs=1e-12)
+        assert pearson(xs, [-3.0 * x for x in xs]) == pytest.approx(-1.0, abs=1e-12)
+
+    def test_a_real_correlation_survives_a_denormal_variance(self) -> None:
+        """The test that distinguishes the FIX from merely guarding the symptom.
+
+        Added because a mutation survived: reverting the denominator to
+        ``sqrt(var_l * var_r)`` broke nothing, since the guard below it turned
+        the underflow into a CorrelationError and every test here accepted a
+        refusal as a valid outcome. Both spellings are safe; only one is
+        *correct*.
+
+        Here the true correlation is exactly 1.0 — ``ys = 2 * xs`` with no
+        additive constant, so no floating-point noise disturbs the
+        relationship — while both variances are denormal and their product is
+        not representable. Refusing this pair would discard an answer that
+        genuinely exists, and would do it silently: the pair would simply be
+        absent from the row and read downstream as "unknown".
+        """
+        xs = [(i + 1) * 1e-160 for i in range(MIN_SESSIONS_FOR_CORRELATION)]
+        ys = [2.0 * x for x in xs]
+
+        n = len(xs)
+        mean_l, mean_r = sum(xs) / n, sum(ys) / n
+        var_l = sum((a - mean_l) ** 2 for a in xs)
+        var_r = sum((b - mean_r) ** 2 for b in ys)
+        assert var_l > 0 and var_r > 0, "both variances must clear the zero guard"
+        assert var_l * var_r == 0.0, "the product must underflow, or this proves nothing"
+
+        rho = pearson(xs, ys)  # must NOT raise
+        assert rho == pytest.approx(1.0, abs=1e-5)
