@@ -29,13 +29,15 @@ from hypothesis import strategies as st
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
 from algotrader.common.metrics import reset_metrics_for_testing
 from algotrader.common.models.trading import Recommendation
-from algotrader.execution.risk.context import RiskContext, RiskContextError
+from algotrader.execution.risk.context import OpenPosition, RiskContext, RiskContextError
 from algotrader.execution.risk.framework import RiskCheck, RiskEngine
 from algotrader.execution.sizer import (
     LOT_ROUNDING,
     MARGIN_CAP,
+    NET_EXPOSURE_CAP,
     POSITION_CAP,
     RISK_BUDGET,
+    SECTOR_CAP,
     SLOT_CAP,
     SizingPolicy,
     build_sizer,
@@ -48,6 +50,9 @@ CID = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
 #: What system.yaml configures.
 POLICY = SizingPolicy(
+    # E14-S10: the portfolio caps, now binding rather than decorative.
+    max_sector_exposure_pct=Decimal("40"),
+    max_net_directional_exposure_pct=Decimal("60"),
     risk_pct=Decimal("1.0"),
     atr_multiplier_stop=Decimal("1.5"),
     max_position_pct=Decimal("20"),
@@ -108,6 +113,14 @@ def _ctx(**overrides) -> RiskContext:
         "available_margin": Decimal("10000000"),
         "margin_per_share": Decimal("1"),
         "lot_size": 1,
+        # E14-S10. The sizer now reads the book to compute sector and
+        # net-directional headroom, so "ample everything" has to include an
+        # empty book and a known sector. `symbol_sector` is REQUIRED rather
+        # than defaulted for the same reason check 9 refuses without it: an
+        # unclassified instrument must not pass the primary concentration
+        # control by default.
+        "symbol_sector": "IT",
+        "open_positions": (),
     }
     base.update(overrides)
     return RiskContext(**base)
@@ -166,6 +179,9 @@ class TestAC1RiskNeverExceedsTheBudget:
         volatility, any price and any lot size.
         """
         policy = SizingPolicy(
+            # E14-S10: the portfolio caps, now binding rather than decorative.
+            max_sector_exposure_pct=Decimal("40"),
+            max_net_directional_exposure_pct=Decimal("60"),
             risk_pct=risk_pct,
             atr_multiplier_stop=Decimal("1.5"),
             max_position_pct=Decimal("20"),
@@ -535,32 +551,397 @@ class TestAC10SizingIsPureAndDeterministic:
         banned = {"random", "time", "datetime", "socket", "requests", "httpx", "os", "redis"}
         assert not (modules & banned), f"sizing can reach {modules & banned}"
 
+    #: Every field the policy carries. Derived from the dataclass rather than
+    #: listed, so a field added later is covered without anyone remembering to
+    #: extend this — the omission E14-S10 would otherwise have made, since the
+    #: two caps it added are exactly the kind of number a zero would break.
+    @staticmethod
+    def _policy_fields() -> list[str]:
+        import dataclasses
+
+        return [f.name for f in dataclasses.fields(SizingPolicy)]
+
     def test_a_nonsensical_policy_is_refused_at_construction(self) -> None:
-        for field in (
-            "risk_pct",
-            "atr_multiplier_stop",
-            "max_position_pct",
-            "capital_per_slot_pct",
-            "target_r_multiple",
-        ):
-            kwargs = {
-                "risk_pct": Decimal("1.0"),
-                "atr_multiplier_stop": Decimal("1.5"),
-                "max_position_pct": Decimal("20"),
-                "capital_per_slot_pct": Decimal("20"),
-                "target_r_multiple": Decimal("2.0"),
-                field: Decimal("0"),
-            }
+        base = {
+            "risk_pct": Decimal("1.0"),
+            "atr_multiplier_stop": Decimal("1.5"),
+            "max_position_pct": Decimal("20"),
+            "capital_per_slot_pct": Decimal("20"),
+            "target_r_multiple": Decimal("2.0"),
+            "max_sector_exposure_pct": Decimal("40"),
+            "max_net_directional_exposure_pct": Decimal("60"),
+        }
+        assert set(base) == set(self._policy_fields()), (
+            "SizingPolicy gained or lost a field; this test must cover all of them"
+        )
+        for field in self._policy_fields():
             with pytest.raises(ValueError, match=field):
-                SizingPolicy(**kwargs)  # type: ignore[arg-type]
+                SizingPolicy(**{**base, field: Decimal("0")})  # type: ignore[arg-type]
+
+    def test_a_cap_above_the_whole_book_is_refused(self) -> None:
+        """E14-S10. A cap over 100% of capital cannot bind, and a limit that
+        cannot bind is worse than no limit: it reads as a control in every
+        review and stops nothing. This is the same class of defect the story
+        exists to fix, so the fix must not be able to reintroduce it."""
+        base = {
+            "risk_pct": Decimal("1.0"),
+            "atr_multiplier_stop": Decimal("1.5"),
+            "max_position_pct": Decimal("20"),
+            "capital_per_slot_pct": Decimal("20"),
+            "target_r_multiple": Decimal("2.0"),
+            "max_sector_exposure_pct": Decimal("40"),
+            "max_net_directional_exposure_pct": Decimal("60"),
+        }
+        for field in ("max_sector_exposure_pct", "max_net_directional_exposure_pct"):
+            with pytest.raises(ValueError, match="more than 100"):
+                SizingPolicy(**{**base, field: Decimal("101")})  # type: ignore[arg-type]
+        # The control: exactly 100% is a real, if permissive, configuration.
+        SizingPolicy(**{**base, "max_sector_exposure_pct": Decimal("100")})  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("bad", ["NaN", "Infinity"])
     def test_a_non_finite_policy_value_is_refused(self, bad: str) -> None:
         with pytest.raises(ValueError, match="risk_pct"):
             SizingPolicy(
+                # E14-S10: the portfolio caps, now binding rather than decorative.
+                max_sector_exposure_pct=Decimal("40"),
+                max_net_directional_exposure_pct=Decimal("60"),
                 risk_pct=Decimal(bad),
                 atr_multiplier_stop=Decimal("1.5"),
                 max_position_pct=Decimal("20"),
                 capital_per_slot_pct=Decimal("20"),
                 target_r_multiple=Decimal("2.0"),
             )
+
+
+# ---------------------------------------------------------------------------
+# E14-S10 — the sizer clamps to exposure headroom
+# ---------------------------------------------------------------------------
+
+
+def _held(
+    symbol: str,
+    *,
+    notional: str,
+    sector: str | None = "IT",
+    direction: Direction = Direction.LONG,
+) -> OpenPosition:
+    """A position of a given rupee notional, so tests read in percentages.
+
+    Quantity 1 at ``notional`` rather than a realistic price/quantity split:
+    every exposure figure in this story is notional, and making a reader
+    multiply two numbers to check a percentage hides the thing being asserted.
+    """
+    return OpenPosition(
+        symbol=symbol,
+        direction=direction,
+        quantity=1,
+        entry_price=Decimal(notional),
+        stop_price=Decimal(notional) / 2,
+        sector=sector,
+    )
+
+
+class TestS10Ac1SectorHeadroomClamps:
+    """AC1. A position sized into a sector already at 35% of capital, under a
+    40% cap, leaves the resulting book at or below 40%.
+
+    That is a claim about the book AFTER the trade, and it is the whole story.
+    Check 9 runs BEFORE sizing, so it can only ask whether the book is
+    *already* at the cap. It passes a book at 35%, and until this clamp existed
+    the sizer was then free to add a position worth another 20% of capital —
+    ending at 55% against a 40% cap with every control reporting success.
+    """
+
+    #: 35% of 5,00,000, the AC's own figure.
+    THIRTY_FIVE_PCT = "175000"
+    #: 36%, where the 5% of remaining room (250 shares at a 100-rupee entry)
+    #: finally falls below the 246-share risk budget and the sector clamp is
+    #: the one that binds. At 35% the risk budget still binds first — the AC
+    #: holds there without this clamp doing any work, which is exactly why
+    #: both cases are asserted.
+    THIRTY_SIX_PCT = "180000"
+
+    def test_the_resulting_book_is_at_or_below_the_cap(self) -> None:
+        """AC1 verbatim, at the AC's own 35%."""
+        result = _size(open_positions=(_held("TCS", notional=self.THIRTY_FIVE_PCT),))
+        book_after = Decimal(self.THIRTY_FIVE_PCT) + result.quantity * Decimal("100.00")
+        assert book_after <= CAPITAL * Decimal("40") / 100
+
+    def test_the_clamp_binds_once_the_headroom_is_the_smallest_constraint(self) -> None:
+        """The case that actually exercises the new code. 20,000 of room at a
+        100-rupee entry is 200 shares, below the 246 the risk budget allows."""
+        result = _size(open_positions=(_held("TCS", notional=self.THIRTY_SIX_PCT),))
+        assert result.quantity == 200
+        assert result.binding_constraint == SECTOR_CAP
+
+    def test_it_sizes_to_the_headroom_rather_than_refusing(self) -> None:
+        """The clamp must not become a rejection in disguise. 200 shares is a
+        real position and taking it is correct — the rejected design (have
+        check 9 assume the candidate takes the full max_position_pct) would
+        have refused this trade outright."""
+        result = _size(open_positions=(_held("TCS", notional=self.THIRTY_SIX_PCT),))
+        book_after = Decimal(self.THIRTY_SIX_PCT) + result.quantity * Decimal("100.00")
+        assert result.quantity > 0
+        assert book_after == CAPITAL * Decimal("40") / 100
+
+    def test_a_position_in_a_different_sector_does_not_consume_the_room(self) -> None:
+        """The control on attribution. Concentration is per-sector, so a
+        BANKING position must leave the IT headroom untouched — otherwise the
+        clamp is a gross-exposure limit wearing a sector's name."""
+        result = _size(open_positions=(_held("HDFCBANK", notional="100000", sector="BANKING"),))
+        assert result.quantity == 246
+        assert result.binding_constraint == RISK_BUDGET
+
+    def test_a_short_in_the_sector_still_consumes_the_room(self) -> None:
+        """Sector exposure is UNSIGNED, deliberately: a sector shock moves
+        every name in the sector, and a short there is exposed to the same
+        event. A signed reading would let a long and a short in one sector
+        cancel and report a concentrated book as flat."""
+        result = _size(
+            open_positions=(_held("TCS", notional=self.THIRTY_SIX_PCT, direction=Direction.SHORT),)
+        )
+        assert result.quantity == 200
+        assert result.binding_constraint == SECTOR_CAP
+
+
+class TestS10Ac2NetDirectionalHeadroomClamps:
+    """AC2. The same for net directional exposure — where the arithmetic is
+    genuinely different, because the figure is SIGNED.
+
+    A long adds to net and a short subtracts, so the room available depends on
+    which way the book already leans. A formula that ignored the sign would
+    refuse the short that *reduces* directional risk while permitting the long
+    that makes the book worse.
+    """
+
+    #: The cap is 60% of 5,00,000 = 3,00,000. A book 2,90,000 net long leaves
+    #: 10,000 for another long — 100 shares — and 5,90,000 for a short.
+    #: Held in BANKING so the IT sector clamp stays out of the way.
+    NET_LONG = "290000"
+
+    def test_a_long_into_a_long_book_is_clamped_to_the_remaining_room(self) -> None:
+        result = _size(open_positions=(_held("TCS", notional=self.NET_LONG, sector="BANKING"),))
+        assert result.quantity == 100
+        assert result.binding_constraint == NET_EXPOSURE_CAP
+
+    def test_the_resulting_net_is_at_or_below_the_cap(self) -> None:
+        result = _size(open_positions=(_held("TCS", notional=self.NET_LONG, sector="BANKING"),))
+        net_after = Decimal(self.NET_LONG) + result.quantity * Decimal("100.00")
+        assert net_after <= CAPITAL * Decimal("60") / 100
+
+    def test_a_short_into_a_long_book_is_not_clamped(self) -> None:
+        """The case that proves the sign is read. Same book, same cap, opposite
+        direction — and the short has ample room because it moves the book
+        toward flat. Sizing it as though it consumed room would refuse the very
+        trade that reduces the risk this cap measures."""
+        result = _size(
+            rec=_rec(direction=Direction.SHORT),
+            open_positions=(_held("TCS", notional=self.NET_LONG, sector="BANKING"),),
+        )
+        assert result.quantity == 246
+        assert result.binding_constraint == RISK_BUDGET
+
+    def test_a_matched_book_leaves_the_cap_available(self) -> None:
+        """Net is signed, so an equal long and short cancel. The book carries
+        real risk, but not DIRECTIONAL risk, and this cap measures direction."""
+        result = _size(
+            open_positions=(
+                _held("TCS", notional="400000", sector="BANKING"),
+                _held(
+                    "SUNPHARMA",
+                    notional="400000",
+                    sector="PHARMA",
+                    direction=Direction.SHORT,
+                ),
+            )
+        )
+        assert result.quantity == 246
+        assert result.binding_constraint == RISK_BUDGET
+
+
+class TestS10Ac3TheBindingClampIsNamed:
+    """AC3. A surprisingly small position must be explainable from the audit
+    log rather than investigated — E14-S07's AC2, extended to these two."""
+
+    def test_the_sector_clamp_names_itself(self) -> None:
+        result = _size(open_positions=(_held("TCS", notional="180000"),))
+        assert result.binding_constraint == SECTOR_CAP
+
+    def test_the_net_clamp_names_itself(self) -> None:
+        result = _size(open_positions=(_held("TCS", notional="290000", sector="BANKING"),))
+        assert result.binding_constraint == NET_EXPOSURE_CAP
+
+    def test_a_full_sector_refuses_with_the_sector_reason(self) -> None:
+        """Through the real engine, and NOT as POSITION_TOO_SMALL.
+
+        ``signals_rejected_total{reason}`` is what turns "why isn't it
+        trading?" into a glance, and mislabelling a full sector as "too small"
+        is the SIT-001 conflation exactly.
+
+        Run with no checks: checks 9 and 10 would refuse first in a full
+        pipeline — correctly — and would also hide whether the SIZER labels
+        its own zero properly, which is what this asserts.
+        """
+        engine = RiskEngine(checks=[], sizer=build_sizer(POLICY))
+        decision = engine.evaluate(_rec(), _ctx(open_positions=(_held("TCS", notional="200000"),)))
+        assert not decision.approved
+        assert decision.reason is RejectReason.SECTOR_EXPOSURE_LIMIT
+        assert SECTOR_CAP in (decision.detail or "")
+
+    def test_a_full_book_refuses_with_the_net_exposure_reason(self) -> None:
+        engine = RiskEngine(checks=[], sizer=build_sizer(POLICY))
+        decision = engine.evaluate(
+            _rec(),
+            _ctx(open_positions=(_held("TCS", notional="300000", sector="BANKING"),)),
+        )
+        assert not decision.approved
+        assert decision.reason is RejectReason.NET_EXPOSURE_LIMIT
+
+    def test_an_ordinary_zero_is_still_position_too_small(self) -> None:
+        """The control on the mapping. Adding two reason codes must not have
+        swallowed the default — a zero from lot rounding is still exactly what
+        POSITION_TOO_SMALL means."""
+        engine = RiskEngine(checks=[], sizer=build_sizer(POLICY))
+        decision = engine.evaluate(_rec(), _ctx(lot_size=10_000))
+        assert decision.reason is RejectReason.POSITION_TOO_SMALL
+
+
+class TestS10Ac4TheControl:
+    """AC4. A position with ample headroom is unaffected by either clamp.
+
+    Without this, every assertion above is satisfied by a sizer that always
+    returns zero.
+    """
+
+    def test_an_empty_book_sizes_exactly_as_before_the_story(self) -> None:
+        """The number E14-S07 established, unchanged. If adding two clamps
+        moved the ordinary answer, they are binding when they should not be and
+        every previously-verified size is now wrong."""
+        result = _size()
+        assert result.quantity == 246
+        assert result.binding_constraint == RISK_BUDGET
+
+    def test_a_modest_book_is_unaffected(self) -> None:
+        result = _size(
+            open_positions=(
+                _held("TCS", notional="50000"),
+                _held("HDFCBANK", notional="50000", sector="BANKING"),
+            )
+        )
+        assert result.quantity == 246
+        assert result.binding_constraint == RISK_BUDGET
+
+    def test_the_new_clamps_never_raise_the_quantity(self) -> None:
+        """A clamp can only ever reduce. Asserted directly because a sign error
+        in the signed net-directional arithmetic shows up precisely as a
+        headroom LARGER than the cap, which no single worked example catches.
+        """
+        empty = _size().quantity
+        for positions in (
+            (_held("TCS", notional="100000"),),
+            (_held("TCS", notional="100000", direction=Direction.SHORT),),
+            (_held("TCS", notional="250000", sector="BANKING"),),
+            (
+                _held("A", notional="80000"),
+                _held("B", notional="80000", sector="PHARMA"),
+            ),
+        ):
+            assert _size(open_positions=positions).quantity <= empty
+
+
+class TestS10HeadroomIsNeverComputedFromUntrustworthyInput:
+    """The fail-closed half, and why this is not merely arithmetic.
+
+    A headroom computed from an incomplete book is too LARGE, which makes the
+    clamp too LOOSE — a safety control reporting a number nobody has reason to
+    doubt. Both refusals are also made by check 9; they are repeated in the
+    sizer because it must not depend on a particular engine having been
+    assembled with a particular check. That is the AUDIT-005 lesson.
+    """
+
+    def test_an_unclassified_open_position_refuses(self) -> None:
+        with pytest.raises(ValueError, match="no sector"):
+            _size(open_positions=(_held("TCS", notional="100000", sector=None),))
+
+    def test_the_refusal_names_the_offending_symbol(self) -> None:
+        with pytest.raises(ValueError, match="TCS"):
+            _size(open_positions=(_held("TCS", notional="100000", sector=None),))
+
+    def test_an_unclassified_candidate_refuses(self) -> None:
+        with pytest.raises(RiskContextError, match="sector classification"):
+            _size(symbol_sector=None)
+
+    def test_the_engine_reports_a_fault_not_a_business_reason(self) -> None:
+        """An operator must be able to tell "your data is incomplete" from
+        "the sector is full". Those lead to entirely different actions."""
+        engine = RiskEngine(checks=[], sizer=build_sizer(POLICY))
+        decision = engine.evaluate(
+            _rec(), _ctx(open_positions=(_held("TCS", notional="1000", sector=None),))
+        )
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+
+    def test_a_fully_classified_book_is_the_control(self) -> None:
+        result = _size(open_positions=(_held("TCS", notional="100000", sector="IT"),))
+        assert result.quantity > 0
+
+
+class TestS10AnUntrustedSymbolCannotForgeALogLine:
+    """Phase 7 on E14-S10's own diff.
+
+    The story adds a code path that interpolates ``OpenPosition.symbol`` into
+    an exception message. That field carries **no validator** — unlike
+    ``Trigger``, ``Recommendation`` and ``OrderRequest``, each of which gained
+    ``_validate_symbol`` only after log forgery was found on it. It arrives
+    from the position store, which is fed by the broker, so the same argument
+    that made those three untrusted applies here.
+
+    ``RiskDecision.detail`` escapes it downstream (QA-SEC-38), and that is not
+    enough on its own: the same exception reaches ``log.exception``'s
+    traceback, which the model validator never sees.
+    """
+
+    FORGERY = "INFY" + chr(10) + "CRITICAL kill switch disarmed by operator"
+
+    #: A real newline, and the two-character sequence it must become. Built
+    #: with chr() rather than written as literals so that no amount of quoting
+    #: or reformatting between here and the file can turn one into the other —
+    #: which is precisely the confusion this test exists to catch.
+    RAW_NEWLINE = chr(10)
+    ESCAPED_NEWLINE = chr(92) + "n"
+
+    def test_a_newline_in_a_held_symbol_does_not_reach_the_message_raw(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _size(open_positions=(_held(self.FORGERY, notional="100000", sector=None),))
+        message = str(excinfo.value)
+        assert self.RAW_NEWLINE not in message, "the message spans two log lines"
+        assert self.ESCAPED_NEWLINE in message, (
+            "the attempt should be visible to an investigator, not silently stripped"
+        )
+
+    def test_the_engine_detail_is_a_single_line_too(self) -> None:
+        engine = RiskEngine(checks=[], sizer=build_sizer(POLICY))
+        decision = engine.evaluate(
+            _rec(),
+            _ctx(open_positions=(_held(self.FORGERY, notional="1000", sector=None),)),
+        )
+        assert decision.detail is not None
+        assert self.RAW_NEWLINE not in decision.detail
+
+    def test_eight_enormous_symbols_cannot_produce_an_enormous_message(self) -> None:
+        """Capping the COUNT does not bound the OUTPUT. Eight symbols with no
+        length limit is exactly how QA-SEC-29 produced an 80,054-character
+        detail from a line of code that looked capped."""
+        positions = tuple(
+            _held(f"{'X' * 5000}{i}", notional="1000", sector=None) for i in range(12)
+        )
+        with pytest.raises(ValueError) as excinfo:
+            _size(open_positions=positions)
+        assert len(str(excinfo.value)) < 1000, (
+            f"message grew to {len(str(excinfo.value))} characters"
+        )
+
+    def test_an_ordinary_symbol_is_still_named_in_full(self) -> None:
+        """The control. Escaping must not have cost the operator the one piece
+        of information the message exists to carry."""
+        with pytest.raises(ValueError, match="RELIANCE"):
+            _size(open_positions=(_held("RELIANCE", notional="1000", sector=None),))

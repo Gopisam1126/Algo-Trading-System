@@ -132,7 +132,7 @@ Never commit a `.env`, a credential, or anything under `data/`.
 carrying a quantity and an executable stop. Nothing trades, and nothing can —
 there is no order placement, so nothing turns that decision into an order.**
 
-Built and tested (**1,708 tests, 83% coverage** — 1,461 pass locally, 247 need
+Built and tested (**1,746 tests, 83% coverage** — 1,499 pass locally, 247 need
 Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -176,7 +176,7 @@ this file means: the system cannot trade, correctly or otherwise.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,708 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,746 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -240,8 +240,9 @@ Recorded because each was believed, written down, and wrong.
   no automatic un-halt, and a predicate over a mutable number cannot express
   "terminal". Both loss checks read a **latch** as well as the live figure.
 - **"Configuring a limit means the limit is enforced."** `max_sector_exposure_pct`
-  and `max_net_directional_exposure_pct` have been in `system.yaml` since the
-  beginning and are binding on nothing. Risk checks run *before* sizing, so
+  and `max_net_directional_exposure_pct` were in `system.yaml` since the
+  beginning and were binding on nothing. **Closed by E14-S10**, which made them
+  two more clamps in the sizer's `min()`. Risk checks run *before* sizing, so
   they cannot know the candidate's notional and can only refuse a book that is
   *already* at a cap; and `LOW_LEVEL_ARCHITECTURE.md §5.7`'s sizing formula
   clamps on position value, slot capital and broker margin only. A number in a
@@ -266,6 +267,24 @@ Recorded because each was believed, written down, and wrong.
   healthy. `signals_rejected_total{reason}` is the metric that turns "why
   isn't it trading?" into a glance, so a wrong label there costs exactly the
   glance it exists to provide. Now `RISK_ENGINE_FAULT`. See SIT-001.
+- **"Guarding the operands guards the expression."** `pearson` refuses a series
+  with zero variance — a correct guard, and not the one that mattered. The
+  division below it used `sqrt(var_l * var_r)`, and the **product** of two
+  strictly positive variances can underflow to zero: 9.667e-293 times 3.611e-34
+  is not representable, so `sqrt` returned 0.0 and the division raised
+  `ZeroDivisionError`. `correlations_against` catches `CorrelationError` and
+  only that, on purpose, so the escape turned "one pair could not be computed"
+  into "the whole correlation row failed". Take each root first. CORR-001.
+- **"A property test cannot be wrong about its own domain."** The correlation
+  invariance test drew returns from `st.floats(-0.2, 0.2)`, which includes
+  1e-160 — a series whose variance is so small that rho is rounding noise, and
+  where a rescale flips it between 0 and ±1. It had been falsifiable since it
+  was written; a 20,000-case sweep finds 4,335 violations under the *old*
+  denominator too. Fixing CORR-001 made three times as many such inputs
+  computable and so raised the chance of drawing one. **Bound the strategy, not
+  the tolerance** — a 0.02% move is a real market day, 1e-160 is not any market
+  day, and a tolerance wide enough for noise stops catching the cancellation
+  bug the test exists for. CORR-002.
 - **"`or 0` is a harmless default."** It is the same defect as every entry
   above, one layer further out — at the boundary where an external number
   *enters*. `fetch_margins` read `Decimal(str(available.get("cash", 0) or 0))`,

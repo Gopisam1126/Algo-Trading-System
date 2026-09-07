@@ -1335,6 +1335,9 @@ class TestTheTriggerBecomesAnApprovedOrder:
     @staticmethod
     def _policy() -> SizingPolicy:
         return SizingPolicy(
+            # E14-S10: the portfolio caps, now binding rather than decorative.
+            max_sector_exposure_pct=Decimal("40"),
+            max_net_directional_exposure_pct=Decimal("60"),
             risk_pct=Decimal("1.0"),
             atr_multiplier_stop=Decimal("1.5"),
             max_position_pct=Decimal("20"),

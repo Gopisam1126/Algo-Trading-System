@@ -397,6 +397,9 @@ class TestSessionRiskStateIsNeverAssumed:
             ],
             sizer=build_sizer(
                 SizingPolicy(
+                    # E14-S10: the portfolio caps, now binding rather than decorative.
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
                     risk_pct=Decimal("1.0"),
                     atr_multiplier_stop=Decimal("1.5"),
                     max_position_pct=Decimal("20"),
@@ -415,6 +418,9 @@ class TestSessionRiskStateIsNeverAssumed:
             # than "cleared every check and then had nowhere to go".
             atr=Decimal("13.5000"),
             lot_size=1,
+            # E14-S10: the sizer reads the book for exposure headroom.
+            symbol_sector="IT",
+            open_positions=(),
             available_margin=Decimal("400000"),
             margin_per_share=Decimal("240"),
             **state,  # type: ignore[arg-type]
