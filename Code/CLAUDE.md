@@ -132,7 +132,7 @@ Never commit a `.env`, a credential, or anything under `data/`.
 carrying a quantity and an executable stop. Nothing trades, and nothing can —
 there is no order placement, so nothing turns that decision into an order.**
 
-Built and tested (**1,755 tests, 83% coverage** — 1,508 pass locally, 247 need
+Built and tested (**1,818 tests, 83% coverage** — 1,558 pass locally, 260 need
 Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -166,17 +166,32 @@ Docker):
   then **floored** to a whole lot. Flooring is what makes "risk never exceeds
   `risk_pct`" true; rounding to nearest breaks it on every round-up. The
   binding clamp is recorded, so a surprisingly small position is explainable.
+- **E14-S10 exposure clamps** — the sector and net-directional caps bind, as
+  two more entries in the sizer's `min()`. Sector is unsigned; net directional
+  is signed, so a short into a long book has *more* room, not less.
+- **E14-S08 slots** — `execution/slots.py`. `EPIC01_TECHNICAL_SPEC.md §8.4`'s
+  three layers composed: ask the database which slots are open, take a
+  short-lived Redis lock on a free index, and let `uq_open_slot` be the
+  guarantee underneath. **The lock guards the insert, not the position** —
+  positions live for hours and `MAX_TTL_MS` is 300s, so a lock held for a
+  position's life would either expire mid-position or need a heartbeat that
+  goes quiet exactly when the process dies. The database row holds the slot.
+  Reconciliation reports three drift categories separately, because a leaked
+  lock self-heals on its TTL, a stale record never does, and a missing record
+  is the direction that *understates* occupancy. Task 2 (the priority queue)
+  was split out as **E14-S11**: nothing computes an expectancy, so ranking on
+  one would mean inventing it.
 
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/` — seven of thirteen packages.
-`execution/` holds `risk/` and `sizer.py`. **There is no order manager and
+`execution/` holds `risk/`, `sizer.py` and `slots.py`. **There is no order manager and
 no order placement**, which is the single fact that decides what the rest of
 this file means: the system cannot trade, correctly or otherwise.
 
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,755 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,818 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -267,6 +282,24 @@ Recorded because each was believed, written down, and wrong.
   healthy. `signals_rejected_total{reason}` is the metric that turns "why
   isn't it trading?" into a glance, so a wrong label there costs exactly the
   glance it exists to provide. Now `RISK_ENGINE_FAULT`. See SIT-001.
+- **"A test named `..._is_catchable` establishes that it is catchable."** Two
+  did not. Both asserted `pytest.raises((psycopg.errors.UniqueViolation,
+  Exception))`, and **`Exception` in a `pytest.raises` tuple matches
+  anything** — a typo, a connection failure, an `AttributeError`. Neither test
+  could fail, while both read as though they pinned the exception type down.
+  It mattered exactly where they were: `EPIC01_TECHNICAL_SPEC.md §8.4` tells
+  callers to catch the unique violation and treat it as *"slot taken"*, and
+  SQLAlchemy wraps every DBAPI error — so the psycopg type the spec names
+  arrives as `sqlalchemy.exc.IntegrityError` with the original on `.orig`.
+  Catching the named type alone would miss every real occurrence and turn the
+  expected outcome into an unhandled crash during position opening. Both now
+  assert through `is_slot_taken()`. E14-S08.
+- **"Bounding the output means asserting the output is small."** A mutation
+  that removed the cap on a drift description *survived* a test asserting
+  `len(describe()) < 300`, because twenty slot indices are short enough to fit
+  either way. Length was measuring the values, not the rule. Assert **how many
+  values are named**, not how long the string came out. Third variation on
+  QA-SEC-29 in this repository.
 - **"Guarding the operands guards the expression."** `pearson` refuses a series
   with zero variance — a correct guard, and not the one that mattered. The
   division below it used `sqrt(var_l * var_r)`, and the **product** of two
