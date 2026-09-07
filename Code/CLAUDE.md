@@ -132,7 +132,7 @@ Never commit a `.env`, a credential, or anything under `data/`.
 carrying a quantity and an executable stop. Nothing trades, and nothing can —
 there is no order placement, so nothing turns that decision into an order.**
 
-Built and tested (**1,746 tests, 83% coverage** — 1,499 pass locally, 247 need
+Built and tested (**1,755 tests, 83% coverage** — 1,508 pass locally, 247 need
 Docker):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -176,7 +176,7 @@ this file means: the system cannot trade, correctly or otherwise.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,746 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,755 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
