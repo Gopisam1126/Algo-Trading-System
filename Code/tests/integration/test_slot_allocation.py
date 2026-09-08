@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from algotrader.common.db import engine as db_engine
@@ -35,6 +36,24 @@ from algotrader.execution.slots import SlotManager, is_slot_taken
 pytestmark = [pytest.mark.integration]
 
 TOTAL_SLOTS = 5
+
+#: One name per concurrent claimer. ``uq_open_symbol`` is a partial unique
+#: index too, so twelve claimers all bidding for "INFY" would collide on the
+#: SYMBOL and never reach the slot question this file is about.
+SYMBOLS = [
+    "INFY",
+    "TCS",
+    "WIPRO",
+    "HDFCBANK",
+    "SBIN",
+    "ITC",
+    "RELIANCE",
+    "AXISBANK",
+    "LT",
+    "MARUTI",
+    "TITAN",
+    "NESTLEIND",
+]
 
 
 @pytest.fixture
@@ -74,12 +93,12 @@ async def instruments(session: AsyncSession) -> InstrumentRepository:
                 "broker_token": f"slot-tok-{index}",
                 "tick_size": Decimal("0.05"),
                 "lot_size": 1,
-                "instrument_type": "EQ",
             }
-            for index, symbol in enumerate(["INFY", "TCS", "WIPRO", "HDFCBANK", "SBIN", "ITC"])
+            for index, symbol in enumerate(SYMBOLS)
         ]
     )
     await session.flush()
+    await repo.refresh_cache()
     return repo
 
 
@@ -153,67 +172,132 @@ class TestTheUniqueViolationIsRecognisable:
         assert await positions.occupied_slots() == {0}
 
 
+@pytest.fixture
+async def clean_positions(session: AsyncSession) -> AsyncIterator[None]:
+    """Empty the positions table around a test that COMMITS.
+
+    The ordinary ``session`` fixture rolls back, which isolates every other
+    test in this file for free. The concurrency tests cannot use that: their
+    claimers each need their own session and must commit, or no other claimer
+    would see the row — and seeing it is the entire point. So the rows are
+    real and have to be cleaned up explicitly.
+    """
+    await session.execute(text("DELETE FROM positions"))
+    await session.commit()
+    yield
+    await session.execute(text("DELETE FROM positions"))
+    await session.commit()
+
+
 class TestConcurrentSignalsCannotOverAllocate:
     """🔴 The acceptance criterion.
 
-    **Each concurrent claimer gets its own session.** Not a detail: an
-    ``AsyncSession`` wraps one connection and is not safe to use from two
-    coroutines at once, so sharing one here would fail on SQLAlchemy's own
-    concurrency guard rather than on the slot race — a red test that proves
-    nothing about slots. It is also what the real system does, where two
-    signals are two units of work.
+    **Each claimer opens a real position and commits it.** The first draft only
+    held the lock across a sleep, and slot 0 came back three times — correctly,
+    because ``claiming`` releases on exit and nothing had claimed the slot in
+    the database. That draft was asserting a property the design never had. The
+    lock guards the *insert*; it is the committed row that holds the slot
+    afterwards, so a test that never inserts is testing nothing about
+    over-allocation.
+
+    Each claimer also gets its own session: an ``AsyncSession`` wraps one
+    connection and is not safe to share across coroutines, and two signals are
+    two units of work in the real system anyway.
     """
 
     @staticmethod
-    async def _claim_concurrently(
-        engine: object,
-        client: aioredis.Redis,
-        instruments: InstrumentRepository,
-        count: int,
-    ) -> list[int | None]:
+    async def _open_concurrently(
+        engine: object, client: aioredis.Redis, count: int
+    ) -> tuple[list[tuple[str, int]], list[str]]:
         factory = db_engine.create_session_factory(engine)  # type: ignore[arg-type]
-        handed: list[int | None] = []
+        opened: list[tuple[str, int]] = []
+        refused: list[str] = []
 
-        async def claim() -> None:
+        async def claim_and_open(symbol: str) -> None:
             async with factory() as own_session:
-                repo = PositionRepository(own_session, InstrumentRepository(own_session))
+                instruments = InstrumentRepository(own_session)
+                await instruments.refresh_cache()
+                repo = PositionRepository(own_session, instruments)
                 manager = SlotManager(client, repo, total_slots=TOTAL_SLOTS)
-                async with manager.claiming("INFY") as index:
-                    # A real await point inside the block: without one, the
-                    # coroutines would run to completion one at a time and the
-                    # race this exists to test would never occur.
+                async with manager.claiming(symbol) as index:
+                    if index is None:
+                        refused.append(symbol)
+                        return
+                    # A real await point inside the block, so the coroutines
+                    # actually interleave rather than running to completion one
+                    # at a time — without it the race never happens.
                     await asyncio.sleep(0.01)
-                    handed.append(index)
+                    try:
+                        await repo.open_position(_position(symbol, index))
+                        await own_session.commit()
+                    except Exception as exc:
+                        # §8.4: a unique violation here is a NORMAL outcome
+                        # under concurrency, not an error to surface.
+                        if not is_slot_taken(exc):
+                            raise
+                        await own_session.rollback()
+                        refused.append(symbol)
+                        return
+                    opened.append((symbol, index))
 
-        await asyncio.gather(*(claim() for _ in range(count)))
-        return handed
+        await asyncio.gather(*(claim_and_open(s) for s in SYMBOLS[:count]))
+        return opened, refused
 
-    async def test_two_claimers_on_an_empty_book_get_different_slots(
-        self, engine: object, r: aioredis.Redis, instruments: InstrumentRepository
+    async def test_two_claimers_on_an_empty_book_open_different_slots(
+        self,
+        engine: object,
+        r: aioredis.Redis,
+        instruments: InstrumentRepository,
+        clean_positions: None,
     ) -> None:
         """The narrow race: both read an empty book, both look at slot 0."""
-        handed = await self._claim_concurrently(engine, r, instruments, 2)
-        assert len(set(handed)) == 2, f"one slot was handed to both claimers: {handed}"
+        opened, _ = await self._open_concurrently(engine, r, 2)
+        slots = [index for _, index in opened]
+        assert len(slots) == 2, f"a claimer was refused on an empty book: {opened}"
+        assert len(set(slots)) == 2, f"one slot was opened twice: {opened}"
 
-    async def test_more_claimers_than_slots_never_duplicates(
-        self, engine: object, r: aioredis.Redis, instruments: InstrumentRepository
+    async def test_twelve_claimers_never_exceed_five_positions(
+        self,
+        engine: object,
+        r: aioredis.Redis,
+        instruments: InstrumentRepository,
+        clean_positions: None,
+        session: AsyncSession,
     ) -> None:
-        handed = await self._claim_concurrently(engine, r, instruments, 12)
-        allocated = [i for i in handed if i is not None]
-        assert len(allocated) == len(set(allocated)), f"a slot was reused: {handed}"
-        assert len(allocated) == TOTAL_SLOTS
-        assert set(allocated) == set(range(TOTAL_SLOTS))
-        assert handed.count(None) == 12 - TOTAL_SLOTS
+        """The criterion itself: more signals than slots, and the book must not
+        grow past its slot count."""
+        opened, refused = await self._open_concurrently(engine, r, 12)
+        slots = [index for _, index in opened]
+        assert len(slots) == len(set(slots)), f"a slot was opened twice: {opened}"
+        assert len(opened) == TOTAL_SLOTS, f"opened {len(opened)} of {TOTAL_SLOTS}"
+        assert set(slots) == set(range(TOTAL_SLOTS))
+        assert len(refused) == 12 - TOTAL_SLOTS
+
+        # The database is the arbiter, so ask it rather than trusting the tally.
+        positions = PositionRepository(session, InstrumentRepository(session))
+        assert await positions.occupied_slots() == set(range(TOTAL_SLOTS))
+
+    async def test_no_claimer_crashes_on_a_lost_race(
+        self,
+        engine: object,
+        r: aioredis.Redis,
+        instruments: InstrumentRepository,
+        clean_positions: None,
+    ) -> None:
+        """Losing is ordinary. §8.4 calls the unique violation a normal outcome,
+        and `_open_concurrently` re-raises anything `is_slot_taken` does not
+        recognise — so reaching this assertion at all is the claim."""
+        opened, refused = await self._open_concurrently(engine, r, 12)
+        assert len(opened) + len(refused) == 12, "a claimer vanished"
 
     async def test_the_database_refuses_what_the_lock_somehow_lets_through(
         self, session: AsyncSession, positions: PositionRepository
     ) -> None:
-        """Layer 2, exercised with layer 1 deliberately bypassed.
+        """Layer 2, with layer 1 deliberately bypassed.
 
         The lock is the fast path and can be lost — to an expiry, a partition,
-        or a future refactor. This asserts the guarantee underneath it still
-        holds when it is, which is the entire reason §8.4 has three layers
-        instead of one.
+        or a future refactor. This asserts the guarantee underneath still holds
+        when it is, which is why §8.4 has three layers rather than one.
         """
         await positions.open_position(_position("INFY", 3))
         await session.flush()
@@ -235,7 +319,7 @@ class TestConcurrentSignalsCannotOverAllocate:
     async def test_a_full_book_hands_out_nothing(
         self, session: AsyncSession, r: aioredis.Redis, positions: PositionRepository
     ) -> None:
-        for index, symbol in enumerate(["INFY", "TCS", "WIPRO", "HDFCBANK", "SBIN"]):
+        for index, symbol in enumerate(SYMBOLS[:TOTAL_SLOTS]):
             await positions.open_position(_position(symbol, index))
         await session.flush()
         manager = SlotManager(r, positions, total_slots=TOTAL_SLOTS)
