@@ -31,10 +31,12 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from algotrader.broker.kite.mapping import broker_tag
 from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_status
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
 from algotrader.common.metrics import reset_metrics_for_testing
 from algotrader.common.models.trading import Recommendation
+from algotrader.execution.gateway import GatewayPolicy, OrderGateway
 from algotrader.execution.halt import (
     HaltController,
     HaltReason,
@@ -2206,6 +2208,231 @@ class TestSit13AHaltIsTerminalForTheDay:
         session = self._session(calendar).run(
             mutate=self._driven_by(controller, arm_at=dt.time(12, 0), reason=HaltReason.MANUAL)
         )
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
+
+
+# --------------------------------------------------------------------------
+# SIT-14 — a session that reaches the broker (E15-S01)
+# --------------------------------------------------------------------------
+
+
+class _RecordingBroker:
+    """Stands in for the broker, and records exactly what it was asked to do.
+
+    The gateway is real, the risk engine is real, the sizer is real. Only the
+    socket at the far end is substituted — which is the most that can be
+    substituted while the claim is still "the system reaches a broker".
+    """
+
+    def __init__(self) -> None:
+        self.orders: list[object] = []
+
+    async def place_order(self, request) -> str:
+        self.orders.append(request)
+        return f"BROKER-{len(self.orders):06d}"
+
+
+class TestSit14ASessionThatReachesABroker:
+    """Every SIT group before this one ended at a `RiskDecision`. Ten stories
+    have been walked across a session and none of them could produce an order,
+    because there was nothing to produce one.
+
+    This asks the question that only becomes askable now: across a whole
+    trading day, does the number of orders that reach the broker equal the
+    number of decisions the risk engine approved — and never exceed it?
+
+    That is a *session*-scale claim. A component test shows one approval
+    becoming one order. It cannot show that 316 approvals become 316 orders and
+    not 317, nor that a halted afternoon sends nothing, nor that every order
+    carries an id the recovery path could find it by.
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    @staticmethod
+    def _submit_every_approval(session, broker):
+        """Walk the day's decisions through the REAL gateway, in order."""
+        gateway = OrderGateway(
+            broker,
+            policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+        )
+        submitted = []
+        for ist_time in sorted(session.decisions):
+            decision = session.decisions[ist_time]
+            if not decision.approved:
+                continue
+            submitted.append(
+                asyncio.run(
+                    gateway.submit_entry(
+                        decision,
+                        _recommendation(_at(TRADING_DAY, ist_time.hour, ist_time.minute)),
+                        trade_date=TRADING_DAY,
+                    )
+                )
+            )
+        return submitted
+
+    def test_every_approval_becomes_exactly_one_order(self, calendar) -> None:
+        """The count that could not be checked before this story existed."""
+        session = self._session(calendar).run()
+        broker = _RecordingBroker()
+        submitted = self._submit_every_approval(session, broker)
+        approved = [d for d in session.decisions.values() if d.approved]
+        assert len(approved) == 316, "the tradable window moved; the rest is untrustworthy"
+        assert len(broker.orders) == len(approved)
+        assert len(submitted) == len(approved)
+
+    def test_a_halted_day_sends_nothing(self, calendar) -> None:
+        """The property that matters most, stated as a session: a kill switch
+        does not merely change a reason code, it stops orders reaching a
+        broker. Asserted at the SOCKET, which is the only place it counts."""
+        session = self._session(calendar, kill_switch_active=True).run()
+        broker = _RecordingBroker()
+        self._submit_every_approval(session, broker)
+        assert broker.orders == []
+
+    def test_a_loss_limit_stops_the_orders_mid_session(self, calendar) -> None:
+        def breach(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time >= dt.time(12, 0):
+                kwargs["daily_loss_halted"] = True
+
+        session = self._session(calendar).run(mutate=breach)
+        broker = _RecordingBroker()
+        self._submit_every_approval(session, broker)
+        assert broker.orders, "the morning sent nothing, so the property is untested"
+        assert len(broker.orders) < 316
+
+    def test_every_order_carries_what_the_sizer_decided(self, calendar) -> None:
+        """The seam. A quantity that changed between the risk engine and the
+        broker would be a position nobody sized."""
+        session = self._session(calendar).run()
+        broker = _RecordingBroker()
+        self._submit_every_approval(session, broker)
+        sized = {d.sizing.quantity for d in session.decisions.values() if d.approved}
+        assert {o.quantity for o in broker.orders} == sized
+
+    def test_every_order_carries_the_sebi_algo_id(self, calendar) -> None:
+        """316 chances to omit it. An algorithmic order without one is a
+        compliance breach the exchange accepts and the audit fails later."""
+        session = self._session(calendar).run()
+        broker = _RecordingBroker()
+        self._submit_every_approval(session, broker)
+        assert broker.orders
+        assert all(o.algo_id == "ALGO12345" for o in broker.orders)
+
+    def test_every_order_carries_market_protection(self, calendar) -> None:
+        session = self._session(calendar).run()
+        broker = _RecordingBroker()
+        self._submit_every_approval(session, broker)
+        assert all(o.market_protection == Decimal("-1") for o in broker.orders)
+
+    def test_every_order_is_findable_by_its_idempotency_key(self, calendar) -> None:
+        """The recovery path searches the orderbook by tag. An order whose id
+        could not round-trip through Kite's 20-character alphanumeric field
+        would be invisible to it — and invisible means 'never landed', which
+        means resubmit."""
+        session = self._session(calendar).run()
+        broker = _RecordingBroker()
+        self._submit_every_approval(session, broker)
+        assert broker.orders
+        for order in broker.orders:
+            assert order.client_order_id.isalnum()
+            assert broker_tag(order.client_order_id) == order.client_order_id[:20]
+
+    def test_resubmitting_the_same_signals_reuses_the_same_ids(self, calendar) -> None:
+        """The idempotency claim, at session scale: re-submitting the SAME
+        signals must produce the SAME ids, so a retry after a timeout finds the
+        first order rather than opening a second position.
+
+        The recommendations are minted ONCE and submitted twice. The first
+        version of this test built them twice and failed — correctly, because
+        ``_recommendation`` mints a fresh ``correlation_id`` per call, so the
+        two runs were two different sets of signals rather than one set
+        replayed. That is realistic (two signals really are two ids) and it is
+        also the residual risk the gateway's docstring records from the other
+        side: **the key is only stable because the correlation id is.**
+        """
+        session = self._session(calendar).run()
+        approved = [
+            (ist_time, session.decisions[ist_time])
+            for ist_time in sorted(session.decisions)
+            if session.decisions[ist_time].approved
+        ]
+        assert approved, "nothing was approved, so the property is untested"
+
+        # One set of signals, minted once — this is what makes it a replay.
+        signals = [
+            (decision, _recommendation(_at(TRADING_DAY, t.hour, t.minute)))
+            for t, decision in approved
+        ]
+
+        def submit_all() -> list[str]:
+            broker = _RecordingBroker()
+            gateway = OrderGateway(
+                broker,
+                policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            )
+            for decision, rec in signals:
+                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+            return [o.client_order_id for o in broker.orders]
+
+        assert submit_all() == submit_all()
+
+    def test_two_different_signals_never_share_an_id(self, calendar) -> None:
+        """The other half. Every minute of the day is a distinct signal, so the
+        316 ids must be 316 distinct values — a collision would suppress a real
+        order as a duplicate of an unrelated one."""
+        session = self._session(calendar).run()
+        broker = _RecordingBroker()
+        self._submit_every_approval(session, broker)
+        ids = [o.client_order_id for o in broker.orders]
+        assert len(ids) == len(set(ids)), "two different signals produced one id"
+
+    def test_no_credential_reached_the_log_on_a_day_that_placed_orders(self, calendar) -> None:
+        """Re-asserted now that the log carries broker order ids and tags."""
+        import re
+
+        session = self._session(calendar).run()
+        self._submit_every_approval(session, _RecordingBroker())
         assert not re.search(
             r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
             session.log_text,

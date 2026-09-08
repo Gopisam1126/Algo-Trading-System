@@ -119,18 +119,51 @@ class InstrumentRepository:
         self._session = session
         self._by_symbol: dict[str, int] = {}
         self._by_id: dict[int, str] = {}
+        self._tick_by_symbol: dict[str, Decimal] = {}
 
     async def refresh_cache(self) -> int:
         """Load every instrument into the cache. Returns how many.
 
         One query for the whole table — it is a few thousand rows and the
         alternative is a query per lookup.
+
+        Tick sizes are loaded here too (E15-S01). The column has been populated
+        by the instrument sync since E02-S06 and nothing read it: the order
+        gateway needs a **synchronous** resolver, because the trading adapter's
+        ``tick_size_for`` is a plain callable, and the only way to answer
+        synchronously is from a cache filled in advance.
         """
-        rows = (await self._session.execute(select(Instrument.id, Instrument.tradingsymbol))).all()
-        pairs = [(int(sid), str(symbol)) for sid, symbol in rows]
-        self._by_symbol = {symbol: sid for sid, symbol in pairs}
-        self._by_id = dict(pairs)
+        rows = (
+            await self._session.execute(
+                select(Instrument.id, Instrument.tradingsymbol, Instrument.tick_size)
+            )
+        ).all()
+        triples = [(int(sid), str(symbol), Decimal(str(tick))) for sid, symbol, tick in rows]
+        self._by_symbol = {symbol: sid for sid, symbol, _ in triples}
+        self._by_id = {sid: symbol for sid, symbol, _ in triples}
+        self._tick_by_symbol = {symbol: tick for _, symbol, tick in triples}
         return len(self._by_symbol)
+
+    def tick_size(self, symbol: str) -> Decimal:
+        """Tick size for ``symbol``, from the cache. **Synchronous, and raises.**
+
+        Synchronous because ``KiteTradingAdapter`` takes ``tick_size_for`` as a
+        plain callable; async here would mean changing that contract, and the
+        adapter's signature is the one already under test.
+
+        Raises rather than returning a default. A wrong tick size does not fail
+        loudly at the broker — it produces a price the exchange refuses, or
+        worse, one it accepts at a level nobody chose. ``0.05`` is the common
+        NSE tick and would be right often enough to hide the times it is not.
+        """
+        try:
+            return self._tick_by_symbol[symbol]
+        except KeyError:
+            raise UnknownSymbolError(
+                f"no cached tick size for {symbol!r}. Either the instrument sync has "
+                f"not run or refresh_cache() was not called; guessing a tick would "
+                f"price an order on a grid the exchange does not use."
+            ) from None
 
     async def symbol_id(self, symbol: str) -> int:
         """Ticker -> integer id. Raises :class:`UnknownSymbolError` if absent.

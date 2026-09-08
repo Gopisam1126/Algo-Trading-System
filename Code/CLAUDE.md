@@ -128,11 +128,18 @@ Never commit a `.env`, a credential, or anything under `data/`.
 
 ## Current state
 
-**The deterministic path runs from tick to an APPROVED `RiskDecision`
-carrying a quantity and an executable stop. Nothing trades, and nothing can —
-there is no order placement, so nothing turns that decision into an order.**
+**The deterministic path runs from tick to an approved `RiskDecision` and now
+through `execution/gateway.py` to a submitted broker order.** The keystone
+sentence that led this file for months — *"nothing turns that decision into an
+order"* — is no longer true. What is still true: nothing has ever placed a real
+order, because that needs credentials (B5), a static IP (B6) and an Algo-ID
+(B1), and because the pieces around the gateway are unbuilt — no order state
+machine (E15-S03), no protective stop attachment (E15-S04), no position manager
+(E15-S05), no reconciliation loop (E15-S09). **A gateway is not a trading
+system**, and E15-S04's rule is the one to hold onto: a position without a live
+stop must not survive a cycle.
 
-Built and tested (**1,883 tests, 92% coverage** — all pass locally with Docker running;
+Built and tested (**1,933 tests, 92% coverage** — all pass locally with Docker running;
 without it 273 skip and coverage reads 83%):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -195,6 +202,16 @@ without it 273 skip and coverage reads 83%):
   Tasks 1 and 4 split out as **E14-S12** (transport, needs credentials) and
   **E14-S13** (close command, needs an order path).
 
+- **E15-S01 the order gateway** — `execution/gateway.py`, the only path from a
+  decision to a broker. Generates §8.2's deterministic `client_order_id`, which
+  was *consumed* in three places and *generated* nowhere; attaches the SEBI
+  algo_id and market protection; refuses anything the risk engine did not
+  approve; takes a rate-limiter token only after the order is known to be
+  valid, so a rejected decision never spends one. **The tick resolver is wired**
+  — E02 left the adapter refusing every priced order with `NO_TICK_RESOLVER`,
+  and the repository now exposes a synchronous `tick_size` that raises rather
+  than defaulting to 0.05.
+
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/` — seven of thirteen packages.
 `execution/` holds `risk/`, `sizer.py` and `slots.py`. **There is no order manager and
@@ -204,7 +221,7 @@ this file means: the system cannot trade, correctly or otherwise.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,883 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,933 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -295,6 +312,12 @@ Recorded because each was believed, written down, and wrong.
   healthy. `signals_rejected_total{reason}` is the metric that turns "why
   isn't it trading?" into a glance, so a wrong label there costs exactly the
   glance it exists to provide. Now `RISK_ENGINE_FAULT`. See SIT-001.
+- **"The repository already holds it."** E15-S01's build concern said to wire
+  the tick resolver to the instrument repository, "which already holds the
+  per-instrument tick size from E02-S06's sync". The **table** held it. The
+  **repository** did not: `refresh_cache` selected only `id` and
+  `tradingsymbol`, and there was no accessor at all. A note about a capability
+  is not the capability — read the consumer before designing around it.
 - **"`Final` marks a constant."** Not inside a dataclass. An annotated
   assignment without `ClassVar` declares a **field with a default**, so
   `OperatorAction.FORBIDDEN` — the list of names that are not people — would
