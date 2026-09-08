@@ -470,8 +470,16 @@ class TestPositionSlots:
     async def test_slot_collision_raises_and_is_catchable(
         self, session: AsyncSession, instruments: InstrumentRepository
     ) -> None:
-        """A normal outcome under concurrency, not an error to surface."""
-        import psycopg
+        """A normal outcome under concurrency, not an error to surface.
+
+        The assertion was `pytest.raises((psycopg.errors.UniqueViolation,
+        Exception))`. `Exception` in that tuple matches anything at all, so the
+        test could not fail and never established the one thing its name
+        claims: that the collision is *catchable* — i.e. identifiable — by a
+        caller. E14-S08's allocator depends on exactly that, so it is now
+        asserted through the function that does the identifying.
+        """
+        from algotrader.execution.slots import is_slot_taken
 
         positions = PositionRepository(session, instruments)
         base = {
@@ -487,9 +495,10 @@ class TestPositionSlots:
         await positions.open_position({**base, "symbol": "INFY"})
         await session.flush()
 
-        with pytest.raises((psycopg.errors.UniqueViolation, Exception)):
+        with pytest.raises(Exception) as excinfo:
             await positions.open_position({**base, "symbol": "TCS"})
             await session.flush()
+        assert is_slot_taken(excinfo.value, constraints=["uq_open_slot"])
 
     async def test_occupied_slots_reports_only_open_positions(
         self, session: AsyncSession, instruments: InstrumentRepository

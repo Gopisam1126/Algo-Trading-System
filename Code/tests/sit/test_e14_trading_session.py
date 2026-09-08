@@ -1767,3 +1767,153 @@ class TestSit11ExposureCapsHoldAcrossAWholeSession:
             session.log_text,
             re.IGNORECASE,
         )
+
+
+# --------------------------------------------------------------------------
+# SIT-12 — a session whose book fills and recycles (E14-S08)
+# --------------------------------------------------------------------------
+
+
+class TestSit12TheBookFillsAndRecyclesAcrossASession:
+    """E14-S08 built the allocator; check 6 is what a full book *does* to a
+    trading day. The unit and integration tiers prove that two signals cannot
+    take one slot. This asks the session question neither can: when the book
+    fills at 11:00 and a position closes at 13:00, does the day stop and
+    restart at exactly the right minutes, and does it say why?
+
+    Slot state is driven here rather than allocated, because ``SlotManager``
+    needs a real Redis and a real Postgres and this tier runs without either.
+    That split is deliberate: the allocator's correctness is proved where the
+    stores are real, and its *effect on a session* is proved where a whole day
+    can be walked in milliseconds.
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    @staticmethod
+    def _fills_at_eleven(ist_time: dt.time, kwargs: dict) -> None:
+        """Five of five in use from 11:00. The shape of a morning that found
+        five setups before lunch."""
+        if ist_time >= dt.time(11, 0):
+            kwargs["slots_used"] = 5
+
+    @staticmethod
+    def _fills_then_recycles(ist_time: dt.time, kwargs: dict) -> None:
+        """Full at 11:00, one position closes at 13:00."""
+        if dt.time(11, 0) <= ist_time < dt.time(13, 0):
+            kwargs["slots_used"] = 5
+        elif ist_time >= dt.time(13, 0):
+            kwargs["slots_used"] = 4
+
+    def test_a_full_book_stops_approving_from_that_minute(self, calendar) -> None:
+        session = self._session(calendar).run(mutate=self._fills_at_eleven)
+        approved = sorted(t for t, d in session.decisions.items() if d.approved)
+        assert approved, "the morning approved nothing, so the property is untested"
+        assert approved[-1] == dt.time(10, 59)
+
+    def test_a_full_book_says_why(self, calendar) -> None:
+        """NO_SLOT_AVAILABLE, not a generic refusal.
+        ``signals_rejected_total{reason}`` is what answers "why isn't it
+        trading?" at a glance, and "the book is full" and "the market is shut"
+        need different answers."""
+        session = self._session(calendar).run(mutate=self._fills_at_eleven)
+        assert session.decisions[dt.time(12, 0)].reason is RejectReason.NO_SLOT_AVAILABLE
+
+    def test_the_detail_distinguishes_contention_from_misconfiguration(self, calendar) -> None:
+        """Five of five clears on its own; zero of zero never can. The check
+        reports used/total precisely so an operator can tell them apart."""
+        session = self._session(calendar).run(mutate=self._fills_at_eleven)
+        detail = session.decisions[dt.time(12, 0)].detail or ""
+        assert "5 of 5" in detail
+
+    def test_a_recycled_slot_restarts_the_day(self, calendar) -> None:
+        """Task 3 at session scale. A slot freed at 13:00 must make the very
+        next minute tradable again — a book that filled once and never
+        recovered would look identical for the rest of the day."""
+        session = self._session(calendar).run(mutate=self._fills_then_recycles)
+        approved = sorted(t for t, d in session.decisions.items() if d.approved)
+        assert dt.time(10, 59) in approved
+        assert dt.time(12, 0) not in approved
+        assert dt.time(13, 0) in approved
+
+    def test_the_gap_is_exactly_the_full_window(self, calendar) -> None:
+        """Not merely "it stopped and started" — the boundaries must be the
+        two minutes the book actually changed on."""
+        session = self._session(calendar).run(mutate=self._fills_then_recycles)
+        refused = sorted(
+            t for t, d in session.decisions.items() if d.reason is RejectReason.NO_SLOT_AVAILABLE
+        )
+        assert refused[0] == dt.time(11, 0)
+        assert refused[-1] == dt.time(12, 59)
+
+    def test_a_book_with_no_slots_configured_never_trades(self, calendar) -> None:
+        """Zero of zero. Distinct from contention, and a configuration that can
+        never trade should be obvious from the first minute rather than look
+        like a quiet day."""
+        session = self._session(calendar, slots_total=0, slots_used=0).run()
+        assert [t for t, d in session.decisions.items() if d.approved] == []
+        assert session.decisions[dt.time(10, 0)].reason is RejectReason.NO_SLOT_AVAILABLE
+        assert "0 of 0" in (session.decisions[dt.time(10, 0)].detail or "")
+
+    def test_slot_pressure_does_not_change_the_size_of_what_does_trade(self, calendar) -> None:
+        """A subtle one worth pinning. Sizing divides capital per SLOT, so a
+        book under pressure must still size each position the same — a sizer
+        that reacted to occupancy would quietly shrink positions as the day
+        got busier, and nothing else would report it."""
+        empty = self._session(calendar).run()
+        pressured = self._session(calendar, slots_used=4).run()
+        empty_q = {d.sizing.quantity for d in empty.decisions.values() if d.approved}
+        pressured_q = {d.sizing.quantity for d in pressured.decisions.values() if d.approved}
+        assert pressured_q, "a book with one free slot approved nothing"
+        assert empty_q == pressured_q
+
+    def test_the_audit_records_the_refusal_on_every_blocked_minute(self, calendar) -> None:
+        """A day that stopped trading has to be explainable afterwards without
+        re-deriving the book."""
+        session = self._session(calendar).run(mutate=self._fills_at_eleven)
+        blocked = [
+            e
+            for e in session.audit
+            if e["outcome"] == "rejected"
+            and e["reason_code"] == RejectReason.NO_SLOT_AVAILABLE.value
+        ]
+        assert blocked, "the full book produced no audit trail"
+        # `stage` is the CHECK that stopped it, not a generic "rejected" — which
+        # is what makes the log answer "which gate?" rather than only "no".
+        assert {e["stage"] for e in blocked} == {"slot_available"}
+        assert all("5 of 5" in (e["payload"]["detail"] or "") for e in blocked)

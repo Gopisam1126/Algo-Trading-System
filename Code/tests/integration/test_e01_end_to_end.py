@@ -41,6 +41,7 @@ from algotrader.common.db.repositories import (
 from algotrader.common.enums import Timeframe
 from algotrader.common.events import Envelope, stream
 from algotrader.common.redis import keys, locks, primitives, state
+from algotrader.execution.slots import is_slot_taken
 
 pytestmark = [pytest.mark.integration]
 
@@ -401,7 +402,6 @@ class TestCrossComponentContracts:
         If the lock were released before the insert committed, the index would
         be the only thing standing between two signals and a double position.
         """
-        import psycopg
 
         instruments = InstrumentRepository(db)
         await instruments.upsert(
@@ -435,9 +435,21 @@ class TestCrossComponentContracts:
         await db.flush()
 
         # Even if the lock were somehow lost, the index must still refuse.
-        with pytest.raises((psycopg.errors.UniqueViolation, Exception)):
+        #
+        # Asserted through `is_slot_taken` rather than as a type tuple. The
+        # tuple here was `(psycopg.errors.UniqueViolation, Exception)`, and
+        # `Exception` in a pytest.raises tuple matches ANYTHING — a typo, a
+        # connection failure, an AttributeError. It could not fail, so it never
+        # established what it was named for, while reading as though it had.
+        # Found during E14-S08, whose whole design depends on this exception
+        # being recognisable (EPIC01_TECHNICAL_SPEC 8.4).
+        with pytest.raises(Exception) as excinfo:
             await positions.open_position({**base, "symbol": "BBB"})
             await db.flush()
+        assert is_slot_taken(excinfo.value), (
+            f"the slot collision surfaced as {type(excinfo.value).__name__}, "
+            f"which callers following 8.4 would not recognise as 'slot taken'."
+        )
 
 
 class TestFailClosedBehaviour:
