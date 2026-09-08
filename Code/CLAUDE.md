@@ -132,8 +132,8 @@ Never commit a `.env`, a credential, or anything under `data/`.
 carrying a quantity and an executable stop. Nothing trades, and nothing can —
 there is no order placement, so nothing turns that decision into an order.**
 
-Built and tested (**1,818 tests, 83% coverage** — 1,558 pass locally, 260 need
-Docker):
+Built and tested (**1,873 tests, 92% coverage** — all pass locally with Docker running;
+without it 273 skip and coverage reads 83%):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
   redacting logging, NSE calendar, broker protocol, strategy DSL.
@@ -182,6 +182,19 @@ Docker):
   was split out as **E14-S11**: nothing computes an expectancy, so ranking on
   one would mean inventing it.
 
+- **E14-S09 the halt controller** — `execution/halt.py`. Three persisted
+  latches (kill switch, daily loss, consecutive loss), each carrying why, when
+  and by whom. **Arming is idempotent and the first reason wins**: if the loss
+  limit stops the day and the broker then disconnects, the operator must still
+  see that a loss limit stopped it. Reads fail closed on every path, including
+  an unparseable record — a latch whose payload cannot be read is not evidence
+  that trading may resume. `clear()` takes an `OperatorAction` that cannot be
+  constructed without a named human, so an automatic un-halt would require code
+  that invents a person. The controller holds a Redis client and nothing else,
+  which is how "halting must never disable the exit path" is made structural.
+  Tasks 1 and 4 split out as **E14-S12** (transport, needs credentials) and
+  **E14-S13** (close command, needs an order path).
+
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/` — seven of thirteen packages.
 `execution/` holds `risk/`, `sizer.py` and `slots.py`. **There is no order manager and
@@ -191,7 +204,7 @@ this file means: the system cannot trade, correctly or otherwise.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,818 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,873 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -282,6 +295,20 @@ Recorded because each was believed, written down, and wrong.
   healthy. `signals_rejected_total{reason}` is the metric that turns "why
   isn't it trading?" into a glance, so a wrong label there costs exactly the
   glance it exists to provide. Now `RISK_ENGINE_FAULT`. See SIT-001.
+- **"`Final` marks a constant."** Not inside a dataclass. An annotated
+  assignment without `ClassVar` declares a **field with a default**, so
+  `OperatorAction.FORBIDDEN` — the list of names that are not people — would
+  have become a third constructor parameter. A caller could then pass their own
+  empty allow-list and clear a halt as "system", defeating the exact bypass the
+  type exists to prevent, through the type's own constructor. mypy reported it
+  as a typing nit; it was a safety defect. E14-S09.
+- **"A guardrail that exists, guards."** `keys.py` says no key literal may live
+  outside it and that a test enumerates the builders. The test checked one
+  direction — every *listed* name is callable — and never that every *defined*
+  builder is listed. Two had already slipped through (`data_rate_limit`,
+  `broker_session`), invisible to the check meant to enumerate the keyspace.
+  The docstring names the cost itself: a typo'd key does not raise, it reads
+  `None` — "no position", "no plan", **"kill switch not set"**. KEYS-001.
 - **"A test named `..._is_catchable` establishes that it is catchable."** Two
   did not. Both asserted `pytest.raises((psycopg.errors.UniqueViolation,
   Exception))`, and **`Exception` in a `pytest.raises` tuple matches
