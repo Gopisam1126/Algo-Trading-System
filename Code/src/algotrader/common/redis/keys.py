@@ -171,6 +171,17 @@ def kill_switch() -> str:
     return f"{CONTROL}:killswitch"
 
 
+def halt_latch(name: str) -> str:
+    """STRING — one halt latch, holding a JSON record of why. Never TTL'd.
+
+    The kill switch has its own builder above because it predates this and is
+    read by ``state.is_kill_switch_active``. The two loss latches share this
+    one. A TTL on any of them would be an automatic un-halt on a timer, which
+    ``LOW_LEVEL_ARCHITECTURE.md §8.1`` forbids.
+    """
+    return f"{CONTROL}:halt:{_safe(name, 'halt latch')}"
+
+
 def mode() -> str:
     return f"{CONTROL}:mode"
 
@@ -263,8 +274,14 @@ def stream_dlq(stream_name: str) -> str:
     return f"{STREAM}:dlq:{short}"
 
 
-#: Every builder, for the test that asserts §9 is fully covered and that no key
-#: literal exists elsewhere. Update this when adding a builder.
+#: Every builder. Checked in BOTH directions — every name here is callable, and
+#: every public builder in this module appears here.
+#:
+#: The reverse direction was missing until E14-S09 and two builders had already
+#: slipped through it (``data_rate_limit``, ``broker_session``): the test only
+#: asserted "declared but not implemented", so a builder added without touching
+#: this tuple was invisible to the very check meant to enumerate it. A guard
+#: that only looks one way is how the thing it guards drifts.
 ALL_BUILDERS: Final[tuple[str, ...]] = (
     "indicator_state",
     "current_bar",
@@ -275,12 +292,15 @@ ALL_BUILDERS: Final[tuple[str, ...]] = (
     "plan_candidate",
     "market_context",
     "kill_switch",
+    "halt_latch",
     "mode",
     "interval",
     "health",
     "slot_lock",
     "symbol_lock",
     "order_rate_limit",
+    "data_rate_limit",
+    "broker_session",
     "squareoff_timer",
     "stream_ticks",
     "stream_bars",

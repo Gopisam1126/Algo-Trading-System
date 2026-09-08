@@ -49,6 +49,30 @@ class TestKeyBuilders:
         missing = [n for n in keys.ALL_BUILDERS if not callable(getattr(keys, n, None))]
         assert not missing, f"declared but not implemented: {missing}"
 
+    def test_every_builder_is_declared(self) -> None:
+        """The other direction, which was missing until E14-S09.
+
+        ``ALL_BUILDERS`` says it exists so the keyspace can be enumerated, and
+        the module docstring says no key literal may live outside it. Only the
+        "declared but not implemented" half was ever checked, so a builder
+        added without touching the tuple was invisible to the very test meant
+        to enumerate it — and two already were: ``data_rate_limit`` and
+        ``broker_session``. A guard that looks one way is how the thing it
+        guards drifts.
+        """
+        import inspect
+
+        defined = {
+            name
+            for name, obj in inspect.getmembers(keys, inspect.isfunction)
+            if not name.startswith("_") and obj.__module__ == keys.__name__
+        }
+        undeclared = sorted(defined - set(keys.ALL_BUILDERS))
+        assert not undeclared, (
+            f"implemented but not declared in ALL_BUILDERS: {undeclared}. "
+            f"Add them, or the keyspace enumeration is incomplete."
+        )
+
     def test_keys_are_namespaced_by_lifecycle(self) -> None:
         assert keys.indicator_state("INFY", Timeframe.M5) == "state:indicator:INFY:5m"
         assert keys.slot_lock(3) == "lock:slot:3"
