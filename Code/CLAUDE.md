@@ -139,7 +139,7 @@ machine (E15-S03), no protective stop attachment (E15-S04), no position manager
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**1,923 tests, 92% coverage** — all pass locally with Docker running;
+Built and tested (**1,933 tests, 92% coverage** — all pass locally with Docker running;
 without it 273 skip and coverage reads 83%):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -221,7 +221,7 @@ this file means: the system cannot trade, correctly or otherwise.
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,923 tests are claims about *components*;
+both `ingest` and `indicators`. The 1,933 tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
