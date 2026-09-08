@@ -20,6 +20,7 @@ assert that rather than paper over it.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import io
 import logging
@@ -34,6 +35,11 @@ from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_s
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
 from algotrader.common.metrics import reset_metrics_for_testing
 from algotrader.common.models.trading import Recommendation
+from algotrader.execution.halt import (
+    HaltController,
+    HaltReason,
+    OperatorAction,
+)
 from algotrader.execution.risk.checks import (
     ELIGIBILITY_ORDER,
     EXPOSURE_ORDER,
@@ -1917,3 +1923,291 @@ class TestSit12TheBookFillsAndRecyclesAcrossASession:
         # is what makes the log answer "which gate?" rather than only "no".
         assert {e["stage"] for e in blocked} == {"slot_available"}
         assert all("5 of 5" in (e["payload"]["detail"] or "") for e in blocked)
+
+
+# --------------------------------------------------------------------------
+# SIT-13 — a halt walked across a whole session (E14-S09)
+# --------------------------------------------------------------------------
+
+
+class _SessionRedis:
+    """A store that lives for one simulated session.
+
+    Deliberately not a mock of the controller: the REAL ``HaltController`` runs
+    here, on every minute of the day, and only the transport underneath it is
+    substituted. A test that stubbed the controller would assert that a fake
+    said "halted" — which is not the claim.
+    """
+
+    def __init__(self) -> None:
+        self.data: dict[str, str] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.data.get(key)
+
+    async def set(self, key: str, value: str, **_kwargs) -> bool:
+        self.data[key] = value
+        return True
+
+    async def delete(self, key: str) -> int:
+        return 1 if self.data.pop(key, None) is not None else 0
+
+
+class TestSit13AHaltIsTerminalForTheDay:
+    """``LOW_LEVEL_ARCHITECTURE.md §8.1`` says HALTED is terminal for the day.
+    "Terminal" is a claim about a *session*, not about a function call, and the
+    unit suite cannot make it: it asserts that one read returns True. This
+    walks 480 minutes with the real controller in the loop and asks whether the
+    day ever comes back on its own.
+
+    The distinction matters because the failure it guards against is
+    specifically a *recovery*: a daily-loss limit trips precisely when losing
+    positions are open, and one of them closing at a profit lifts
+    ``realised_pnl_today`` back over the threshold. A predicate would resume
+    trading at that moment, silently, and only a session-length test can see
+    the difference between a predicate and a latch.
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    @staticmethod
+    def _driven_by(controller: HaltController, *, arm_at: dt.time, reason: HaltReason):
+        """Read the REAL controller on every minute, arming it once at ``arm_at``.
+
+        ``asyncio.run`` per minute is affordable against an in-memory store and
+        is what keeps the controller genuinely in the loop rather than
+        simulated by a boolean the test flips.
+        """
+
+        def mutate(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time == arm_at:
+                asyncio.run(
+                    controller.arm(
+                        reason,
+                        detail="realised -3.2% against a 3.0% limit",
+                        armed_by="risk-engine",
+                        now=_at(TRADING_DAY, ist_time.hour, ist_time.minute),
+                    )
+                )
+            state = asyncio.run(controller.state())
+            kwargs["kill_switch_active"] = state.kill_switch
+            kwargs["daily_loss_halted"] = state.daily_loss
+            kwargs["consecutive_loss_halted"] = state.consecutive_loss
+
+        return mutate
+
+    def test_the_day_stops_at_the_minute_the_halt_is_armed(self, calendar) -> None:
+        controller = HaltController(_SessionRedis())  # type: ignore[arg-type]
+        session = self._session(calendar).run(
+            mutate=self._driven_by(
+                controller, arm_at=dt.time(12, 0), reason=HaltReason.DAILY_LOSS_LIMIT
+            )
+        )
+        approved = sorted(t for t, d in session.decisions.items() if d.approved)
+        assert approved, "the morning approved nothing, so the property is untested"
+        assert approved[-1] == dt.time(11, 59)
+
+    def test_the_day_never_comes_back(self, calendar) -> None:
+        """Terminal. Not "stopped for a while" — every remaining minute of the
+        session, to the close."""
+        controller = HaltController(_SessionRedis())  # type: ignore[arg-type]
+        session = self._session(calendar).run(
+            mutate=self._driven_by(
+                controller, arm_at=dt.time(12, 0), reason=HaltReason.DAILY_LOSS_LIMIT
+            )
+        )
+        after = [t for t, d in session.decisions.items() if t >= dt.time(12, 0) and d.approved]
+        assert after == [], f"trading resumed after the halt at {after[:5]}"
+
+    def test_a_recovering_loss_figure_does_not_resume_trading(self, calendar) -> None:
+        """The failure the latch exists for, at session scale.
+
+        The halt is armed at 12:00 while the book is down. From 12:30 the
+        realised P&L RECOVERS to healthy — a losing position closed at a
+        profit. A predicate over ``realised_pnl_today`` would clear itself and
+        trade again; the latch must not.
+        """
+        controller = HaltController(_SessionRedis())  # type: ignore[arg-type]
+        driver = self._driven_by(
+            controller, arm_at=dt.time(12, 0), reason=HaltReason.DAILY_LOSS_LIMIT
+        )
+
+        def mutate(ist_time: dt.time, kwargs: dict) -> None:
+            driver(ist_time, kwargs)
+            # The book heals; the halt must not.
+            kwargs["realised_pnl_today"] = (
+                Decimal("-16000") if ist_time < dt.time(12, 30) else Decimal("5000")
+            )
+
+        session = self._session(calendar).run(mutate=mutate)
+        recovered = [t for t, d in session.decisions.items() if t >= dt.time(12, 30) and d.approved]
+        assert recovered == [], (
+            f"trading resumed once the P&L recovered — that is a predicate, not a "
+            f"latch: {recovered[:5]}"
+        )
+
+    def test_the_halt_reason_reaches_the_rejection(self, calendar) -> None:
+        """A halted day must say WHICH limit stopped it. Three latches exist so
+        that this stays possible; one flag would have made every halt look the
+        same."""
+        controller = HaltController(_SessionRedis())  # type: ignore[arg-type]
+        session = self._session(calendar).run(
+            mutate=self._driven_by(
+                controller, arm_at=dt.time(12, 0), reason=HaltReason.DAILY_LOSS_LIMIT
+            )
+        )
+        assert session.decisions[dt.time(13, 0)].reason is RejectReason.DAILY_LOSS_LIMIT
+
+    def test_a_manual_halt_reports_the_kill_switch_not_a_loss_limit(self, calendar) -> None:
+        """The same walk with a different reason, to prove the reason is
+        carried rather than assumed. An operator stopping the day manually must
+        not appear in the metrics as a loss limit."""
+        controller = HaltController(_SessionRedis())  # type: ignore[arg-type]
+        session = self._session(calendar).run(
+            mutate=self._driven_by(controller, arm_at=dt.time(12, 0), reason=HaltReason.MANUAL)
+        )
+        assert session.decisions[dt.time(13, 0)].reason is RejectReason.KILL_SWITCH_ACTIVE
+
+    def test_only_an_operator_can_bring_the_day_back(self, calendar) -> None:
+        """The other half of "terminal": it is not permanent, it is
+        human-gated. A halt nothing could clear would be a different defect —
+        the operator could never resume."""
+        redis = _SessionRedis()
+        controller = HaltController(redis)  # type: ignore[arg-type]
+        driver = self._driven_by(
+            controller, arm_at=dt.time(12, 0), reason=HaltReason.DAILY_LOSS_LIMIT
+        )
+
+        def mutate(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time == dt.time(14, 0):
+                asyncio.run(
+                    controller.clear_all(
+                        OperatorAction(
+                            operator="gopikrishnan",
+                            acknowledged="reviewed the drawdown and chose to resume",
+                        )
+                    )
+                )
+            driver(ist_time, kwargs)
+
+        session = self._session(calendar).run(mutate=mutate)
+        approved = sorted(t for t, d in session.decisions.items() if d.approved)
+        assert dt.time(13, 0) not in approved, "the halt did not hold"
+        assert dt.time(14, 0) in approved, "the operator could not resume the day"
+
+    def test_the_halt_survives_a_restart_mid_session(self, calendar) -> None:
+        """A crash at 12:30. The store outlives the process, so a fresh
+        controller must find the day still halted — which is the whole reason
+        the latch is persisted rather than held in memory."""
+        redis = _SessionRedis()
+        first = HaltController(redis)  # type: ignore[arg-type]
+
+        def mutate(ist_time: dt.time, kwargs: dict) -> None:
+            if ist_time == dt.time(12, 0):
+                asyncio.run(
+                    first.arm(
+                        HaltReason.MARGIN_SHORTFALL,
+                        detail="short by 12,000",
+                        armed_by="risk",
+                        now=_at(TRADING_DAY, 12, 0),
+                    )
+                )
+            # From 12:30 a NEW controller instance serves every read.
+            live = first if ist_time < dt.time(12, 30) else HaltController(redis)  # type: ignore[arg-type]
+            state = asyncio.run(live.state())
+            kwargs["kill_switch_active"] = state.kill_switch
+            kwargs["daily_loss_halted"] = state.daily_loss
+            kwargs["consecutive_loss_halted"] = state.consecutive_loss
+
+        session = self._session(calendar).run(mutate=mutate)
+        after = [t for t, d in session.decisions.items() if t >= dt.time(12, 30) and d.approved]
+        assert after == [], f"the restarted process forgot the halt: {after[:5]}"
+
+    def test_an_unreachable_store_halts_the_day_rather_than_opening_it(self, calendar) -> None:
+        """Fail closed, at session scale. If the coordination layer breaks at
+        12:00, the day must stop — that is precisely the circumstance in which
+        it should."""
+
+        class _DeadRedis(_SessionRedis):
+            async def get(self, key: str) -> str | None:
+                raise ConnectionError("redis is gone")
+
+        redis = _SessionRedis()
+        dead = _DeadRedis()
+
+        def mutate(ist_time: dt.time, kwargs: dict) -> None:
+            store = redis if ist_time < dt.time(12, 0) else dead
+            state = asyncio.run(HaltController(store).state())  # type: ignore[arg-type]
+            kwargs["kill_switch_active"] = state.kill_switch
+            kwargs["daily_loss_halted"] = state.daily_loss
+            kwargs["consecutive_loss_halted"] = state.consecutive_loss
+
+        session = self._session(calendar).run(mutate=mutate)
+        approved = sorted(t for t, d in session.decisions.items() if d.approved)
+        assert approved, "nothing was approved before the outage"
+        assert approved[-1] == dt.time(11, 59)
+
+    def test_a_clean_store_trades_the_whole_day(self, calendar) -> None:
+        """The control. Every assertion above is satisfied by a controller that
+        always reports halted, which would stop the system trading forever."""
+        controller = HaltController(_SessionRedis())  # type: ignore[arg-type]
+
+        def mutate(_ist_time: dt.time, kwargs: dict) -> None:
+            state = asyncio.run(controller.state())
+            kwargs["kill_switch_active"] = state.kill_switch
+            kwargs["daily_loss_halted"] = state.daily_loss
+            kwargs["consecutive_loss_halted"] = state.consecutive_loss
+
+        session = self._session(calendar).run(mutate=mutate)
+        approved = [t for t, d in session.decisions.items() if d.approved]
+        assert len(approved) == 316, f"a clean store did not trade the day: {len(approved)}"
+
+    def test_no_credential_reached_the_log_on_a_halted_day(self, calendar) -> None:
+        """The halt path logs CRITICAL with an operator name and a detail on
+        every arm and clear, so this re-asserts for that shape."""
+        import re
+
+        controller = HaltController(_SessionRedis())  # type: ignore[arg-type]
+        session = self._session(calendar).run(
+            mutate=self._driven_by(controller, arm_at=dt.time(12, 0), reason=HaltReason.MANUAL)
+        )
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
