@@ -36,6 +36,14 @@ from algotrader.common.enums import AutonomyLevel, SystemMode, Timeframe
 # that goes through review, which is exactly the point.
 # ---------------------------------------------------------------------------
 
+#: SEBI's algo-registration threshold, in orders per second per segment per
+#: exchange.  At or above this rate a self-developed algo must be registered
+#: with the exchange through the broker and carries a registered Algo-ID;
+#: below it, no registration exists and the broker/exchange tags the order
+#: with a generic identifier.  Verified 9 Sep 2026 against SEBI circular
+#: SEBI/HO/MIRSD/MIRSD-PoD/P/CIR/2025/0000013 clause I(c).
+SEBI_ALGO_REGISTRATION_OPS = 10
+
 MAX_ORDERS_PER_SECOND = 5  # SEBI threshold is 10; we cap at half
 MAX_RISK_PCT_PER_TRADE = Decimal("10.0")
 MAX_POSITION_SLOTS = 20
@@ -45,6 +53,30 @@ MIN_STRATEGY_TRIALS = 50  # below this, statistics are meaningless
 MAX_PBO_ALLOWED = Decimal("0.6")  # Probability of Backtest Overfitting
 MAX_ACTIVE_STRATEGIES = 12
 MIN_EXIT_BUFFER_MINUTES = 1
+
+
+def _assert_below_registration_threshold(cap: int, threshold: int) -> None:
+    """Refuse to load if the hard cap has been raised into the registration regime.
+
+    Split out of the module body so the condition and its message are
+    reachable by a test. Left inline, the guard only executes when someone
+    edits the constants above — which meant a typo in it (``<=`` for ``>=``,
+    or the operands swapped) would be discovered on the one day it was needed
+    and never before. A mutation that deleted the guard entirely survived the
+    suite, which is what surfaced this.
+    """
+    if cap >= threshold:
+        raise RuntimeError(
+            f"MAX_ORDERS_PER_SECOND is {cap}, at or above SEBI's "
+            f"algo-registration threshold of {threshold}/sec. That is not a "
+            f"rate change, it is a change of regulatory regime: the algo must "
+            f"be registered with the exchange through the broker and every "
+            f"order must then carry the registered Algo-ID. Raising this "
+            f"constant requires that registration to exist first."
+        )
+
+
+_assert_below_registration_threshold(MAX_ORDERS_PER_SECOND, SEBI_ALGO_REGISTRATION_OPS)
 
 Pct = Annotated[Decimal, Field(ge=0, le=100)]
 
@@ -240,6 +272,14 @@ class BrokerAuthConfig(_Model):
 class BrokerConfig(_Model):
     primary: str = "angelone"
     fallback: str | None = "fyers"
+
+    #: The registered Algo-ID, and empty is the CORRECT value at this
+    #: system's operating profile. A self-developed algo below
+    #: :data:`SEBI_ALGO_REGISTRATION_OPS` is not registered, so no such id
+    #: exists to put here; the broker tags the order generically. Set it only
+    #: if registration is ever obtained -- see
+    #: ``_live_mode_requires_compliance``, which requires it above the
+    #: threshold and nowhere else.
     algo_id: str = ""
     auth: BrokerAuthConfig = Field(default_factory=BrokerAuthConfig)
 
@@ -446,8 +486,10 @@ class ExecutionConfig(_Model):
         if v > MAX_ORDERS_PER_SECOND:
             raise ValueError(
                 f"max_orders_per_second {v} exceeds the hard cap of "
-                f"{MAX_ORDERS_PER_SECOND}. SEBI's algo-registration threshold is "
-                f"10 orders/sec per segment; we stay at half that deliberately."
+                f"{MAX_ORDERS_PER_SECOND}. SEBI's algo-registration threshold "
+                f"is {SEBI_ALGO_REGISTRATION_OPS} orders/sec per segment; we "
+                f"stay at half that deliberately, which is also what keeps "
+                f"this system out of the registration regime entirely."
             )
         return v
 
@@ -690,16 +732,64 @@ class AppConfig(_Model):
 
     @model_validator(mode="after")
     def _live_mode_requires_compliance(self) -> Self:
+        """The two SEBI obligations that bind before live trading.
+
+        **Static IP is unconditional.** It applies to every API order
+        regardless of rate, and an order from an unwhitelisted address is
+        rejected outright.
+
+        **An Algo-ID is required only at or above the registration
+        threshold**, and this is a correction (9 Sep 2026). The gate used to
+        demand one in every live configuration, which would have blocked
+        go-live permanently on a requirement that does not apply here: below
+        :data:`SEBI_ALGO_REGISTRATION_OPS` there is no registration, so there
+        is no registered Algo-ID to obtain, and the broker/exchange tags the
+        order with a generic identifier instead.
+
+        The evidence, recorded because the previous belief was confidently
+        wrong and the same reasoning must be re-checkable:
+
+        * SEBI/HO/MIRSD/MIRSD-PoD/P/CIR/2025/0000013 (4 Feb 2025) I(c) --
+          algos self-developed by retail investors "shall also be registered
+          with the Exchange, through their broker, **only if they cross the
+          specified order per second threshold**".
+        * The same circular I(d) has brokers categorise "all orders **above
+          the specified threshold** as algo orders". Below it, the order is
+          not categorised as an algo order in the first place.
+        * I(b) scopes the tagging duty to APIs "extended by brokers **to algo
+          providers**". A personal algo is not an algo provider; II(b)'s "all
+          algo orders shall be tagged" sits under the stock broker's
+          responsibilities, and the tag it refers to is the one the broker
+          applies.
+        * Zerodha's own guidance describes sub-threshold client algos as
+          "tagged with generic ID (unregistered, <=10 OPS)" and asks the
+          developer only for a dedicated static IP.
+        * ``kiteconnect.KiteConnect.place_order`` documents ``algo_id`` as
+          "an optional algo ID to associate with the order", default ``None``.
+
+        **What would make this wrong.** Raising
+        :data:`MAX_ORDERS_PER_SECOND` to or past the threshold -- which the
+        module-level guard already refuses -- or SEBI extending registration
+        below it. Both are changes to the constants above, and both bring
+        this branch back to life.
+        """
         if self.system.mode is SystemMode.LIVE:
             if not self.system.static_ip:
                 raise ValueError(
                     "live mode requires system.static_ip to be set and whitelisted "
-                    "with the broker (SEBI requirement)"
+                    "with the broker (SEBI requirement, and it applies at every "
+                    "order rate)"
                 )
-            if not self.broker.algo_id:
+            if (
+                self.execution.max_orders_per_second >= SEBI_ALGO_REGISTRATION_OPS
+                and not self.broker.algo_id
+            ):
                 raise ValueError(
-                    "live mode requires broker.algo_id — every algorithmic order "
-                    "must carry an exchange-assigned Algo-ID (SEBI, since 1 Apr 2026)"
+                    f"live mode at {self.execution.max_orders_per_second} "
+                    f"orders/sec is at or above SEBI's algo-registration "
+                    f"threshold of {SEBI_ALGO_REGISTRATION_OPS}/sec, so the algo "
+                    f"must be registered with the exchange through the broker "
+                    f"and broker.algo_id must carry the registered Algo-ID"
                 )
         return self
 

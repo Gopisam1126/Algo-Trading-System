@@ -340,7 +340,12 @@ class OrderRequest(_Frozen):
     limit_price: Price | None = None
     trigger_price: Price | None = None
     intent: OrderIntent
-    algo_id: str | None = None  # SEBI-mandated, attached by the gateway
+    #: The registered Algo-ID, attached by the gateway when one exists.
+    #: ``None`` is the normal value: SEBI requires registration only above
+    #: the order-rate threshold, and below it the broker tags the order with
+    #: a generic identifier. The adapter omits the parameter when this is
+    #: unset rather than sending an empty string.
+    algo_id: str | None = None
 
     #: Market protection for MARKET and SL-M orders.
     #:

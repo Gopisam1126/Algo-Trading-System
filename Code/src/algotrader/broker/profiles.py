@@ -158,11 +158,16 @@ ZERODHA = BrokerProfile(
         "Historical data is INCLUDED in the Rs.500/month Connect plan as of "
         "Aug 2026; the old separate add-on no longer exists. The free Personal "
         "tier has no data at all, so it cannot feed this system.",
-        "Self-developed algos under 10 OPS need no exchange registration; SEBI's "
-        "framework has the BROKER tag the strategy. Zerodha's own compliance "
-        "guidance covers static IP, the 10 OPS cap and market protection and "
-        "never asks the developer to supply an algo_id - so leaving it unset is "
-        "the working assumption. Still worth one confirmation before live.",
+        "CONFIRMED 9 Sep 2026 (blocker B1, closed): self-developed algos under "
+        "10 OPS need no exchange registration and there is no Algo-ID for the "
+        "developer to obtain - the order is tagged with a GENERIC identifier on "
+        "the broker/exchange side. SEBI circular 4 Feb 2025 clause I(c) makes "
+        "registration conditional on crossing the threshold and I(d) has brokers "
+        "categorise as algo orders only those ABOVE it; Zerodha's own summary "
+        "says orders are 'tagged with generic ID (unregistered, <=10 OPS)' and "
+        "asks the developer only for a dedicated static IP; kiteconnect "
+        "documents place_order's algo_id as optional, default None. Leaving "
+        "algo_id unset is CORRECT here, not an outstanding task.",
         "The order `tag` field is alphanumeric, max 20 chars, and IS returned in "
         "the orderbook - which is what makes query-by-tag a real recovery path.",
     ],

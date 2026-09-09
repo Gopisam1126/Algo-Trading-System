@@ -21,10 +21,10 @@ every SIT scenario depends on. §5.7 also calls the gateway *"the only path to
 an order"*, and a second path is how a control gets bypassed.
 
 **The failure it prevents.** An approved decision reaching the broker without
-an ``algo_id`` — a SEBI violation on an algorithmic order; without market
-protection — rejected outright by Zerodha since 1 April 2026; at a price off
-the tick grid — rejected by the exchange; or faster than the rate limit, which
-is throttling below 10/sec and a regulatory threshold above it.
+market protection — rejected outright by Zerodha since 1 April 2026; at a
+price off the tick grid — rejected by the exchange; or faster than the rate
+limit, which is throttling below 10/sec and a change of regulatory regime at
+it (see ``config.SEBI_ALGO_REGISTRATION_OPS``).
 
 **What would make this decision wrong.** If submission ever needed to be
 concurrent. It is deliberately serialised (§9.1: *"execution-svc is
@@ -185,11 +185,23 @@ def client_order_id(
 class GatewayPolicy:
     """The configured values every order carries.
 
-    ``algo_id`` is ``str | None`` because Zerodha assigns it at algo
-    registration (blocker B1) and it is genuinely absent until then. That is
-    safe here and not a hole: ``AppConfig`` already refuses to load in LIVE
-    mode without one, so an order can only be built without an algo_id in a
-    mode that cannot reach the exchange.
+    ``algo_id`` is ``str | None`` and ``None`` is the EXPECTED value at this
+    system's operating profile, not a placeholder waiting on paperwork.
+
+    That reasoning was corrected on 9 Sep 2026. It previously read: absent
+    until Zerodha assigns one at registration (blocker B1), and safe only
+    because ``AppConfig`` refuses to load in LIVE mode without one. The second
+    half is no longer true and the first half was never true. SEBI requires
+    registration for a self-developed algo **only above** 10 orders/sec
+    (circular of 4 Feb 2025, clause I(c)); below it the broker tags the order
+    with a generic identifier and there is no id for the developer to supply.
+    ``AppConfig`` now demands one only at or above that threshold, which
+    ``MAX_ORDERS_PER_SECOND = 5`` structurally prevents this system reaching.
+
+    So a ``None`` here is carried through to the adapter, which omits the
+    parameter entirely — ``kiteconnect`` documents ``algo_id`` as optional and
+    defaults it to ``None``. What still binds unconditionally is the static
+    IP, which is checked at config load and is blocker B6.
     """
 
     algo_id: str | None

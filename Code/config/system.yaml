@@ -65,7 +65,9 @@ redis:
 broker:
   primary: zerodha                # angelone | zerodha | fyers | dhan | upstox
   fallback: fyers                 # free minute-level history; data redundancy
-  algo_id: ""                     # exchange-assigned; required for live mode
+  algo_id: ""                     # CORRECT as empty: below 10 OPS the algo is
+                                  # unregistered, so no Algo-ID exists to set.
+                                  # The broker tags the order generically.
   auth:
     # Zerodha uses a REDIRECT flow (login URL -> request_token -> access_token),
     # not a programmatic login. The token expires daily and must be renewed

@@ -2350,14 +2350,51 @@ class TestSit14ASessionThatReachesABroker:
         sized = {d.sizing.quantity for d in session.decisions.values() if d.approved}
         assert {o.quantity for o in broker.orders} == sized
 
-    def test_every_order_carries_the_sebi_algo_id(self, calendar) -> None:
-        """316 chances to omit it. An algorithmic order without one is a
-        compliance breach the exchange accepts and the audit fails later."""
+    def test_a_configured_algo_id_reaches_every_one_of_them(self, calendar) -> None:
+        """316 chances to drop it on the floor.
+
+        RENAMED AND RE-ARGUED 9 Sep 2026. This used to claim an order without
+        an Algo-ID was a compliance breach. It is not, below the registration
+        threshold — see the test below. What this asserts is the mechanical
+        property that survives either way: whatever the policy carries, every
+        order carries, across a whole session and not just the first one.
+        """
         session = self._session(calendar).run()
         broker = _RecordingBroker()
         self._submit_every_approval(session, broker)
         assert broker.orders
         assert all(o.algo_id == "ALGO12345" for o in broker.orders)
+
+    def test_the_real_configuration_sends_no_algo_id_and_that_is_correct(self, calendar) -> None:
+        """The session as it will actually be configured on day one.
+
+        Below SEBI's 10 orders/sec threshold this algo is unregistered, so no
+        Algo-ID is issued and none is sent; the broker tags the order with a
+        generic identifier. Run across the full day because the failure mode
+        worth excluding is an empty string leaking into the payload on some
+        orders and not others — Zerodha would reject those and accept the
+        rest, which is the hardest kind of defect to see.
+        """
+        session = self._session(calendar).run()
+        broker = _RecordingBroker()
+        gateway = OrderGateway(
+            broker,
+            policy=GatewayPolicy(algo_id=None, market_protection=Decimal("-1")),
+        )
+        for ist_time in sorted(session.decisions):
+            decision = session.decisions[ist_time]
+            if not decision.approved:
+                continue
+            asyncio.run(
+                gateway.submit_entry(
+                    decision,
+                    _recommendation(_at(TRADING_DAY, ist_time.hour, ist_time.minute)),
+                    trade_date=TRADING_DAY,
+                )
+            )
+        assert broker.orders
+        assert all(o.algo_id is None for o in broker.orders)
+        assert all(o.market_protection == Decimal("-1") for o in broker.orders)
 
     def test_every_order_carries_market_protection(self, calendar) -> None:
         session = self._session(calendar).run()

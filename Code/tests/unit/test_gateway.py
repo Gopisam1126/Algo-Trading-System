@@ -364,23 +364,51 @@ class TestThePolicyRefusesUnsafeConfiguration:
         with pytest.raises(GatewayError, match="not protection"):
             _policy(market_protection=Decimal("0"))
 
-    async def test_a_missing_algo_id_is_allowed_but_only_because_config_gates_it(
+    async def test_a_missing_algo_id_is_the_expected_state_not_a_gap(
         self,
     ) -> None:
-        """Zerodha assigns the algo_id at registration (blocker B1), so it is
-        genuinely absent until then. That is safe ONLY because AppConfig
-        refuses to load in LIVE mode without one — asserted here so the two
-        halves of that argument stay together."""
-        from algotrader.common.config import AppConfig
+        """CORRECTED 9 Sep 2026, and the correction is the point.
+
+        This test used to assert that ``None`` was safe *only because*
+        ``AppConfig`` refused LIVE mode without an algo_id. Both halves were
+        wrong: SEBI requires a registered Algo-ID only at or above the
+        order-rate threshold (circular 4 Feb 2025, I(c)), so at 5 orders/sec
+        none is ever issued, and the config gate no longer demands one.
+
+        What actually makes ``None`` safe is structural: the hard cap sits
+        below the threshold, so this system cannot enter the regime where an
+        Algo-ID is required. Asserted here so the two halves of the *current*
+        argument stay together.
+        """
+        from algotrader.common.config import (
+            MAX_ORDERS_PER_SECOND,
+            SEBI_ALGO_REGISTRATION_OPS,
+            AppConfig,
+        )
 
         placer = RecordingPlacer()
         gateway = _gateway(placer, algo_id=None)
         await gateway.submit_entry(_approved(), _rec(), trade_date=TRADE_DATE)
         assert placer.submitted[0].algo_id is None
 
+        assert MAX_ORDERS_PER_SECOND < SEBI_ALGO_REGISTRATION_OPS
+
         live = AppConfig().model_dump()
         live["system"]["mode"] = "live"
-        with pytest.raises(Exception, match=r"algo_id|static_ip"):
+        live["system"]["static_ip"] = "1.2.3.4"
+        live["broker"]["algo_id"] = ""
+        assert AppConfig(**live).broker.algo_id == ""
+
+    async def test_live_mode_still_refuses_to_load_without_a_static_ip(self) -> None:
+        """The obligation that did NOT dissolve, kept adjacent to the one that
+        did. Static IP applies at every order rate, and an order from an
+        unwhitelisted address is rejected outright."""
+        from algotrader.common.config import AppConfig
+
+        live = AppConfig().model_dump()
+        live["system"]["mode"] = "live"
+        live["system"]["static_ip"] = ""
+        with pytest.raises(Exception, match="static_ip"):
             AppConfig(**live)
 
     async def test_the_default_product_is_intraday(self) -> None:

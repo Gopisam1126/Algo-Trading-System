@@ -241,12 +241,28 @@ def check_compliance(r: Report) -> None:
     else:
         r.warn("static IP not set", "required before live trading")
 
+    # Algo-ID: registration-gated, NOT universal. Below SEBI's threshold a
+    # self-developed algo is unregistered, so an empty value is the correct
+    # one and must not be reported as an outstanding task. Corrected 9 Sep
+    # 2026; this used to fail live mode outright, which would have blocked
+    # go-live on a requirement that does not apply at 5 orders/sec.
+    from algotrader.common.config import SEBI_ALGO_REGISTRATION_OPS
+
+    registrable = cfg.execution.max_orders_per_second >= SEBI_ALGO_REGISTRATION_OPS
     if cfg.broker.algo_id:
-        r.ok("Algo-ID configured")
-    elif live:
-        r.fail("Algo-ID required for live mode")
+        r.ok("Algo-ID configured", cfg.broker.algo_id)
+    elif registrable and live:
+        r.fail(
+            f"Algo-ID required at {cfg.execution.max_orders_per_second} orders/sec",
+            f"at or above SEBI's {SEBI_ALGO_REGISTRATION_OPS}/sec threshold the "
+            f"algo must be registered and its Algo-ID supplied",
+        )
     else:
-        r.warn("Algo-ID not set", "required before live trading")
+        r.ok(
+            "Algo-ID not set - correct below the registration threshold",
+            f"{cfg.execution.max_orders_per_second}/sec is under SEBI's "
+            f"{SEBI_ALGO_REGISTRATION_OPS}/sec; the broker tags generically",
+        )
 
     if len(cfg.notifications.recipients) <= 1:
         r.ok("single notification recipient", "broadcasting signals can trigger RA obligations")
@@ -347,9 +363,11 @@ def check_broker_sdk(r: Report) -> None:
     - ``market_protection`` — MARKET and SL-M orders are rejected without it
       from 1 Apr 2026, so an SDK lacking it cannot square off a position.
       pykiteconnect 5.1.0 omitted it (zerodha/pykiteconnect#225); 5.2.1 has it.
-    - ``algo_id`` — SEBI requires every algorithmic order to carry an
-      exchange-assigned Algo-ID. Its presence here establishes that the ID is
-      **client-supplied per order**, not injected server-side by the broker.
+    - ``algo_id`` — optional, and its being optional is the point. SEBI
+      requires a registered Algo-ID only above the order-rate threshold; the
+      SDK documents this parameter as "an optional algo ID to associate with
+      the order" and defaults it to ``None``, which is what a sub-threshold
+      account sends. Checked so that an SDK change removing it is noticed.
     """
     section("Broker SDK")
 
@@ -388,11 +406,14 @@ def check_broker_sdk(r: Report) -> None:
         )
 
     if "algo_id" in params:
-        r.ok(f"kiteconnect {version} accepts algo_id per order", "SEBI: client-supplied")
+        r.ok(
+            f"kiteconnect {version} accepts algo_id per order",
+            "optional; omitted below the registration threshold",
+        )
     else:
-        r.warn(
+        r.ok(
             f"kiteconnect {version} has no algo_id parameter",
-            "confirm with Zerodha how the Algo-ID is attached (blocker B1)",
+            "not needed below the registration threshold",
         )
 
 
