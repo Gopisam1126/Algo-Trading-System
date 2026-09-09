@@ -220,9 +220,12 @@ added to LOW_LEVEL_ARCHITECTURE.md §1.1.
 
 ### Still unresolved
 
-- **Algo-ID attachment mechanics.** Sources disagree on whether the developer
-  supplies it via the order `tag` field or the broker injects it. One line of
-  code either way, but it must be confirmed with Zerodha before live.
+- ~~**Algo-ID attachment mechanics.**~~ ✅ **RESOLVED 9 Sep 2026 — the question
+  was malformed.** Both candidate answers assumed an Algo-ID must be attached.
+  Below the 10 OPS threshold the algo is unregistered, no ID is issued, and the
+  broker tags the order generically (SEBI circular 4 Feb 2025, I(c) and I(d);
+  Zerodha's own guidance; `kiteconnect`'s `algo_id` is optional, default
+  `None`). No Zerodha correspondence was needed.
 - **`pykiteconnect` 5.1.0 lacks `market_protection`.** A plain
   `pip install kiteconnect` yields a version that cannot place compliant market
   orders. Verify the installed version before live trading.

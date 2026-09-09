@@ -33,8 +33,8 @@ SEBI's retail algo trading framework (circular dated 4 Feb 2025) became **fully 
 | Requirement | Impact on this system |
 |---|---|
 | **Broker is the "principal"** — every algo on a broker's platform is the broker's responsibility; algo providers must partner with a registered broker and cannot connect directly to exchanges. | Route everything through a broker API. No direct exchange connectivity. |
-| **Algo-ID on every order** — from 1 Apr 2026, every algorithmically-placed order carries an exchange-assigned identifier so orders are traceable to their source. | The order-placement module must attach the correct Algo-ID; confirm with your broker how they issue/inject it. |
-| **Order-rate threshold: 10 orders/second per segment.** Above this = registered algo, full approval process. Below this = still needs a **Generic Algo ID**, but is exempt from individual approval. | **Design the system to stay well under 10 OPS.** For a multi-minute-interval, multi-stock system this is easy and should be enforced as a hard config limit (see §7 `execution.max_orders_per_second`). Staying under this threshold is a deliberate design goal, not an accident. |
+| **Order tagging** — algo orders carry an exchange identifier so they are traceable to their source. **The duty is the broker's, and it is rate-gated.** Clause I(b) scopes developer-side tagging to APIs “extended by brokers **to algo providers**”; I(d) has brokers categorise as algo orders those **above** the order-rate threshold. | **Nothing to attach at this system's profile.** Below 10 OPS the order is tagged generically on the broker/exchange side. `OrderRequest.algo_id` stays `None` and the adapter omits the parameter. *(Corrected 9 Sep 2026 — this row previously said every order must carry an exchange-assigned ID, which is only true above the threshold.)* |
+| **Order-rate threshold: 10 orders/second per segment per exchange.** At or above it = registered algo, full approval process, registered Algo-ID on every order. Below it = **no registration and no ID for the developer to obtain**; the generic ID is applied on the broker/exchange side. SEBI circular 4 Feb 2025, clause I(c). | **This threshold is the regulatory hinge of the whole system.** Staying under it is not a throttling preference, it is what keeps this system out of the registration regime entirely. Enforced as a hard bound: `MAX_ORDERS_PER_SECOND = 5` in `common/config.py`, with an import-time guard that refuses to load if that constant is ever raised to `SEBI_ALGO_REGISTRATION_OPS`. |
 | **Self-developed algos for personal use are permitted** for the trader's own account and immediate family (spouse, dependent children, dependent parents), without registering the algo — provided the order-rate threshold isn't breached. | ✅ This system, used for your own capital, fits in the permitted lane. |
 | **Static IP whitelisting** — brokers must block API requests from non-whitelisted/dynamic IPs. Static IP can be shared only within "family" as defined above, with 2FA-verified consent and prior broker permission. | **Deployment must have a static IP.** This rules out naive serverless/autoscaling deployments where the egress IP changes. Plan for a fixed-IP VPS or a NAT gateway with a reserved static IP. |
 | **Algos must be hosted on Indian servers.** | **Deploy in an India region** (AWS `ap-south-1` Mumbai, Azure Central India, GCP `asia-south1`, or an Indian VPS provider). This also happens to help latency to NSE/BSE — the compliance constraint and the performance goal point the same direction. |
@@ -43,7 +43,7 @@ SEBI's retail algo trading framework (circular dated 4 Feb 2025) became **fully 
 
 ### 1.2 Practical takeaways
 - ✅ Personal-use, self-developed, sub-10-OPS, static-IP, India-hosted → **the permitted lane.** Design to stay inside it deliberately.
-- ⚠️ **Confirm the specifics with your chosen broker before building** — brokers implement the framework slightly differently (some require pre-registering the API app, some auto-inject Algo-IDs, some have extra API terms). This is the single highest-value phone call to make before writing code.
+- ✅ **Confirmed for Zerodha, 9 Sep 2026 (blocker B1, closed).** Zerodha's own guidance describes sub-threshold client algos as “tagged with generic ID (unregistered, ≤10 OPS)” and asks the developer for exactly one thing: a static IP dedicated to the API key. `kiteconnect.place_order` documents `algo_id` as optional, default `None`. **Re-confirm if the broker changes**, since brokers implement the framework slightly differently.
 - 🚫 Do not design for anything that requires direct exchange connectivity, cross-client algo distribution, or high order rates.
 
 ---
@@ -125,7 +125,7 @@ Z-Connect, August 2026. The machine-readable copy lives in
 | **IP registration** | `developers.kite.trade` → profile → "IP Whitelist". IPv4 and IPv6 both accepted. Orders from an unregistered IP are rejected. | One-time setup, verified at startup by `doctor.py`. |
 | **IP binding** | Each static IP binds to **one account**. Family sharing is permitted; multiple Zerodha accounts can sit under one developer profile. | Relevant only when extending to family accounts. |
 | **Daily auth** | Browser redirect: login URL → `request_token` → exchange with `api_secret` → `access_token`, expiring daily. | **Manual daily login accepted** for this deployment. Sets a floor of one human touchpoint each trading morning. |
-| **Algo-ID** | Self-developed algos under 10 OPS receive a **generic** exchange ID, not a unique registered one. | ⚠️ Sources disagree on whether the developer attaches it via the order `tag` field or the broker injects it — **confirm with Zerodha before live**. |
+| **Algo-ID** ✅ | Self-developed algos under 10 OPS are **unregistered**; the order is tagged with a **generic** ID applied on the broker/exchange side, not a registered one the developer procures. | **RESOLVED 9 Sep 2026 (B1).** There is nothing to attach. `broker.algo_id` stays empty and that is the correct value; the adapter omits the parameter rather than sending an empty string. The obligation that *does* bind is the static IP. |
 | **Daily order cap** | ~3,000 orders/day for most accounts, extendable on request. | Far above this system's usage. |
 | **Cost** | ~₹500/month for data APIs; order placement reported free. Historical data appears to be a separate add-on. | Confirm current pricing directly. |
 
@@ -327,7 +327,8 @@ system:
 broker:
   primary: zerodha               # angelone | zerodha | fyers | dhan | upstox
   fallback: fyers                # optional secondary for data redundancy
-  algo_id: ""                    # exchange-assigned; confirm with broker
+  algo_id: ""                    # correct as empty below 10 OPS: the algo is
+                                 # unregistered, so no Algo-ID exists to set
   auth:
     method: oauth_2fa
     daily_reauth_time: "07:00"   # SEBI: sessions auto-logout before pre-open

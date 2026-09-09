@@ -82,9 +82,13 @@ class TestAutobahnIsNotTheVulnerableVersion:
         assert issubclass(exceptions.TokenException, Exception)
 
     def test_the_order_parameters_we_depend_on_survive(self) -> None:
-        """`market_protection` and `algo_id` are compliance requirements, not
-        conveniences. If the replacement ever changed the SDK's surface, an
-        order would be rejected at the exchange rather than here."""
+        """`market_protection` is a compliance requirement — Zerodha rejects
+        an unprotected MARKET order outright. `algo_id` is optional and only
+        needed above the registration threshold, but its presence is still
+        worth pinning: it is the parameter that would carry a registered
+        Algo-ID if this system ever crossed into that regime. Either way, a
+        replacement SDK that changed this surface would fail at the exchange
+        rather than here."""
         pytest.importorskip("kiteconnect")
         import inspect
 

@@ -673,7 +673,10 @@ qty           = floor_to_lot(min(
 Every clamp is applied and the binding constraint is recorded in the audit log — so a surprisingly small position can be explained rather than investigated.
 
 **`OrderGateway` responsibilities:**
-- Constructs the broker order payload, attaching the SEBI `algo_id`.
+- Constructs the broker order payload, attaching the SEBI `algo_id` **when one
+  is configured**. Below SEBI's 10 orders/sec registration threshold none is
+  issued, and the adapter omits the parameter rather than sending an empty
+  string — see `common/config.SEBI_ALGO_REGISTRATION_OPS` (corrected 9 Sep 2026).
 - Generates the deterministic `client_order_id` (§8.2).
 - Enforces the order-rate token bucket (constraint C2).
 - **Places the protective stop immediately after entry fill confirmation.** If the stop order fails to place, the position is closed at market immediately — a naked position is never acceptable (constraint: every `positions` row has a non-null `stop_price`).

@@ -131,7 +131,7 @@ GIFT Nifty · India VIX · FII/DII flows · sector rotation · economic calendar
 Fully mandatory since 1 April 2026. Recapping the operational requirements (full detail in companion doc §1):
 
 - **Self-developed algos for personal use are explicitly permitted** without registering the algorithm, as long as the order-rate threshold isn't breached.
-- Below 10 orders/second you still need a **Generic Algo-ID** from the exchange (obtained via your broker), but not individual algo approval.
+- Below 10 orders/second there is **no registration and no Algo-ID to obtain** — the order is tagged with a generic identifier on the broker/exchange side. *(Corrected 9 Sep 2026: this line previously said you still needed to obtain a Generic Algo-ID via your broker. SEBI's circular of 4 Feb 2025 makes registration conditional on crossing the threshold, clause I(c), and Zerodha asks the developer only for a static IP.)*
 - **Static IP whitelisting**, **India-hosted servers**, **OAuth + 2FA**, and **daily session logout before pre-open** are all mandatory. These are architectural constraints, not paperwork (LLD §1.1, C1–C3).
 - The broker is the *principal* — legally responsible for every algo on their platform. This means their terms of service matter as much as SEBI's rules. **Read them.**
 
@@ -183,7 +183,7 @@ Brokerage, STT, GST on brokerage, exchange transaction charges, SEBI turnover fe
 
 | ID | Feature | Why |
 |---|---|---|
-| L-1 | Algo-ID attached to every order | SEBI mandatory since 1 Apr 2026 |
+| ~~L-1~~ | ~~Algo-ID attached to every order~~ — **withdrawn 9 Sep 2026** | Not applicable below the 10 OPS registration threshold; the broker tags generically. The adapter still sends one when configured, so this costs nothing if the profile ever changes |
 | L-2 | Order-rate limiter (hard cap 5/sec) | Keeps you under the 10 OPS registration threshold |
 | L-3 | Static IP verification at startup — refuse to start if the egress IP doesn't match config | Prevents accidental non-compliant operation after an infra change |
 | L-4 | Daily re-auth with audit trail | SEBI session rule |
@@ -1026,7 +1026,7 @@ The system is MVP-complete when **all** of these hold:
 **Compliance**
 - [ ] Static IP verified and broker-whitelisted; startup check active
 - [ ] Deployed in an India region
-- [ ] Algo-ID attached to every order
+- [x] ~~Algo-ID attached to every order~~ — N/A below the registration threshold (B1 closed)
 - [ ] Order rate demonstrably capped at 5/sec under a flood test
 - [ ] Daily re-auth working for 20 consecutive sessions
 - [ ] Single-recipient notification enforced

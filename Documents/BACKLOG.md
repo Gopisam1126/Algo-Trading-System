@@ -301,7 +301,10 @@ Multiply by 1.5 if you are learning the domain as you go.
 **Tasks**
 - [ ] Implement `TradingAdapter` for Kite
 - [ ] Attach `market_protection` on MARKET/SL-M
-- [ ] Attach Algo-ID per the confirmed mechanic (**blocked on B1**)
+- [x] ~~Attach Algo-ID per the confirmed mechanic~~ — **N/A, B1 closed 9 Sep 2026.**
+      Below 10 OPS the algo is unregistered and the broker tags it generically.
+      The adapter sends `algo_id` only when one is configured, and omits the
+      parameter entirely otherwise rather than sending an empty string.
 - [ ] `place_order`, `modify_order`, `cancel_order`
 - [ ] `fetch_orderbook`, `fetch_positions`, `find_by_client_order_id`
 - [ ] Map broker errors → `OrderRejectedError` / `AmbiguousOrderError` / `RateLimitError`
@@ -1998,7 +2001,8 @@ Daily loss limit → halt · consecutive loss limit → halt.
 
 **Tasks**
 - [ ] Build `OrderRequest` from `RiskDecision`
-- [ ] Attach Algo-ID and market protection
+- [x] Attach market protection (and `algo_id` when configured — not applicable
+      below the registration threshold; see B1)
 - [ ] Round prices to tick size
 - [ ] Single-threaded serialised submission
 - [ ] Rate limiter integration
@@ -2503,10 +2507,28 @@ Correlation ID binding across all services.
 
 *Phase 6 · 7 stories · 9 days*
 
-### E21-S01 · Algo-ID attachment
-`P0` `Phase 5` `🔴` `SEC` · **0.5 day** · **blocked on B1**
+### E21-S01 · Algo-ID attachment — **CLOSED 9 Sep 2026, NOT APPLICABLE**
+`P0` `Phase 5` `🔴` `SEC` · ~~0.5 day~~ · ~~blocked on B1~~
 
-Attach per the confirmed mechanic; verify present on every order.
+**Cancelled, not deferred.** The story assumed an Algo-ID must be attached to
+every order. It must not, at this system's operating profile: SEBI requires
+registration only *at or above* 10 orders/sec (circular 4 Feb 2025, clause
+I(c)), so a sub-threshold self-developed algo has no registered Algo-ID, and the
+broker/exchange applies a generic identifier instead. `kiteconnect` documents
+`algo_id` as optional, default `None`.
+
+What the codebase carries instead, and it is enough:
+
+- `OrderRequest.algo_id` is `str | None`; `KiteTradingAdapter` omits the
+  parameter when unset rather than sending an empty string.
+- `common/config.py` requires `broker.algo_id` in LIVE mode **only** at or above
+  `SEBI_ALGO_REGISTRATION_OPS`, with an import-time guard that refuses to load if
+  `MAX_ORDERS_PER_SECOND` is ever raised to meet it.
+- `tests/sit/test_e14_trading_session.py` asserts both across a full session:
+  a configured id reaches every order, and the real configuration sends none.
+
+**Reopen this story only if** the order-rate cap is raised to 10+, or SEBI
+extends registration below the threshold.
 
 ---
 
@@ -2722,7 +2744,7 @@ These gate multiple epics and are not code. Resolve first.
 
 | ID | Blocker | Blocks | Action |
 |---|---|---|---|
-| **B1** | Algo-ID attachment mechanic unconfirmed | E02-S04, E21-S01 | Ask Zerodha: `tag` field or broker-injected? |
+| ~~**B1**~~ | ~~Algo-ID attachment mechanic unconfirmed~~ | — | ✅ **CLOSED 9 Sep 2026 — not applicable.** Unregistered below 10 OPS; the broker tags generically and there is no ID to obtain. E21-S01 cancelled; E02-S04 unblocked |
 | **B2** | `pykiteconnect` lacks `market_protection` | E02-S04, E15-S01 | Install from git main, or wait for release |
 | **B3** | NSE holiday list incomplete | E04-S07, all scheduling | Transcribe the circular |
 | **B4** | Historical data pricing unconfirmed | E03-S03 budget | Ask Zerodha |

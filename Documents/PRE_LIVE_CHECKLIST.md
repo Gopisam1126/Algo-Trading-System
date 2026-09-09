@@ -15,7 +15,7 @@ Open questions that must be answered before anything else on this list matters.
 
 | # | Item | Why it blocks | Owner |
 |---|---|---|---|
-| B1 | **Confirm the Algo-ID attachment mechanic with Zerodha** — does the developer supply it via the order `tag` field, or does the broker inject it? | Sources disagree. One line of code either way, but an order rejected for a missing Algo-ID on day one is an avoidable failure. | You → Zerodha |
+| ~~B1~~ | ~~Confirm the Algo-ID attachment mechanic with Zerodha~~ | ✅ **CLOSED 9 Sep 2026 — NOT APPLICABLE at this operating profile.** The question assumed an Algo-ID must be attached. Below SEBI's 10 orders/sec threshold a self-developed personal algo is **not registered**, so no Algo-ID is issued and there is nothing to attach — the broker/exchange tags the order with a **generic** identifier. Evidence: SEBI circular of 4 Feb 2025 clause I(c) (registration “only if they cross the specified order per second threshold”) and I(d) (brokers categorise as algo orders those **above** the threshold); Zerodha's own guidance describes sub-threshold client algos as “tagged with generic ID (unregistered, ≤10 OPS)” and asks the developer only for a static IP; `kiteconnect.place_order` documents `algo_id` as optional, default `None`. `config.py` used to refuse LIVE mode without one — that gate is now conditional on the rate threshold, which `MAX_ORDERS_PER_SECOND = 5` structurally prevents reaching. **The real obligation is B6 (static IP).** | Done |
 | ~~B2~~ | ~~Verify the installed `kiteconnect` exposes `market_protection`~~ | ✅ **CLOSED.** 5.1.0 on PyPI omitted it (zerodha/pykiteconnect#225), but the installed 5.2.1 exposes it, and `make doctor` verifies it at runtime rather than trusting this row. Without it MARKET and SL-M orders are rejected — including the square-off exit, which means positions do not close. | Done |
 | ~~B3~~ | ~~Populate `config/nse_holidays.yaml`~~ | ✅ **CLOSED 24 Aug 2026.** Full 2026 list, cross-checked against three publications of the circular; 19 dates, 245 trading sessions, `verified_against_nse_circular: true`. `make doctor` now reports it verified. **Renew every December** — the list is published one year at a time and the calendar refuses to answer for an uncovered year. | Done |
 | B6 | **Procure an India-hosted VPS with a static IP, and whitelist it at developers.kite.trade** | Applies to **order endpoints only** — market data, order book and positions work from any address, so this does not block development. One IP per app; orders from an unregistered IP are rejected outright. Also resolves B8. | You |
@@ -32,8 +32,8 @@ Open questions that must be answered before anything else on this list matters.
 - [ ] `make doctor` confirms actual egress IP matches `EXPECTED_EGRESS_IP`
 - [ ] Deployment host is in an **India region** (config validation enforces this)
 - [ ] Daily re-authentication working for **20 consecutive sessions**
-- [ ] Algo-ID configured and confirmed present on orders (B1)
-- [ ] Order rate demonstrably capped under a deliberate flood test
+- [x] ~~Algo-ID configured and confirmed present on orders~~ — **N/A below the registration threshold** (B1 closed 9 Sep 2026). `make doctor` reports this as OK rather than outstanding; `config.py` requires an Algo-ID only at or above `SEBI_ALGO_REGISTRATION_OPS`
+- [ ] Order rate demonstrably capped under a deliberate flood test — this is now **the** control that keeps the system out of the registration regime, not just a throttling nicety
 - [ ] **Single** notification recipient (config validation enforces this)
 - [ ] Broker's API terms of service read, and this use case confirmed permitted in writing
 

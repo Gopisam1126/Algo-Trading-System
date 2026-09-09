@@ -1387,7 +1387,7 @@ squeezing it produces the same overrun with less visibility.
 
 | Day | Work | Rationale |
 |---|---|---|
-| **1–2** | E01-S01 (2 d) · fire off blocker questions to Zerodha (B1, B4) on day 1 | Get the questions out first — the answers take days to arrive |
+| **1–2** | E01-S01 (2 d) · ~~fire off blocker questions to Zerodha (B1, B4) on day 1~~ | ~~Get the questions out first — the answers take days to arrive~~ — **both closed by research instead:** B4 in Aug 2026, B1 on 9 Sep 2026. Neither email was needed |
 | **2** | B3 (transcribe holiday circular), alongside S01 | Independent desk work, fits in the gaps |
 | **3–4** | E01-S03 (1.5 d) — independent of S01 | Start it while S01 settles; nothing blocks it |
 | **5–6** | E01-S02 (2 d) | Needs S01 done |
@@ -1410,10 +1410,10 @@ depends on it, so the deferral is free.
 
 | Blocker | Sprint 1 action | Your note |
 |---|---|---|
-| B1 Algo-ID | Email Zerodha; research the forum in parallel | *"Research and arrive at a relevant answer"* |
+| ~~B1 Algo-ID~~ | ✅ **Closed 9 Sep 2026 by research alone — the email was never sent and did not need to be.** The framing was wrong: below 10 OPS the algo is unregistered, so no Algo-ID is issued and the broker tags the order generically (SEBI circular 4 Feb 2025 I(c)/I(d); Zerodha's own guidance; `kiteconnect`'s `algo_id` is optional, default `None`) | *"Research and arrive at a relevant answer"* — done |
 | B2 SDK gap | **Decision made: wait for release.** The `doctor` check already exists (`scripts/doctor.py:274`) and fails when the installed SDK lacks `market_protection` — no new work needed, the wait is already visible | *"I would prefer wait for release"* |
 | B3 Holiday list | Transcribe the NSE circular; set `verified: true` | *"Research and arrive at a relevant answer"* |
-| B4 Data pricing | Ask Zerodha alongside B1 | |
+| ~~B4 Data pricing~~ | ✅ Closed Aug 2026 — Connect ₹500/mo bundles WebSocket and historical | |
 | B5 Login flow | Not Sprint 1 — needs E02 | |
 | B6 Static IP | **Procedure needs documenting** — see §17 | *"Explain on the procedure for this"* |
 

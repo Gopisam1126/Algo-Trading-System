@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from algotrader.common.config import (
     MAX_ORDERS_PER_SECOND,
+    SEBI_ALGO_REGISTRATION_OPS,
     AIConfig,
     AppConfig,
     ExecutionConfig,
@@ -27,6 +28,7 @@ from algotrader.common.config import (
     RiskConfig,
     ScoringWeights,
     StrategyPromotionConfig,
+    _assert_below_registration_threshold,
 )
 from algotrader.common.models.trading import Recommendation
 from algotrader.common.secrets import REDACTED, SecretString
@@ -179,11 +181,75 @@ class TestLiveModeRequiresCompliance:
                 {"system": {"mode": "live", "static_ip": ""}, "broker": {"algo_id": "ALGO123"}}
             )
 
-    def test_live_mode_requires_algo_id(self) -> None:
-        with pytest.raises(ValidationError, match="algo_id"):
-            AppConfig.model_validate(
-                {"system": {"mode": "live", "static_ip": "1.2.3.4"}, "broker": {"algo_id": ""}}
-            )
+    def test_live_mode_does_not_require_an_algo_id_below_the_threshold(self) -> None:
+        """CORRECTED 9 Sep 2026. This assertion used to be its exact opposite.
+
+        SEBI requires a registered Algo-ID only for algos at or above the
+        order-rate threshold (circular 4 Feb 2025, I(c)). At 5 orders/sec this
+        system is unregistered by design, so no Algo-ID exists to configure —
+        and the old gate would have refused to start LIVE mode forever,
+        waiting on paperwork that is never issued.
+        """
+        cfg = AppConfig.model_validate(
+            {
+                "system": {"mode": "live", "static_ip": "1.2.3.4"},
+                "broker": {"algo_id": ""},
+            }
+        )
+        assert cfg.system.mode.value == "live"
+        assert cfg.broker.algo_id == ""
+
+    def test_live_mode_does_require_one_at_or_above_the_threshold(self) -> None:
+        """The control, and the reason the check still exists.
+
+        This state is NOT reachable from a config file — the field validator
+        caps ``max_orders_per_second`` at 5, so a YAML asking for 10 is
+        refused earlier and for a different reason. It is reachable from a
+        future edit to the constants, which is exactly the change that must
+        not pass silently. ``model_copy`` does not re-validate, so the
+        threshold branch is driven directly.
+        """
+        cfg = AppConfig.model_validate(
+            {"system": {"mode": "live", "static_ip": "1.2.3.4"}, "broker": {"algo_id": ""}}
+        )
+        at_threshold = cfg.model_copy(
+            update={
+                "execution": cfg.execution.model_copy(
+                    update={"max_orders_per_second": SEBI_ALGO_REGISTRATION_OPS}
+                )
+            }
+        )
+        with pytest.raises(ValueError, match="algo_id"):
+            at_threshold._live_mode_requires_compliance()
+
+        registered = at_threshold.model_copy(
+            update={"broker": cfg.broker.model_copy(update={"algo_id": "NSE-ALGO-1"})}
+        )
+        assert registered._live_mode_requires_compliance() is registered
+
+    def test_the_import_guard_refuses_a_cap_at_or_above_the_threshold(self) -> None:
+        """The guard itself, not just the invariant it protects.
+
+        Deleting the guard survived mutation testing, because with the cap at
+        5 it never executes — so its condition and message were unverified. A
+        swapped operator here would be found on the one day it mattered.
+        """
+        with pytest.raises(RuntimeError, match="regulatory regime"):
+            _assert_below_registration_threshold(10, SEBI_ALGO_REGISTRATION_OPS)
+        with pytest.raises(RuntimeError, match="regulatory regime"):
+            _assert_below_registration_threshold(11, SEBI_ALGO_REGISTRATION_OPS)
+        assert _assert_below_registration_threshold(9, SEBI_ALGO_REGISTRATION_OPS) is None, (
+            "one below the threshold is still the permitted lane"
+        )
+
+    def test_the_hard_cap_keeps_this_system_out_of_the_registration_regime(self) -> None:
+        """The structural reason the branch above is unreachable from config.
+
+        This is the invariant that makes an empty algo_id safe. If someone
+        raises the cap to the threshold, importing the module fails — the
+        regulatory regime changes at that line, not just the throughput.
+        """
+        assert MAX_ORDERS_PER_SECOND < SEBI_ALGO_REGISTRATION_OPS
 
     def test_paper_mode_does_not_require_them(self) -> None:
         cfg = AppConfig.model_validate({"system": {"mode": "paper"}})

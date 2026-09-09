@@ -127,8 +127,9 @@ The workflow then:
 **PROD promotion is blocked by a deliberate speed bump.** The workflow fails
 with a message pointing at `PRE_LIVE_CHECKLIST.md`. That step is meant to be
 removed only by someone who has actually read the file and can say the static
-IP is whitelisted, the Algo-ID is confirmed, and paper trading has a record
-across more than one market regime.
+IP is whitelisted — which is now the *only* outstanding SEBI item, B1 having
+closed as not-applicable on 9 Sep 2026 — and paper trading has a record across
+more than one market regime.
 
 ---
 
@@ -165,7 +166,9 @@ make doctor                 # config, compliance and datastore posture
 
 `make doctor` is the readiness check. It reports which datastore configuration
 source is in effect, whether the broker SDK supports `market_protection` and
-`algo_id`, and what remains before live trading.
+`algo_id`, and what remains before live trading. It reports an unset `algo_id`
+as **OK** rather than outstanding: below SEBI's registration threshold there is
+none to set.
 
 ### What QA is actually for
 

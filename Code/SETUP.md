@@ -357,16 +357,29 @@ positive percentage, `0` rejected — so the model and the broker already agree
 with no change needed. `pyproject.toml` now floors the dependency at `>=5.2.1`
 so a downgrade cannot silently reintroduce the gap.
 
-**B1 — Algo-ID mechanic — RESOLVED (the value is still open).** `place_order()`
-takes an `algo_id` parameter, documented as *"an optional algo ID to associate
-with the order"*. So the Algo-ID is **client-supplied per order**, not injected
-server-side by the broker — which is exactly what `BrokerConfig.algo_id` and the
-live-mode validator already assumed. No design change needed.
+**B1 — Algo-ID — CLOSED 9 Sep 2026. There is nothing to send.** `place_order()`
+takes an `algo_id` parameter documented as *"an **optional** algo ID to associate
+with the order"*, defaulting to `None` — and *optional* is the answer, not an
+aside. SEBI requires a self-developed algo to be registered with the exchange
+**only if it crosses the order-per-second threshold** (circular of 4 Feb 2025,
+clause I(c)); clause I(d) has brokers categorise as algo orders those **above**
+the threshold. Zerodha's own guidance describes sub-threshold client algos as
+*"tagged with generic ID (unregistered, ≤10 OPS)"* and asks the developer for
+exactly one thing: a static IP dedicated to the API key.
 
-What remains is a paperwork question, not an architectural one: *which* generic
-exchange-issued ID to send for a sub-10-OPS self-developed algo. That is still
-worth asking Zerodha on Day 1, but it no longer blocks E02-S04 from being
-**built** — only from going live.
+So there is no paperwork question left. `broker.algo_id` stays empty, the
+adapter omits the parameter, and `make doctor` reports that as OK.
+
+**What changed in the code as a result.** `common/config.py` used to refuse to
+load in LIVE mode without an `algo_id` — a fail-closed gate on a requirement
+that does not apply, which would have blocked go-live indefinitely. It now
+demands one only at or above `SEBI_ALGO_REGISTRATION_OPS`, and a module-level
+guard refuses to import if `MAX_ORDERS_PER_SECOND` is ever raised to meet that
+threshold: crossing it is a change of regulatory regime, not of throughput.
+
+**The obligation that did not dissolve is the static IP (B6)** — mandatory at
+every order rate, and orders from an unwhitelisted address are rejected
+outright.
 
 `doctor` now asserts both parameters against the installed signature every run.
 

@@ -1122,7 +1122,11 @@ asserting it is true.
 
 - **Self-developed algos for personal use are permitted** without registering the
   algorithm, provided the order-rate threshold isn't breached.
-- Below 10 OPS you receive a **generic Algo-ID**, not a unique registered one.
+- Below 10 OPS the algo is **unregistered** and the order is tagged with a
+  **generic** ID applied on the broker/exchange side — there is no registered
+  Algo-ID for the developer to obtain or attach. Registration is conditional on
+  *crossing* the threshold (SEBI circular 4 Feb 2025, clause I(c)); brokers
+  categorise as algo orders only those **above** it (I(d)). Confirmed 9 Sep 2026.
 - **Static IP whitelisting** — at `developers.kite.trade` → profile → IP
   Whitelist. Applies to **order endpoints only**; quotes, WebSocket, orderbook
   and positions remain reachable from any IP.
@@ -1151,7 +1155,7 @@ config validation refuses to start with more than one recipient.
 | **SDK gap** ⚠️ | `pykiteconnect` 5.1.0 on PyPI **lacks** it (main branch only, issue #225) |
 | Static IP scope | Order endpoints only |
 | Daily auth | Browser redirect flow — **manual login accepted** for this deployment |
-| Algo-ID | Generic for self-developed under 10 OPS. **Attachment mechanic unconfirmed** |
+| Algo-ID ✅ | Generic and broker-applied for self-developed under 10 OPS. **Nothing for the developer to attach**; `kiteconnect`'s `algo_id` is optional, default `None` |
 | Daily order cap | ~3,000/day, extendable |
 | Cost | ~₹500/mo data APIs; order placement reported free; historical data a separate add-on |
 
@@ -1314,13 +1318,19 @@ for Phase 0.
 
 ### 21.1 Immediate — the critical path
 
-**Talk to Zerodha.** Everything in Phase 1 sits behind this. Get in writing:
+**Procure the static IP.** That is now the whole of the critical path. B1 and B4
+were both resolved by research rather than correspondence, which leaves one item
+that genuinely needs procurement and one that needs a decision:
 
-1. **Algo-ID mechanic** — does the developer supply it via the order `tag`, or
-   does the broker inject it? (One line of code either way.)
-2. **Static IP whitelisting** — process and lead time.
-3. **Historical data** — pricing and entitlement.
-4. **Daily login** — what is permitted for an unattended personal algo.
+1. ~~**Algo-ID mechanic**~~ — ✅ **closed 9 Sep 2026, not applicable.** Below
+   10 OPS the algo is unregistered and the broker tags it generically. No email
+   required.
+2. **Static IP whitelisting** — process and lead time. **The one real SEBI
+   obligation left, and it applies at every order rate.**
+3. ~~**Historical data**~~ — ✅ closed: Connect ₹500/mo bundles WebSocket and
+   historical.
+4. **Daily login** — what is permitted for an unattended personal algo. Worth
+   asking Zerodha, and the only remaining question that is.
 
 ### 21.2 Unblocked work to run in parallel
 
@@ -1364,7 +1374,7 @@ passing tests. Cheap now, annoying to retrofit.
 
 | # | Item | Status | Blocks |
 |---|---|---|---|
-| B1 | **Algo-ID attachment mechanic** | 🔍 Mechanic understood, registration needs you | Live trading |
+| B1 | **Algo-ID attachment mechanic** | ✅ **Closed 9 Sep 2026 — not applicable.** Unregistered below 10 OPS; broker tags generically. `config.py` no longer demands one in LIVE mode | — |
 | B2 | `kiteconnect` lacks `market_protection` | ✅ **Closed** — present in 5.2.1 | — |
 | B3 | NSE holiday list incomplete | ✅ **Closed 24 Aug 2026** | — |
 | B4 | Historical data pricing | ✅ **Closed** — Connect ₹500/mo bundles WebSocket + historical | — |

@@ -132,8 +132,9 @@ Never commit a `.env`, a credential, or anything under `data/`.
 through `execution/gateway.py` to a submitted broker order.** The keystone
 sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
-order, because that needs credentials (B5), a static IP (B6) and an Algo-ID
-(B1), and because the pieces around the gateway are unbuilt — no order state
+order, because that needs credentials (B5) and a static IP (B6) — B1, the
+Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
+the gateway are unbuilt — no order state
 machine (E15-S03), no protective stop attachment (E15-S04), no position manager
 (E15-S05), no reconciliation loop (E15-S09). **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
@@ -204,8 +205,9 @@ without it 273 skip and coverage reads 83%):
 
 - **E15-S01 the order gateway** — `execution/gateway.py`, the only path from a
   decision to a broker. Generates §8.2's deterministic `client_order_id`, which
-  was *consumed* in three places and *generated* nowhere; attaches the SEBI
-  algo_id and market protection; refuses anything the risk engine did not
+  was *consumed* in three places and *generated* nowhere; attaches market
+  protection (and an `algo_id` only if one is configured — none is, and that is
+  correct below the registration threshold); refuses anything the risk engine did not
   approve; takes a rate-limiter token only after the order is known to be
   valid, so a rejected decision never spends one. **The tick resolver is wired**
   — E02 left the adapter refusing every priced order with `NO_TICK_RESOLVER`,
@@ -457,7 +459,7 @@ else was examined. Verified sound, with probes rather than by reading:
 | B4 historical data pricing | ✅ Closed — Connect ₹500/mo bundles WebSocket + historical |
 | B7 `autobahn` CVE-2020-35678 | ✅ Closed 24 Aug 2026 — upgraded to 26.7.1 |
 | B3 NSE holiday list | ✅ Closed 24 Aug 2026 — 2026 verified, 245 sessions. **Renew each December** |
-| B1 Algo-ID | 🔍 Mechanic understood; broker assigns it at registration. Paperwork with Zerodha |
+| B1 Algo-ID | ✅ Closed 9 Sep 2026 — **not applicable.** Unregistered below 10 OPS; the broker tags generically and there is no ID to obtain. `config.py` requires one only at or above `SEBI_ALGO_REGISTRATION_OPS` |
 | B5 daily login | ⚠️ Needs real credentials |
 | B6 static IP | 🔍 **Order endpoints only** — does not block development |
 | B8 NSE data access | 🔍 Same fix as B6; `scripts/check_data_reachability.py` answers it in one command |
