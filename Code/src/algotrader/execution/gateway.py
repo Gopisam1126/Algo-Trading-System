@@ -103,6 +103,7 @@ from algotrader.common.enums import (
 from algotrader.common.models.trading import (
     Order,
     OrderRequest,
+    Position,
     Recommendation,
     RiskDecision,
 )
@@ -321,7 +322,40 @@ class OrderGateway:
         every failure here means no position was opened, and a caller that
         forgot to check a returned ``None`` would believe otherwise.
         """
-        request = self.build_entry(decision, recommendation, trade_date=trade_date)
+        return await self.submit(self.build_entry(decision, recommendation, trade_date=trade_date))
+
+    async def submit_stop(self, position: Position, *, trade_date: dt.date) -> str:
+        """Submit the protective stop for a position (E15-S04).
+
+        Goes through the same :meth:`submit` as an entry, deliberately. The
+        stop is the order whose loss most needs the two-transaction record and
+        the query-don't-retry recovery: a stop submitted twice is two exits for
+        one position, and a stop whose outcome is unknown is a position that
+        may be naked. Both are already solved on this path.
+        """
+        return await self.submit(self.build_stop(position, trade_date=trade_date))
+
+    async def submit_exit(
+        self,
+        position: Position,
+        *,
+        trade_date: dt.date,
+        intent: OrderIntent = OrderIntent.SQUAREOFF,
+    ) -> str:
+        """Submit a MARKET exit closing the whole position."""
+        return await self.submit(self.build_exit(position, trade_date=trade_date, intent=intent))
+
+    async def submit(self, request: OrderRequest) -> str:
+        """Send one order, once. The only path to the broker for any intent.
+
+        Extracted from :meth:`submit_entry` by E15-S04 rather than copied: an
+        entry, a protective stop and an emergency exit have different payloads
+        and identical *submission* requirements — the duplicate check, the rate
+        limiter, TX1 before the call, TX2 after, and query-don't-retry on an
+        ambiguous failure. A second submission path would be a second place for
+        idempotency to be forgotten, and the order it would be forgotten for is
+        the stop.
+        """
         cid = request.client_order_id
 
         # Layer 1 of the pattern EPIC01 8.4 uses for slots, applied to orders:
@@ -373,6 +407,84 @@ class OrderGateway:
         await self._attach(cid, broker_order_id)
         log.info("submitted %s for %s as broker order %s", cid, request.symbol, broker_order_id)
         return broker_order_id
+
+    def build_stop(self, position: Position, *, trade_date: dt.date) -> OrderRequest:
+        """The protective stop for an open position.
+
+        **SL-M, not SL.** A stop-loss *limit* can fail to fill in exactly the
+        move it exists to protect against — the price gaps through the limit
+        and the order sits unfilled while the loss runs. SL-M accepts slippage
+        to guarantee the exit, which is the correct trade for a stop and the
+        wrong one for an entry. Market protection bounds that slippage and is
+        mandatory on SL-M from 1 Apr 2026 anyway.
+
+        The side is the OPPOSITE of the position: a long is protected by a
+        sell. ``Position`` already refuses a stop on the wrong side of entry,
+        so a stop that would trigger immediately cannot be constructed here.
+        """
+        side = Side.SELL if position.direction is Direction.LONG else Side.BUY
+        return OrderRequest(
+            client_order_id=client_order_id(
+                correlation_id=position.correlation_id,
+                symbol=position.symbol,
+                side=side,
+                intent=OrderIntent.STOP,
+                trade_date=trade_date,
+            ),
+            correlation_id=position.correlation_id,
+            symbol=position.symbol,
+            side=side,
+            order_type=OrderType.SLM,
+            product=self._policy.product,
+            quantity=position.quantity,
+            trigger_price=position.stop_price,
+            intent=OrderIntent.STOP,
+            algo_id=self._policy.algo_id,
+            market_protection=self._policy.market_protection,
+        )
+
+    def build_exit(
+        self,
+        position: Position,
+        *,
+        trade_date: dt.date,
+        intent: OrderIntent = OrderIntent.SQUAREOFF,
+    ) -> OrderRequest:
+        """A MARKET order closing the whole position, now.
+
+        Used for the emergency close when a stop cannot be established, and by
+        the square-off timer later (E15-S06). MARKET rather than limit for the
+        same reason the entry is: an exit that does not fill is not an exit,
+        and here the alternative to filling is holding an unprotected position.
+        """
+        side = Side.SELL if position.direction is Direction.LONG else Side.BUY
+        return OrderRequest(
+            client_order_id=client_order_id(
+                correlation_id=position.correlation_id,
+                symbol=position.symbol,
+                side=side,
+                intent=intent,
+                trade_date=trade_date,
+            ),
+            correlation_id=position.correlation_id,
+            symbol=position.symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            product=self._policy.product,
+            quantity=position.quantity,
+            intent=intent,
+            algo_id=self._policy.algo_id,
+            market_protection=self._policy.market_protection,
+        )
+
+    async def find_order(self, client_order_id_: str) -> Order | None:
+        """Ask the broker about one of our orders. Used to verify liveness.
+
+        On the gateway rather than reaching past it to the placer, because
+        §5.7 makes this object the boundary to the broker and a second caller
+        holding the adapter is how that boundary stops being one.
+        """
+        return await self._placer.find_by_client_order_id(client_order_id_)
 
     async def _resume(self, cid: str, recorded: dict[str, Any]) -> str:
         """A row already exists for this decision. Decide without sending.

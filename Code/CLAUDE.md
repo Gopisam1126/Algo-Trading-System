@@ -134,9 +134,9 @@ sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
 order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
-the gateway are unbuilt: no protective stop attachment (E15-S04), no position
-manager (E15-S05), no reconciliation loop (E15-S09). The order state machine
-(E15-S03) now exists. **A gateway is not a trading
+the gateway are unbuilt: no position manager (E15-S05) and no reconciliation
+loop (E15-S09). The order state machine (E15-S03) and protective stop
+attachment (E15-S04) now exist. **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
@@ -237,6 +237,18 @@ without it the container-backed integration tests skip and coverage reads lower)
   **§8.2's diagram turned out to be the happy path, not the table** — see the
   five groups of edge now documented there. Wired into the gateway's resume
   path, which had been inspecting only `broker_order_id`.
+
+- **E15-S04 protective stop attachment** — `execution/protective_stop.py`, and
+  the story carrying invariant 5. The sequence is **place → verify → on any
+  failure exit → on a failed exit halt**. The only way to obtain an
+  `EstablishedPosition` is to come out of the good end of it, so a caller
+  cannot hold one for an unprotected position — the check stops being something
+  anyone has to remember. A contained failure does not stop the day; a failure
+  to exit arms `HaltReason.NAKED_POSITION`, a new member rather than a borrowed
+  neighbour. **No migration was needed**: the stop's `client_order_id` is
+  derivable from the position's `correlation_id` with `intent=STOP`, so
+  reconciliation can find a stop it never saw placed. Mutation: 17 injected,
+  17 killed.
 
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/` — seven of thirteen packages.
@@ -430,6 +442,21 @@ Recorded because each was believed, written down, and wrong.
   this was. The rule they broke was already written on the field directly above
   them: *"`None` means the broker did not answer, which is a rejection and
   never an assumption."* AUDIT-005.
+- **"`stop_price` NOT NULL means the position has a stop."** It means the
+  position has a stop *price* — the number the sizer chose, written whether or
+  not any order is protecting anything. BR-1 makes the column non-null and the
+  schema comment says "there is no way to represent a position without a
+  protective stop, deliberately", which is true of the price and false of the
+  protection. The dangerous state is *transient*, between the entry filling and
+  the stop going live, and no row shows it. Same shape as the two exposure caps
+  that were configured and binding on nothing: the record of an intention is
+  not the enforcement of it. E15-S04.
+- **"The broker accepted it, so it is working."** Accepted and live are
+  different, and the gap between them is where a stop gets rejected
+  asynchronously. E15-S04 guarded that for the stop and then trusted the
+  EMERGENCY EXIT's acceptance in the same file — the identical defect, one
+  component further along, written by the same hand on the same day. Found by
+  the STRIDE pass against the story's own diff, not by a test. QA-E15-11.
 - **"An empty file is an empty file."** `broker/__init__.py` being empty is
   *load-bearing*. `AppConfig` has one upward import — a deferred
   `broker.profiles` — and what makes it cheap is that reaching `profiles`
