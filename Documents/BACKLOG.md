@@ -2013,12 +2013,21 @@ Daily loss limit → halt · consecutive loss limit → halt.
 `P0` `Phase 5` `🔴` `SEC` · **1 day** · deps: E15-S01
 
 **Tasks**
-- [ ] `client_order_id = sha256(correlation|symbol|side|intent|date)[:32]`
-- [ ] Persist before submission
-- [ ] On ambiguous failure: **query by client_order_id, never retry**
+- [x] `client_order_id = sha256(correlation|symbol|side|intent|date)[:32]` —
+      delivered in E15-S01; a story cannot depend on a later one for a field
+      its own output requires
+- [x] Persist before submission — TX1 writes `SUBMITTING` with a null broker id
+- [x] On ambiguous failure: **query by client_order_id, never retry**
 
 **Acceptance**
-- 🔴 Chaos test: timeout + reconnect produces exactly one order
+- [x] 🔴 Chaos test: timeout + reconnect produces exactly one order —
+      `tests/unit/test_gateway.py::TestTheChaosScenario`, and again at session
+      scale as SIT-15
+- [x] 🔴 The intent is recorded before the broker is called, and *not* recorded
+      for an order that is never sent
+- [x] 🔴 The same decision twice is one broker call
+- [x] An unrecordable order never reaches the broker; an unrecordable *outcome*
+      never reports a live order as failed
 
 ---
 

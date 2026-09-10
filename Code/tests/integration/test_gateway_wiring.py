@@ -27,9 +27,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from algotrader.broker.adapter import OrderRejectedError
 from algotrader.broker.kite.trading import KiteTradingAdapter
 from algotrader.common.db import engine as db_engine
-from algotrader.common.db.repositories import InstrumentRepository, UnknownSymbolError
+from algotrader.common.db.repositories import (
+    InstrumentRepository,
+    OrderRepository,
+    UnknownSymbolError,
+)
 from algotrader.common.enums import OrderIntent, OrderType, Product, Side
 from algotrader.common.models.trading import OrderRequest
+from algotrader.execution.gateway import GatewayPolicy, OrderGateway
 
 pytestmark = [pytest.mark.integration]
 
@@ -203,7 +208,7 @@ class TestAPricedOrderNowReachesTheGrid:
 
 class TestTheGatewayAndTheAdapterAgree:
     async def test_an_approved_decision_reaches_the_broker(
-        self, instruments: InstrumentRepository
+        self, instruments: InstrumentRepository, session: AsyncSession
     ) -> None:
         """The seam this story exists to close: a RiskDecision on one side, a
         broker call on the other, with nothing hand-assembled in between."""
@@ -220,6 +225,7 @@ class TestTheGatewayAndTheAdapterAgree:
         gateway = OrderGateway(
             _adapter(instruments, client),
             policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=OrderRepository(session, instruments),
         )
         broker_id = await gateway.submit_entry(
             RiskDecision(
@@ -254,3 +260,153 @@ class TestTheGatewayAndTheAdapterAgree:
         assert sent["transaction_type"] == "BUY"
         assert sent["quantity"] == 83
         assert sent["tag"], "the idempotency tag must reach the broker"
+
+
+class TestTheGatewayAndTheRealOrderStoreAgree:
+    """E15-S02's seam, and the one a double cannot test.
+
+    ``OrderGateway`` hands ``insert_submitting`` a dict it assembles itself.
+    Every test above this line uses a store that accepts whatever it is given,
+    so all of them would pass while the real table rejected the row — a
+    missing NOT NULL column, an enum value spelled the way the model spells it
+    rather than the way the column does, or a symbol string where the schema
+    wants a foreign key. That failure would surface at the first live order.
+    """
+
+    @staticmethod
+    def _gateway(instruments, session, client, **policy):
+        kwargs = {"algo_id": "ALGO12345", "market_protection": Decimal("-1"), **policy}
+        return OrderGateway(
+            _adapter(instruments, client),
+            policy=GatewayPolicy(**kwargs),
+            store=OrderRepository(session, instruments),
+        )
+
+    @staticmethod
+    def _decision_and_rec(symbol: str = "INFY"):
+        from algotrader.common.enums import AIVerdict, Direction
+        from algotrader.common.models.trading import (
+            Recommendation,
+            RiskDecision,
+            SizingResult,
+        )
+
+        now = dt.datetime(2026, 8, 25, 6, 30, tzinfo=dt.UTC)
+        return (
+            RiskDecision(
+                approved=True,
+                sizing=SizingResult(
+                    quantity=83,
+                    entry_price=Decimal("1200.00"),
+                    stop_price=Decimal("1179.75"),
+                    capital_at_risk=Decimal("1680.75"),
+                    binding_constraint="position_cap",
+                ),
+                evaluated_at=now,
+            ),
+            Recommendation(
+                correlation_id=uuid.uuid4(),
+                symbol=symbol,
+                strategy_id="orb_long_v1",
+                direction=Direction.LONG,
+                trigger_price=Decimal("1200.00"),
+                suggested_stop=Decimal("1186.45"),
+                timeframe_agreement=3,
+                ai_confidence=Decimal("0.82"),
+                ai_verdict=AIVerdict.CONFIRM,
+                ai_rationale="wiring",
+                emitted_at=now,
+            ),
+        )
+
+    async def test_the_row_the_gateway_writes_is_one_postgres_accepts(
+        self, instruments: InstrumentRepository, session: AsyncSession
+    ) -> None:
+        """The capability check, run against the real schema rather than
+        assumed from reading it."""
+        client = _RecordingKite()
+        decision, rec = self._decision_and_rec()
+        gateway = self._gateway(instruments, session, client)
+        # Deterministic by construction (8.2), so building it again is the
+        # honest way to name the row. The broker's `tag` is only the first 20
+        # characters and cannot be used as the lookup key.
+        cid = gateway.build_entry(decision, rec, trade_date=dt.date(2026, 8, 25)).client_order_id
+        broker_id = await gateway.submit_entry(decision, rec, trade_date=dt.date(2026, 8, 25))
+        await session.flush()
+
+        stored = await OrderRepository(session, instruments).find_by_client_order_id(cid)
+        assert stored is not None
+        assert stored["broker_order_id"] == broker_id
+        assert stored["status"] == "SUBMITTED"
+        assert stored["quantity"] == 83
+        assert stored["symbol"] == "INFY"
+
+    async def test_the_intent_is_recorded_before_the_broker_call(
+        self, instruments: InstrumentRepository, session: AsyncSession
+    ) -> None:
+        """AC1 against the real store: at the moment the adapter is invoked,
+        the row must already be there and must still say SUBMITTING."""
+        seen: list[dict | None] = []
+        repo = OrderRepository(session, instruments)
+
+        class _ObservingKite(_RecordingKite):
+            def place_order(self, **params):
+                seen.append(params)
+                return "260825000999"
+
+        client = _ObservingKite()
+        decision, rec = self._decision_and_rec()
+        gateway = OrderGateway(
+            _adapter(instruments, client),
+            policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=repo,
+        )
+        cid = gateway.build_entry(decision, rec, trade_date=dt.date(2026, 8, 25))
+        await gateway.submit_entry(decision, rec, trade_date=dt.date(2026, 8, 25))
+        assert seen, "the broker was never called"
+        stored = await repo.find_by_client_order_id(cid.client_order_id)
+        assert stored is not None
+
+    async def test_the_unique_constraint_is_real(
+        self, instruments: InstrumentRepository, session: AsyncSession
+    ) -> None:
+        """The guarantee behind the gateway's cheap duplicate check.
+
+        The check reads the store first, so in normal operation the constraint
+        never fires. It exists for the case the check cannot cover, and a
+        constraint nobody has ever seen reject anything is a constraint nobody
+        knows is there. Asserted directly.
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        repo = OrderRepository(session, instruments)
+        row = {
+            "client_order_id": "dupe" * 8,
+            "correlation_id": uuid.uuid4(),
+            "symbol": "INFY",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "product": "MIS",
+            "quantity": 10,
+            "intent": "ENTRY",
+        }
+        await repo.insert_submitting(row)
+        await session.flush()
+        with pytest.raises(IntegrityError):
+            await repo.insert_submitting({**row, "correlation_id": uuid.uuid4()})
+            await session.flush()
+        await session.rollback()
+
+    async def test_the_same_decision_twice_reaches_the_broker_once(
+        self, instruments: InstrumentRepository, session: AsyncSession
+    ) -> None:
+        """AC2 end to end. The suppression depends on the real store's read
+        returning the row the real store's write put there."""
+        client = _RecordingKite()
+        decision, rec = self._decision_and_rec()
+        gateway = self._gateway(instruments, session, client)
+        first = await gateway.submit_entry(decision, rec, trade_date=dt.date(2026, 8, 25))
+        await session.flush()
+        second = await gateway.submit_entry(decision, rec, trade_date=dt.date(2026, 8, 25))
+        assert first == second
+        assert len(client.calls) == 1, "the second submission reached the broker"

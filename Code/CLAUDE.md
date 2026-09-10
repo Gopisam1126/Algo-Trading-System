@@ -214,6 +214,19 @@ without it 273 skip and coverage reads 83%):
   and the repository now exposes a synchronous `tick_size` that raises rather
   than defaulting to 0.05.
 
+- **E15-S02 idempotency** — the gateway now records an order **before** calling
+  the broker and attaches the broker id after, and an ambiguous failure is
+  **queried, never retried**. A gateway cannot be constructed without a store,
+  so there is no configuration in which orders are placed untracked.
+  `OrderNeverLandedError` is raised rather than resubmitting automatically:
+  §8.2 grants permission to resubmit, not an obligation, and if the absence
+  call is ever wrong an automatic retry is a second real position.
+  **What this found in existing tests:** `test_the_limiter_is_consulted_once_per_submission`
+  submitted the SAME decision three times and asserted three orders reached the
+  broker — the duplicate this story prevents, written down as a passing
+  assertion. Corrected to three distinct signals. Mutation: 12 injected, 12
+  killed, including "retry instead of query".
+
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/` — seven of thirteen packages.
 `execution/` holds `risk/`, `sizer.py` and `slots.py`. **There is no order manager and

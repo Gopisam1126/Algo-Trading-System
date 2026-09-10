@@ -89,14 +89,17 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
+from algotrader.broker.adapter import AmbiguousOrderError
 from algotrader.common.enums import Direction, OrderIntent, OrderType, Product, Side
 from algotrader.common.models.trading import (
+    Order,
     OrderRequest,
     Recommendation,
     RiskDecision,
 )
+from algotrader.common.text import one_safe_line
 
 log = logging.getLogger(__name__)
 
@@ -112,14 +115,45 @@ _SEPARATOR: Final = "|"
 
 
 class OrderPlacer(Protocol):
-    """The one broker capability this needs.
+    """The broker capabilities this needs.
 
     A Protocol rather than an import of ``KiteTradingAdapter``: the gateway is
     testable without a broker, and the dependency reads as a capability rather
     than as a vendor.
+
+    ``find_by_client_order_id`` belongs on the SAME protocol as
+    ``place_order`` deliberately (E15-S02). Splitting the query into its own
+    protocol would let a caller wire a placer and a finder that talk to
+    different brokers, or to the same broker through different credentials —
+    and the recovery path would then ask one venue about an order sent to
+    another, conclude "absent", and resubmit. One object, one venue, one
+    answer.
     """
 
     async def place_order(self, request: OrderRequest) -> str: ...
+
+    async def find_by_client_order_id(self, client_order_id: str) -> Order | None: ...
+
+
+class OrderStore(Protocol):
+    """Order persistence, as the gateway needs it.
+
+    Structurally identical to the subset of
+    ``common.db.repositories.OrderRepositoryProtocol`` used here, and declared
+    locally for the same reason ``OrderPlacer`` is: ``execution`` does not
+    import ``common.db``, and a capability is a better dependency than a
+    module.
+
+    ``insert_submitting`` writes the row with status ``SUBMITTING`` and no
+    ``broker_order_id``. That intermediate state is not bookkeeping — it is
+    the entire recovery mechanism, and §8.2 is unimplementable without it.
+    """
+
+    async def insert_submitting(self, order: dict[str, Any]) -> int: ...
+
+    async def attach_broker_id(self, client_order_id: str, broker_order_id: str) -> None: ...
+
+    async def find_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None: ...
 
 
 class RateLimiter(Protocol):
@@ -141,6 +175,31 @@ class RateLimitedError(GatewayError):
 
     Distinct from the broker's own ``RateLimitError``: this one never reached
     the broker, so nothing is in flight and there is nothing to reconcile.
+    """
+
+
+class OrderNeverLandedError(GatewayError):
+    """An ambiguous submission was queried, and the order genuinely is not there.
+
+    The gateway raises this rather than resubmitting on its own initiative.
+    §8.2 says such an order "may be resubmitted" — permission, not obligation,
+    and the difference matters: if the absence determination is ever wrong,
+    an automatic resubmit turns it into two real positions, which §8.2 calls
+    "the single most expensive bug possible in a trading system". Resubmission
+    stays an explicit act by a caller that can see this error.
+
+    Distinct from ``AmbiguousOrderError``, which means *unknown*. This one
+    means *known absent*, and only the query can tell them apart.
+    """
+
+
+class OrderStateUnknownError(GatewayError):
+    """The recovery query answered, but not with enough to adopt.
+
+    The broker returned a record for our ``client_order_id`` that carries no
+    broker order id. Neither "it landed" nor "it did not" is supportable, so
+    neither is claimed: this fails closed rather than resubmitting on a
+    half-answer.
     """
 
 
@@ -227,10 +286,18 @@ class OrderGateway:
         placer: OrderPlacer,
         *,
         policy: GatewayPolicy,
+        store: OrderStore,
         limiter: RateLimiter | None = None,
     ) -> None:
         self._placer = placer
         self._policy = policy
+        #: REQUIRED, not optional (E15-S02). An optional store would mean
+        #: ``None`` silently skips the pre-submission record - the exact shape
+        #: of defect this codebase keeps finding, where an absent capability
+        #: reads as a satisfied one. A gateway that cannot record an order
+        #: cannot be constructed, so there is no configuration in which orders
+        #: are placed untracked.
+        self._store = store
         self._limiter = limiter
 
     async def submit_entry(
@@ -247,20 +314,134 @@ class OrderGateway:
         forgot to check a returned ``None`` would believe otherwise.
         """
         request = self.build_entry(decision, recommendation, trade_date=trade_date)
+        cid = request.client_order_id
+
+        # Layer 1 of the pattern EPIC01 8.4 uses for slots, applied to orders:
+        # the cheap check that catches the ordinary case. The UNIQUE
+        # constraint on ``client_order_id`` (BR-2) remains the guarantee
+        # behind it, and reconciliation (8.3) is the backstop behind that.
+        # Execution is single-threaded and strictly serialised (9.1), so there
+        # is no concurrent submitter for this check to race with.
+        already = await self._store.find_by_client_order_id(cid)
+        if already is not None:
+            return await self._resume(cid, already)
+
+        # BEFORE the record, so a refusal leaves nothing behind. A SUBMITTING
+        # row for an order that was never sent would send reconciliation
+        # hunting an order the broker has never heard of, every 30 seconds,
+        # for the rest of the day.
         if self._limiter is not None and not await self._limiter.allow():
             raise RateLimitedError(
-                f"the order-rate limiter refused {request.client_order_id}. Nothing "
-                f"was sent, so there is nothing to reconcile — but the signal is "
-                f"stale by definition and must not be queued behind the bucket."
+                f"the order-rate limiter refused {cid}. Nothing was sent, so "
+                f"there is nothing to reconcile — but the signal is stale by "
+                f"definition and must not be queued behind the bucket."
             )
-        broker_order_id = await self._placer.place_order(request)
-        log.info(
-            "submitted %s for %s as broker order %s",
-            request.client_order_id,
-            request.symbol,
-            broker_order_id,
+
+        # TX1. If this raises, no broker call happens: a fact we cannot record
+        # is a fact we must not create.
+        await self._store.insert_submitting(
+            {
+                "client_order_id": cid,
+                "correlation_id": request.correlation_id,
+                "symbol": request.symbol,
+                "side": request.side.value,
+                "order_type": request.order_type.value,
+                "product": request.product.value,
+                "quantity": request.quantity,
+                "intent": request.intent.value,
+                "limit_price": request.limit_price,
+                "trigger_price": request.trigger_price,
+                "market_protection": request.market_protection,
+                "algo_id": request.algo_id,
+            }
         )
+
+        try:
+            broker_order_id = await self._placer.place_order(request)
+        except AmbiguousOrderError:
+            # The one branch this story exists for. Query, never retry.
+            broker_order_id = await self._recover(cid)
+
+        await self._attach(cid, broker_order_id)
+        log.info("submitted %s for %s as broker order %s", cid, request.symbol, broker_order_id)
         return broker_order_id
+
+    async def _resume(self, cid: str, recorded: dict[str, Any]) -> str:
+        """A row already exists for this decision. Decide without sending.
+
+        Two shapes reach here. A row carrying a broker id is a completed
+        submission - the caller is retrying something that already succeeded,
+        and the answer is the id it got last time. A row still in
+        ``SUBMITTING`` is the dangerous one: the previous attempt died
+        somewhere between recording the intent and recording the outcome, and
+        only the broker knows which side of the call it died on.
+        """
+        broker_order_id = recorded.get("broker_order_id")
+        if broker_order_id:
+            log.info("%s was already submitted as broker order %s", cid, broker_order_id)
+            return str(broker_order_id)
+
+        log.warning(
+            "%s is recorded as %s with no broker order id - a previous attempt "
+            "did not finish. Querying the broker rather than resubmitting.",
+            cid,
+            one_safe_line(str(recorded.get("status", "unknown"))),
+        )
+        broker_order_id = await self._recover(cid)
+        await self._attach(cid, broker_order_id)
+        return broker_order_id
+
+    async def _recover(self, cid: str) -> str:
+        """Query, don't retry. Section 8.2's recovery path, and the whole point.
+
+        Every outcome here is either an adopted broker id or an exception.
+        There is deliberately no path that returns "probably fine".
+        """
+        found = await self._placer.find_by_client_order_id(cid)
+        if found is None:
+            raise OrderNeverLandedError(
+                f"{cid} is not in the broker's orderbook, so it never landed. "
+                f"Resubmitting is safe but is NOT done here: if this absence "
+                f"determination is ever wrong, an automatic retry becomes a "
+                f"second real position. Resubmit deliberately, or let "
+                f"reconciliation adopt it."
+            )
+        if not found.broker_order_id:
+            raise OrderStateUnknownError(
+                f"the broker returned a record for {cid} with no broker order "
+                f"id. That supports neither 'it landed' nor 'it did not', so "
+                f"neither is assumed."
+            )
+        log.warning(
+            "adopted broker order %s for %s after an ambiguous submission",
+            found.broker_order_id,
+            cid,
+        )
+        return found.broker_order_id
+
+    async def _attach(self, cid: str, broker_order_id: str) -> None:
+        """TX2. A failure here is logged, never raised.
+
+        The order is real by this point. Raising would tell the caller the
+        submission failed, and the natural response to that is to submit
+        again - which is precisely the duplicate this story exists to prevent.
+        A stale row is recoverable by reconciliation (8.3); a duplicate
+        position is not.
+        """
+        try:
+            await self._store.attach_broker_id(cid, broker_order_id)
+        # Deliberately total: every persistence failure mode is less bad than
+        # the resubmission a raise would invite. See the docstring.
+        except Exception as exc:
+            log.error(
+                "order %s LANDED as broker order %s but could not be recorded: %s. "
+                "The order is live and the local row is stale - reconciliation "
+                "must adopt it. Not raising, because a raise here reads as "
+                "'submission failed' and invites a duplicate.",
+                cid,
+                broker_order_id,
+                one_safe_line(str(exc)),
+            )
 
     def build_entry(
         self,

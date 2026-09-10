@@ -678,7 +678,24 @@ Every clamp is applied and the binding constraint is recorded in the audit log �
   issued, and the adapter omits the parameter rather than sending an empty
   string — see `common/config.SEBI_ALGO_REGISTRATION_OPS` (corrected 9 Sep 2026).
 - Generates the deterministic `client_order_id` (§8.2).
-- Enforces the order-rate token bucket (constraint C2).
+- **Records the order as `SUBMITTING` before calling the broker, and attaches
+  the broker id after** (E15-S02). The two transactions are the whole of §8.2's
+  recovery design: a process that dies during the broker call leaves a
+  `SUBMITTING` row with a null `broker_order_id`, which is what tells
+  reconciliation to *query* rather than resubmit. A gateway cannot be
+  constructed without a store, so there is no configuration in which orders are
+  placed untracked.
+- **On an ambiguous failure, queries by `client_order_id` and never retries.**
+  If the order is in the broker's orderbook it is adopted; if it is genuinely
+  absent the gateway raises `OrderNeverLandedError` rather than resubmitting on
+  its own initiative. §8.2 says such an order *may* be resubmitted — permission,
+  not obligation, and the distinction is deliberate: if the absence
+  determination is ever wrong, an automatic retry becomes a second real
+  position. A broker record with no order id raises `OrderStateUnknownError`,
+  because it supports neither conclusion.
+- Enforces the order-rate token bucket (constraint C2). The bucket is consulted
+  **after** the duplicate check, so a suppressed resubmission does not spend a
+  token that a real order needs.
 - **Places the protective stop immediately after entry fill confirmation.** If the stop order fails to place, the position is closed at market immediately — a naked position is never acceptable (constraint: every `positions` row has a non-null `stop_price`).
 
 ### 5.8 `PositionManager` and the square-off timer

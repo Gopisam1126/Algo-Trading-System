@@ -282,3 +282,41 @@ class TestRedactionSurvivesExceptions:
         handler.flush()
 
         assert opaque not in buf.getvalue()
+
+
+class TestTheOrderGatewaySwallowsAStoreFailureWithoutLeakingIt:
+    """E15-S02 added the first log line in the execution path that renders a
+    DATABASE exception's text.
+
+    ``OrderGateway._attach`` deliberately swallows a persistence failure — the
+    order is already live, and raising would invite a resubmission. Swallowing
+    means logging, and a store failure is exactly the exception most likely to
+    carry a DSN: ``OperationalError`` renders the connection URL, password and
+    all. The redactor is known to handle this shape; this asserts it on the
+    string the gateway actually builds, because "known to handle" and
+    "handled here" are different claims.
+    """
+
+    DSN = "postgresql+psycopg://algotrader:hunter2SuperSecret@db.internal:5432/algo"
+
+    def test_a_store_exception_carrying_a_dsn_is_scrubbed(
+        self, redactor: RedactingProcessor
+    ) -> None:
+        from algotrader.common.text import one_safe_line
+
+        exc = RuntimeError(f"could not connect to {self.DSN}")
+        # Precisely what gateway._attach passes as a %s argument.
+        rendered = render(redactor, {"event": "attach failed", "detail": one_safe_line(str(exc))})
+        assert "hunter2SuperSecret" not in rendered
+        assert "db.internal" in rendered, (
+            "the host must survive: a redacted DSN that hides WHICH database "
+            "failed is a redaction that costs an operator the diagnosis"
+        )
+
+    def test_the_exception_object_itself_is_scrubbed_too(
+        self, redactor: RedactingProcessor
+    ) -> None:
+        """The control on the line above. If a future edit passes ``exc``
+        rather than ``str(exc)``, that must not reopen the hole."""
+        exc = RuntimeError(f"could not connect to {self.DSN}")
+        assert "hunter2SuperSecret" not in render(redactor, {"error": exc})
