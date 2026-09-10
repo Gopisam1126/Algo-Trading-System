@@ -37,12 +37,13 @@ from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_s
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
 from algotrader.common.metrics import reset_metrics_for_testing
 from algotrader.common.models.trading import Recommendation
-from algotrader.execution.gateway import GatewayPolicy, OrderGateway
+from algotrader.execution.gateway import GatewayError, GatewayPolicy, OrderGateway
 from algotrader.execution.halt import (
     HaltController,
     HaltReason,
     OperatorAction,
 )
+from algotrader.execution.order_state import IllegalTransitionError
 from algotrader.execution.risk.checks import (
     ELIGIBILITY_ORDER,
     EXPOSURE_ORDER,
@@ -2683,3 +2684,186 @@ class TestSit15ASessionThatSurvivesATimeout:
             session.log_text,
             re.IGNORECASE,
         )
+
+
+# --------------------------------------------------------------------------
+# SIT-16 — a session that restarts onto a store it did not leave (E15-S03)
+# --------------------------------------------------------------------------
+
+
+class TestSit16ASessionThatRefusesToResumeWhatItCannotResume:
+    """SIT-15 asked what a session does when the BROKER misbehaves. This asks
+    what it does when its OWN RECORDS are not what it expects.
+
+    That is the realistic restart: the process died yesterday, or a reconciler
+    that does not exist yet (E15-S09) wrote a status, or a row was edited by
+    hand during an incident. A component test shows one row being refused. It
+    cannot show that a whole day's worth of decisions meeting a poisoned store
+    produces zero orders rather than a few — and "a few" is the outcome that
+    opens positions nobody chose.
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    @staticmethod
+    def _signals(session) -> list:
+        return [
+            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)))
+            for t in sorted(session.decisions)
+            if session.decisions[t].approved
+        ]
+
+    @staticmethod
+    def _gateway(broker, store):
+        return OrderGateway(
+            broker,
+            policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=store,
+        )
+
+    def _poison(self, signals, store, status: str) -> None:
+        """Record every one of the day's orders in `status`, as a previous run
+        would have left them. No broker id: these are rows for orders that
+        either finished or were never completed, not orders in flight."""
+        gateway = self._gateway(_RecordingBroker(), store)
+        for decision, rec in signals:
+            request = gateway.build_entry(decision, rec, trade_date=TRADING_DAY)
+            store.rows[request.client_order_id] = {
+                "client_order_id": request.client_order_id,
+                "broker_order_id": None,
+                "status": status,
+            }
+
+    @pytest.mark.parametrize("status", ["FILLED", "CANCELLED", "REJECTED"])
+    def test_a_day_of_finished_rows_produces_no_orders_at_all(self, calendar, status: str) -> None:
+        """Terminal is terminal at session scale. Every one of 316 decisions
+        meets a row the state machine will not move, and the count that matters
+        is zero — not "most"."""
+        session = self._session(calendar).run()
+        signals = self._signals(session)
+        broker, store = _RecordingBroker(), _SessionOrderStore()
+        self._poison(signals, store, status)
+
+        gateway = self._gateway(broker, store)
+        refused = 0
+        for decision, rec in signals:
+            try:
+                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+            except IllegalTransitionError:
+                refused += 1
+        assert refused == len(signals) == 316
+        assert broker.orders == [], "a finished order was resubmitted"
+
+    def test_a_reconcile_owned_day_is_left_to_reconciliation(self, calendar) -> None:
+        """RECONCILE_REQUIRED cannot return to SUBMITTED: §8.3 gives those
+        orders to the reconciliation loop, and a second owner is how one gets
+        submitted twice."""
+        session = self._session(calendar).run()
+        signals = self._signals(session)
+        broker, store = _RecordingBroker(), _SessionOrderStore()
+        self._poison(signals, store, "RECONCILE_REQUIRED")
+
+        gateway = self._gateway(broker, store)
+        for decision, rec in signals:
+            with pytest.raises(IllegalTransitionError):
+                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+        assert broker.orders == []
+
+    def test_an_unreadable_status_stops_the_day_rather_than_guessing(self, calendar) -> None:
+        """Corrupt a cached value; the system must refuse, not guess. There is
+        no safe default for a status we cannot parse — treating it as
+        SUBMITTING would adopt a corrupted row as though it were in flight."""
+        session = self._session(calendar).run()
+        signals = self._signals(session)
+        broker, store = _RecordingBroker(), _SessionOrderStore()
+        self._poison(signals, store, "NOT_A_STATUS")
+
+        gateway = self._gateway(broker, store)
+        for decision, rec in signals:
+            with pytest.raises(GatewayError, match="not a modelled OrderStatus"):
+                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+        assert broker.orders == []
+
+    def test_a_clean_store_still_trades_the_whole_day(self, calendar) -> None:
+        """The control, and it is not optional. Every test above asserts that
+        the session refuses; without this one, a gateway that refused
+        everything would pass all of them and the day would simply never
+        trade."""
+        session = self._session(calendar).run()
+        signals = self._signals(session)
+        broker, store = _RecordingBroker(), _SessionOrderStore()
+
+        gateway = self._gateway(broker, store)
+        ids = [
+            asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+            for decision, rec in signals
+        ]
+        assert len(ids) == len(broker.orders) == 316
+        assert all(row["status"] == "SUBMITTED" for row in store.rows.values())
+
+    def test_a_half_poisoned_day_trades_exactly_the_clean_half(self, calendar) -> None:
+        """The one that would catch an off-by-one in the refusal. A store where
+        alternate orders are finished must produce exactly the other half — not
+        all, not none."""
+        session = self._session(calendar).run()
+        signals = self._signals(session)
+        broker, store = _RecordingBroker(), _SessionOrderStore()
+        gateway = self._gateway(broker, store)
+
+        poisoned = set()
+        for index, (decision, rec) in enumerate(signals):
+            if index % 2:
+                continue
+            request = gateway.build_entry(decision, rec, trade_date=TRADING_DAY)
+            store.rows[request.client_order_id] = {
+                "client_order_id": request.client_order_id,
+                "broker_order_id": None,
+                "status": "FILLED",
+            }
+            poisoned.add(request.client_order_id)
+
+        placed = 0
+        for decision, rec in signals:
+            try:
+                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+                placed += 1
+            except IllegalTransitionError:
+                pass
+        assert placed == len(signals) - len(poisoned)
+        assert len(broker.orders) == placed
+        assert not ({o.client_order_id for o in broker.orders} & poisoned)
