@@ -31,6 +31,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from algotrader.broker.adapter import AmbiguousOrderError
 from algotrader.broker.kite.mapping import broker_tag
 from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_status
 from algotrader.common.enums import AIVerdict, Direction, RejectReason
@@ -2226,14 +2227,78 @@ class _RecordingBroker:
     The gateway is real, the risk engine is real, the sizer is real. Only the
     socket at the far end is substituted — which is the most that can be
     substituted while the claim is still "the system reaches a broker".
+
+    ``fail_next_with`` and ``orderbook`` were added for E15-S02: a session
+    that never fails cannot show that a failing one produces no duplicates.
     """
 
     def __init__(self) -> None:
         self.orders: list[object] = []
+        self.fail_next_with: Exception | None = None
+        self.orderbook: dict[str, object] = {}
 
     async def place_order(self, request) -> str:
         self.orders.append(request)
+        if self.fail_next_with is not None:
+            failure, self.fail_next_with = self.fail_next_with, None
+            # The order LANDED; only the response was lost. This is the case
+            # blind retry gets wrong, so it is the one the session replays.
+            self.orderbook[request.client_order_id] = _landed_order(
+                request, f"BROKER-{len(self.orders):06d}"
+            )
+            raise failure
         return f"BROKER-{len(self.orders):06d}"
+
+    async def find_by_client_order_id(self, client_order_id: str):
+        return self.orderbook.get(client_order_id)
+
+
+def _landed_order(request, broker_order_id: str):
+    from algotrader.common.enums import OrderStatus
+    from algotrader.common.models.trading import Order
+
+    return Order(
+        client_order_id=request.client_order_id,
+        broker_order_id=broker_order_id,
+        correlation_id=request.correlation_id,
+        symbol=request.symbol,
+        side=request.side,
+        order_type=request.order_type,
+        product=request.product,
+        quantity=request.quantity,
+        status=OrderStatus.OPEN,
+        intent=request.intent,
+        placed_at=_at(TRADING_DAY, 10, 0),
+        last_update_at=_at(TRADING_DAY, 10, 0),
+    )
+
+
+class _SessionOrderStore:
+    """The order book as this system records it, for one session.
+
+    Enforces ``uq_client_order`` the way the real table does. A session that
+    tried to insert one idempotency key twice fails here rather than in
+    production, which is the only place the constraint would otherwise speak.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict] = {}
+        self.insert_count = 0
+
+    async def insert_submitting(self, order: dict) -> int:
+        cid = order["client_order_id"]
+        assert cid not in self.rows, f"uq_client_order: {cid} inserted twice"
+        self.rows[cid] = {**order, "status": "SUBMITTING", "broker_order_id": None}
+        self.insert_count += 1
+        return self.insert_count
+
+    async def attach_broker_id(self, client_order_id: str, broker_order_id: str) -> None:
+        self.rows[client_order_id]["broker_order_id"] = broker_order_id
+        self.rows[client_order_id]["status"] = "SUBMITTED"
+
+    async def find_by_client_order_id(self, client_order_id: str):
+        row = self.rows.get(client_order_id)
+        return None if row is None else dict(row)
 
 
 class TestSit14ASessionThatReachesABroker:
@@ -2294,6 +2359,7 @@ class TestSit14ASessionThatReachesABroker:
         gateway = OrderGateway(
             broker,
             policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=_SessionOrderStore(),
         )
         submitted = []
         for ist_time in sorted(session.decisions):
@@ -2380,6 +2446,7 @@ class TestSit14ASessionThatReachesABroker:
         gateway = OrderGateway(
             broker,
             policy=GatewayPolicy(algo_id=None, market_protection=Decimal("-1")),
+            store=_SessionOrderStore(),
         )
         for ist_time in sorted(session.decisions):
             decision = session.decisions[ist_time]
@@ -2447,6 +2514,7 @@ class TestSit14ASessionThatReachesABroker:
             gateway = OrderGateway(
                 broker,
                 policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+                store=_SessionOrderStore(),
             )
             for decision, rec in signals:
                 asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
@@ -2470,6 +2538,146 @@ class TestSit14ASessionThatReachesABroker:
 
         session = self._session(calendar).run()
         self._submit_every_approval(session, _RecordingBroker())
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
+
+
+# --------------------------------------------------------------------------
+# SIT-15 — a session that survives a broker timeout (E15-S02)
+# --------------------------------------------------------------------------
+
+
+class TestSit15ASessionThatSurvivesATimeout:
+    """SIT-14 asked whether every approval becomes exactly one order on a
+    HEALTHY day. This asks the question that only matters on a bad one.
+
+    A component test can show that one timeout produces one order. It cannot
+    show that a day containing a timeout still ends with as many orders as
+    approvals — that the recovery path did not quietly drop the order it was
+    recovering, and did not add one. That is a session-scale claim, and it is
+    the claim under which real money is lost.
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    @staticmethod
+    def _signals(session) -> list:
+        """The day's approved signals, minted ONCE.
+
+        `_recommendation` generates a fresh correlation_id on every call, and
+        the correlation_id is the first component of the idempotency key. A
+        helper that re-minted per run would make a "replay" a different day
+        with different keys — and the replay test would pass while proving
+        nothing. SIT-14 was corrected for exactly this; the trap is in the
+        helper, so it catches every new caller too.
+        """
+        return [
+            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)))
+            for t in sorted(session.decisions)
+            if session.decisions[t].approved
+        ]
+
+    @staticmethod
+    def _run_day(signals, broker, store, fail_at: int | None = None) -> list[str]:
+        gateway = OrderGateway(
+            broker,
+            policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=store,
+        )
+        ids: list[str] = []
+        for decision, recommendation in signals:
+            if fail_at is not None and len(ids) == fail_at:
+                broker.fail_next_with = AmbiguousOrderError("read timed out")
+            ids.append(
+                asyncio.run(gateway.submit_entry(decision, recommendation, trade_date=TRADING_DAY))
+            )
+        return ids
+
+    def test_a_timeout_mid_session_still_yields_one_order_per_approval(self, calendar) -> None:
+        """The count SIT-14 established, re-asserted across a failure."""
+        session = self._session(calendar).run()
+        signals = self._signals(session)
+        broker, store = _RecordingBroker(), _SessionOrderStore()
+        ids = self._run_day(signals, broker, store, fail_at=100)
+        approved = [d for d in session.decisions.values() if d.approved]
+        assert len(ids) == len(approved) == 316
+        assert len(set(ids)) == len(ids), "two approvals adopted one broker order"
+        assert store.insert_count == len(approved)
+
+    def test_the_timed_out_order_is_adopted_not_resent(self, calendar) -> None:
+        """One `place_order` per approval even though one of them raised. The
+        broker records the attempt that timed out, so the count proves the
+        recovery path queried rather than resubmitting."""
+        session = self._session(calendar).run()
+        broker, store = _RecordingBroker(), _SessionOrderStore()
+        self._run_day(self._signals(session), broker, store, fail_at=100)
+        approved = [d for d in session.decisions.values() if d.approved]
+        assert len(broker.orders) == len(approved)
+
+    def test_replaying_the_whole_day_sends_nothing_the_second_time(self, calendar) -> None:
+        """Restart, same store. Every order is already recorded, so a second
+        pass must reach the broker zero times and return the same ids.
+
+        This is the property that makes a crash-and-restart safe, and it is
+        not observable in any single-order test.
+        """
+        session = self._session(calendar).run()
+        signals = self._signals(session)
+        broker, store = _RecordingBroker(), _SessionOrderStore()
+        first = self._run_day(signals, broker, store)
+
+        replay = _RecordingBroker()
+        replay.orderbook = broker.orderbook
+        second = self._run_day(signals, replay, store)
+
+        assert first == second
+        assert replay.orders == [], "the restart resubmitted the whole day"
+
+    def test_no_credential_reached_the_log_on_a_day_that_timed_out(self, calendar) -> None:
+        """Re-asserted on the failure path: recovery logs carry ids, statuses
+        and broker exception text, none of which may carry a secret."""
+        import re
+
+        session = self._session(calendar).run()
+        self._run_day(self._signals(session), _RecordingBroker(), _SessionOrderStore(), fail_at=10)
         assert not re.search(
             r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
             session.log_text,
