@@ -60,6 +60,7 @@ from algotrader.execution.gateway import (
     RateLimitedError,
     client_order_id,
 )
+from algotrader.execution.order_state import IllegalTransitionError
 
 _ASYNC = pytest.mark.asyncio
 
@@ -756,6 +757,130 @@ class TestAc3AnAmbiguousFailureQueriesAndNeverRetries:
                 _approved(), _rec(), trade_date=TRADE_DATE
             )
         assert placer.find_calls == []
+
+
+@_ASYNC
+class TestTheResumePathConsultsTheStateMachine:
+    """E15-S03's wiring, and it existed untested until mutation said so.
+
+    Before E15-S03 `_resume` inspected only `broker_order_id`. A row recorded
+    REJECTED or CANCELLED carries none — there is no live order — so it fell
+    into the mid-flight branch and would have been queried and adopted as
+    though a submission were still in progress. Asking the state machine
+    whether the recorded status may legally reach SUBMITTED answers every one
+    of those cases at once.
+    """
+
+    @pytest.mark.parametrize("recorded", ["FILLED", "CANCELLED", "REJECTED"])
+    async def test_a_finished_order_is_never_resumed(self, recorded: str) -> None:
+        """Terminal states have no legal moves at all, so this is AC2 reaching
+        the gateway: an order the system already considers finished cannot be
+        dragged back into a submission."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        cid = (
+            _gateway(placer, store=store)
+            .build_entry(_approved(), _rec(), trade_date=TRADE_DATE)
+            .client_order_id
+        )
+        store.preexisting(cid, broker_order_id=None, status=recorded)
+
+        with pytest.raises(IllegalTransitionError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        assert placer.submitted == []
+        assert placer.find_calls == [], "the broker was queried about a finished order"
+
+    async def test_a_reconcile_owned_order_is_not_resumed(self) -> None:
+        """RECONCILE_REQUIRED deliberately cannot return to SUBMITTED: §8.3
+        gives that order to the reconciliation loop, and a second owner is how
+        it gets submitted twice."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        cid = (
+            _gateway(placer, store=store)
+            .build_entry(_approved(), _rec(), trade_date=TRADE_DATE)
+            .client_order_id
+        )
+        store.preexisting(cid, broker_order_id=None, status="RECONCILE_REQUIRED")
+
+        with pytest.raises(IllegalTransitionError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        assert placer.submitted == []
+
+    async def test_an_unmodelled_stored_status_is_refused(self) -> None:
+        """No safe default exists. Treating an unreadable status as SUBMITTING
+        would let a corrupted or hand-edited row be adopted as in-flight."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        cid = (
+            _gateway(placer, store=store)
+            .build_entry(_approved(), _rec(), trade_date=TRADE_DATE)
+            .client_order_id
+        )
+        store.preexisting(cid, broker_order_id=None, status="NOT_A_REAL_STATUS")
+
+        with pytest.raises(GatewayError, match="not a modelled OrderStatus"):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        assert placer.submitted == []
+
+    async def test_the_refusal_does_not_echo_a_forged_status_verbatim(self) -> None:
+        """The stored status is data, and a newline in it would forge a log
+        line in the message this raises."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        cid = (
+            _gateway(placer, store=store)
+            .build_entry(_approved(), _rec(), trade_date=TRADE_DATE)
+            .client_order_id
+        )
+        forged = "OPEN" + chr(10) + "CRITICAL kill switch disarmed by operator"
+        store.preexisting(cid, broker_order_id=None, status=forged)
+        with pytest.raises(GatewayError) as excinfo:
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        assert chr(10) not in str(excinfo.value)
+
+    async def test_a_mid_flight_row_is_still_resumed(self) -> None:
+        """The control. SUBMITTING legally reaches SUBMITTED, so the recovery
+        path E15-S02 built must still run — otherwise this check would have
+        closed the hole by closing the feature."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        request = _gateway(placer, store=store).build_entry(
+            _approved(), _rec(), trade_date=TRADE_DATE
+        )
+        store.preexisting(request.client_order_id, broker_order_id=None, status="SUBMITTING")
+        placer.landed(request, "ADOPTED-2")
+
+        assert (
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+            == "ADOPTED-2"
+        )
+        assert placer.submitted == []
+
+    async def test_a_completed_row_still_short_circuits_before_the_check(self) -> None:
+        """A row carrying a broker id is answered from the record without
+        consulting the state machine at all: it was submitted, and the id it
+        got is the honest answer whatever the order later became."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        cid = (
+            _gateway(placer, store=store)
+            .build_entry(_approved(), _rec(), trade_date=TRADE_DATE)
+            .client_order_id
+        )
+        store.preexisting(cid, broker_order_id="ALREADY-1", status="FILLED")
+
+        assert (
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+            == "ALREADY-1"
+        )
+        assert placer.submitted == []
 
 
 @_ASYNC
