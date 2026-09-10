@@ -2057,13 +2057,22 @@ Full lifecycle per LOW_LEVEL_ARCHITECTURE §8.2 with illegal transitions rejecte
 > position is ever naked.
 
 **Tasks**
-- [ ] Place stop on entry fill confirmation
-- [ ] **If stop placement fails → close position at market immediately**
-- [ ] Verify stop is live before considering the position established
-- [ ] Alert on any stop failure
+- [x] Place stop on entry fill confirmation — SL-M, opposite side, full
+      quantity, at the position's `stop_price`. *(The fill-confirmation
+      TRIGGER is E15-S05; this is the action it will call.)*
+- [x] **If stop placement fails → close position at market immediately**
+- [x] Verify stop is live before considering the position established —
+      and the emergency exit is verified the same way
+- [x] Alert on any stop failure — CRITICAL log + two counters.
+      *(Alert TRANSPORT is E14-S12, which needs credentials.)*
+- [x] **Added:** if the emergency exit also fails, arm
+      `HaltReason.NAKED_POSITION`
 
 **Acceptance**
-- 🔴 A position without a live stop cannot persist for more than one cycle
+- [x] 🔴 A position without a live stop cannot persist for more than one cycle
+      — the synchronous half is `ProtectiveStop.attach`; the per-cycle half is
+      `ProtectiveStop.is_protected`, which **E15-S09 must call** and which
+      catches the asynchronous rejection this story's build concern names
 
 ---
 

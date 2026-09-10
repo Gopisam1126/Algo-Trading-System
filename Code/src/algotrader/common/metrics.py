@@ -78,6 +78,27 @@ class Metrics:
             registry=self.registry,
         )
 
+        # -- execution: protective stops (E15-S04) ---------------------------
+        # Two counters, not one, for the same reason errors are separate from
+        # rejections above: a stop that failed and was CONTAINED by closing the
+        # position is a bad trade, and a stop that failed where the close also
+        # failed is a naked position and an incident. One counter would let the
+        # second hide inside the first's noise.
+        self.stop_attach_failures_total = Counter(
+            "stop_attach_failures_total",
+            "Positions whose protective stop could not be established. Each of "
+            "these was closed at market, so the position is contained - but "
+            "every one is a trade exited at an unplanned price.",
+            registry=self.registry,
+        )
+        self.naked_positions_total = Counter(
+            "naked_positions_total",
+            "Positions with no stop that could NOT be closed. Each one halts "
+            "the session and needs a human. This should be zero, and any "
+            "non-zero value is an incident rather than a statistic.",
+            registry=self.registry,
+        )
+
     def rejected(self, check: str, reason: str) -> None:
         self.signals_rejected_total.labels(check=check, reason=reason).inc()
 

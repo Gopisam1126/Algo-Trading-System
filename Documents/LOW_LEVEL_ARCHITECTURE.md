@@ -696,7 +696,34 @@ Every clamp is applied and the binding constraint is recorded in the audit log �
 - Enforces the order-rate token bucket (constraint C2). The bucket is consulted
   **after** the duplicate check, so a suppressed resubmission does not spend a
   token that a real order needs.
-- **Places the protective stop immediately after entry fill confirmation.** If the stop order fails to place, the position is closed at market immediately — a naked position is never acceptable (constraint: every `positions` row has a non-null `stop_price`).
+- **Places the protective stop immediately after entry fill confirmation**, as
+  SL-M. Since E15-S04 the sequence and its failure handling live in
+  `execution/protective_stop.py`; the gateway supplies `build_stop`,
+  `build_exit`, `submit_stop`, `submit_exit` and `find_order`, and remains the
+  only path to the broker.
+
+  The sequence is **place → verify → on any failure exit → on a failed exit
+  halt**, and two points in it are easy to get wrong:
+
+  - **Acceptance is not liveness.** A stop the broker accepted and does not
+    list is not protecting anything, so the position is exited. The same rule
+    applies to the emergency exit itself — trusting the exit's acceptance while
+    distrusting the stop's would be indefensible, since the exit is the only
+    thing between a naked position and the square-off deadline.
+  - **`stop_price` NOT NULL (BR-1) does not mean a stop ORDER exists.** The
+    column records the price the sizer chose, and it is populated whether or
+    not any order is protecting the position. Those are different facts, and
+    conflating them is what makes a naked position invisible in the database.
+
+  A contained failure — stop refused, position exited — does **not** halt the
+  day; one bad symbol must not stop trading. A failure to exit arms
+  `HaltReason.NAKED_POSITION`, which is its own reason rather than the nearest
+  plausible neighbour.
+
+  The stop order needs no schema column: its `client_order_id` is derivable
+  from the position's `correlation_id` via §8.2's hash with `intent=STOP`, so
+  anything holding the position can find its stop — including a reconciliation
+  loop that never saw it placed.
 
 ### 5.8 `PositionManager` and the square-off timer
 

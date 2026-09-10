@@ -99,6 +99,13 @@ class HaltReason(StrEnum):
     STALE_FEED = "STALE_FEED"
     MARGIN_SHORTFALL = "MARGIN_SHORTFALL"
     UNKNOWN_POSITION = "UNKNOWN_POSITION"
+    #: A position exists that we could neither protect nor close (E15-S04).
+    #: Distinct from UNKNOWN_POSITION, which means the BROKER reports a
+    #: position we have no record of. Here the position is ours, we know
+    #: about it, and both the stop and the emergency exit failed. Borrowing
+    #: the nearest plausible neighbour is how HEALTH_GATE_FAILED came to mean
+    #: four different things in this codebase; this gets its own member.
+    NAKED_POSITION = "NAKED_POSITION"
 
 
 #: Which latch each reason writes to. Three latches rather than one flag,
