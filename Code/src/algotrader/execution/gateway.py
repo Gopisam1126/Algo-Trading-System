@@ -92,7 +92,14 @@ from decimal import Decimal
 from typing import Any, Final, Protocol
 
 from algotrader.broker.adapter import AmbiguousOrderError
-from algotrader.common.enums import Direction, OrderIntent, OrderType, Product, Side
+from algotrader.common.enums import (
+    Direction,
+    OrderIntent,
+    OrderStatus,
+    OrderType,
+    Product,
+    Side,
+)
 from algotrader.common.models.trading import (
     Order,
     OrderRequest,
@@ -100,6 +107,7 @@ from algotrader.common.models.trading import (
     RiskDecision,
 )
 from algotrader.common.text import one_safe_line
+from algotrader.execution.order_state import assert_legal
 
 log = logging.getLogger(__name__)
 
@@ -369,27 +377,67 @@ class OrderGateway:
     async def _resume(self, cid: str, recorded: dict[str, Any]) -> str:
         """A row already exists for this decision. Decide without sending.
 
-        Two shapes reach here. A row carrying a broker id is a completed
+        Three shapes reach here. A row carrying a broker id is a completed
         submission - the caller is retrying something that already succeeded,
         and the answer is the id it got last time. A row still in
         ``SUBMITTING`` is the dangerous one: the previous attempt died
         somewhere between recording the intent and recording the outcome, and
         only the broker knows which side of the call it died on.
+
+        The third shape is why this consults the state machine (E15-S03): a row
+        in any OTHER status. Before, only ``broker_order_id`` was inspected, so
+        a row recorded ``REJECTED`` or ``CANCELLED`` - no broker id, because
+        there is no live order - fell into the mid-flight branch and would have
+        been adopted as though it were in flight. Asking whether the recorded
+        status may legally reach ``SUBMITTED`` answers all of it at once:
+        terminal states have no legal moves at all, and
+        ``RECONCILE_REQUIRED`` deliberately cannot return to a submitted state
+        because reconciliation owns it.
         """
+        recorded_status = self._recorded_status(cid, recorded)
         broker_order_id = recorded.get("broker_order_id")
         if broker_order_id:
-            log.info("%s was already submitted as broker order %s", cid, broker_order_id)
+            log.info(
+                "%s was already submitted as broker order %s (status %s)",
+                cid,
+                broker_order_id,
+                recorded_status.value,
+            )
             return str(broker_order_id)
+
+        # Raises IllegalTransitionError for a terminal or reconcile-owned row.
+        # Deliberately BEFORE the broker query: an order the state machine will
+        # not let us adopt is one we should not be asking the broker about.
+        assert_legal(recorded_status, OrderStatus.SUBMITTED)
 
         log.warning(
             "%s is recorded as %s with no broker order id - a previous attempt "
             "did not finish. Querying the broker rather than resubmitting.",
             cid,
-            one_safe_line(str(recorded.get("status", "unknown"))),
+            recorded_status.value,
         )
         broker_order_id = await self._recover(cid)
         await self._attach(cid, broker_order_id)
         return broker_order_id
+
+    @staticmethod
+    def _recorded_status(cid: str, recorded: dict[str, Any]) -> OrderStatus:
+        """The stored status as a state-machine member, or refuse.
+
+        A status this system does not model, on a row it is about to act on, is
+        the "unknown quietly becomes fine" shape: defaulting it to SUBMITTING
+        would let a corrupted or hand-edited row be adopted as though it were
+        in flight. There is no safe default, so there is none.
+        """
+        raw = recorded.get("status")
+        try:
+            return OrderStatus(str(raw))
+        except ValueError:
+            raise GatewayError(
+                f"order {cid} carries status {one_safe_line(str(raw))!r}, which is "
+                f"not a modelled OrderStatus. Refusing to act on a row whose "
+                f"state cannot be established."
+            ) from None
 
     async def _recover(self, cid: str) -> str:
         """Query, don't retry. Section 8.2's recovery path, and the whole point.

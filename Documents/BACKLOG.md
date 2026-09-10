@@ -2031,7 +2031,19 @@ Daily loss limit → halt · consecutive loss limit → halt.
 
 ---
 
-### E15-S03 · Order state machine
+### E15-S03 · Order state machine ✅ **DELIVERED 10 Sep 2026**
+
+`execution/order_state.py`. One frozen, read-only transition table checked at
+import for exhaustiveness and for agreement with `OrderStatus.is_terminal`;
+`assert_legal` refuses anything outside it, naming both states. Wired into the
+gateway's resume path, which previously inspected only `broker_order_id` and
+would have adopted a `REJECTED` or `CANCELLED` row as though a submission were
+still in flight.
+
+**The integration seam found four missing transitions** (QA-E15-07) and the
+STRIDE tampering question found the table was mutable at runtime despite its
+`Final` annotation (QA-E15-08). Mutation: 15 injected, 14 killed.
+
 `P0` `Phase 5` `🔴` `FEAT` · **1.5 days** · deps: E15-S01
 
 Full lifecycle per LOW_LEVEL_ARCHITECTURE §8.2 with illegal transitions rejected.

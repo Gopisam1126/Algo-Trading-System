@@ -134,14 +134,14 @@ sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
 order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
-the gateway are unbuilt — no order state
-machine (E15-S03), no protective stop attachment (E15-S04), no position manager
-(E15-S05), no reconciliation loop (E15-S09). **A gateway is not a trading
+the gateway are unbuilt: no protective stop attachment (E15-S04), no position
+manager (E15-S05), no reconciliation loop (E15-S09). The order state machine
+(E15-S03) now exists. **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**1,933 tests, 92% coverage** — all pass locally with Docker running;
-without it 273 skip and coverage reads 83%):
+Built and tested (**2,083 tests, 92% coverage** — all pass locally with Docker running;
+without it the container-backed integration tests skip and coverage reads lower):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
   redacting logging, NSE calendar, broker protocol, strategy DSL.
@@ -227,11 +227,26 @@ without it 273 skip and coverage reads 83%):
   assertion. Corrected to three distinct signals. Mutation: 12 injected, 12
   killed, including "retry instead of query".
 
+- **E15-S03 the order state machine** — `execution/order_state.py`. One frozen
+  table of legal transitions, verified at import to be exhaustive over
+  `OrderStatus` and to agree with `OrderStatus.is_terminal` — two independent
+  definitions of "this order is finished" that must not drift. A terminal state
+  has an empty target set, so a `FILLED` order cannot become `CANCELLED` and
+  erase a position that exists. Re-observing the same state is a no-op, because
+  reconciliation polls every 30s and an alarm that is always on is not read.
+  **§8.2's diagram turned out to be the happy path, not the table** — see the
+  five groups of edge now documented there. Wired into the gateway's resume
+  path, which had been inspecting only `broker_order_id`.
+
 **Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
 `api/`, `notifier/`, `ai/`, `macro/` — seven of thirteen packages.
-`execution/` holds `risk/`, `sizer.py` and `slots.py`. **There is no order manager and
-no order placement**, which is the single fact that decides what the rest of
-this file means: the system cannot trade, correctly or otherwise.
+`execution/` holds `risk/`, `sizer.py`, `slots.py`, `halt.py`, `gateway.py` and
+`order_state.py`. **Order PLACEMENT exists; order MANAGEMENT does not** — an
+approved decision reaches a broker and its lifecycle is now a validated state
+machine, but nothing attaches a protective stop (E15-S04), nothing manages a
+position (E15-S05), and nothing reconciles against the broker (E15-S09). The
+system still cannot trade safely, and the reason is now specific rather than
+total.
 
 ### The architectural fact to keep in mind
 

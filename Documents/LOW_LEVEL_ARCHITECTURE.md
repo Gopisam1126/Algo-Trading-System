@@ -956,6 +956,29 @@ PENDING_RISK ──► APPROVED ──► SUBMITTING ──► SUBMITTED ──�
                           RECONCILE_REQUIRED
 ```
 
+**The diagram is the happy path, not the whole table.** Since E15-S03 the
+authority is `execution/order_state.py`, which carries the full transition set
+and refuses everything outside it. Five groups of edge exist that the drawing
+above does not show, each because the broker can actually produce it:
+
+| Added | Why |
+|---|---|
+| `SUBMITTED -> FILLED`, `OPEN -> FILLED` | A MARKET order — this system's entry — commonly fills whole, and reconciliation polls every 30s, so most fills are *observed* complete with no partial ever seen. Requiring `PARTIAL` would make the normal case illegal. |
+| `SUBMITTED -> {REJECTED, CANCELLED}` | Kite accepts into `PUT ORDER REQ RECEIVED` and the exchange can reject or cancel afterwards. |
+| `SUBMITTING -> {OPEN, FILLED, CANCELLED, REJECTED}` | §8.2's own recovery path: an ambiguous submission is queried and the broker reports the order it already holds — possibly already filled — while our row still says `SUBMITTING`. Without these the outcome of a recovered timeout cannot be written down. |
+| `PARTIAL -> CANCELLED` | A partly filled order cancelled at square-off; the filled quantity is a real position. |
+| `* -> RECONCILE_REQUIRED` from every non-terminal state | `status_in` returns it for any Kite status we do not model, which can arrive on any poll. |
+
+**Two exclusions are deliberate and will look like bugs.** `PARTIAL -> OPEN` is
+refused even though Kite reports `OPEN` for a partially-filled order — going
+back would discard the knowledge that a fill occurred, and the refusal is what
+forces a reconciler to consult `filled_quantity` rather than status alone.
+`PARTIAL -> REJECTED` is refused because part of the order already happened.
+Backwards moves into `SUBMITTED` are refused from every later state: that is
+the direction that could re-enable submission. **A reconciler meeting a refused
+transition must record `RECONCILE_REQUIRED`** — legal from every non-terminal
+state — rather than retrying it.
+
 **Idempotency design.** The `client_order_id` is a deterministic hash — the same logical decision always produces the same ID:
 
 ```python
