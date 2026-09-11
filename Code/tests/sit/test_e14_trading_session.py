@@ -31,12 +31,18 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from algotrader.broker.adapter import AmbiguousOrderError
+from algotrader.broker.adapter import AmbiguousOrderError, OrderRejectedError
 from algotrader.broker.kite.mapping import broker_tag
 from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_status
-from algotrader.common.enums import AIVerdict, Direction, RejectReason
-from algotrader.common.metrics import reset_metrics_for_testing
-from algotrader.common.models.trading import Recommendation
+from algotrader.common.enums import (
+    AIVerdict,
+    Direction,
+    OrderIntent,
+    OrderStatus,
+    RejectReason,
+)
+from algotrader.common.metrics import get_metrics, reset_metrics_for_testing
+from algotrader.common.models.trading import Position, Recommendation
 from algotrader.execution.gateway import GatewayError, GatewayPolicy, OrderGateway
 from algotrader.execution.halt import (
     HaltController,
@@ -44,6 +50,12 @@ from algotrader.execution.halt import (
     OperatorAction,
 )
 from algotrader.execution.order_state import IllegalTransitionError
+from algotrader.execution.protective_stop import (
+    NakedPositionError,
+    ProtectiveStop,
+    StopNotEstablishedError,
+    stop_client_order_id,
+)
 from algotrader.execution.risk.checks import (
     ELIGIBILITY_ORDER,
     EXPOSURE_ORDER,
@@ -2254,8 +2266,7 @@ class _RecordingBroker:
         return self.orderbook.get(client_order_id)
 
 
-def _landed_order(request, broker_order_id: str):
-    from algotrader.common.enums import OrderStatus
+def _landed_order(request, broker_order_id: str, status: OrderStatus = OrderStatus.OPEN):
     from algotrader.common.models.trading import Order
 
     return Order(
@@ -2267,7 +2278,7 @@ def _landed_order(request, broker_order_id: str):
         order_type=request.order_type,
         product=request.product,
         quantity=request.quantity,
-        status=OrderStatus.OPEN,
+        status=status,
         intent=request.intent,
         placed_at=_at(TRADING_DAY, 10, 0),
         last_update_at=_at(TRADING_DAY, 10, 0),
@@ -2296,6 +2307,10 @@ class _SessionOrderStore:
     async def attach_broker_id(self, client_order_id: str, broker_order_id: str) -> None:
         self.rows[client_order_id]["broker_order_id"] = broker_order_id
         self.rows[client_order_id]["status"] = "SUBMITTED"
+
+    async def mark_rejected(self, client_order_id: str, *, reason: str | None) -> None:
+        self.rows[client_order_id]["status"] = "REJECTED"
+        self.rows[client_order_id]["rejection_reason"] = reason
 
     async def find_by_client_order_id(self, client_order_id: str):
         row = self.rows.get(client_order_id)
@@ -2867,3 +2882,470 @@ class TestSit16ASessionThatRefusesToResumeWhatItCannotResume:
         assert placed == len(signals) - len(poisoned)
         assert len(broker.orders) == placed
         assert not ({o.client_order_id for o in broker.orders} & poisoned)
+
+
+# --------------------------------------------------------------------------
+# SIT-17 — a session whose positions are protected, or are not positions
+#          (E15-S04)
+# --------------------------------------------------------------------------
+
+
+class _OrderbookBroker:
+    """A broker that LISTS what it accepted — which SIT-15's did not need to.
+
+    ``_RecordingBroker`` fills its orderbook only when a response was lost,
+    because a timeout was the only reason SIT-15 ever queried. The protective
+    stop queries on the HAPPY path too: submitted is not protecting, so every
+    attach asks the orderbook. A broker that recorded nothing would make every
+    stop look dead, and every test here would pass for the wrong reason.
+
+    The knobs are kept separate because the module treats them separately:
+    ``refuse`` is a synchronous rejection, ``hide`` is an order accepted and
+    then not listed, and ``status_for`` is an order listed in a state that is
+    not protection. Collapsing them would hide the distinction this story is
+    about.
+    """
+
+    def __init__(self) -> None:
+        self.orders: list[object] = []
+        self.orderbook: dict[str, object] = {}
+        self.refuse: frozenset[OrderIntent] = frozenset()
+        self.hide: frozenset[OrderIntent] = frozenset()
+        self.status_for: dict[OrderIntent, OrderStatus] = {}
+
+    async def place_order(self, request) -> str:
+        self.orders.append(request)
+        if request.intent in self.refuse:
+            raise OrderRejectedError(
+                f"{request.intent.value} refused by RMS", reason_code="RMS_REJECT"
+            )
+        broker_order_id = f"BROKER-{len(self.orders):06d}"
+        if request.intent not in self.hide:
+            self.orderbook[request.client_order_id] = _landed_order(
+                request,
+                broker_order_id,
+                status=self.status_for.get(request.intent, OrderStatus.OPEN),
+            )
+        return broker_order_id
+
+    async def find_by_client_order_id(self, client_order_id: str):
+        return self.orderbook.get(client_order_id)
+
+    def intents(self, intent: OrderIntent) -> list:
+        return [o for o in self.orders if o.intent is intent]
+
+
+class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
+    """SIT-14 through SIT-16 end at an order reaching the broker. This asks
+    what happens *after* one fills, which is where the fifth invariant lives:
+    every position has a stop.
+
+    The component suite shows one position being protected, and one failure
+    being contained. It cannot show the three things that only exist at
+    session scale, and all three are the ones that would cost money:
+
+    * that a day of 316 fills yields 316 stops and not 315 — the missing one
+      being a real position with no exit but the square-off deadline;
+    * that a day on which the broker refuses EVERY stop still ends with
+      nothing open and the session still trading, because a contained failure
+      must not stop the day — "does not halt" is a claim about 316 failures,
+      not about one;
+    * that when the exits fail too, the escalation actually stops the day
+      rather than merely raising — which needs the halt latch and the risk
+      engine in the same test.
+
+    **The trigger is the test.** E15-S05 owns the fill-confirmation hook that
+    will call ``attach`` in production; until it exists, this file plays that
+    part deliberately, and says so rather than letting a reader infer wiring
+    that is not there.
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    @staticmethod
+    def _signals(session) -> list:
+        """The day's approved signals, minted ONCE — see SIT-15's note.
+
+        It matters more here than there. The stop's idempotency key is derived
+        from the POSITION's correlation_id, so a helper that re-minted would
+        give the same position a different stop on every call, and the replay
+        test would prove nothing while passing.
+        """
+        return [
+            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            for t in sorted(session.decisions)
+            if session.decisions[t].approved
+        ]
+
+    @staticmethod
+    def _positions(signals) -> list[Position]:
+        """The day's fills, as the position manager will one day record them."""
+        positions = []
+        for index, (decision, recommendation, ist_time) in enumerate(signals):
+            sizing = decision.sizing
+            assert sizing is not None and sizing.quantity > 0, "an approval sized to nothing"
+            positions.append(
+                Position(
+                    correlation_id=recommendation.correlation_id,
+                    symbol=recommendation.symbol,
+                    slot_index=index % 5,
+                    direction=recommendation.direction,
+                    quantity=sizing.quantity,
+                    entry_price=sizing.entry_price,
+                    stop_price=sizing.stop_price,
+                    opened_at=_at(TRADING_DAY, ist_time.hour, ist_time.minute),
+                    squareoff_deadline=_at(TRADING_DAY, 15, 15),
+                )
+            )
+        return positions
+
+    @staticmethod
+    def _attacher(broker, store, controller):
+        """The REAL gateway and the REAL halt controller. Only the socket and
+        the row store are substituted, which is the most that can be while the
+        claim is still "the assembled system protects its positions"."""
+        gateway = OrderGateway(
+            broker,
+            policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=store,
+        )
+        return gateway, ProtectiveStop(gateway, halter=controller, metrics=get_metrics())
+
+    @staticmethod
+    def _counter(name: str) -> float:
+        for metric in get_metrics().registry.collect():
+            for sample in metric.samples:
+                if sample.name == name:
+                    return sample.value
+        raise AssertionError(f"{name} is registered nowhere")
+
+    def _walk(self, positions, attacher, *, stop_on_first_raise=False):
+        """Attach a stop to every position in the day's order.
+
+        Returns the established ones and the failures, because both counts are
+        assertions somewhere below and "most of them worked" is never the
+        claim.
+        """
+        established, failures = [], []
+        for position in positions:
+            try:
+                established.append(
+                    asyncio.run(
+                        attacher.attach(
+                            position,
+                            trade_date=TRADING_DAY,
+                            now=position.opened_at,
+                        )
+                    )
+                )
+            except Exception as exc:
+                failures.append((position, exc))
+                if stop_on_first_raise:
+                    break
+        return established, failures
+
+    # -- the healthy day, which is also the control --------------------------
+
+    def test_every_filled_position_gets_exactly_one_live_stop(self, calendar) -> None:
+        """The count SIT-14 established for entries, one component along.
+
+        This is also the control for every test below it: without it, an
+        attacher that closed every position would satisfy all the failure
+        assertions and the book would simply never hold anything.
+        """
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+
+        established, failures = self._walk(positions, attacher)
+
+        assert len(positions) == 316, "the tradable window moved; the rest is untrustworthy"
+        assert failures == []
+        assert len(established) == len(positions)
+        assert len(broker.intents(OrderIntent.STOP)) == len(positions)
+        assert broker.intents(OrderIntent.SQUAREOFF) == [], "a healthy day exited a position"
+        assert len({e.stop_client_order_id for e in established}) == len(positions), (
+            "two positions were protected by one stop order"
+        )
+
+    def test_no_position_is_established_without_its_stop_reaching_the_broker(
+        self, calendar
+    ) -> None:
+        """Invariant 5, asserted at the SOCKET rather than in the database.
+
+        The entry goes through the real gateway too, so the pairing checked is
+        the one that exists in production: for every ENTRY that reached the
+        broker there is a STOP that reached it, carrying the key derived from
+        the position — not merely a row saying ``stop_price``.
+        """
+        session = self._session(calendar).run()
+        signals = self._signals(session)
+        positions = self._positions(signals)
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+
+        for decision, recommendation, _t in signals:
+            asyncio.run(gateway.submit_entry(decision, recommendation, trade_date=TRADING_DAY))
+        established, _failures = self._walk(positions, attacher)
+
+        entries = broker.intents(OrderIntent.ENTRY)
+        stops = {o.client_order_id for o in broker.intents(OrderIntent.STOP)}
+        assert len(entries) == len(positions) == len(established)
+        assert stops == {stop_client_order_id(p, trade_date=TRADING_DAY) for p in positions}, (
+            "an entry reached the broker whose stop did not"
+        )
+
+    # -- the day the broker refuses every stop -------------------------------
+
+    def test_a_day_of_refused_stops_leaves_nothing_open_and_keeps_trading(self, calendar) -> None:
+        """The claim that is only a claim at session scale.
+
+        One contained failure is a unit test. Three hundred and sixteen of them
+        not halting the day is the actual policy — one bad symbol must not stop
+        trading — and an implementation that escalated on the tenth would pass
+        every component test written for this story.
+        """
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        broker.refuse = frozenset({OrderIntent.STOP})
+        controller = HaltController(_SessionRedis())
+        _gateway, attacher = self._attacher(broker, store, controller)
+
+        established, failures = self._walk(positions, attacher)
+
+        assert established == [], "a position was called protected with no stop"
+        assert len(failures) == len(positions)
+        assert all(isinstance(exc, StopNotEstablishedError) for _p, exc in failures)
+        assert len(broker.intents(OrderIntent.SQUAREOFF)) == len(positions)
+        assert not asyncio.run(controller.is_halted()), (
+            "a contained failure stopped the day; one bad symbol must not"
+        )
+        assert self._counter("stop_attach_failures_total") == len(positions)
+        assert self._counter("naked_positions_total") == 0
+
+    def test_a_day_of_refused_stops_leaves_no_row_claiming_to_be_in_flight(self, calendar) -> None:
+        """SIT-003, and the reason it was found here rather than in the unit
+        suite: the defect is in what the day LEAVES BEHIND, not in what it
+        does. Every position was exited correctly and every exception was the
+        right one — and the store finished holding 316 rows that said an order
+        was in flight at a broker that had refused it.
+
+        Stated as a count over the whole store, because "the reconciliation
+        working set is clean at the end of the day" is the actual claim and
+        one row is not a working set.
+        """
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        broker.refuse = frozenset({OrderIntent.STOP})
+        _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+
+        self._walk(positions, attacher)
+
+        stops = [r for r in store.rows.values() if r["intent"] == OrderIntent.STOP.value]
+        exits = [r for r in store.rows.values() if r["intent"] == OrderIntent.SQUAREOFF.value]
+        assert len(stops) == len(exits) == len(positions)
+        assert {r["status"] for r in stops} == {"REJECTED"}
+        assert {r["status"] for r in exits} == {"SUBMITTED"}
+        assert all(r["rejection_reason"] for r in stops), (
+            "the broker's reason for refusing 316 stops was recorded nowhere"
+        )
+
+    def test_a_stop_the_broker_accepts_and_never_lists_is_treated_as_absent(self, calendar) -> None:
+        """Acceptance is not liveness, asserted across a whole day.
+
+        Distinct from the test above in the only way that matters: here every
+        submission SUCCEEDS. A system that trusted its own submission would
+        report a fully protected book and be wrong 316 times, with no exception
+        anywhere to notice.
+        """
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        broker.hide = frozenset({OrderIntent.STOP})
+        _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+
+        established, failures = self._walk(positions, attacher)
+
+        assert established == []
+        assert len(broker.intents(OrderIntent.STOP)) == len(positions), (
+            "the stops were never submitted, so liveness is not what was tested"
+        )
+        assert len(broker.intents(OrderIntent.SQUAREOFF)) == len(positions)
+        assert len(failures) == len(positions)
+
+    def test_a_stop_listed_as_rejected_is_not_protection(self, calendar) -> None:
+        """The third shape: submitted, listed, and dead. Same outcome."""
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        broker.status_for = {OrderIntent.STOP: OrderStatus.REJECTED}
+        _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+
+        established, failures = self._walk(positions, attacher)
+
+        assert established == []
+        assert len(failures) == len(positions)
+        assert len(broker.intents(OrderIntent.SQUAREOFF)) == len(positions)
+
+    # -- the day the exits fail too ------------------------------------------
+
+    def test_a_naked_position_halts_the_session_and_the_day_stops(self, calendar) -> None:
+        """The escalation, composed with the thing it escalates to.
+
+        The unit suite asserts that ``arm`` was called. That is a claim about a
+        method. The claim that matters is that the DAY stops, and it needs the
+        real latch and the real risk engine in one test: a halt that armed a
+        latch nothing reads would satisfy every component assertion while the
+        session carried on opening positions.
+        """
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        broker.refuse = frozenset({OrderIntent.STOP, OrderIntent.SQUAREOFF})
+        controller = HaltController(_SessionRedis())
+        _gateway, attacher = self._attacher(broker, store, controller)
+
+        _established, failures = self._walk(positions, attacher, stop_on_first_raise=True)
+
+        assert len(failures) == 1
+        assert isinstance(failures[0][1], NakedPositionError)
+        state = asyncio.run(controller.state())
+        assert state.kill_switch, "a naked position did not arm the kill switch"
+
+        after = self._session(calendar, kill_switch_active=state.kill_switch).run()
+        assert [d for d in after.decisions.values() if d.approved] == [], (
+            "the session kept approving after a position was left naked"
+        )
+        assert self._counter("naked_positions_total") == 1
+
+    def test_the_halt_names_the_naked_position_rather_than_a_neighbour(self, calendar) -> None:
+        """``UNKNOWN_POSITION`` means the broker reports a position we have no
+        record of — a different fact, and the one an operator would chase down
+        the wrong path at the worst possible moment."""
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        broker.refuse = frozenset({OrderIntent.STOP, OrderIntent.SQUAREOFF})
+        controller = HaltController(_SessionRedis())
+        _gateway, attacher = self._attacher(broker, store, controller)
+
+        self._walk(positions, attacher, stop_on_first_raise=True)
+
+        record = next(iter(asyncio.run(controller.state()).records.values()))
+        assert record.reason is HaltReason.NAKED_POSITION
+        assert positions[0].symbol in record.detail
+        assert record.armed_by == "protective-stop"
+
+    # -- restart, and the predicate the reconciler will call ------------------
+
+    def test_replaying_the_days_attachments_sends_nothing_the_second_time(self, calendar) -> None:
+        """The property that makes the derived key safe across a restart.
+
+        The stop carries no column in ``positions``; its key is recomputed from
+        the position. So a process that dies after protecting the book and
+        comes back must recompute the SAME keys and place nothing — and that is
+        a claim about 316 derivations agreeing, not one.
+        """
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+        first, _ = self._walk(positions, attacher)
+
+        replay = _OrderbookBroker()
+        replay.orderbook = broker.orderbook
+        _g2, attacher2 = self._attacher(replay, store, HaltController(_SessionRedis()))
+        second, failures = self._walk(positions, attacher2)
+
+        assert failures == []
+        assert [e.stop_broker_order_id for e in first] == [e.stop_broker_order_id for e in second]
+        assert replay.orders == [], "the restart placed a second stop on every position"
+
+    def test_is_protected_finds_the_one_stop_that_died_after_it_was_verified(
+        self, calendar
+    ) -> None:
+        """The predicate E15-S09 must call, walked across the whole book.
+
+        Every stop here was verified live at attach time, so no synchronous
+        check can see the failure — it happens afterwards, which is exactly the
+        case this story's build concern names. The count is the assertion: 315
+        still protected and EXACTLY one not, because a predicate that answered
+        False for the whole book would also "find" it.
+        """
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+        established, _ = self._walk(positions, attacher)
+        assert len(established) == len(positions)
+
+        casualty = positions[100]
+        cid = stop_client_order_id(casualty, trade_date=TRADING_DAY)
+        broker.orderbook[cid] = broker.orderbook[cid].model_copy(
+            update={"status": OrderStatus.REJECTED}
+        )
+
+        unprotected = [
+            p
+            for p in positions
+            if not asyncio.run(attacher.is_protected(p, trade_date=TRADING_DAY))
+        ]
+        assert unprotected == [casualty]
+
+    # -- cross-cutting -------------------------------------------------------
+
+    def test_no_credential_reached_the_log_on_a_day_of_naked_positions(self, calendar) -> None:
+        """The CRITICAL path logs broker exception text, which is the one place
+        a rejection reason from an untrusted source enters a log line."""
+        import re
+
+        session = self._session(calendar).run()
+        positions = self._positions(self._signals(session))
+        broker, store = _OrderbookBroker(), _SessionOrderStore()
+        broker.refuse = frozenset({OrderIntent.STOP})
+        _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+        self._walk(positions[:20], attacher)
+
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )

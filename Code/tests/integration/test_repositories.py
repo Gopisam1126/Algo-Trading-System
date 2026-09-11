@@ -437,6 +437,66 @@ class TestOrderRecoveryPath:
         assert found["status"] == "SUBMITTED"
         assert found["symbol"] == "INFY", "symbol_id was not translated back"
 
+    async def test_a_refused_order_is_recorded_with_the_brokers_reason(
+        self, session: AsyncSession, instruments: InstrumentRepository
+    ) -> None:
+        """SIT-003, against the real column. ``rejection_reason`` has existed
+        since the first migration and nothing had ever written it."""
+        orders = OrderRepository(session, instruments)
+        cid = f"cid-{uuid.uuid4().hex[:12]}"
+        await orders.insert_submitting(
+            {
+                "client_order_id": cid,
+                "correlation_id": uuid.uuid4(),
+                "symbol": "INFY",
+                "side": "BUY",
+                "order_type": "MARKET",
+                "product": "MIS",
+                "quantity": 5,
+                "intent": "STOP",
+            }
+        )
+        await session.flush()
+        await orders.mark_rejected(cid, reason="RMS: insufficient margin")
+        await session.flush()
+
+        found = await orders.find_by_client_order_id(cid)
+        assert found is not None
+        assert found["status"] == "REJECTED"
+        assert found["rejection_reason"] == "RMS: insufficient margin"
+        assert found["broker_order_id"] is None
+
+    async def test_a_refused_order_leaves_the_reconciliation_working_set(
+        self, session: AsyncSession, instruments: InstrumentRepository
+    ) -> None:
+        """The consequence that made SIT-003 worth fixing rather than noting.
+
+        ``open_orders`` is the set reconciliation walks every 30 seconds. A
+        refused order that stayed SUBMITTING sat in it for the rest of the
+        day, and the reconciler would have queried a broker that has never
+        heard of it, forever.
+        """
+        orders = OrderRepository(session, instruments)
+        cid = f"cid-{uuid.uuid4().hex[:12]}"
+        await orders.insert_submitting(
+            {
+                "client_order_id": cid,
+                "correlation_id": uuid.uuid4(),
+                "symbol": "INFY",
+                "side": "BUY",
+                "order_type": "MARKET",
+                "product": "MIS",
+                "quantity": 5,
+                "intent": "STOP",
+            }
+        )
+        await session.flush()
+        assert cid in {o["client_order_id"] for o in await orders.open_orders()}
+
+        await orders.mark_rejected(cid, reason="RMS")
+        await session.flush()
+        assert cid not in {o["client_order_id"] for o in await orders.open_orders()}
+
     async def test_unknown_client_order_id_returns_none(
         self, session: AsyncSession, instruments: InstrumentRepository
     ) -> None:

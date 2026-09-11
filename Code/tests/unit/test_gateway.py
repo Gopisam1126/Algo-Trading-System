@@ -138,8 +138,10 @@ class RecordingStore:
         self.rows: dict[str, dict] = {}
         self.inserts: list[dict] = []
         self.attaches: list[tuple[str, str]] = []
+        self.rejections: list[tuple[str, str | None]] = []
         self.fail_insert: Exception | None = None
         self.fail_attach: Exception | None = None
+        self.fail_reject: Exception | None = None
 
     async def insert_submitting(self, order: dict) -> int:
         if self.fail_insert is not None:
@@ -163,6 +165,13 @@ class RecordingStore:
         self.attaches.append((client_order_id, broker_order_id))
         self.rows[client_order_id]["broker_order_id"] = broker_order_id
         self.rows[client_order_id]["status"] = "SUBMITTED"
+
+    async def mark_rejected(self, client_order_id: str, *, reason: str | None) -> None:
+        if self.fail_reject is not None:
+            raise self.fail_reject
+        self.rejections.append((client_order_id, reason))
+        self.rows[client_order_id]["status"] = "REJECTED"
+        self.rows[client_order_id]["rejection_reason"] = reason
 
     async def find_by_client_order_id(self, client_order_id: str) -> dict | None:
         row = self.rows.get(client_order_id)
@@ -972,3 +981,111 @@ class TestTheChaosScenario:
         assert len(placer.submitted) == 1
         assert reconnected.submitted == [], "the reconnect placed a second order"
         assert len(store.inserts) == 1
+
+
+class TestARefusedOrderIsRecordedAsRefused:
+    """SIT-003. TX1 writes SUBMITTING before the broker call, and nothing wrote
+    the outcome when the broker said no.
+
+    The row then asserted "in flight" about an order that would never exist,
+    ``open_orders`` — documented as the reconciliation working set — would hand
+    it to the reconciler every 30 seconds forever, and the broker's reason code
+    went into an exception message and nowhere durable, past a
+    ``rejection_reason`` column that has existed since the first migration.
+    """
+
+    async def test_a_rejection_is_recorded_rather_than_left_in_flight(self) -> None:
+        placer, store = RecordingPlacer(), RecordingStore()
+        placer.fail_with = OrderRejectedError("RMS: insufficient margin", reason_code="RMS")
+
+        with pytest.raises(OrderRejectedError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+
+        (row,) = store.rows.values()
+        assert row["status"] == "REJECTED", "a refused order still reads as in flight"
+        assert row["broker_order_id"] is None
+
+    async def test_the_brokers_reason_is_persisted_not_just_raised(self) -> None:
+        """The audit half. An exception is gone the moment it is handled."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        placer.fail_with = OrderRejectedError("RMS: insufficient margin", reason_code="RMS")
+
+        with pytest.raises(OrderRejectedError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+
+        ((_cid, reason),) = store.rejections
+        assert reason is not None and "insufficient margin" in reason
+
+    async def test_a_refused_order_is_terminal_and_is_never_resubmitted(self) -> None:
+        """The behaviour the record buys: REJECTED has no legal move to
+        SUBMITTED, so a retry is refused by the state machine rather than
+        sent to a broker that has already said no.
+
+        Before the fix the retry took the SUBMITTING path, queried the broker,
+        found nothing and reported ``OrderNeverLandedError`` — "it never
+        landed", about an order that landed and was refused. Fail-closed
+        either way; truthful only now.
+        """
+        placer, store = RecordingPlacer(), RecordingStore()
+        placer.fail_with = OrderRejectedError("RMS", reason_code="RMS")
+        with pytest.raises(OrderRejectedError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+
+        placer.fail_with = None
+        before = len(placer.submitted)
+        with pytest.raises(IllegalTransitionError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        assert len(placer.submitted) == before, "a refused order was sent again"
+
+    async def test_an_unrecordable_rejection_still_raises_the_brokers_error(self) -> None:
+        """A persistence failure must not replace the broker's exception.
+
+        The caller needs "the broker refused this, here is why", not "the
+        database is down" — and the row left in SUBMITTING is exactly the
+        prior behaviour, which reconciliation can still resolve.
+        """
+        placer, store = RecordingPlacer(), RecordingStore()
+        placer.fail_with = OrderRejectedError("RMS: circuit limit", reason_code="RMS")
+        store.fail_reject = RuntimeError("connection reset")
+
+        with pytest.raises(OrderRejectedError, match="circuit limit"):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        (row,) = store.rows.values()
+        assert row["status"] == "SUBMITTING"
+
+    async def test_an_unmodelled_failure_still_means_we_do_not_know(self) -> None:
+        """The control, and the reason this catches ``OrderRejectedError``
+        rather than ``Exception``.
+
+        SUBMITTING means "we do not know whether it landed", and for an
+        unmodelled error that is the truth. Recording those as REJECTED would
+        assert a refusal nobody observed, and close the query path §8.2 needs.
+        """
+        placer, store = RecordingPlacer(), RecordingStore()
+        placer.fail_with = RuntimeError("the socket closed mid-write")
+
+        with pytest.raises(RuntimeError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        (row,) = store.rows.values()
+        assert row["status"] == "SUBMITTING"
+        assert store.rejections == []
+
+    async def test_the_ordinary_path_records_no_rejection(self) -> None:
+        """The other control: a gateway that marked everything rejected would
+        pass every test above."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        await _gateway(placer, store=store).submit_entry(_approved(), _rec(), trade_date=TRADE_DATE)
+        assert store.rejections == []
+        assert [r["status"] for r in store.rows.values()] == ["SUBMITTED"]

@@ -184,6 +184,9 @@ def _real_gateway():
         async def attach_broker_id(self, cid, bid):  # pragma: no cover
             return None
 
+        async def mark_rejected(self, cid, *, reason):  # pragma: no cover
+            return None
+
         async def find_by_client_order_id(self, cid):  # pragma: no cover
             return None
 
