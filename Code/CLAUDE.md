@@ -457,6 +457,15 @@ Recorded because each was believed, written down, and wrong.
   EMERGENCY EXIT's acceptance in the same file — the identical defect, one
   component further along, written by the same hand on the same day. Found by
   the STRIDE pass against the story's own diff, not by a test. QA-E15-11.
+- **"The failure path is correct because the failure was handled."** Handling
+  an error is not the same as recording it. A refused order was raised
+  correctly, exited correctly, logged correctly — and left a database row
+  saying it was in flight, with the broker's reason code discarded past a
+  column that had waited since the first migration to receive it. Every
+  *action* was right and the *record* was false, which is why no test failed:
+  the unit test for that exact input asserted what must NOT happen
+  (`find_calls == []`) and never asked what did. SIT-003, found by running a
+  whole session and then looking at what it left behind.
 - **"An empty file is an empty file."** `broker/__init__.py` being empty is
   *load-bearing*. `AppConfig` has one upward import — a deferred
   `broker.profiles` — and what makes it cheap is that reaching `profiles`

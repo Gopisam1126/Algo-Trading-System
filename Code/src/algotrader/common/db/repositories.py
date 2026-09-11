@@ -98,6 +98,7 @@ class BarRepositoryProtocol(Protocol):
 class OrderRepositoryProtocol(Protocol):
     async def insert_submitting(self, order: dict[str, Any]) -> int: ...
     async def attach_broker_id(self, client_order_id: str, broker_order_id: str) -> None: ...
+    async def mark_rejected(self, client_order_id: str, *, reason: str | None) -> None: ...
     async def find_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None: ...
     async def open_orders(self) -> list[dict[str, Any]]: ...
 
@@ -765,6 +766,32 @@ class OrderRepository:
             .values(
                 broker_order_id=broker_order_id,
                 status="SUBMITTED",
+                last_update_at=dt.datetime.now(dt.UTC),
+            )
+        )
+
+    async def mark_rejected(self, client_order_id: str, *, reason: str | None) -> None:
+        """TX2's other outcome: the broker refused the order (SIT-003).
+
+        ``attach_broker_id`` records the call that succeeded. Nothing recorded
+        the call that was REFUSED, so the row kept saying SUBMITTING — "this
+        order is in flight" about an order that will never exist — and
+        ``open_orders`` below, documented as the reconciliation working set,
+        would hand it to the reconciler every 30 seconds forever.
+
+        ``rejection_reason`` is written here because the column has existed
+        since the first migration and nothing has ever populated it. The
+        broker's reason code is the only explanation of why an order died, and
+        it was being discarded with the exception.
+        """
+        from sqlalchemy import update
+
+        await self._session.execute(
+            update(Order)
+            .where(Order.client_order_id == client_order_id)
+            .values(
+                status="REJECTED",
+                rejection_reason=reason,
                 last_update_at=dt.datetime.now(dt.UTC),
             )
         )

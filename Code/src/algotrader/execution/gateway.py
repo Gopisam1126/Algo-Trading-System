@@ -91,7 +91,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Final, Protocol
 
-from algotrader.broker.adapter import AmbiguousOrderError
+from algotrader.broker.adapter import AmbiguousOrderError, OrderRejectedError
 from algotrader.common.enums import (
     Direction,
     OrderIntent,
@@ -161,6 +161,8 @@ class OrderStore(Protocol):
     async def insert_submitting(self, order: dict[str, Any]) -> int: ...
 
     async def attach_broker_id(self, client_order_id: str, broker_order_id: str) -> None: ...
+
+    async def mark_rejected(self, client_order_id: str, *, reason: str | None) -> None: ...
 
     async def find_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None: ...
 
@@ -403,10 +405,46 @@ class OrderGateway:
         except AmbiguousOrderError:
             # The one branch this story exists for. Query, never retry.
             broker_order_id = await self._recover(cid)
+        except OrderRejectedError as exc:
+            # SIT-003. A refusal is the one failure whose outcome we KNOW, and
+            # it was the one left unrecorded: the row kept saying SUBMITTING
+            # about an order the broker will never have. Every other exception
+            # deliberately still leaves SUBMITTING, because "we do not know"
+            # is what that row means and querying is the right response to it.
+            await self._reject(cid, exc)
+            raise
 
         await self._attach(cid, broker_order_id)
         log.info("submitted %s for %s as broker order %s", cid, request.symbol, broker_order_id)
         return broker_order_id
+
+    async def _reject(self, cid: str, exc: OrderRejectedError) -> None:
+        """Record a definitive refusal. Never raises (SIT-003).
+
+        Swallowing follows :meth:`_attach`'s reasoning one step further: the
+        caller is about to receive the broker's own rejection, which is the
+        more useful exception. Replacing it with a persistence error would
+        lose the reason code and say "the database failed" about an order the
+        broker refused. A row left in ``SUBMITTING`` is the prior behaviour —
+        recoverable by reconciliation, and no worse than before.
+        """
+        try:
+            await self._store.mark_rejected(cid, reason=one_safe_line(str(exc)))
+        # Deliberately total: see the docstring.
+        except Exception as store_exc:
+            log.error(
+                "order %s was REJECTED by the broker but the rejection could not "
+                "be recorded: %s. The row still reads SUBMITTING; reconciliation "
+                "must resolve it.",
+                cid,
+                one_safe_line(str(store_exc)),
+            )
+            return
+        log.warning(
+            "order %s was rejected by the broker (%s); recorded as REJECTED",
+            cid,
+            one_safe_line(str(exc)),
+        )
 
     def build_stop(self, position: Position, *, trade_date: dt.date) -> OrderRequest:
         """The protective stop for an open position.

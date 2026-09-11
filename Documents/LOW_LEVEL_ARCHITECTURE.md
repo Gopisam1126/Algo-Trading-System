@@ -685,6 +685,21 @@ Every clamp is applied and the binding constraint is recorded in the audit log �
   reconciliation to *query* rather than resubmit. A gateway cannot be
   constructed without a store, so there is no configuration in which orders are
   placed untracked.
+- **Records an outright rejection as `REJECTED`, with the broker's reason**
+  (SIT-003). `SUBMITTING` means *we do not know whether this order landed*, and
+  leaving a refused order in it states the one thing we do know is false — the
+  row claims an order is in flight at a broker that has refused it, and
+  `open_orders()` (§8.3's working set) hands it to reconciliation every 30
+  seconds forever. `orders.rejection_reason` is written here; it had existed
+  since the first migration with nothing populating it, and a broker's reason
+  code is the only explanation of why an order died.
+
+  Deliberately **only** for `OrderRejectedError`. Every other exception still
+  leaves `SUBMITTING`, because for an unmodelled failure that is the truth, and
+  it is what keeps the query path below reachable. Recording the refusal never
+  raises: the caller is about to receive the broker's own rejection, which is
+  the more useful exception, and replacing it with a persistence error would
+  say "the database failed" about an order the broker refused.
 - **On an ambiguous failure, queries by `client_order_id` and never retries.**
   If the order is in the broker's orderbook it is adopted; if it is genuinely
   absent the gateway raises `OrderNeverLandedError` rather than resubmitting on
@@ -993,8 +1008,17 @@ above does not show, each because the broker can actually produce it:
 | `SUBMITTED -> FILLED`, `OPEN -> FILLED` | A MARKET order — this system's entry — commonly fills whole, and reconciliation polls every 30s, so most fills are *observed* complete with no partial ever seen. Requiring `PARTIAL` would make the normal case illegal. |
 | `SUBMITTED -> {REJECTED, CANCELLED}` | Kite accepts into `PUT ORDER REQ RECEIVED` and the exchange can reject or cancel afterwards. |
 | `SUBMITTING -> {OPEN, FILLED, CANCELLED, REJECTED}` | §8.2's own recovery path: an ambiguous submission is queried and the broker reports the order it already holds — possibly already filled — while our row still says `SUBMITTING`. Without these the outcome of a recovered timeout cannot be written down. |
+| `SUBMITTING -> REJECTED` | Written by the gateway itself since SIT-003, not only observed from the broker: an outright refusal is the one failure whose outcome is known at the moment it happens. |
 | `PARTIAL -> CANCELLED` | A partly filled order cancelled at square-off; the filled quantity is a real position. |
 | `* -> RECONCILE_REQUIRED` from every non-terminal state | `status_in` returns it for any Kite status we do not model, which can arrive on any poll. |
+
+**`SUBMIT_FAILED` is modelled and nothing writes it yet.** Stated here because
+the gap is invisible from the table: a transition set can be complete,
+internally consistent and verified, and still contain a state no caller ever
+reaches — reachability is a property of the callers, not of the table, so
+`order_state._verify_table` cannot see it. Until SIT-003 the same was true of
+`REJECTED`. `SUBMIT_FAILED` belongs to the reconciliation path (E15-S09), and
+the constraint is recorded on that story rather than left to be rediscovered.
 
 **Two exclusions are deliberate and will look like bugs.** `PARTIAL -> OPEN` is
 refused even though Kite reports `OPEN` for a partially-filled order — going
