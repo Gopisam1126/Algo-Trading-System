@@ -119,17 +119,25 @@ def indicator_state(symbol: str, timeframe: Timeframe | str) -> str:
 
 
 def current_bar(symbol: str, timeframe: Timeframe | str) -> str:
-    """HASH — the bar currently being built. Not yet persisted; not yet final."""
+    """HASH — the bar being built. Not yet persisted; not yet final.
+
+    Nothing writes this yet, so the type above is still the SPEC's intent
+    rather than an observed fact - unlike ``quote`` and ``position_state``,
+    which are written as JSON strings.
+    """
     return f"{STATE}:bar:current:{_safe(symbol, 'symbol')}:{_tf(timeframe)}"
 
 
 def quote(symbol: str) -> str:
-    """HASH — latest quote. 60 s TTL: an expired quote IS the staleness signal."""
+    """JSON string — latest quote. TTL: an expired quote IS the staleness signal."""
     return f"{STATE}:quote:{_safe(symbol, 'symbol')}"
 
 
 def position_state(symbol: str) -> str:
-    """HASH — live position. No TTL; deleted on close."""
+    """JSON string — live position. No TTL; deleted on close.
+
+    Written by ``PositionManager`` as a ``PositionSnapshot`` (E15-S05).
+    """
     return f"{STATE}:position:{_safe(symbol, 'symbol')}"
 
 

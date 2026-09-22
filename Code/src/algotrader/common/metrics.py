@@ -99,6 +99,31 @@ class Metrics:
             registry=self.registry,
         )
 
+        # -- execution: the book (E15-S05) -----------------------------------
+        # Registered here rather than read by name off a double, which is the
+        # defect QA-E15-13 caught on E15-S04's two counters: a tolerant getattr
+        # makes the code robust and makes the gap invisible.
+        self.positions_opened_total = Counter(
+            "positions_opened_total",
+            "Positions opened from a confirmed fill and protected by a verified "
+            "live stop. Only the good path increments this.",
+            registry=self.registry,
+        )
+        self.partial_fills_total = Counter(
+            "partial_fills_total",
+            "Entries or exits that filled for less than the quantity ordered. "
+            "Each one is a position whose size is not the size that was asked "
+            "for, which is the number every downstream check must use.",
+            registry=self.registry,
+        )
+        self.unprotectable_fills_total = Counter(
+            "unprotectable_fills_total",
+            "Fills whose price put the approved stop on the wrong side of entry. "
+            "The holding was exited at market and never became a position; a "
+            "rising count means entries are slipping through their own stops.",
+            registry=self.registry,
+        )
+
     def rejected(self, check: str, reason: str) -> None:
         self.signals_rejected_total.labels(check=check, reason=reason).inc()
 
