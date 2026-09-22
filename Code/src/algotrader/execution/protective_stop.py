@@ -75,7 +75,7 @@ from typing import Protocol
 from algotrader.common.enums import OrderStatus
 from algotrader.common.models.trading import Order, Position
 from algotrader.common.text import one_safe_line
-from algotrader.execution.gateway import client_order_id
+from algotrader.execution.gateway import Closable, client_order_id
 from algotrader.execution.halt import HaltReason
 
 log = logging.getLogger(__name__)
@@ -133,7 +133,7 @@ class StopGateway(Protocol):
 
     async def submit_stop(self, position: Position, *, trade_date: dt.date) -> str: ...
 
-    async def submit_exit(self, position: Position, *, trade_date: dt.date) -> str: ...
+    async def submit_exit(self, position: Closable, *, trade_date: dt.date) -> str: ...
 
     async def find_order(self, client_order_id_: str) -> Order | None: ...
 
@@ -154,7 +154,7 @@ class EstablishedPosition:
     established_at: dt.datetime
 
 
-def _exit_cid(position: Position, trade_date: dt.date) -> str:
+def _exit_cid(position: Closable, trade_date: dt.date) -> str:
     """The emergency exit's idempotency key, derived like the stop's."""
     from algotrader.common.enums import Direction, OrderIntent, Side
 
@@ -168,7 +168,7 @@ def _exit_cid(position: Position, trade_date: dt.date) -> str:
     )
 
 
-def stop_client_order_id(position: Position, *, trade_date: dt.date) -> str:
+def stop_client_order_id(position: Closable, *, trade_date: dt.date) -> str:
     """The idempotency key of this position's protective stop.
 
     Derivable from the position alone, which is what makes a schema change
@@ -291,8 +291,32 @@ class ProtectiveStop:
         cid = stop_client_order_id(position, trade_date=trade_date)
         return is_live(await self._gateway.find_order(cid))
 
+    async def exit_now(
+        self,
+        target: Closable,
+        *,
+        trade_date: dt.date,
+        now: dt.datetime,
+        because: str,
+    ) -> None:
+        """Exit a holding at market because it cannot be protected.
+
+        The same path :meth:`attach` takes when a stop fails, made public for
+        E15-S05. A fill whose price puts the approved stop on the wrong side of
+        entry is a real holding that **cannot be represented as a**
+        ``Position`` at all - so it can never reach :meth:`attach`, and without
+        a public door the position manager would have had to reach past this
+        object to the gateway. §5.7 keeps the gateway behind one boundary, and
+        the policy for "unprotected, therefore exit, and halt if the exit
+        fails" belongs here rather than in a second copy.
+
+        Raises :class:`NakedPositionError` if the exit itself cannot be
+        established, having armed the halt first.
+        """
+        await self._emergency_close(target, trade_date=trade_date, now=now, because=because)
+
     async def _emergency_close(
-        self, position: Position, *, trade_date: dt.date, now: dt.datetime, because: str
+        self, position: Closable, *, trade_date: dt.date, now: dt.datetime, because: str
     ) -> None:
         """Close at market now. If that fails too, halt the session."""
         self._count("stop_attach_failures_total")

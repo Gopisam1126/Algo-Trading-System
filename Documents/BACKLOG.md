@@ -2076,14 +2076,47 @@ Full lifecycle per LOW_LEVEL_ARCHITECTURE §8.2 with illegal transitions rejecte
 
 ---
 
-### E15-S05 · Position manager
+### E15-S05 · Position manager 🔴
 `P0` `Phase 5` `🔴` `FEAT` · **2 days** · deps: E15-S04
 
+> As a trader, I want the system to know exactly what it is holding — opened
+> only from a real fill, protected before it counts as held, and priced
+> continuously — so that every other safety mechanism is reasoning about the
+> actual book rather than the one it intended to have.
+
+**The story arrived with four tasks, no user story and no acceptance criteria
+at all**, on a safety-critical item. Phase 1 wrote them; the task list was also
+missing the fill-confirmation trigger, which E15-S04 had recorded as belonging
+here and is the most important thing the story delivers.
+
 **Tasks**
-- [ ] Track open positions with live P&L
-- [ ] MFE/MAE tracking for the journal
-- [ ] R-multiple computation
-- [ ] Position state in Redis for fast reads
+- [x] Confirm a fill: how much filled, at what price, and refuse to call
+      anything else a fill — gating on `filled_quantity`, never status
+- [x] **The fill-confirmation trigger that calls `ProtectiveStop.attach`**
+      *(inherited from E15-S04; was absent from the task list)*
+- [x] Track open positions with live P&L
+- [x] MFE/MAE tracking for the journal — including **persisting** them, which
+      nothing did: the columns existed since the first migration with no
+      writer and no reader
+- [x] R-multiple computation *(largely delivered by E14-S07 on the model)*
+- [x] Position state in Redis for fast reads
+- [x] Confirm the **fill** of an emergency exit *(E15-S04 proves the exit is
+      live, not that it filled)*
+- [x] **Added:** a fill that lands through its own approved stop is exited at
+      market and never becomes a position
+
+**Acceptance**
+- [x] 🔴 A position is opened for the quantity that **filled** at the price it
+      filled, never the quantity ordered
+- [x] 🔴 Nothing enters the book as protected without a verified live stop —
+      the protected variant is constructible only from an `EstablishedPosition`
+- [x] 🔴 A position whose stop could not be established stays tracked until its
+      exit is confirmed **filled**
+- [x] MFE and MAE are the running extremes of unrealised P&L and survive a
+      round trip through Redis and through Postgres *(property-tested)*
+- [x] 🔴 A position rebuilt from the database is **never** presumed protected —
+      `restore()` yields `UnverifiedPosition` and there is no path from a row
+      to the protected type. **E15-S09's loop is what resolves it.**
 
 ---
 

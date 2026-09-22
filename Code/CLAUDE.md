@@ -134,9 +134,9 @@ sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
 order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
-the gateway are unbuilt: no position manager (E15-S05) and no reconciliation
-loop (E15-S09). The order state machine (E15-S03) and protective stop
-attachment (E15-S04) now exist. **A gateway is not a trading
+the gateway are unbuilt: no reconciliation loop (E15-S09) and no square-off
+timer (E15-S06). The order state machine (E15-S03), protective stop attachment
+(E15-S04) and the position manager (E15-S05) now exist. **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
@@ -442,6 +442,34 @@ Recorded because each was believed, written down, and wrong.
   this was. The rule they broke was already written on the field directly above
   them: *"`None` means the broker did not answer, which is a rejection and
   never an assumption."* AUDIT-005.
+- **E15-S05 position manager** — `execution/positions.py`, the book. A tracked
+  position is one of three **types**, not a status field: `ProtectedPosition`
+  (holds an `EstablishedPosition`), `ExitingPosition` (a live exit whose fill is
+  unconfirmed), `UnverifiedPosition` (restored from a row, protection unknown).
+  It carries **the fill-confirmation trigger** E15-S04 recorded as belonging
+  here, so the protective stop is no longer built-and-unwired. Fills are
+  confirmed on `filled_quantity`, never status. Mutation: 24 injected, 24
+  killed.
+
+- **"A type annotation is a guarantee."** It is a guarantee to mypy, about
+  `src/`. `ProtectedPosition` is the type that proves a position is protected,
+  and as a plain frozen dataclass it accepted a database row without complaint —
+  constructing exactly the object it exists to make impossible. Dataclasses do
+  not check types at runtime. Found by writing the test that asserts the
+  guarantee instead of assuming the annotation was one. QA-E15-15.
+- **"The columns are there, so the data is there."** `max_favourable_excursion`
+  and `max_adverse_excursion` have existed since the first migration; nothing
+  wrote them and `_position_to_dict` did not return them, so a restart silently
+  reset every position's excursions to zero. Same shape as the exposure caps
+  binding on nothing and `SUBMIT_FAILED` being modelled and unreachable: the
+  artefact exists, looks complete, and is connected at neither end. QA-E15-16.
+- **"An edit anchored on `class X:` lands before the class."** It lands before
+  the class and *after* its decorator. Inserting a protocol above
+  `class GatewayPolicy:` made the new protocol the `@dataclass` and left
+  `GatewayPolicy` without one — no generated `__init__`, and the
+  `__post_init__` that refuses `market_protection=0` never called. Valid
+  Python, caught by mypy before any test ran. Anchor on the decorator when
+  there is one. QA-E15-18.
 - **"`stop_price` NOT NULL means the position has a stop."** It means the
   position has a stop *price* — the number the sizer chose, written whether or
   not any order is protecting anything. BR-1 makes the column non-null and the

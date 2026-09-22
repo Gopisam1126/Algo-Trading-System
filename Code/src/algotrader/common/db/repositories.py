@@ -910,12 +910,20 @@ class PositionRepository:
         exit_reason: str,
         realized_pnl: Decimal,
         closed_at: dt.datetime | None = None,
+        max_favourable_excursion: Decimal | None = None,
+        max_adverse_excursion: Decimal | None = None,
     ) -> None:
         """Close a position. All three exit fields are required together.
 
         The ``ck_closed_complete`` CHECK enforces this at the database level too
         — a CLOSED row that cannot say when, at what price, or why is an
         unauditable hole in the trade record and a tax-reporting problem.
+
+        The excursions are OPTIONAL because they are journal data, not audit
+        data, and a close must never fail for want of them. E15-S05 added
+        them: without a writer, "MFE/MAE tracking" would have computed two
+        numbers in memory and dropped them at the one moment they become
+        history.
         """
         from sqlalchemy import update
 
@@ -928,6 +936,8 @@ class PositionRepository:
                 exit_price=exit_price,
                 exit_reason=exit_reason,
                 realized_pnl=realized_pnl,
+                max_favourable_excursion=max_favourable_excursion,
+                max_adverse_excursion=max_adverse_excursion,
             )
         )
 
@@ -950,6 +960,12 @@ class PositionRepository:
             "exit_price": row.exit_price,
             "exit_reason": row.exit_reason,
             "realized_pnl": row.realized_pnl,
+            # Omitted until E15-S05, and open_positions() is how the book is
+            # rebuilt after a restart - so a restart silently reset every
+            # excursion to zero while the columns held the real values. The
+            # gap was invisible because the only reader never asked.
+            "max_favourable_excursion": row.max_favourable_excursion,
+            "max_adverse_excursion": row.max_adverse_excursion,
         }
 
 

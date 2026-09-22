@@ -90,6 +90,7 @@ import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Final, Protocol
+from uuid import UUID
 
 from algotrader.broker.adapter import AmbiguousOrderError, OrderRejectedError
 from algotrader.common.enums import (
@@ -251,6 +252,33 @@ def client_order_id(
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:CLIENT_ORDER_ID_LENGTH]
 
 
+class Closable(Protocol):
+    """The four facts an exit order needs, and nothing more.
+
+    ``build_exit`` never reads ``entry_price`` or ``stop_price``, so requiring
+    a whole :class:`Position` was a coupling rather than a requirement - and a
+    load-bearing one: E15-S05 must exit a fill whose price makes the approved
+    stop invalid, which is precisely a holding that CANNOT be expressed as a
+    ``Position`` (the model refuses a long whose stop is at or above entry).
+    Widening to what is actually used lets the dangerous case be exited instead
+    of raising a validation error with a real position open.
+
+    ``Position`` satisfies this structurally; nothing had to change to fit.
+    """
+
+    @property
+    def correlation_id(self) -> UUID: ...
+
+    @property
+    def symbol(self) -> str: ...
+
+    @property
+    def direction(self) -> Direction: ...
+
+    @property
+    def quantity(self) -> int: ...
+
+
 @dataclass(frozen=True)
 class GatewayPolicy:
     """The configured values every order carries.
@@ -339,7 +367,7 @@ class OrderGateway:
 
     async def submit_exit(
         self,
-        position: Position,
+        position: Closable,
         *,
         trade_date: dt.date,
         intent: OrderIntent = OrderIntent.SQUAREOFF,
@@ -483,7 +511,7 @@ class OrderGateway:
 
     def build_exit(
         self,
-        position: Position,
+        position: Closable,
         *,
         trade_date: dt.date,
         intent: OrderIntent = OrderIntent.SQUAREOFF,

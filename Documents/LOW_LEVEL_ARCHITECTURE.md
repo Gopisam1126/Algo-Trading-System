@@ -384,8 +384,8 @@ Explicit naming convention prevents collisions and makes `SCAN`-based debugging 
 # ---- Hot state (Hashes) ----
 state:indicator:{symbol}:{timeframe}      → HASH  {ema20, ema50, rsi14, atr14, macd, ...}
 state:bar:current:{symbol}:{timeframe}    → HASH  {o,h,l,c,v,open_ts}  (in-progress bar)
-state:quote:{symbol}                      → HASH  {ltp, bid, ask, volume, ts}
-state:position:{symbol}                   → HASH  (mirror of positions row, for fast reads)
+state:quote:{symbol}                      → STRING (JSON QuoteState)
+state:position:{symbol}                   → STRING (JSON PositionSnapshot, for fast reads)
 state:slots                               → HASH  {0: "RELIANCE", 1: null, ...}
 
 # ---- Daily plan (String, JSON) ----
@@ -415,6 +415,15 @@ ratelimit:orders                          → STRING  (token bucket counter, per
 # ---- Timers (Sorted Set: score = unix ts of deadline) ----
 timer:squareoff                           → ZSET   {symbol → deadline_epoch}
 ```
+
+**Correction, E15-S05.** The two `state:*` keys that are actually implemented
+hold **JSON strings**, not hashes — `state.set_state` writes
+`model_dump_json`, because that round-trips `Decimal` exactly and money is
+never a float here; a hash of stringified decimals would re-introduce parsing
+at every read. `HGETALL` against them raises `WRONGTYPE`. The keys above are
+corrected to match the code. `state:indicator` and `state:bar:current` still
+say HASH because **nothing writes them yet** — that is the spec's intent, not
+an observed fact, and `state:slots` genuinely is a hash.
 
 **Key design decision:** `stream:*` uses Redis **Streams with consumer groups**, not Pub/Sub. Pub/Sub is fire-and-forget — a consumer that restarts loses everything published while it was down. For ticks that is acceptable (the next tick supersedes), but for **signals, orders, and audit events it is not**. Streams give at-least-once delivery, explicit acknowledgement, and pending-entry recovery after a crash.
 
@@ -743,6 +752,53 @@ Every clamp is applied and the binding constraint is recorded in the audit log �
 ### 5.8 `PositionManager` and the square-off timer
 
 **Responsibility:** Track open positions, manage trailing stops and partial exits, and guarantee constraint C5 (own-terms exit before the broker's deadline).
+
+Since E15-S05 the book lives in `execution/positions.py`. **A tracked position
+is one of three TYPES, not a status field:**
+
+| Type | Means |
+|---|---|
+| `ProtectedPosition` | Holds an `EstablishedPosition` — a stop was verified live at the broker |
+| `ExitingPosition` | The stop could not be established; a market exit is live and its fill is **not yet confirmed** |
+| `UnverifiedPosition` | Restored from the database; whether any order protects it is **unknown** |
+
+A boolean `is_protected` would read identically and permit the one state this
+design exists to prevent — a position called protected because a field said so.
+A flag can be set; an `EstablishedPosition` can only be *obtained*, and only
+from the success path of `ProtectiveStop.attach`. There is deliberately **no
+code path from a database row to `ProtectedPosition`**: `stop_price` is NOT
+NULL on every row (BR-1), so a row guarantees the *price* and can say nothing
+about the *order*. Resolving an `UnverifiedPosition` means asking the broker,
+which is E15-S09's loop.
+
+**Fills are confirmed on `filled_quantity`, never on status.** Kite reports
+`OPEN` for a partially filled order, and `PARTIAL -> CANCELLED` is legal and
+real — a partly filled order cancelled at square-off, whose filled quantity is
+a genuine position. A status-driven implementation opens nothing for the
+cancelled case and a *full-size* position for the partial; a full-size position
+gets a full-size stop, and that stop sells shares that do not exist when it
+triggers. The protective mechanism becomes a naked short.
+
+**A fill can land through its own stop.** A long that fills at or below its
+approved stop is already past it, and cannot be expressed as a `Position` at
+all — the model refuses it. That holding is exited at market via
+`ProtectiveStop.exit_now` and never becomes a position. Nothing is written to
+`positions` for it on purpose: a row claiming a stop that is not on the
+protective side of entry would be a false record, and the exit order carries
+the same `correlation_id` for anyone tracing it.
+
+**The row is written before the stop is attached**, which is §8.2's TX1/TX2
+reasoning one component along. Dying after the insert leaves a position whose
+stop is missing, and reconciliation exits one position. Dying after the attach
+with no row leaves the broker holding a position we have no record of, which
+§8.3 says trips the kill switch. Losing a trade beats losing the day.
+
+**An exit is not done when it is placed.** `confirm_exit` gates on
+`filled_quantity` and leaves a partially filled exit open for the remainder,
+because a half-exited position is still a position. `ExitReason.UNPROTECTED` is
+its own member rather than the nearest neighbour: `STOP` would claim a stop
+existed and triggered, `MANUAL` would claim a human decided, `KILLSWITCH` would
+claim the session was halted — each sends a reader somewhere wrong.
 
 **Per-stock deadline computation:**
 

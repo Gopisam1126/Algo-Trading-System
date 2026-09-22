@@ -94,6 +94,16 @@ class PositionStatus(StrEnum):
 
 
 class ExitReason(StrEnum):
+    """Why a position was closed.
+
+    ``UNPROTECTED`` is its own member rather than the nearest plausible
+    neighbour, for the reason ``HaltReason.NAKED_POSITION`` is (E15-S04):
+    ``STOP`` would claim a stop existed and triggered, ``MANUAL`` would claim a
+    human decided, and ``KILLSWITCH`` would claim the session was halted. All
+    three are false, and each sends whoever reads the journal down a different
+    wrong path.
+    """
+
     STOP = "STOP"
     TARGET = "TARGET"
     TRAILING_STOP = "TRAILING_STOP"
@@ -101,6 +111,10 @@ class ExitReason(StrEnum):
     THESIS_INVALIDATED = "THESIS_INVALIDATED"
     KILLSWITCH = "KILLSWITCH"
     MANUAL = "MANUAL"
+    #: The protective stop could not be established, so the position was exited
+    #: at market instead of being kept. E15-S04 places the exit; E15-S05
+    #: confirms its fill and writes this reason.
+    UNPROTECTED = "UNPROTECTED"
 
 
 class SessionState(StrEnum):
