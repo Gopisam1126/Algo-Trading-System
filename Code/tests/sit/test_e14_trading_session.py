@@ -37,12 +37,16 @@ from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_s
 from algotrader.common.enums import (
     AIVerdict,
     Direction,
+    ExitReason,
     OrderIntent,
     OrderStatus,
+    OrderType,
+    Product,
     RejectReason,
+    Side,
 )
 from algotrader.common.metrics import get_metrics, reset_metrics_for_testing
-from algotrader.common.models.trading import Position, Recommendation
+from algotrader.common.models.trading import Order, Position, Recommendation
 from algotrader.execution.gateway import GatewayError, GatewayPolicy, OrderGateway
 from algotrader.execution.halt import (
     HaltController,
@@ -50,6 +54,13 @@ from algotrader.execution.halt import (
     OperatorAction,
 )
 from algotrader.execution.order_state import IllegalTransitionError
+from algotrader.execution.positions import (
+    ExitingPosition,
+    PositionAlreadyHeldError,
+    PositionManager,
+    ProtectedPosition,
+    UnverifiedPosition,
+)
 from algotrader.execution.protective_stop import (
     NakedPositionError,
     ProtectiveStop,
@@ -3343,6 +3354,503 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
         broker.refuse = frozenset({OrderIntent.STOP})
         _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
         self._walk(positions[:20], attacher)
+
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
+
+
+# --------------------------------------------------------------------------
+# SIT-18 — a session whose book is the book it actually holds (E15-S05)
+# --------------------------------------------------------------------------
+
+
+class _UniqueViolationError(Exception):
+    """What Postgres raises when a partial unique index refuses an insert.
+
+    ``PositionRepository.open_position`` documents this as "a normal, expected
+    outcome under concurrency, not an error to surface - callers must catch it
+    and treat it as 'slot taken'".
+    """
+
+
+class _SessionPositionStore:
+    """The positions table for one session, with the constraints that bite.
+
+    Enforces ``uq_open_slot`` the way the real partial index does: two OPEN
+    positions cannot share a slot. A session that leaked slots fails here
+    rather than in production, where the index is the only thing standing
+    between a recycled slot and two positions on one line of capital.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[int, dict] = {}
+        self.next_id = 0
+
+    async def open_position(self, position: dict) -> int:
+        slot, symbol = position["slot_index"], position["symbol"]
+        open_rows = [r for r in self.rows.values() if r["status"] == "OPEN"]
+        if slot in {r["slot_index"] for r in open_rows}:
+            raise _UniqueViolationError(f"uq_open_slot: slot {slot} already holds a position")
+        if symbol in {r["symbol"] for r in open_rows}:
+            raise _UniqueViolationError(f"uq_open_symbol: {symbol} is already held")
+        self.next_id += 1
+        self.rows[self.next_id] = {
+            **position,
+            "position_id": self.next_id,
+            "status": "OPEN",
+            "closed_at": None,
+            "exit_price": None,
+            "exit_reason": None,
+            "realized_pnl": None,
+            "max_favourable_excursion": None,
+            "max_adverse_excursion": None,
+        }
+        return self.next_id
+
+    async def open_positions(self) -> list[dict]:
+        return [
+            {k: v for k, v in r.items() if k != "strategy_id"}
+            for r in self.rows.values()
+            if r["status"] == "OPEN"
+        ]
+
+    async def close_position(self, position_id: int, **kwargs) -> None:
+        self.rows[position_id].update(status="CLOSED", **kwargs)
+
+    @property
+    def open_count(self) -> int:
+        return sum(1 for r in self.rows.values() if r["status"] == "OPEN")
+
+
+class _DictMirror:
+    def __init__(self) -> None:
+        self.data: dict[str, object] = {}
+
+    async def write(self, symbol: str, snapshot) -> None:
+        self.data[symbol] = snapshot
+
+    async def clear(self, symbol: str) -> None:
+        self.data.pop(symbol, None)
+
+
+class _SessionQuote:
+    def __init__(self, symbol: str, ltp: Decimal, as_of: dt.datetime) -> None:
+        self.symbol = symbol
+        self.ltp = ltp
+        self.as_of = as_of
+
+
+class TestSit18ASessionWhoseBookIsWhatItHolds:
+    """SIT-17 ends when a stop is verified live. This asks the question that
+    starts there: across a whole day, is the book the system reasons about the
+    book it is actually holding?
+
+    Three claims are session-scale and only session-scale:
+
+    * **A day of partial fills sums to what filled, not what was ordered.** One
+      partial fill is a unit test. Three hundred and sixteen of them is where a
+      systematic off-by-one becomes a book that is wrong by thousands of
+      shares — and every stop, every exposure check and every exit is sized
+      from that number.
+    * **A day of failed stops ends with the book EMPTY**, not merely with 316
+      exceptions raised. The positions have to be exited *and their exits
+      confirmed*, and "confirmed" is the half E15-S04 could not deliver.
+    * **A restart mid-session does not silently re-protect the book.** Every
+      restored position must come back unverified, all 316 of them, because
+      one presumed-protected position is one naked position.
+    """
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    @staticmethod
+    def _signals(session) -> list:
+        """The day's approved signals, minted ONCE — SIT-15's note applies."""
+        return [
+            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            for t in sorted(session.decisions)
+            if session.decisions[t].approved
+        ]
+
+    @staticmethod
+    def _manager(broker, store, mirror, calendar, halter=None):
+        gateway = OrderGateway(
+            broker,
+            policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=_SessionOrderStore(),
+        )
+        protector = ProtectiveStop(
+            gateway, halter=halter or HaltController(_SessionRedis()), metrics=get_metrics()
+        )
+        return PositionManager(
+            protector=protector,
+            store=store,
+            mirror=mirror,
+            calendar=calendar,
+            metrics=get_metrics(),
+        )
+
+    @staticmethod
+    def _fill(recommendation, decision, *, filled_fraction: Decimal, symbol: str) -> Order:
+        """What the broker reports about an entry that filled.
+
+        ``filled_quantity`` is what the book must believe, and it is
+        deliberately not ``quantity`` — this is the number the whole story
+        turns on.
+        """
+        ordered = decision.sizing.quantity
+        filled = max(1, int(ordered * filled_fraction))
+        return Order(
+            client_order_id=f"E{recommendation.correlation_id.hex[:24]}",
+            broker_order_id="BROKER-ENTRY",
+            correlation_id=recommendation.correlation_id,
+            symbol=symbol,
+            side=Side.BUY,
+            order_type=OrderType.MARKET,
+            product=Product.MIS,
+            quantity=ordered,
+            status=OrderStatus.FILLED if filled == ordered else OrderStatus.OPEN,
+            filled_quantity=filled,
+            average_price=Decimal("1200.0000"),
+            intent=OrderIntent.ENTRY,
+            placed_at=_at(TRADING_DAY, 10, 0),
+            last_update_at=_at(TRADING_DAY, 10, 0),
+        )
+
+    @staticmethod
+    def _exit_fill(position, *, price: str = "1195.0000") -> Order:
+        return Order(
+            client_order_id=f"X{position.correlation_id.hex[:24]}",
+            broker_order_id="BROKER-EXIT",
+            correlation_id=position.correlation_id,
+            symbol=position.symbol,
+            side=Side.SELL,
+            order_type=OrderType.MARKET,
+            product=Product.MIS,
+            quantity=position.quantity,
+            status=OrderStatus.FILLED,
+            filled_quantity=position.quantity,
+            average_price=Decimal(price),
+            intent=OrderIntent.SQUAREOFF,
+            placed_at=_at(TRADING_DAY, 15, 0),
+            last_update_at=_at(TRADING_DAY, 15, 0),
+        )
+
+    def _walk_the_day(self, session, manager, *, filled_fraction=Decimal("1"), limit=None):
+        """Open a position for every approval, as the day produces them.
+
+        One symbol per signal so the slot discipline is exercised rather than
+        sidestepped; the store asserts ``uq_open_slot`` on every insert.
+        """
+        opened, failures = [], []
+        for index, (decision, recommendation, ist_time) in enumerate(self._signals(session)):
+            if limit is not None and index >= limit:
+                break
+            symbol = f"SYM{index:04d}"
+            order = self._fill(
+                recommendation, decision, filled_fraction=filled_fraction, symbol=symbol
+            )
+            try:
+                opened.append(
+                    asyncio.run(
+                        manager.open_from_fill(
+                            order,
+                            sizing=decision.sizing,
+                            slot_index=index,
+                            trade_date=TRADING_DAY,
+                            now=_at(TRADING_DAY, ist_time.hour, ist_time.minute),
+                            is_cas_stock=False,
+                        )
+                    )
+                )
+            except Exception as exc:
+                failures.append((symbol, exc))
+        return opened, failures
+
+    # -- the healthy day, and the control ----------------------------------
+
+    def test_every_fill_becomes_one_protected_position(self, calendar) -> None:
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        manager = self._manager(broker, store, mirror, calendar)
+
+        opened, failures = self._walk_the_day(session, manager, limit=120)
+
+        assert failures == []
+        assert len(opened) == 120
+        assert all(isinstance(p, ProtectedPosition) for p in opened)
+        assert len(broker.intents(OrderIntent.STOP)) == 120
+        assert broker.intents(OrderIntent.SQUAREOFF) == []
+        assert store.open_count == 120
+        assert len(mirror.data) == 120
+
+    # -- the day everything fills short ------------------------------------
+
+    def test_a_day_of_partial_fills_books_what_filled_not_what_was_ordered(self, calendar) -> None:
+        """The claim that only exists at scale.
+
+        One partial fill is a unit test. A whole day of them is where the
+        difference between ordered and filled becomes thousands of shares, and
+        every stop the system places is sized from the number the book holds.
+        """
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        manager = self._manager(broker, store, mirror, calendar)
+
+        opened, failures = self._walk_the_day(
+            session, manager, filled_fraction=Decimal("0.4"), limit=120
+        )
+        assert failures == []
+
+        ordered_total = sum(d.sizing.quantity for d, _r, _t in self._signals(session)[:120])
+        booked_total = sum(p.position.quantity for p in opened)
+        stopped_total = sum(o.quantity for o in broker.intents(OrderIntent.STOP))
+
+        assert booked_total < ordered_total, "nothing filled short; the test proves nothing"
+        assert stopped_total == booked_total, (
+            "the stops protect a different number of shares than the book holds"
+        )
+        assert all(
+            r["quantity"] == p.position.quantity
+            for r, p in zip(store.rows.values(), opened, strict=True)
+        )
+
+    def test_the_gap_between_ordered_and_filled_is_never_protected(self, calendar) -> None:
+        """Stated as the failure rather than the total: no stop anywhere in the
+        day is for more shares than its position holds. One such stop sells
+        what does not exist."""
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        manager = self._manager(broker, store, mirror, calendar)
+        opened, _f = self._walk_the_day(session, manager, filled_fraction=Decimal("0.4"), limit=80)
+
+        held = {p.position.symbol: p.position.quantity for p in opened}
+        for stop in broker.intents(OrderIntent.STOP):
+            assert stop.quantity == held[stop.symbol]
+
+    # -- the day the stops all fail ----------------------------------------
+
+    def test_a_day_of_failed_stops_ends_with_an_empty_book(self, calendar) -> None:
+        """E15-S04 could place the exits; it could not confirm they filled.
+
+        This is that half, at session scale: every position exited, every exit
+        confirmed, and the book EMPTY at the close — not 316 exceptions and a
+        book still holding everything.
+        """
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        broker.refuse = frozenset({OrderIntent.STOP})
+        manager = self._manager(broker, store, mirror, calendar)
+
+        opened, failures = self._walk_the_day(session, manager, limit=60)
+        assert opened == []
+        assert len(failures) == 60
+        assert all(isinstance(p, ExitingPosition) for p in manager.open_positions())
+        assert len(broker.intents(OrderIntent.SQUAREOFF)) == 60
+
+        for tracked in list(manager.open_positions()):
+            asyncio.run(
+                manager.confirm_exit(
+                    self._exit_fill(tracked.position),
+                    now=_at(TRADING_DAY, 15, 5),
+                    reason=ExitReason.UNPROTECTED,
+                )
+            )
+
+        assert manager.open_positions() == []
+        assert store.open_count == 0
+        assert mirror.data == {}
+        assert all(r["exit_reason"] == "UNPROTECTED" for r in store.rows.values())
+
+    def test_a_placed_exit_is_not_a_closed_position(self, calendar) -> None:
+        """The distinction the whole story rests on, asserted before the
+        confirmations run: the exits exist and the positions are still held."""
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        broker.refuse = frozenset({OrderIntent.STOP})
+        manager = self._manager(broker, store, mirror, calendar)
+        self._walk_the_day(session, manager, limit=30)
+
+        assert len(broker.intents(OrderIntent.SQUAREOFF)) == 30
+        assert store.open_count == 30, "closed on the strength of an exit being placed"
+
+    # -- the restart -------------------------------------------------------
+
+    def test_a_restart_mid_session_presumes_nothing(self, calendar) -> None:
+        """One presumed-protected position is one naked position. The assertion
+        is the count: all of them unverified, not most."""
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        manager = self._manager(broker, store, mirror, calendar)
+        opened, _f = self._walk_the_day(session, manager, limit=100)
+        assert all(isinstance(p, ProtectedPosition) for p in opened)
+
+        restarted = self._manager(_OrderbookBroker(), store, _DictMirror(), calendar)
+        restored = asyncio.run(restarted.restore())
+
+        assert len(restored) == 100
+        assert all(isinstance(r, UnverifiedPosition) for r in restored)
+        assert not any(isinstance(r, ProtectedPosition) for r in restarted.open_positions())
+        assert [r.position.quantity for r in restored] == [p.position.quantity for p in opened]
+
+    def test_the_restarted_book_can_still_be_priced(self, calendar) -> None:
+        """The control. A restore that produced unusable positions would
+        satisfy the test above and leave the day unable to compute its P&L."""
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        manager = self._manager(broker, store, mirror, calendar)
+        self._walk_the_day(session, manager, limit=40)
+
+        restarted = self._manager(_OrderbookBroker(), store, _DictMirror(), calendar)
+        restored = asyncio.run(restarted.restore())
+        now = _at(TRADING_DAY, 12, 0)
+        for r in restored:
+            asyncio.run(
+                restarted.mark(_SessionQuote(r.position.symbol, Decimal("1210.0000"), now), now=now)
+            )
+        assert restarted.unrealised_pnl is not None
+        assert restarted.unrealised_pnl > 0
+
+    def test_replaying_the_days_fills_after_a_restart(self, calendar) -> None:
+        """Idempotency and restart, the scenario SIT is specifically for.
+
+        The broker still reports yesterday's entries as FILLED after a crash,
+        so whatever asks "have we opened a position for this fill?" will ask
+        again. Replaying must not produce a second position, a second stop, or
+        a second row - and must not look like a failure to open something that
+        is in fact open and protected.
+        """
+        session = self._session(calendar).run()
+        store = _SessionPositionStore()
+        broker = _OrderbookBroker()
+        manager = self._manager(broker, store, _DictMirror(), calendar)
+        opened, _f = self._walk_the_day(session, manager, limit=40)
+        assert len(opened) == 40
+
+        replay_broker = _OrderbookBroker()
+        replay_broker.orderbook = broker.orderbook
+        restarted = self._manager(replay_broker, store, _DictMirror(), calendar)
+        asyncio.run(restarted.restore())
+        again, failures = self._walk_the_day(session, restarted, limit=40)
+
+        assert store.open_count == 40, "the replay opened a second book"
+        assert replay_broker.intents(OrderIntent.STOP) == [], (
+            "the replay placed a second stop on every position"
+        )
+        assert again == []
+        assert len(failures) == 40
+        assert all(isinstance(exc, PositionAlreadyHeldError) for _sym, exc in failures), (
+            "a replay is a normal restart outcome and must say so - SIT-004 found "
+            "it surfacing as a raw database integrity error, which a caller "
+            "cannot tell apart from a genuine failure to open"
+        )
+
+    # -- the book's P&L across the session ---------------------------------
+
+    def test_the_book_refuses_a_total_until_every_position_is_priced(self, calendar) -> None:
+        """Fail closed, at book scale. The daily-loss halt reads this number,
+        and a total that quietly omitted the one position nobody could price
+        would be wrong in the direction of continuing to trade."""
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        manager = self._manager(broker, store, mirror, calendar)
+        opened, _f = self._walk_the_day(session, manager, limit=50)
+
+        now = _at(TRADING_DAY, 12, 0)
+        for tracked in opened[:-1]:
+            asyncio.run(
+                manager.mark(
+                    _SessionQuote(tracked.position.symbol, Decimal("1210.0000"), now), now=now
+                )
+            )
+        assert manager.unrealised_pnl is None, "49 of 50 priced read as a complete total"
+
+        last = opened[-1].position
+        asyncio.run(manager.mark(_SessionQuote(last.symbol, Decimal("1210.0000"), now), now=now))
+        assert manager.unrealised_pnl == sum(
+            p.position.unrealized_pnl(Decimal("1210.0000")) for p in opened
+        )
+
+    def test_the_excursions_follow_the_days_path(self, calendar) -> None:
+        """Marked minute by minute across a real session shape rather than a
+        generated list: MFE and MAE must be the extremes of the path walked."""
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        manager = self._manager(broker, store, mirror, calendar)
+        self._walk_the_day(session, manager, limit=5)
+
+        path = [Decimal("1205"), Decimal("1240"), Decimal("1180"), Decimal("1150"), Decimal("1220")]
+        for minute, price in enumerate(path):
+            now = _at(TRADING_DAY, 11, minute)
+            for tracked in list(manager.open_positions()):
+                asyncio.run(
+                    manager.mark(_SessionQuote(tracked.position.symbol, price, now), now=now)
+                )
+
+        for tracked in manager.open_positions():
+            pnls = [tracked.position.unrealized_pnl(p) for p in path]
+            assert tracked.marks.max_favourable_excursion == max(max(pnls), Decimal("0"))
+            assert tracked.marks.max_adverse_excursion == min(min(pnls), Decimal("0"))
+
+    # -- cross-cutting -----------------------------------------------------
+
+    def test_nothing_in_the_book_is_ever_both_unprotected_and_unexiting(self, calendar) -> None:
+        """Invariant 5 stated over the whole book: every position the system
+        holds is either protected by a verified stop or on its way out."""
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        broker.status_for = {OrderIntent.STOP: OrderStatus.REJECTED}
+        manager = self._manager(broker, store, mirror, calendar)
+        self._walk_the_day(session, manager, limit=40)
+
+        for tracked in manager.open_positions():
+            assert isinstance(tracked, ProtectedPosition | ExitingPosition)
+
+    def test_no_credential_reached_the_log_on_a_day_of_failed_stops(self, calendar) -> None:
+        import re
+
+        session = self._session(calendar).run()
+        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+        broker.refuse = frozenset({OrderIntent.STOP})
+        manager = self._manager(broker, store, mirror, calendar)
+        self._walk_the_day(session, manager, limit=20)
 
         assert not re.search(
             r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",

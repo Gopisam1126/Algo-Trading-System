@@ -451,6 +451,13 @@ Recorded because each was believed, written down, and wrong.
   confirmed on `filled_quantity`, never status. Mutation: 24 injected, 24
   killed.
 
+- **"The database constraint has it covered."** It does, and that is layer 2.
+  `open_from_fill` had no cheap check, so a replayed fill after a restart was
+  refused by `uq_open_symbol` and by nothing else — safe, but reaching the
+  caller as a raw integrity error indistinguishable from a genuine failure to
+  open, whose natural response (exit the holding) is exactly wrong for a
+  position that is open and protected. The instruction was sitting in the
+  docstring of the function being called. SIT-004.
 - **"A type annotation is a guarantee."** It is a guarantee to mypy, about
   `src/`. `ProtectedPosition` is the type that proves a position is protected,
   and as a plain frozen dataclass it accepted a database row without complaint —

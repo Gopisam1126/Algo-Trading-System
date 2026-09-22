@@ -78,6 +78,7 @@ __all__ = [
     "FilledEntry",
     "Marks",
     "NotFilledError",
+    "PositionAlreadyHeldError",
     "PositionManager",
     "PositionSnapshot",
     "ProtectedPosition",
@@ -111,6 +112,26 @@ class ContradictoryFillError(PositionError):
     Refused rather than repaired: there is no safe way to guess which half of a
     contradiction is the real one, and both repairs open a position on a
     number nobody can vouch for.
+    """
+
+
+class PositionAlreadyHeldError(PositionError):
+    """This symbol is already in the book. Nothing was opened, and that is right.
+
+    A **normal outcome, not a fault.** The broker keeps reporting an entry as
+    FILLED after a restart, so whatever asks "have we opened a position for
+    this fill?" will ask again, and re-opening would mean a second position and
+    a second stop on one holding - two exits, the second selling what no longer
+    exists.
+
+    This is layer 1 of the pattern ``EPIC01 §8.4`` uses for slots, applied to
+    positions: the cheap in-memory check here, the ``uq_open_symbol`` and
+    ``uq_open_slot`` partial unique indexes behind it, and reconciliation
+    (E15-S09) behind those. Before SIT-004 only the second layer existed, so a
+    replay surfaced as a raw database integrity error - which a caller cannot
+    distinguish from a genuine failure to open, and whose natural response
+    (exit the holding) would be exactly wrong for a position that is open and
+    protected.
     """
 
 
@@ -545,6 +566,20 @@ class PositionManager:
             )
 
         entry = confirm_fill(order)
+
+        # Layer 1. Cheap, and only as good as the book - which is empty until
+        # restore() has run, so the partial unique indexes remain the guarantee
+        # rather than the optimisation. Both layers are needed: this one gives
+        # the caller an answer it can act on, that one is what is true.
+        held = self._book.get(order.symbol)
+        if held is not None:
+            raise PositionAlreadyHeldError(
+                f"{order.symbol} is already held ({type(held).__name__}, "
+                f"{held.position.quantity} @ {held.position.entry_price}). Nothing "
+                f"was opened. Re-opening would put a second stop on one holding, "
+                f"and the second exit sells what no longer exists."
+            )
+
         if not entry.complete:
             self._count("partial_fills_total")
             log.warning(

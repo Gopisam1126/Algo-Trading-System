@@ -793,6 +793,16 @@ stop is missing, and reconciliation exits one position. Dying after the attach
 with no row leaves the broker holding a position we have no record of, which
 §8.3 says trips the kill switch. Losing a trade beats losing the day.
 
+**Opening is idempotent, in three layers.** The broker keeps reporting an
+entry as `FILLED` after a restart, so whatever asks "have we opened a position
+for this fill?" will ask again. `open_from_fill` checks the in-memory book
+first and raises `PositionAlreadyHeldError`; the `uq_open_symbol` and
+`uq_open_slot` partial unique indexes are the guarantee behind it (the book is
+empty until `restore()` runs); reconciliation is the backstop behind those.
+This is §8.4's pattern, the same one the gateway applies to orders — and until
+SIT-004 positions had only the middle layer, so a normal restart surfaced as a
+raw integrity error the caller could not tell apart from a real failure.
+
 **An exit is not done when it is placed.** `confirm_exit` gates on
 `filled_quantity` and leaves a partially filled exit open for the remainder,
 because a half-exited position is still a position. `ExitReason.UNPROTECTED` is

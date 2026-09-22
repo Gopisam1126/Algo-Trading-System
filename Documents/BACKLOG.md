@@ -2104,6 +2104,8 @@ here and is the most important thing the story delivers.
       live, not that it filled)*
 - [x] **Added:** a fill that lands through its own approved stop is exited at
       market and never becomes a position
+- [x] **Added (SIT-004):** opening is idempotent — a replayed fill raises
+      `PositionAlreadyHeldError` rather than reaching the unique index
 
 **Acceptance**
 - [x] 🔴 A position is opened for the quantity that **filled** at the price it

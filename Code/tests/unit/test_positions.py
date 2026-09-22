@@ -34,6 +34,7 @@ from algotrader.execution.positions import (
     ExitingPosition,
     Marks,
     NotFilledError,
+    PositionAlreadyHeldError,
     PositionManager,
     PositionSnapshot,
     ProtectedPosition,
@@ -671,6 +672,47 @@ class TestAc5RestoreNeverPresumesProtection:
         manager, _p, _s, _m, _c = _manager(store=RecordingStore(rows=[_row()]))
         (restored,) = await manager.restore()
         assert restored.position.position_id == 7
+
+
+class TestReplayingAFill:
+    """SIT-004. The broker keeps reporting an entry as FILLED after a restart."""
+
+    @pytest.mark.asyncio
+    async def test_a_symbol_already_held_is_not_opened_twice(self) -> None:
+        manager, protector, store, _m, _c = _manager()
+        await _open(manager, _order(), _sizing())
+        with pytest.raises(PositionAlreadyHeldError, match="already held"):
+            await _open(manager, _order(), _sizing())
+        assert len(store.inserts) == 1
+        assert len(protector.attached) == 1, "a second stop was placed on one holding"
+
+    @pytest.mark.asyncio
+    async def test_a_restored_position_blocks_the_replay_too(self) -> None:
+        """The case that matters: after a restart the book is rebuilt from rows,
+        and THAT is what has to stop the re-open."""
+        manager, protector, _s, _m, _c = _manager(store=RecordingStore(rows=[_row()]))
+        await manager.restore()
+        with pytest.raises(PositionAlreadyHeldError):
+            await _open(manager, _order(), _sizing())
+        assert protector.attached == []
+
+    @pytest.mark.asyncio
+    async def test_an_unfilled_replay_still_reports_the_fill_first(self) -> None:
+        """Ordering: nothing filled means there is nothing to open, whatever
+        else is true. The fill is the more specific answer."""
+        manager, _p, _s, _m, _c = _manager()
+        await _open(manager, _order(), _sizing())
+        with pytest.raises(NotFilledError):
+            await _open(manager, _order(filled=0), _sizing())
+
+    @pytest.mark.asyncio
+    async def test_a_different_symbol_still_opens(self) -> None:
+        """The control. A manager that refused every second call would pass
+        every test above and trade exactly one position a day."""
+        manager, _p, _s, _m, _c = _manager()
+        await _open(manager, _order(), _sizing())
+        tracked = await _open(manager, _order(symbol="WIPRO"), _sizing())
+        assert tracked.position.symbol == "WIPRO"
 
 
 # ---------------------------------------------------------------------------
