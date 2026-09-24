@@ -31,7 +31,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from algotrader.broker.adapter import AmbiguousOrderError, OrderRejectedError
+from algotrader.broker.adapter import AmbiguousOrderError, BrokerPosition, OrderRejectedError
 from algotrader.broker.kite.mapping import broker_tag
 from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_status
 from algotrader.common.enums import (
@@ -46,8 +46,13 @@ from algotrader.common.enums import (
     Side,
 )
 from algotrader.common.metrics import get_metrics, reset_metrics_for_testing
-from algotrader.common.models.trading import Order, Position, Recommendation
-from algotrader.execution.gateway import GatewayError, GatewayPolicy, OrderGateway
+from algotrader.common.models.trading import Order, OrderRequest, Position, Recommendation
+from algotrader.execution.gateway import (
+    GatewayError,
+    GatewayPolicy,
+    OrderGateway,
+    client_order_id,
+)
 from algotrader.execution.halt import (
     HaltController,
     HaltReason,
@@ -67,6 +72,7 @@ from algotrader.execution.protective_stop import (
     StopNotEstablishedError,
     stop_client_order_id,
 )
+from algotrader.execution.reconciliation import Drift, Reconciler
 from algotrader.execution.risk.checks import (
     ELIGIBILITY_ORDER,
     EXPOSURE_ORDER,
@@ -119,6 +125,40 @@ EXPECTED_LAST_TRADABLE = dt.time(14, 59)
 @pytest.fixture(autouse=True)
 def _fresh_metrics() -> None:
     reset_metrics_for_testing()
+
+
+#: ONE event loop for the whole module, not one per call.
+#:
+#: Every ``asyncio.run`` builds a new event loop, and on Windows every new loop
+#: builds its self-pipe with ``socket.socketpair()`` - which Windows lacks, so
+#: CPython emulates it with a real loopback TCP connection and then waits in
+#: ``accept()`` with NO timeout. This module walks sessions minute by minute and
+#: decision by decision, so it created thousands of loops per test; eventually
+#: one loopback connect never arrived and the run hung forever at zero CPU. The
+#: faulthandler dump showed exactly that: a listener on 127.0.0.1 in LISTEN,
+#: no peer connected, the test blocked in ``socketpair -> accept``.
+#:
+#: One loop removes the cause rather than the symptom, and is also closer to
+#: production, which runs one long-lived loop. Linux CI never saw this because
+#: Linux has a real ``socketpair`` syscall.
+_RUNNER: asyncio.Runner | None = None
+
+
+def _run_async(coro):
+    """``asyncio.run`` on the module's single loop."""
+    global _RUNNER
+    if _RUNNER is None:
+        _RUNNER = asyncio.Runner()
+    return _RUNNER.run(coro)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _one_loop_per_module():
+    yield
+    global _RUNNER
+    if _RUNNER is not None:
+        _RUNNER.close()
+        _RUNNER = None
 
 
 @pytest.fixture(scope="module")
@@ -2043,7 +2083,7 @@ class TestSit13AHaltIsTerminalForTheDay:
 
         def mutate(ist_time: dt.time, kwargs: dict) -> None:
             if ist_time == arm_at:
-                asyncio.run(
+                _run_async(
                     controller.arm(
                         reason,
                         detail="realised -3.2% against a 3.0% limit",
@@ -2051,7 +2091,7 @@ class TestSit13AHaltIsTerminalForTheDay:
                         now=_at(TRADING_DAY, ist_time.hour, ist_time.minute),
                     )
                 )
-            state = asyncio.run(controller.state())
+            state = _run_async(controller.state())
             kwargs["kill_switch_active"] = state.kill_switch
             kwargs["daily_loss_halted"] = state.daily_loss
             kwargs["consecutive_loss_halted"] = state.consecutive_loss
@@ -2142,7 +2182,7 @@ class TestSit13AHaltIsTerminalForTheDay:
 
         def mutate(ist_time: dt.time, kwargs: dict) -> None:
             if ist_time == dt.time(14, 0):
-                asyncio.run(
+                _run_async(
                     controller.clear_all(
                         OperatorAction(
                             operator="gopikrishnan",
@@ -2166,7 +2206,7 @@ class TestSit13AHaltIsTerminalForTheDay:
 
         def mutate(ist_time: dt.time, kwargs: dict) -> None:
             if ist_time == dt.time(12, 0):
-                asyncio.run(
+                _run_async(
                     first.arm(
                         HaltReason.MARGIN_SHORTFALL,
                         detail="short by 12,000",
@@ -2176,7 +2216,7 @@ class TestSit13AHaltIsTerminalForTheDay:
                 )
             # From 12:30 a NEW controller instance serves every read.
             live = first if ist_time < dt.time(12, 30) else HaltController(redis)  # type: ignore[arg-type]
-            state = asyncio.run(live.state())
+            state = _run_async(live.state())
             kwargs["kill_switch_active"] = state.kill_switch
             kwargs["daily_loss_halted"] = state.daily_loss
             kwargs["consecutive_loss_halted"] = state.consecutive_loss
@@ -2199,7 +2239,7 @@ class TestSit13AHaltIsTerminalForTheDay:
 
         def mutate(ist_time: dt.time, kwargs: dict) -> None:
             store = redis if ist_time < dt.time(12, 0) else dead
-            state = asyncio.run(HaltController(store).state())  # type: ignore[arg-type]
+            state = _run_async(HaltController(store).state())  # type: ignore[arg-type]
             kwargs["kill_switch_active"] = state.kill_switch
             kwargs["daily_loss_halted"] = state.daily_loss
             kwargs["consecutive_loss_halted"] = state.consecutive_loss
@@ -2215,7 +2255,7 @@ class TestSit13AHaltIsTerminalForTheDay:
         controller = HaltController(_SessionRedis())  # type: ignore[arg-type]
 
         def mutate(_ist_time: dt.time, kwargs: dict) -> None:
-            state = asyncio.run(controller.state())
+            state = _run_async(controller.state())
             kwargs["kill_switch_active"] = state.kill_switch
             kwargs["daily_loss_halted"] = state.daily_loss
             kwargs["consecutive_loss_halted"] = state.consecutive_loss
@@ -2394,7 +2434,7 @@ class TestSit14ASessionThatReachesABroker:
             if not decision.approved:
                 continue
             submitted.append(
-                asyncio.run(
+                _run_async(
                     gateway.submit_entry(
                         decision,
                         _recommendation(_at(TRADING_DAY, ist_time.hour, ist_time.minute)),
@@ -2479,7 +2519,7 @@ class TestSit14ASessionThatReachesABroker:
             decision = session.decisions[ist_time]
             if not decision.approved:
                 continue
-            asyncio.run(
+            _run_async(
                 gateway.submit_entry(
                     decision,
                     _recommendation(_at(TRADING_DAY, ist_time.hour, ist_time.minute)),
@@ -2544,7 +2584,7 @@ class TestSit14ASessionThatReachesABroker:
                 store=_SessionOrderStore(),
             )
             for decision, rec in signals:
-                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+                _run_async(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
             return [o.client_order_id for o in broker.orders]
 
         assert submit_all() == submit_all()
@@ -2654,7 +2694,7 @@ class TestSit15ASessionThatSurvivesATimeout:
             if fail_at is not None and len(ids) == fail_at:
                 broker.fail_next_with = AmbiguousOrderError("read timed out")
             ids.append(
-                asyncio.run(gateway.submit_entry(decision, recommendation, trade_date=TRADING_DAY))
+                _run_async(gateway.submit_entry(decision, recommendation, trade_date=TRADING_DAY))
             )
         return ids
 
@@ -2809,7 +2849,7 @@ class TestSit16ASessionThatRefusesToResumeWhatItCannotResume:
         refused = 0
         for decision, rec in signals:
             try:
-                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+                _run_async(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
             except IllegalTransitionError:
                 refused += 1
         assert refused == len(signals) == 316
@@ -2827,7 +2867,7 @@ class TestSit16ASessionThatRefusesToResumeWhatItCannotResume:
         gateway = self._gateway(broker, store)
         for decision, rec in signals:
             with pytest.raises(IllegalTransitionError):
-                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+                _run_async(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
         assert broker.orders == []
 
     def test_an_unreadable_status_stops_the_day_rather_than_guessing(self, calendar) -> None:
@@ -2842,7 +2882,7 @@ class TestSit16ASessionThatRefusesToResumeWhatItCannotResume:
         gateway = self._gateway(broker, store)
         for decision, rec in signals:
             with pytest.raises(GatewayError, match="not a modelled OrderStatus"):
-                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+                _run_async(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
         assert broker.orders == []
 
     def test_a_clean_store_still_trades_the_whole_day(self, calendar) -> None:
@@ -2856,7 +2896,7 @@ class TestSit16ASessionThatRefusesToResumeWhatItCannotResume:
 
         gateway = self._gateway(broker, store)
         ids = [
-            asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+            _run_async(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
             for decision, rec in signals
         ]
         assert len(ids) == len(broker.orders) == 316
@@ -2886,7 +2926,7 @@ class TestSit16ASessionThatRefusesToResumeWhatItCannotResume:
         placed = 0
         for decision, rec in signals:
             try:
-                asyncio.run(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
+                _run_async(gateway.submit_entry(decision, rec, trade_date=TRADING_DAY))
                 placed += 1
             except IllegalTransitionError:
                 pass
@@ -3076,7 +3116,7 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
         for position in positions:
             try:
                 established.append(
-                    asyncio.run(
+                    _run_async(
                         attacher.attach(
                             position,
                             trade_date=TRADING_DAY,
@@ -3132,7 +3172,7 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
         gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
 
         for decision, recommendation, _t in signals:
-            asyncio.run(gateway.submit_entry(decision, recommendation, trade_date=TRADING_DAY))
+            _run_async(gateway.submit_entry(decision, recommendation, trade_date=TRADING_DAY))
         established, _failures = self._walk(positions, attacher)
 
         entries = broker.intents(OrderIntent.ENTRY)
@@ -3165,7 +3205,7 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
         assert len(failures) == len(positions)
         assert all(isinstance(exc, StopNotEstablishedError) for _p, exc in failures)
         assert len(broker.intents(OrderIntent.SQUAREOFF)) == len(positions)
-        assert not asyncio.run(controller.is_halted()), (
+        assert not _run_async(controller.is_halted()), (
             "a contained failure stopped the day; one bad symbol must not"
         )
         assert self._counter("stop_attach_failures_total") == len(positions)
@@ -3258,7 +3298,7 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
 
         assert len(failures) == 1
         assert isinstance(failures[0][1], NakedPositionError)
-        state = asyncio.run(controller.state())
+        state = _run_async(controller.state())
         assert state.kill_switch, "a naked position did not arm the kill switch"
 
         after = self._session(calendar, kill_switch_active=state.kill_switch).run()
@@ -3280,7 +3320,7 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
 
         self._walk(positions, attacher, stop_on_first_raise=True)
 
-        record = next(iter(asyncio.run(controller.state()).records.values()))
+        record = next(iter(_run_async(controller.state()).records.values()))
         assert record.reason is HaltReason.NAKED_POSITION
         assert positions[0].symbol in record.detail
         assert record.armed_by == "protective-stop"
@@ -3335,9 +3375,7 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
         )
 
         unprotected = [
-            p
-            for p in positions
-            if not asyncio.run(attacher.is_protected(p, trade_date=TRADING_DAY))
+            p for p in positions if not _run_async(attacher.is_protected(p, trade_date=TRADING_DAY))
         ]
         assert unprotected == [casualty]
 
@@ -3589,7 +3627,7 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
             )
             try:
                 opened.append(
-                    asyncio.run(
+                    _run_async(
                         manager.open_from_fill(
                             order,
                             sizing=decision.sizing,
@@ -3686,7 +3724,7 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
         assert len(broker.intents(OrderIntent.SQUAREOFF)) == 60
 
         for tracked in list(manager.open_positions()):
-            asyncio.run(
+            _run_async(
                 manager.confirm_exit(
                     self._exit_fill(tracked.position),
                     now=_at(TRADING_DAY, 15, 5),
@@ -3723,7 +3761,7 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
         assert all(isinstance(p, ProtectedPosition) for p in opened)
 
         restarted = self._manager(_OrderbookBroker(), store, _DictMirror(), calendar)
-        restored = asyncio.run(restarted.restore())
+        restored = _run_async(restarted.restore())
 
         assert len(restored) == 100
         assert all(isinstance(r, UnverifiedPosition) for r in restored)
@@ -3739,10 +3777,10 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
         self._walk_the_day(session, manager, limit=40)
 
         restarted = self._manager(_OrderbookBroker(), store, _DictMirror(), calendar)
-        restored = asyncio.run(restarted.restore())
+        restored = _run_async(restarted.restore())
         now = _at(TRADING_DAY, 12, 0)
         for r in restored:
-            asyncio.run(
+            _run_async(
                 restarted.mark(_SessionQuote(r.position.symbol, Decimal("1210.0000"), now), now=now)
             )
         assert restarted.unrealised_pnl is not None
@@ -3767,7 +3805,7 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
         replay_broker = _OrderbookBroker()
         replay_broker.orderbook = broker.orderbook
         restarted = self._manager(replay_broker, store, _DictMirror(), calendar)
-        asyncio.run(restarted.restore())
+        _run_async(restarted.restore())
         again, failures = self._walk_the_day(session, restarted, limit=40)
 
         assert store.open_count == 40, "the replay opened a second book"
@@ -3795,7 +3833,7 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
 
         now = _at(TRADING_DAY, 12, 0)
         for tracked in opened[:-1]:
-            asyncio.run(
+            _run_async(
                 manager.mark(
                     _SessionQuote(tracked.position.symbol, Decimal("1210.0000"), now), now=now
                 )
@@ -3803,7 +3841,7 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
         assert manager.unrealised_pnl is None, "49 of 50 priced read as a complete total"
 
         last = opened[-1].position
-        asyncio.run(manager.mark(_SessionQuote(last.symbol, Decimal("1210.0000"), now), now=now))
+        _run_async(manager.mark(_SessionQuote(last.symbol, Decimal("1210.0000"), now), now=now))
         assert manager.unrealised_pnl == sum(
             p.position.unrealized_pnl(Decimal("1210.0000")) for p in opened
         )
@@ -3820,7 +3858,7 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
         for minute, price in enumerate(path):
             now = _at(TRADING_DAY, 11, minute)
             for tracked in list(manager.open_positions()):
-                asyncio.run(
+                _run_async(
                     manager.mark(_SessionQuote(tracked.position.symbol, price, now), now=now)
                 )
 
@@ -3852,6 +3890,459 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
         manager = self._manager(broker, store, mirror, calendar)
         self._walk_the_day(session, manager, limit=20)
 
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
+
+
+# --------------------------------------------------------------------------
+# SIT-19 — a session reconciled against its broker all day (E15-S09)
+# --------------------------------------------------------------------------
+
+
+def _counter_value(name: str) -> float:
+    for metric in get_metrics().registry.collect():
+        for sample in metric.samples:
+            if sample.name == name:
+                return sample.value
+    raise AssertionError(f"{name} is registered nowhere")
+
+
+class _ReconciledBroker:
+    """One broker account for a whole session, kept the way Kite keeps it.
+
+    MARKET orders fill on arrival; a stop stays working. The day's positions
+    are cumulative bought and sold per symbol, and a symbol traded flat stays
+    in the list at zero - Kite's own behaviour, and the reason the reconciler
+    judges activity rather than row presence. Keys are stored whole here; the
+    20-character truncation is the Kite adapter's and is proved in integration.
+    """
+
+    def __init__(self) -> None:
+        self.orders: dict[str, Order] = {}
+        self.placed: list[OrderRequest] = []
+        self.day: dict[str, list[int]] = {}
+
+    async def place_order(self, request) -> str:
+        self.placed.append(request)
+        broker_order_id = f"B{len(self.placed):06d}"
+        order = _landed_order(request, broker_order_id)
+        if request.order_type is OrderType.MARKET:
+            order = order.model_copy(
+                update={
+                    "status": OrderStatus.FILLED,
+                    "filled_quantity": request.quantity,
+                    "average_price": Decimal("1200.0000"),
+                }
+            )
+            self._fill(request.symbol, request.side, request.quantity)
+        self.orders[request.client_order_id] = order
+        return broker_order_id
+
+    def _fill(self, symbol: str, side: Side, quantity: int) -> None:
+        bought_sold = self.day.setdefault(symbol, [0, 0])
+        bought_sold[0 if side is Side.BUY else 1] += quantity
+
+    def foreign_fill(self, symbol: str, quantity: int) -> None:
+        """A fill no order of ours placed - someone else on the account."""
+        self._fill(symbol, Side.BUY, quantity)
+
+    def reject(self, client_order_id: str) -> None:
+        self.orders[client_order_id] = self.orders[client_order_id].model_copy(
+            update={"status": OrderStatus.REJECTED}
+        )
+
+    async def find_by_client_order_id(self, client_order_id: str):
+        return self.orders.get(client_order_id)
+
+    async def fetch_orderbook(self) -> list[Order]:
+        return list(self.orders.values())
+
+    async def fetch_positions(self) -> list[BrokerPosition]:
+        return [
+            BrokerPosition(
+                symbol=symbol,
+                exchange="NSE",
+                product="MIS",
+                quantity=bought - sold,
+                day_buy_quantity=bought,
+                day_sell_quantity=sold,
+            )
+            for symbol, (bought, sold) in self.day.items()
+        ]
+
+    def order_key(self, client_order_id: str) -> str:
+        return client_order_id
+
+    def net(self) -> dict[str, int]:
+        return {symbol: bought - sold for symbol, (bought, sold) in self.day.items()}
+
+
+class _SessionLedger:
+    """Our orders table for one session: the gateway writes it, the reconciler
+    reads and corrects it. ``now`` is the session clock, so ``placed_at`` is the
+    minute the order was sent rather than the minute the test ran."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict] = {}
+        self.now = _at(TRADING_DAY, 9, 15)
+
+    async def insert_submitting(self, order: dict) -> int:
+        cid = order["client_order_id"]
+        assert cid not in self.rows, f"uq_client_order: {cid} inserted twice"
+        self.rows[cid] = {
+            **order,
+            "status": "SUBMITTING",
+            "broker_order_id": None,
+            "filled_quantity": 0,
+            "average_price": None,
+            "placed_at": self.now,
+            "last_update_at": self.now,
+        }
+        return len(self.rows)
+
+    async def attach_broker_id(self, client_order_id: str, broker_order_id: str) -> None:
+        self.rows[client_order_id].update(broker_order_id=broker_order_id, status="SUBMITTED")
+
+    async def mark_rejected(self, client_order_id: str, *, reason) -> None:
+        self.rows[client_order_id].update(status="REJECTED", rejection_reason=reason)
+
+    async def find_by_client_order_id(self, client_order_id: str):
+        row = self.rows.get(client_order_id)
+        return None if row is None else dict(row)
+
+    async def orders_placed_since(self, since) -> list[dict]:
+        return [dict(r) for r in self.rows.values() if r["placed_at"] >= since]
+
+    async def apply_broker_state(self, client_order_id: str, **kwargs) -> None:
+        row = self.rows[client_order_id]
+        row.update(
+            status=kwargs["status"],
+            filled_quantity=kwargs["filled_quantity"],
+            average_price=kwargs["average_price"],
+        )
+        if kwargs["broker_order_id"] is not None:
+            row["broker_order_id"] = kwargs["broker_order_id"]
+
+
+class TestSit19ASessionReconciledAllDay:
+    """SIT-17 and SIT-18 ended at a position being protected or exited. This
+    runs the loop that watches them - after every fill of the day - and asks
+    what only a whole day can answer:
+
+    * **Does a day of our OWN fills and exits ever halt?** One race is a unit
+      test. Sixty fills, each followed by its exit and by a reconciliation
+      cycle, is where a check that confused our activity for someone else's
+      would stop the day.
+    * **Does a stranger's position halt within one cycle, and does the day then
+      stop?** That needs the latch and the risk engine in the same test.
+    * **Until E15-S12 books fills, is every fill exited exactly once, and does
+      the day end flat?** That is the fail-closed claim, and it is only a claim
+      about a whole day.
+
+    **The trigger is the test**, again: nothing yet runs the loop on a timer in
+    production, so this file calls it after each fill, as the scheduler will.
+    """
+
+    LIMIT = 60
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar, **overrides):
+        kwargs = {**self._healthy(), **overrides}
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **kwargs,
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session
+
+    @staticmethod
+    def _signals(session) -> list:
+        return [
+            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            for t in sorted(session.decisions)
+            if session.decisions[t].approved
+        ]
+
+    @staticmethod
+    def _stack(calendar):
+        broker, ledger = _ReconciledBroker(), _SessionLedger()
+        gateway = OrderGateway(
+            broker,
+            policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=ledger,
+        )
+        halter = HaltController(_SessionRedis())
+        protector = ProtectiveStop(gateway, halter=halter, metrics=get_metrics())
+        store = _SessionPositionStore()
+        manager = PositionManager(
+            protector=protector,
+            store=store,
+            mirror=_DictMirror(),
+            calendar=calendar,
+            metrics=get_metrics(),
+        )
+        audit: list = []
+
+        async def sink(entry) -> None:
+            audit.append(entry)
+
+        reconciler = Reconciler(
+            broker=broker,
+            ledger=ledger,
+            manager=manager,
+            protector=protector,
+            halter=halter,
+            audit=sink,
+            metrics=get_metrics(),
+        )
+        return {
+            "broker": broker,
+            "ledger": ledger,
+            "gateway": gateway,
+            "halter": halter,
+            "protector": protector,
+            "store": store,
+            "manager": manager,
+            "reconciler": reconciler,
+            "audit": audit,
+        }
+
+    @staticmethod
+    def _enter(stack, index, decision, recommendation, ist_time) -> str:
+        """Send one entry, as the pipeline will. Returns its idempotency key."""
+        symbol = f"SYM{index:04d}"
+        stack["ledger"].now = _at(TRADING_DAY, ist_time.hour, ist_time.minute)
+        cid = client_order_id(
+            correlation_id=recommendation.correlation_id,
+            symbol=symbol,
+            side=Side.BUY,
+            intent=OrderIntent.ENTRY,
+            trade_date=TRADING_DAY,
+        )
+        _run_async(
+            stack["gateway"].submit(
+                OrderRequest(
+                    client_order_id=cid,
+                    correlation_id=recommendation.correlation_id,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    order_type=OrderType.MARKET,
+                    product=Product.MIS,
+                    quantity=decision.sizing.quantity,
+                    intent=OrderIntent.ENTRY,
+                    algo_id="ALGO12345",
+                    market_protection=Decimal("-1"),
+                )
+            )
+        )
+        return cid
+
+    @staticmethod
+    def _cycle(stack, ist_time, *, seconds: int = 30):
+        moment = _at(TRADING_DAY, ist_time.hour, ist_time.minute) + dt.timedelta(seconds=seconds)
+        return _run_async(stack["reconciler"].run_cycle(now=moment))
+
+    def _run_day(self, calendar, *, limit=LIMIT, before_cycle=None):
+        session = self._session(calendar).run()
+        stack = self._stack(calendar)
+        reports = []
+        for index, (decision, rec, ist_time) in enumerate(self._signals(session)[:limit]):
+            self._enter(stack, index, decision, rec, ist_time)
+            if before_cycle is not None:
+                before_cycle(index, stack)
+            reports.append(self._cycle(stack, ist_time))
+        return session, stack, reports
+
+    # -- the ordinary day ------------------------------------------------------
+
+    def test_a_day_of_our_own_fills_and_exits_never_halts(self, calendar) -> None:
+        _session, stack, reports = self._run_day(calendar)
+        assert len(reports) == self.LIMIT
+        assert all(r.unknown == [] for r in reports), "our own activity read as a stranger's"
+        assert not any(r.halted for r in reports)
+        assert not _run_async(stack["halter"].state()).any_halted
+
+    def test_until_fills_are_booked_every_fill_is_exited_exactly_once(self, calendar) -> None:
+        """E15-S12 books fills. Until it lands, AC7 means every fill leaves - and
+        leaves once: a second exit per fill would sell shares already sold."""
+        _session, stack, _reports = self._run_day(calendar)
+        exits = [r for r in stack["broker"].placed if r.side is Side.SELL]
+        assert len(exits) == self.LIMIT
+        assert len({r.symbol for r in exits}) == self.LIMIT, "a symbol was exited twice"
+        assert all(r.intent is OrderIntent.SQUAREOFF for r in exits)
+
+    def test_the_day_ends_flat(self, calendar) -> None:
+        _session, stack, _reports = self._run_day(calendar)
+        assert set(stack["broker"].net().values()) == {0}
+
+    def test_every_difference_is_one_audit_row_and_clean_cycles_write_none(self, calendar) -> None:
+        _session, stack, reports = self._run_day(calendar)
+        assert len(stack["audit"]) == sum(len(r.drifts) for r in reports)
+        assert {e.stage for e in stack["audit"]} == {"RECONCILIATION_DRIFT"}
+        kinds = {e.outcome for e in stack["audit"]}
+        assert kinds <= {d.value for d in Drift}
+        assert "UNKNOWN_POS" not in kinds
+
+    # -- a stranger on the account ---------------------------------------------
+
+    def test_a_stranger_mid_session_halts_within_one_cycle_and_the_day_stops(
+        self, calendar
+    ) -> None:
+        """The acceptance criterion at session scale, composed with the latch
+        and the risk engine: a halt nothing reads would pass a unit test."""
+
+        def stranger(index, stack) -> None:
+            if index == 30:
+                stack["broker"].foreign_fill("WIPRO", 25)
+
+        _session, stack, reports = self._run_day(calendar, before_cycle=stranger)
+        first = next(i for i, r in enumerate(reports) if r.unknown)
+        assert first == 30, "the stranger was seen late, or early"
+        state = _run_async(stack["halter"].state())
+        assert state.kill_switch
+        assert state.records["kill_switch"].reason is HaltReason.UNKNOWN_POSITION
+
+        after = self._session(calendar, kill_switch_active=state.kill_switch).run()
+        assert [d for d in after.decisions.values() if d.approved] == []
+
+    def test_a_stranger_is_alerted_once_not_every_cycle(self, calendar) -> None:
+        """The stranger's position stays at the broker, so every cycle sees it.
+        Seeing it is right; ALERTING on it every 30 seconds for the rest of the
+        day is an alarm that stops being read - and a counter documented as
+        'positions' that would really be counting cycles."""
+
+        def stranger(index, stack) -> None:
+            if index == 30:
+                stack["broker"].foreign_fill("WIPRO", 25)
+
+        _session, stack, reports = self._run_day(calendar, before_cycle=stranger)
+        assert sum(1 for r in reports if r.unknown) == self.LIMIT - 30, "detection stopped"
+        unknown_rows = [e for e in stack["audit"] if e.outcome == "UNKNOWN_POS"]
+        assert len(unknown_rows) == 1, f"alerted {len(unknown_rows)} times for one stranger"
+        assert _counter_value("unknown_positions_total") == 1
+
+    def test_the_halt_does_not_stop_our_own_exits(self, calendar) -> None:
+        """A halt must never disable the exit path. The fill in the halting
+        cycle and every one after it still leaves."""
+
+        def stranger(index, stack) -> None:
+            if index == 30:
+                stack["broker"].foreign_fill("WIPRO", 25)
+
+        _session, stack, _reports = self._run_day(calendar, before_cycle=stranger)
+        ours = {s: n for s, n in stack["broker"].net().items() if s != "WIPRO"}
+        assert set(ours.values()) == {0}
+        assert stack["broker"].net()["WIPRO"] == 25, "the loop traded a position it did not open"
+
+    # -- protected positions ---------------------------------------------------
+
+    def _book(self, stack, calendar, count: int):
+        """Book positions by hand - E15-S12's job, played by the test."""
+        session = self._session(calendar).run()
+        booked = []
+        for index, (decision, rec, ist_time) in enumerate(self._signals(session)[:count]):
+            cid = self._enter(stack, index, decision, rec, ist_time)
+            order = stack["broker"].orders[cid]
+            booked.append(
+                _run_async(
+                    stack["manager"].open_from_fill(
+                        order,
+                        sizing=decision.sizing,
+                        slot_index=index,
+                        trade_date=TRADING_DAY,
+                        now=_at(TRADING_DAY, ist_time.hour, ist_time.minute),
+                        is_cas_stock=False,
+                    )
+                )
+            )
+        return booked
+
+    def test_booked_positions_with_live_stops_are_left_alone_all_day(self, calendar) -> None:
+        """The control for everything above: a loop that exited everything would
+        pass the unbooked tests and this is where it would fail."""
+        stack = self._stack(calendar)
+        booked = self._book(stack, calendar, 5)
+        for minute in range(0, 120, 5):
+            report = self._cycle(stack, dt.time(12, 0), seconds=minute * 60)
+            assert report.exited == []
+        assert [type(t) for t in stack["manager"].open_positions()] == [ProtectedPosition] * 5
+        assert [p.position.symbol for p in booked] == [f"SYM{i:04d}" for i in range(5)]
+
+    def test_a_stop_rejected_mid_afternoon_is_exited_in_the_next_cycle(self, calendar) -> None:
+        """Verified live at attach, rejected afterwards: E15-S04's asynchronous
+        case, which no synchronous check reaches."""
+        stack = self._stack(calendar)
+        booked = self._book(stack, calendar, 3)
+        assert self._cycle(stack, dt.time(13, 0)).exited == []
+
+        stack["broker"].reject(booked[1].established.stop_client_order_id)
+        report = self._cycle(stack, dt.time(13, 1))
+        assert report.exited == ["SYM0001"]
+        assert stack["broker"].net()["SYM0001"] == 0
+
+    def test_a_restart_resolves_every_restored_position_in_one_cycle(self, calendar) -> None:
+        """E15-S05 ends a restart with protection unknown. One cycle later
+        nothing may still be unknown: each is proved protected or has left."""
+        stack = self._stack(calendar)
+        booked = self._book(stack, calendar, 4)
+        stack["broker"].reject(booked[2].established.stop_client_order_id)
+
+        restarted = PositionManager(
+            protector=stack["protector"],
+            store=stack["store"],
+            mirror=_DictMirror(),
+            calendar=calendar,
+            metrics=get_metrics(),
+        )
+        restored = _run_async(restarted.restore())
+        assert [type(r) for r in restored] == [UnverifiedPosition] * 4
+        stack["reconciler"]._manager = restarted
+
+        report = self._cycle(stack, dt.time(13, 30))
+        assert sorted(report.promoted) == ["SYM0000", "SYM0001", "SYM0003"]
+        assert report.exited == ["SYM0002"]
+        assert not any(isinstance(t, UnverifiedPosition) for t in restarted.open_positions())
+
+    # -- cross-cutting -------------------------------------------------------
+
+    def test_no_credential_reached_the_log_on_a_reconciled_day(self, calendar) -> None:
+        import re
+
+        def stranger(index, stack) -> None:
+            if index == 10:
+                stack["broker"].foreign_fill("WIPRO", 25)
+
+        session, _stack, _reports = self._run_day(calendar, limit=20, before_cycle=stranger)
         assert not re.search(
             r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
             session.log_text,

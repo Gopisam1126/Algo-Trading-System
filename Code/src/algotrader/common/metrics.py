@@ -124,6 +124,35 @@ class Metrics:
             registry=self.registry,
         )
 
+        # -- execution: reconciliation (E15-S09) -----------------------------
+        self.reconciliation_cycles_total = Counter(
+            "reconciliation_cycles_total",
+            "Reconciliation cycles that completed their reads. A flat line during "
+            "market hours means the loop is not running, which is itself a halt "
+            "condition an operator should hear about.",
+            registry=self.registry,
+        )
+        self.reconciliation_read_failures_total = Counter(
+            "reconciliation_read_failures_total",
+            "Cycles that took no action because a broker or database read failed. "
+            "Three consecutive failures halt the session.",
+            registry=self.registry,
+        )
+        self.reconciliation_drift_total = Counter(
+            "reconciliation_drift_total",
+            "Differences between local state and the broker, by kind.",
+            labelnames=("kind",),
+            registry=self.registry,
+        )
+        # Separate from the halt on purpose (the story's build concern): this
+        # counts positions a human must look at NOW; the halt is about the day.
+        self.unknown_positions_total = Counter(
+            "unknown_positions_total",
+            "MIS positions at the broker that no order of ours explains. Each one "
+            "halts the session. Any non-zero value is an incident.",
+            registry=self.registry,
+        )
+
     def rejected(self, check: str, reason: str) -> None:
         self.signals_rejected_total.labels(check=check, reason=reason).inc()
 

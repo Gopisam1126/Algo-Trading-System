@@ -657,3 +657,91 @@ class TestSnappingNeverWidensAProtectiveStop:
         entry = Decimal("1200.00")
         snapped = round_to_tick(Decimal(raw), Decimal("0.05"), side=Side.BUY)
         assert snapped - entry <= Decimal(raw) - entry
+
+
+# ---------------------------------------------------------------------------
+# E15-S09: adopting a stop placed earlier, and asking after an exit
+# ---------------------------------------------------------------------------
+
+
+def _listed_stop(gateway: FakeGateway, position: Position, status: OrderStatus) -> str:
+    """List the stop under the key the REAL gateway builder derives (M12)."""
+    cid = _real_gateway().build_stop(position, trade_date=TRADE_DATE).client_order_id
+    gateway.orderbook[cid] = _order(cid, status=status, symbol=position.symbol)
+    return cid
+
+
+class TestAdoptingAStopPlacedEarlier:
+    """The restart case: a position rebuilt from a row is unverified until the
+    broker confirms a live stop. ``adopt`` is the only way that confirmation
+    becomes an ``EstablishedPosition`` without placing a second stop."""
+
+    @_ASYNC
+    async def test_a_live_stop_is_adopted_as_proof(self) -> None:
+        gateway = FakeGateway()
+        position = _position()
+        cid = _listed_stop(gateway, position, OrderStatus.OPEN)
+        proof = await _attacher(gateway).adopt(position, trade_date=TRADE_DATE, now=NOW)
+        assert isinstance(proof, EstablishedPosition)
+        assert proof.stop_client_order_id == cid
+        assert proof.stop_broker_order_id == "260825000777"
+        assert gateway.stops == [], "adopting placed a second stop"
+
+    @_ASYNC
+    @pytest.mark.parametrize("status", [OrderStatus.REJECTED, OrderStatus.CANCELLED])
+    async def test_a_dead_stop_is_not_proof(self, status: OrderStatus) -> None:
+        gateway = FakeGateway()
+        position = _position()
+        _listed_stop(gateway, position, status)
+        assert await _attacher(gateway).adopt(position, trade_date=TRADE_DATE, now=NOW) is None
+
+    @_ASYNC
+    async def test_an_absent_stop_is_not_proof(self) -> None:
+        assert (
+            await _attacher(FakeGateway()).adopt(_position(), trade_date=TRADE_DATE, now=NOW)
+            is None
+        )
+
+    @_ASYNC
+    async def test_a_stop_with_no_broker_id_is_not_proof(self) -> None:
+        """An EstablishedPosition names the broker order protecting it. A record
+        with no id supports neither 'it is live' nor 'it is not'."""
+        gateway = FakeGateway()
+        position = _position()
+        cid = _listed_stop(gateway, position, OrderStatus.OPEN)
+        gateway.orderbook[cid] = gateway.orderbook[cid].model_copy(update={"broker_order_id": None})
+        assert await _attacher(gateway).adopt(position, trade_date=TRADE_DATE, now=NOW) is None
+
+    @_ASYNC
+    async def test_a_naive_timestamp_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="naive"):
+            await _attacher().adopt(
+                _position(), trade_date=TRADE_DATE, now=dt.datetime(2026, 8, 25)
+            )
+
+
+class TestAskingAfterAnExit:
+    @_ASYNC
+    async def test_a_listed_exit_is_live(self) -> None:
+        gateway = FakeGateway()
+        position = _position()
+        built = _real_gateway().build_exit(position, trade_date=TRADE_DATE)
+        gateway.orderbook[built.client_order_id] = _order(built.client_order_id)
+        assert await _attacher(gateway).exit_is_live(position, trade_date=TRADE_DATE)
+
+    @_ASYNC
+    async def test_an_absent_exit_is_not_live(self) -> None:
+        assert not await _attacher().exit_is_live(_position(), trade_date=TRADE_DATE)
+
+    @_ASYNC
+    async def test_asking_places_nothing_and_raises_no_alarm(self, caplog) -> None:
+        """Why this exists rather than calling exit_now every cycle: the question
+        must not log a CRITICAL naked-position line or count a failure."""
+        gateway, metrics = FakeGateway(), FakeMetrics()
+        with caplog.at_level(logging.CRITICAL):
+            await _attacher(gateway, metrics=metrics).exit_is_live(
+                _position(), trade_date=TRADE_DATE
+            )
+        assert gateway.exits == []
+        assert metrics.stop_attach_failures_total.count == 0
+        assert not [r for r in caplog.records if r.levelno >= logging.CRITICAL]

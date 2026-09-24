@@ -291,6 +291,47 @@ class ProtectiveStop:
         cid = stop_client_order_id(position, trade_date=trade_date)
         return is_live(await self._gateway.find_order(cid))
 
+    async def exit_is_live(self, target: Closable, *, trade_date: dt.date) -> bool:
+        """Whether this holding's emergency exit is live at the broker.
+
+        The loop's question for a position already on its way out (E15-S09).
+        Calling :meth:`exit_now` every 30 seconds instead would be idempotent -
+        the key is derived, so no second order is placed - but it logs a
+        CRITICAL "NAKED POSITION" line and counts a stop failure on every call,
+        and an alarm that repeats every cycle stops being read.
+        """
+        return is_live(await self._gateway.find_order(_exit_cid(target, trade_date)))
+
+    async def adopt(
+        self, position: Position, *, trade_date: dt.date, now: dt.datetime
+    ) -> EstablishedPosition | None:
+        """Prove protection for a position whose stop was placed earlier.
+
+        The restart case (E15-S09). A position rebuilt from the database is
+        ``UnverifiedPosition`` because a row cannot say whether any order is
+        protecting it. This asks the broker for the stop by its derived key,
+        and returns an ``EstablishedPosition`` only if the broker lists it live
+        - so holding one still means exactly what it meant before: the broker
+        confirmed a live stop. It is obtained by ADOPTING an order rather than
+        placing one, which is §8.2's query-don't-retry, one object along.
+
+        Returns ``None`` rather than raising when there is no live stop, because
+        the caller's response to "unprotected" is the exit path and that
+        decision is the loop's, not this method's.
+        """
+        if now.tzinfo is None:
+            raise ValueError(f"adopt timestamp {now!r} is naive")
+        cid = stop_client_order_id(position, trade_date=trade_date)
+        order = await self._gateway.find_order(cid)
+        if not is_live(order) or order is None or not order.broker_order_id:
+            return None
+        return EstablishedPosition(
+            position=position,
+            stop_client_order_id=cid,
+            stop_broker_order_id=order.broker_order_id,
+            established_at=now,
+        )
+
     async def exit_now(
         self,
         target: Closable,

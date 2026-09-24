@@ -811,17 +811,79 @@ class OrderRepository:
         return None if row is None else await self._order_to_dict(row)
 
     async def open_orders(self) -> list[dict[str, Any]]:
-        """Everything not in a terminal state — the reconciliation working set."""
+        """Everything not in a terminal state — the reconciliation working set.
+
+        The terminal set is asked of ``OrderStatus.is_terminal`` rather than
+        restated here. It was three string literals until E15-S09 - a second
+        definition of a fact the state machine owns, which would have silently
+        kept reconciling a status the enum had learned was terminal, or stopped
+        reconciling one it had learned was not.
+        """
+        from algotrader.common.enums import OrderStatus
+
+        terminal = tuple(s.value for s in OrderStatus if s.is_terminal)
+        rows = (
+            (await self._session.execute(select(Order).where(Order.status.notin_(terminal))))
+            .scalars()
+            .all()
+        )
+        return [await self._order_to_dict(r) for r in rows]
+
+    async def orders_placed_since(self, since: dt.datetime) -> list[dict[str, Any]]:
+        """Every order placed at or after ``since``, in any status.
+
+        The reconciliation loop needs FILLED rows too, not only open ones: which
+        broker fills are ours is answered by all of today's orders, and a
+        working set that dropped the filled ones would call our own completed
+        trades unknown and halt the day on them.
+        """
+        if since.tzinfo is None:
+            raise ValueError(f"{since!r} is naive; which day's orders is ambiguous")
         rows = (
             (
                 await self._session.execute(
-                    select(Order).where(Order.status.notin_(("FILLED", "CANCELLED", "REJECTED")))
+                    select(Order).where(Order.placed_at >= since).order_by(Order.id)
                 )
             )
             .scalars()
             .all()
         )
         return [await self._order_to_dict(r) for r in rows]
+
+    async def apply_broker_state(
+        self,
+        client_order_id: str,
+        *,
+        status: str,
+        filled_quantity: int,
+        average_price: Decimal | None,
+        broker_order_id: str | None,
+    ) -> None:
+        """Record what the broker says about one of our orders (E15-S09).
+
+        Deliberately dumb, like ``attach_broker_id`` and ``mark_rejected``:
+        persistence, not policy. Whether the move is LEGAL is decided by the
+        reconciler against ``execution/order_state.py`` before this is called,
+        and the ``fill_not_over`` CHECK refuses a filled quantity above the
+        ordered one at the database.
+
+        ``broker_order_id`` is written only when supplied, because adopting a
+        SUBMITTING row is exactly the case where we learn it for the first time,
+        and every other case must not overwrite it with None.
+        """
+        from sqlalchemy import update
+
+        values: dict[str, Any] = {
+            "status": status,
+            "filled_quantity": filled_quantity,
+            "average_price": average_price,
+            "last_update_at": dt.datetime.now(dt.UTC),
+        }
+        if broker_order_id is not None:
+            values["broker_order_id"] = broker_order_id
+        await self._session.execute(
+            update(Order).where(Order.client_order_id == client_order_id).values(**values)
+        )
 
     async def _order_to_dict(self, row: Order) -> dict[str, Any]:
         return {

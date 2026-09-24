@@ -759,6 +759,62 @@ class PositionManager:
         )
         return None
 
+    # -- resolving ----------------------------------------------------------
+
+    async def promote(self, established: EstablishedPosition) -> ProtectedPosition:
+        """Replace an ``UnverifiedPosition`` with the protected type (E15-S09).
+
+        The only other way into ``ProtectedPosition``, and it takes the same
+        proof: an ``EstablishedPosition``, which only ``ProtectiveStop`` can
+        produce and only from a broker confirmation. The marks carry over - a
+        restart must not reset a position's excursions a second time.
+
+        Refuses anything but an unverified position for the same holding. A
+        promote aimed at an EXITING position would put a stop-protected label
+        on a holding whose stop is known to have failed.
+        """
+        position = established.position
+        current = self._book.get(position.symbol)
+        if not isinstance(current, UnverifiedPosition):
+            raise PositionError(
+                f"{position.symbol} is {type(current).__name__ if current else 'not held'}; "
+                f"only an UnverifiedPosition can be promoted"
+            )
+        if current.position.correlation_id != position.correlation_id:
+            raise PositionError(
+                f"{position.symbol}: the proof is for correlation "
+                f"{position.correlation_id}, the book holds {current.position.correlation_id}"
+            )
+        promoted = ProtectedPosition(established=established, marks=current.marks)
+        self._book[position.symbol] = promoted
+        await self._mirror.write(position.symbol, PositionSnapshot.of(promoted))
+        return promoted
+
+    async def mark_exiting(self, symbol: str, *, because: str) -> ExitingPosition:
+        """Record that a held position is being exited because it is unprotected.
+
+        The reconciler's counterpart to what ``open_from_fill`` does when attach
+        fails (SIT-006). Without it, a position whose stop the broker had just
+        reported dead kept its ``ProtectedPosition`` label - the book claiming a
+        protection the broker had disproved, which is the one state the three
+        types exist to rule out - and the loop re-ran the exit path every cycle,
+        logging a CRITICAL naked-position line and counting a failure each time.
+
+        Idempotent on a position already exiting. The marks carry over.
+        """
+        current = self._book.get(symbol)
+        if current is None:
+            raise PositionError(f"{symbol} is not held; there is nothing to mark exiting")
+        if isinstance(current, ExitingPosition):
+            return current
+        exiting = ExitingPosition(
+            position=current.position, because=one_safe_line(because), marks=current.marks
+        )
+        self._book[symbol] = exiting
+        await self._mirror.write(symbol, PositionSnapshot.of(exiting))
+        log.warning("%s is now EXITING: %s", symbol, one_safe_line(because))
+        return exiting
+
     # -- restarting ---------------------------------------------------------
 
     async def restore(self) -> list[UnverifiedPosition]:
