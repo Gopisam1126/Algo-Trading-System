@@ -106,6 +106,13 @@ class HaltReason(StrEnum):
     #: the nearest plausible neighbour is how HEALTH_GATE_FAILED came to mean
     #: four different things in this codebase; this gets its own member.
     NAKED_POSITION = "NAKED_POSITION"
+    #: One of our idempotency keys is on more than one broker order (E15-S09).
+    #: Either our own idempotency failed - the defect E15-S02 exists to prevent -
+    #: or someone with access to the account copied one of our tags onto their
+    #: own order. The two cannot be told apart from the orderbook, and both
+    #: warrant stopping. Not UNKNOWN_POSITION: the shares here carry our key,
+    #: and naming them unknown would send an operator looking for a stranger.
+    DUPLICATE_ORDER = "DUPLICATE_ORDER"
 
 
 #: Which latch each reason writes to. Three latches rather than one flag,

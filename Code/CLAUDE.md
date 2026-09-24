@@ -134,9 +134,11 @@ sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
 order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
-the gateway are unbuilt: no reconciliation loop (E15-S09) and no square-off
-timer (E15-S06). The order state machine (E15-S03), protective stop attachment
-(E15-S04) and the position manager (E15-S05) now exist. **A gateway is not a trading
+the gateway are unbuilt: no square-off timer (E15-S06) and nothing that books
+an observed fill into the position manager (E15-S12), so **every fill is exited
+as unprotected until E15-S12 lands**. The order state machine (E15-S03),
+protective stop attachment (E15-S04), the position manager (E15-S05) and the
+reconciliation loop (E15-S09) now exist. **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
@@ -451,6 +453,48 @@ Recorded because each was believed, written down, and wrong.
   confirmed on `filled_quantity`, never status. Mutation: 24 injected, 24
   killed.
 
+- **E15-S09 reconciliation loop** — `execution/reconciliation.py`. Read
+  everything, then act; never act on a partial view. Unknown positions are found
+  **per side** (bought, sold), because net quantity is not monotone and a net
+  check halts the day on its own exits. Any unexplained MIS fill halts; the loop
+  never trades a position it did not open. A key on two broker orders halts as
+  `DUPLICATE_ORDER` (REC-001). Every booked position is asked of the broker every
+  cycle. Mutation: see the story.
+
+- **"A protocol is a contract."** Only if something checks it.
+  `TradingAdapter.fetch_positions` promised `Position`, the Kite adapter
+  returned dicts, and the design doc said `BrokerPosition` — three definitions,
+  none agreeing. `subscribe` was declared a coroutine while every implementation
+  is an async iterator. `@runtime_checkable` checks attribute *names*, never
+  signatures. `broker/kite/trading.py` now has a type-checked `_conforms`.
+- **"An order carrying our tag is ours."** A tag is readable by anyone with
+  access to the account, so it can be copied. The first reconciler, meeting our
+  FILLED entry and a foreign order with the same tag, raised no halt, never
+  looked at the duplicate — terminal rows skip order reconciliation — and sent
+  an exit for all 140 shares, 100 of them someone else's. Found by the STRIDE
+  pass against the story's own attribution rule. REC-001.
+- **"Net quantity tells you whether a position is explained."** Not across two
+  separate reads. Net goes up on entries and down on exits, so a fill between
+  the reads can move it either way; per-side cumulative quantities only grow.
+- **"The test that passed after I killed the orphans proves the orphans were
+  the cause."** It proved nothing. SIT stalls on 22 and 24 Sep were blamed on
+  two orphaned pytest processes; the full suite then hung again with none
+  present. A faulthandler dump named it: every `asyncio.run` builds an event
+  loop, every Windows loop builds its self-pipe with an EMULATED `socketpair`
+  over loopback TCP, and CPython waits for it in `accept()` with no timeout.
+  Thousands of loops per SIT test made the rare lost connect likely. One loop per
+  SIT module fixed it (and cut SIT from ~60 s to 17 s). A probabilistic hang does
+  not recur on every run, so "it passed after my change" confirms nothing. SIT-007.
+- **"A unit test for the path is a regression test for the path."** Not if it
+  asserts what the code currently does. `test_a_restored_position_with_no_stop_is_exited`
+  ended by asserting the position was still `UnverifiedPosition` after being
+  exited — the stale label SIT-006 then found, written down as correct. Same
+  shape as QA-E15-04. Assert what SHOULD be true, not what is.
+- **"A lesson written down is a lesson learned."** QA-E15-18 recorded that an
+  edit anchored on `class X:` lands between the class and its decorator. Two
+  days later, inserting `BrokerPosition` above `class MarketDataAdapter` did it
+  again — `@runtime_checkable` moved onto a dataclass. mypy caught it both
+  times. The written lesson prevented nothing; the type checker prevented both.
 - **"The database constraint has it covered."** It does, and that is layer 2.
   `open_from_fill` had no cheap check, so a replayed fill after a restart was
   refused by `uq_open_symbol` and by nothing else — safe, but reaching the

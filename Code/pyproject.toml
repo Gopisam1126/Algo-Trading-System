@@ -191,6 +191,11 @@ asyncio_mode = "auto"
 # fixtures would silently start getting a fresh event loop per test.
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--strict-markers --strict-config"
+# A test that runs past this dumps every thread's stack instead of hanging in
+# silence. Added after a hang inside CPython's Windows socketpair emulation cost
+# two wrong diagnoses before a dump named it (tests/sit, E15-S09). It reports; it
+# does not kill, so a slow test still finishes.
+faulthandler_timeout = 300
 markers = [
     "unit: fast, no I/O",
     "property: Hypothesis property-based tests",

@@ -2155,21 +2155,40 @@ Activate trailing after N R; partial booking at configured levels.
 
 ---
 
-### E15-S09 · Reconciliation loop
+### E15-S09 · Reconciliation loop 🔴
 `P0` `Phase 5` `🔴` `SEC` · **2 days** · deps: E15-S03
 
 > As an operator, I want local state continuously compared against the broker's,
 > so that drift is detected rather than discovered.
 
+The story had one acceptance criterion and ten recorded constraints; Phase 1
+turned them into nine falsifiable criteria. Chosen ahead of E15-S06, whose
+dependency E04-S05 is still New.
+
 **Tasks**
-- [ ] Every 30s during market hours, plus on every reconnect
-- [ ] Diff orders and positions
-- [ ] **Broker state wins** — it is the legal record
-- [ ] `RECONCILIATION_DRIFT` audit event per difference
-- [ ] **Unknown position → kill switch + P0 alert immediately**
+- [x] Every 30s during market hours, plus on every reconnect
+- [x] Diff orders and positions
+- [x] **Broker state wins** — through the state machine, consulting `filled_quantity`
+- [x] `RECONCILIATION_DRIFT` audit event per difference
+- [x] **Unknown position → kill switch + P0 alert immediately** — alert separate
+      from the halt
+- [x] Every booked position checked for a live stop every cycle; restored
+      positions resolved from the broker
+- [x] `SUBMITTING` rows queried; absent past a grace window → `SUBMIT_FAILED`
+- [x] `fetch_positions` given an honest type; adapter conformance now type-checked
+- [x] **Added (REC-001):** a key on two broker orders halts (`DUPLICATE_ORDER`)
+      and the holding is not traded
 
 **Acceptance**
-- 🔴 An unknown position halts the system within one reconciliation cycle
+- [x] 🔴 An unknown position arms the kill switch in the cycle that first sees it
+- [x] 🔴 A fill racing the two broker reads never produces a false halt
+- [x] 🔴 Every booked position is checked every cycle; unprotected → exited
+- [x] 🔴 An `UnverifiedPosition` is promoted only on the broker's confirmation
+- [x] 🔴 Broker status goes through the state machine; a refusal is recorded once
+- [x] `SUBMITTING` past the grace window → `SUBMIT_FAILED`
+- [x] 🔴 Our fill with no book entry is exited *(every fill, until E15-S12)*
+- [x] Every drift fits `decision_log`'s columns, proved against the real table
+- [x] A failed read is never acted on; three in a row halt
 
 ---
 
@@ -2195,6 +2214,32 @@ Activate trailing after N R; partial booking at configured levels.
 
 Final reconciliation, journal entries with setup/regime/outcome attribution,
 daily statistics.
+
+---
+
+### E15-S12 · Book fills from reconciliation 🔴
+`P0` `Phase 5` `🔴` `FEAT` · **1.5 days** · deps: E15-S09, E15-S05
+
+> As a trader, I want a fill the reconciliation loop observes to become a
+> protected position in the book, so that the system can hold a position at
+> all — until this exists, every fill is exited as unprotected.
+
+*Raised by E15-S09's business analysis.* `open_from_fill` needs the approved
+sizing, slot and CAS flag, and the `orders` table carries none of them.
+
+**Tasks**
+- [ ] Carry the approved sizing, slot and CAS flag from submission to fill
+- [ ] Entry observed `FILLED`/`PARTIAL` → `PositionManager.open_from_fill`
+- [ ] Stop observed `FILLED` → `confirm_exit(reason=STOP)`; square-off → its reason
+- [ ] After a restart, a fill with no recorded sizing is exited, not guessed
+
+**Acceptance**
+- 🔴 An entry fill becomes a `ProtectedPosition` within the same cycle
+- 🔴 A stopped-out position leaves the book with `exit_reason=STOP`
+- 🔴 A fill whose sizing is unknown is exited rather than booked on a guess
+
+**Constraint:** booking must run **before** E15-S09's unbooked-holding step in
+the same cycle, or a fresh fill is exited before it could be protected.
 
 ---
 ---

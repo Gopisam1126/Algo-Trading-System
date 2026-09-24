@@ -450,7 +450,7 @@ class BrokerAdapter(Protocol):
     async def fetch_margins(self) -> MarginSnapshot: ...
 
     # --- Market data ---
-    async def subscribe(self, tokens: list[str]) -> AsyncIterator[RawTick]: ...
+    def subscribe(self, tokens: list[str]) -> AsyncIterator[RawTick]: ...
     async def fetch_historical(
         self, token: str, timeframe: Timeframe, start: datetime, end: datetime
     ) -> list[Bar]: ...
@@ -461,7 +461,23 @@ class BrokerAdapter(Protocol):
     async def cancel_order(self, broker_id: str) -> None: ...
     async def fetch_orderbook(self) -> list[BrokerOrder]: ...
     async def fetch_positions(self) -> list[BrokerPosition]: ...
+    def order_key(self, client_order_id: str) -> str: ...   # E15-S09
 ```
+
+**The spec was right and the code had drifted from it, twice (E15-S09).** This
+block always said `fetch_positions() -> list[BrokerPosition]`. The protocol in
+`broker/adapter.py` said `-> list[Position]`; the Kite adapter returned raw
+dicts, and its docstring explained correctly why a `Position` — which needs a
+stop price, a correlation id and a slot — cannot be built from broker data.
+Three definitions of one method, none agreeing, and nothing noticed:
+`@runtime_checkable` checks that attribute *names* exist, never their
+signatures. `subscribe` had the second drift, in this block too: an `async def`
+returning an async iterator is a coroutine that must be awaited before
+iterating, and an async generator cannot be awaited — so a caller written
+against the protocol would have raised `TypeError` against every real
+implementation. Both are corrected, `BrokerPosition` now exists, and
+`broker/kite/trading.py` carries a type-checked `_conforms` function so mypy
+fails the moment the adapter and its protocol disagree again.
 
 **Internal design:**
 - `AuthManager` — handles the daily re-auth (constraint C3): TOTP-based login at the configured `daily_reauth_time`, stores the resulting session token in Redis with a TTL ending at the next pre-open. Publishes `auth.refreshed` on success, `auth.failed` on failure (which trips the health gate).
@@ -1078,13 +1094,14 @@ above does not show, each because the broker can actually produce it:
 | `PARTIAL -> CANCELLED` | A partly filled order cancelled at square-off; the filled quantity is a real position. |
 | `* -> RECONCILE_REQUIRED` from every non-terminal state | `status_in` returns it for any Kite status we do not model, which can arrive on any poll. |
 
-**`SUBMIT_FAILED` is modelled and nothing writes it yet.** Stated here because
-the gap is invisible from the table: a transition set can be complete,
-internally consistent and verified, and still contain a state no caller ever
-reaches — reachability is a property of the callers, not of the table, so
-`order_state._verify_table` cannot see it. Until SIT-003 the same was true of
-`REJECTED`. `SUBMIT_FAILED` belongs to the reconciliation path (E15-S09), and
-the constraint is recorded on that story rather than left to be rediscovered.
+**`SUBMIT_FAILED` was modelled for two stories before anything wrote it.** A
+transition set can be complete, internally consistent and verified, and still
+contain a state no caller reaches — reachability is a property of the callers,
+not of the table, so `order_state._verify_table` cannot see it. SIT-003 made
+`REJECTED` reachable; E15-S09's reconciler made `SUBMIT_FAILED` reachable: a
+`SUBMITTING` row the broker does not list, older than a 60-second grace window
+(the request may still be in flight inside it). Its only legal move is to
+`RECONCILE_REQUIRED`, which is what happens if the order turns up late.
 
 **Two exclusions are deliberate and will look like bugs.** `PARTIAL -> OPEN` is
 refused even though Kite reports `OPEN` for a partially-filled order — going
@@ -1115,6 +1132,75 @@ Runs every 30 seconds during market hours and on every reconnect:
 3. For each discrepancy, **broker state wins** — it is the legal record.
 4. Emit a `RECONCILIATION_DRIFT` audit event for every difference.
 5. If drift involves an **unknown position** (a position the broker reports that we have no record of), trip the kill switch immediately and alert. That condition means either a bug or an unauthorized order, and both warrant stopping.
+
+Since E15-S09 this is `execution/reconciliation.py`. A cycle is **read
+everything, then act**, and never acts on a partial view: if any read fails it
+does nothing and counts a failure; three in a row halt with
+`BROKER_DISCONNECTED`, because a book nobody can see is not being watched.
+
+**Unknown positions are found per side, not by net quantity.** The two broker
+reads are separate calls, so a fill can land between them. With positions read
+first, an *entry* fill in the gap is harmless — but an *exit* fill makes the
+broker appear to hold shares nobody ordered, and a net comparison halts the day
+on its own square-off. The day's cumulative bought and sold quantities are each
+monotone; read positions **first** and the orderbook **second**, compare each
+side separately, and anything beyond what our orders explain did not come from
+us. Race-free in both directions without a second read.
+
+**Scope and policy.** Product `MIS` only — the account is also a human's, and
+`CNC`, `NRML` and `MTF` holdings are outside anything this system trades. Any
+MIS fill our orders do not explain halts, including a foreign sale that nets
+against our own long: our book says long 40, the broker is flat, and our stop
+would sell 40 shares that are gone. The owner trading MIS by hand on the same
+account will therefore halt the system; that is this section's own policy,
+stated so it is a choice. Kite keeps positions closed during the day in the
+list at quantity 0 — they are not positions. **The loop never trades an
+unknown position** (it may be the owner's); it halts, and it alerts separately
+from the halt, because "look at this position now" and "decide about the day"
+are different jobs on different clocks.
+
+**Attribution is by tag, and a tag can be copied (REC-001).** A key found on
+more than one broker order means our idempotency failed or someone copied our
+tag; the two cannot be told apart and both halt, with their own reason,
+`DUPLICATE_ORDER`. A holding whose attribution is in doubt is never traded.
+The first version missed this entirely when our row was already `FILLED` —
+terminal rows skip order reconciliation — and sent an exit sized to include
+100 shares that were not ours.
+
+**Orders follow the broker through the state machine.** An `OPEN` report with a
+fill in it is `PARTIAL` (Kite uses `OPEN` for both), so the classic
+`PARTIAL -> OPEN` refusal never arises. A refused move records
+`RECONCILE_REQUIRED` once, not every cycle. A fill the broker reports as
+smaller than we recorded keeps the higher number.
+
+**Every booked position is checked every cycle**, by asking the broker — never
+the Redis mirror or a row. An `UnverifiedPosition` whose stop the broker lists
+live is promoted via `ProtectiveStop.adopt`, which produces the same proof an
+attach does; one without a live stop is exited. A position already exiting is
+asked `exit_is_live` rather than exited again, because re-calling the exit path
+every 30 seconds logs a CRITICAL line and counts a failure every time.
+
+**A fill our orders explain but the book does not hold is unprotected**, and is
+exited. Until E15-S12 books fills, that is every fill.
+
+**The book records what the loop did (SIT-006).** An exited position becomes
+`ExitingPosition` — the reconciler's counterpart to what `open_from_fill` does
+when attach fails. The first version exited correctly and left the label alone,
+so the book said *protected* about a position the broker had just shown was not,
+and the next cycle re-ran the exit path with its CRITICAL line. A *failed* exit
+leaves the label as it was: there is no live exit to claim.
+
+**Detection runs every cycle; the alert runs once (SIT-005).** A stranger's
+position stays at the broker, so every cycle sees it. It is alerted when new or
+when its size changes — the first version alerted one position thirty times, and
+a counter documented as counting positions counted cycles. The **halt** is
+re-armed every cycle regardless, so a latch cleared while a stranger remains is
+set again by the next one.
+
+Every difference is one `RECONCILIATION_DRIFT` row in `decision_log`. The
+module reads the `stage`, `outcome` and `service` widths off the real model at
+import and refuses to load if any label it can write would not fit —
+`UNKNOWN_POSITION` is 16 characters against `String(12)`.
 
 ---
 

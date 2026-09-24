@@ -18,6 +18,7 @@ organizational one (LOW_LEVEL_ARCHITECTURE.md §10.3):
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
@@ -26,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from algotrader.common.enums import Timeframe
 from algotrader.common.models.market import Bar, Instrument, Tick
-from algotrader.common.models.trading import Order, OrderRequest, Position
+from algotrader.common.models.trading import Order, OrderRequest
 
 
 class BrokerSession(BaseModel):
@@ -115,6 +116,37 @@ class DuplicateBrokerOrderError(BrokerError):
         self.broker_order_ids = broker_order_ids
 
 
+@dataclass(frozen=True)
+class BrokerPosition:
+    """One row of the broker's net positions, and only what the broker knows.
+
+    ``quantity`` is SIGNED: negative is short. Kite's portfolio documentation
+    says "Quantity held", and its own example shows ``-3``. Rows for positions
+    opened and fully closed during the day remain in the list at zero, so a
+    reader that treated every row as an open position would see a book full of
+    positions that are not there.
+
+    ``product`` and ``exchange`` stay strings rather than enums, deliberately.
+    The account is also a human's, and it can hold products this system never
+    trades (CNC, NRML, MTF). Mapping them through a closed enum would make one
+    delivery holding the owner bought by hand fail every reconciliation read -
+    and a read that always fails is, after three cycles, a halt.
+
+    The day's cumulative buy and sell quantities are carried because they are
+    MONOTONE, which net quantity is not: see ``execution/reconciliation.py``
+    for why that is the difference between a race-free unknown-position check
+    and one that halts on its own exits.
+    """
+
+    symbol: str
+    exchange: str
+    product: str
+    quantity: int
+    day_buy_quantity: int
+    day_sell_quantity: int
+    average_price: Decimal | None = None
+
+
 @runtime_checkable
 class MarketDataAdapter(Protocol):
     """Read-only broker surface."""
@@ -125,8 +157,16 @@ class MarketDataAdapter(Protocol):
 
     async def fetch_instruments(self) -> list[Instrument]: ...
 
-    async def subscribe(self, tokens: list[str]) -> AsyncIterator[Tick]:
+    def subscribe(self, tokens: list[str]) -> AsyncIterator[Tick]:
         """Stream live ticks.
+
+        A plain ``def`` returning an async iterator, not an ``async def``. The
+        protocol said ``async def`` until E15-S09, which types the method as a
+        coroutine that must be awaited before iterating - and an async
+        generator cannot be awaited, so a caller written against the protocol
+        would have raised ``TypeError`` against every real implementation.
+        Nothing noticed because nothing checked that the Kite adapter
+        conforms; ``broker/kite/trading.py`` now asserts it.
 
         Implementations must reconnect with backoff on drop, and must signal
         the gap so downstream can mark indicator state stale rather than
@@ -172,7 +212,26 @@ class TradingAdapter(MarketDataAdapter, Protocol):
 
     async def fetch_orderbook(self) -> list[Order]: ...
 
-    async def fetch_positions(self) -> list[Position]: ...
+    async def fetch_positions(self) -> list[BrokerPosition]:
+        """The broker's NET positions, as the broker describes them.
+
+        Declared ``-> list[Position]`` until E15-S09 while the Kite adapter
+        returned raw dicts - and the adapter was right. A ``Position`` requires
+        a stop price, a correlation id, a slot and a square-off deadline, and a
+        broker has none of them; "mapping" into it would mean inventing them.
+        The first consumer of this method, the reconciliation loop, would have
+        been typed against fields that do not exist.
+        """
+        ...
+
+    def order_key(self, client_order_id: str) -> str:
+        """How the broker stores OUR idempotency key on an order.
+
+        Kite truncates it to a 20-character tag. The rule is the broker's, so it
+        lives here rather than in every caller that needs to match an orderbook
+        row back to one of our orders.
+        """
+        ...
 
     async def find_by_client_order_id(self, client_order_id: str) -> Order | None:
         """Look up an order by OUR idempotency key.

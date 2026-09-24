@@ -32,10 +32,11 @@ import datetime as dt
 import logging
 from collections.abc import Callable
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from algotrader.broker.adapter import (
     AmbiguousOrderError,
+    BrokerPosition,
     DuplicateBrokerOrderError,
     MarginSnapshot,
     OrderRejectedError,
@@ -308,16 +309,41 @@ class KiteTradingAdapter(KiteReads):
             )
         return self._to_order(matches[0])
 
-    async def fetch_positions(self) -> list[dict[str, Any]]:
-        """Raw broker positions.
+    async def fetch_positions(self) -> list[BrokerPosition]:
+        """The broker's NET positions, typed as exactly what the broker knows.
 
-        Returned as dicts on purpose: the broker's position shape is its own,
-        and mapping it into our ``Position`` model would invent fields the
-        broker does not have (correlation id, slot, stop price). Reconciliation
-        compares identities and quantities, not our richer model.
+        Not our ``Position``: that model requires a stop price, a correlation
+        id, a slot and a deadline, and the broker has none of them. The earlier
+        version returned raw dicts for that reason - correctly - while the
+        protocol promised ``Position``; see ``BrokerPosition``.
+
+        Every field is REQUIRED. A missing ``quantity`` read as zero would make
+        an open position invisible to the one loop whose job is to notice it,
+        which is AUDIT-002's defect in the place it would cost most. A row that
+        cannot be read fails the whole read, and the reconciler treats a failed
+        read as "take no action on a partial view" rather than as "no positions".
         """
         raw = await self._call(self._client.positions)
-        return list(raw.get("net", []) if isinstance(raw, dict) else raw)
+        rows = raw.get("net", []) if isinstance(raw, dict) else raw
+        what = "a net position row"
+        return [
+            BrokerPosition(
+                symbol=str(mapping.require_field(row, "tradingsymbol", what=what)),
+                exchange=str(mapping.require_field(row, "exchange", what=what)),
+                product=str(mapping.require_field(row, "product", what=what)),
+                quantity=int(mapping.require_field(row, "quantity", what=what)),
+                day_buy_quantity=int(mapping.require_field(row, "day_buy_quantity", what=what)),
+                day_sell_quantity=int(mapping.require_field(row, "day_sell_quantity", what=what)),
+                average_price=(
+                    Decimal(str(row["average_price"])) if row.get("average_price") else None
+                ),
+            )
+            for row in rows
+        ]
+
+    def order_key(self, client_order_id: str) -> str:
+        """Our idempotency key as Kite stores it: the 20-character tag."""
+        return mapping.broker_tag(client_order_id)
 
     async def fetch_margins(self) -> MarginSnapshot:
         """Live margin. Always a fresh call; caching is the caller's decision."""
@@ -413,3 +439,20 @@ def _intent_from_tag(_tag: str) -> Any:
     from algotrader.common.enums import OrderIntent
 
     return OrderIntent.ENTRY
+
+
+if TYPE_CHECKING:
+    from algotrader.broker.adapter import TradingAdapter
+
+    def _conforms(adapter: KiteTradingAdapter) -> TradingAdapter:
+        """mypy proves the adapter satisfies the protocol it is used as.
+
+        Added by E15-S09 after finding two drifts nothing had caught:
+        ``fetch_positions`` promised ``Position`` and returned dicts, and
+        ``subscribe`` was declared a coroutine while every implementation is an
+        async iterator. ``@runtime_checkable`` checks only that the attribute
+        names exist, never their signatures, so the protocol could say anything.
+        This function is never called; its only job is to fail type-checking the
+        moment the two disagree.
+        """
+        return adapter
