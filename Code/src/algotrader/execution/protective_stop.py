@@ -86,6 +86,7 @@ __all__ = [
     "ProtectiveStop",
     "StopFailureError",
     "StopNotEstablishedError",
+    "exit_client_order_id",
     "stop_client_order_id",
 ]
 
@@ -166,6 +167,16 @@ def _exit_cid(position: Closable, trade_date: dt.date) -> str:
         intent=OrderIntent.SQUAREOFF,
         trade_date=trade_date,
     )
+
+
+def exit_client_order_id(position: Closable, *, trade_date: dt.date) -> str:
+    """The idempotency key of this holding's emergency exit (E15-S12).
+
+    Public for the same reason :func:`stop_client_order_id` is: reconciliation
+    must find the exit in the broker's orderbook to know whether it FILLED,
+    and the key is derivable from the holding alone.
+    """
+    return _exit_cid(position, trade_date)
 
 
 def stop_client_order_id(position: Closable, *, trade_date: dt.date) -> str:

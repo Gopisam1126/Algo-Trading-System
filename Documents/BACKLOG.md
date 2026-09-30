@@ -2228,18 +2228,55 @@ daily statistics.
 sizing, slot and CAS flag, and the `orders` table carries none of them.
 
 **Tasks**
-- [ ] Carry the approved sizing, slot and CAS flag from submission to fill
-- [ ] Entry observed `FILLED`/`PARTIAL` → `PositionManager.open_from_fill`
-- [ ] Stop observed `FILLED` → `confirm_exit(reason=STOP)`; square-off → its reason
-- [ ] After a restart, a fill with no recorded sizing is exited, not guessed
+- [x] Carry the approved sizing, slot and CAS flag from submission to fill —
+      `EntryPlan`, registered with the position manager (in memory, by design)
+- [x] Entry observed finished with a fill → `PositionManager.open_from_fill`,
+      under OUR identity, before the unbooked-exit step
+- [x] Stop observed `FILLED` → `confirm_exit(reason=STOP)`; emergency exit →
+      `UNPROTECTED`
+- [x] After a restart, a fill with no recorded sizing is exited, not guessed
+- [x] **Added:** a working partial entry is frozen (remainder cancelled) first
+- [x] **Added:** `OrderGateway.cancel`, the only path to a cancel
+- [x] **Added (QA-E15-23, CRITICAL):** only a *working* exit covers a holding;
+      what cannot be exited halts
 
 **Acceptance**
-- 🔴 An entry fill becomes a `ProtectedPosition` within the same cycle
-- 🔴 A stopped-out position leaves the book with `exit_reason=STOP`
-- 🔴 A fill whose sizing is unknown is exited rather than booked on a guess
+- [x] 🔴 A finished entry fill with a plan becomes a `ProtectedPosition` in the
+      same cycle
+- [x] 🔴 A stopped-out position leaves the book with `exit_reason=STOP` and its P&L
+- [x] 🔴 A fill whose sizing is unknown is exited rather than booked on a guess
+- [x] 🔴 A working partial entry is frozen before it is booked or exited
+- [x] 🔴 A holding that cannot be exited under the day's key halts
+- [x] A doubted correlation is never booked; a replayed booking is normal
 
 **Constraint:** booking must run **before** E15-S09's unbooked-holding step in
 the same cycle, or a fresh fill is exited before it could be protected.
+
+---
+
+### E15-S13 · Execution service: from signal to protected position 🔴
+`P0` `Phase 5` `🔴` `FEAT` · **2 days** · deps: E15-S12, E15-S09, E14-S07
+
+> As a trader, I want the execution service to take an approved signal all the
+> way to a protected position and keep watching it, so that the mechanisms built
+> separately in E15 actually run together.
+
+*Raised by E15-S12.* S04, S05, S09 and S12 each delivered a mechanism and
+deliberately left its caller; this story is the caller. Until it exists nothing
+registers an `EntryPlan` when an entry is sent, so in production every fill is
+still exited as unprotected.
+
+**Tasks**
+- [ ] Consume `Recommendation`s from `stream:signals`; evaluate with the real risk engine
+- [ ] Allocate the slot, submit the entry, register its `EntryPlan` as it is sent
+- [ ] Run the reconciliation loop every 30 s and on reconnect
+- [ ] Restore the book on start-up before the first cycle
+- [ ] Supply the CAS flag from `instrument_daily_status` (E04-S05)
+
+**Acceptance**
+- 🔴 An approved signal becomes a `ProtectedPosition` through the running service
+- 🔴 A signal the risk engine rejects places nothing
+- 🔴 A restart restores the book before the first cycle
 
 ---
 ---

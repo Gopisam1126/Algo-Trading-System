@@ -144,6 +144,11 @@ class OrderPlacer(Protocol):
 
     async def find_by_client_order_id(self, client_order_id: str) -> Order | None: ...
 
+    #: On the same protocol for the same reason the query is (E15-S12): a
+    #: cancel sent to a different venue from the one that holds the order is a
+    #: cancel that silently does nothing.
+    async def cancel_order(self, broker_order_id: str) -> None: ...
+
 
 class OrderStore(Protocol):
     """Order persistence, as the gateway needs it.
@@ -542,6 +547,40 @@ class OrderGateway:
             algo_id=self._policy.algo_id,
             market_protection=self._policy.market_protection,
         )
+
+    async def cancel(self, client_order_id_: str) -> bool:
+        """Cancel whatever is still working of one of our orders (E15-S12).
+
+        The only path to a cancel, as :meth:`submit` is the only path to a
+        placement - LOW_LEVEL_ARCHITECTURE principle 4 gates and logs both.
+
+        Returns ``False`` when there is nothing to cancel: the broker does not
+        list the order, or it is already terminal. Asks the BROKER for the
+        order's id rather than our row, because an order adopted after a lost
+        response is exactly the one whose row may not carry it yet.
+
+        Raises on a refusal or a transport failure. The caller that freezes a
+        partly filled entry counts its attempts and halts if it cannot freeze
+        one; swallowing the error here would make that count meaningless.
+        """
+        order = await self._placer.find_by_client_order_id(client_order_id_)
+        if order is None or order.status.is_terminal or not order.broker_order_id:
+            return False
+        if self._limiter is not None and not await self._limiter.allow():
+            raise RateLimitedError(
+                f"the order-rate limiter refused cancelling {client_order_id_}; it is "
+                f"still working and will be tried again next cycle"
+            )
+        await self._placer.cancel_order(order.broker_order_id)
+        log.warning(
+            "cancel sent for %s (%s, broker %s): %s of %s filled",
+            client_order_id_,
+            order.symbol,
+            order.broker_order_id,
+            order.filled_quantity,
+            order.quantity,
+        )
+        return True
 
     async def find_order(self, client_order_id_: str) -> Order | None:
         """Ask the broker about one of our orders. Used to verify liveness.

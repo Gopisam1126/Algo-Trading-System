@@ -127,6 +127,8 @@ class FakeProtector:
         self.exits: list[tuple[Any, str]] = []
         self.exit_raises: dict[str, Exception] = {}
         self.adopted: list[str] = []
+        self.attached: list[Position] = []
+        self.attach_raises: dict[str, Exception] = {}
 
     async def is_protected(self, position: Position, *, trade_date: dt.date) -> bool:
         return position.symbol in self.live_stops
@@ -154,6 +156,49 @@ class FakeProtector:
         if target.symbol in self.exit_raises:
             raise self.exit_raises[target.symbol]
 
+    async def attach(
+        self, position: Position, *, trade_date: dt.date, now: dt.datetime
+    ) -> EstablishedPosition:
+        """Booking (E15-S12) goes through open_from_fill, which attaches a stop.
+
+        Faithful to what the real attach leaves behind, because step 4 re-asks
+        the broker about a position booked earlier in the same cycle: success
+        means a stop the broker lists as live; StopNotEstablishedError means the
+        real protector has already placed and verified a live exit.
+        """
+        self.attached.append(position)
+        failure = self.attach_raises.get(position.symbol)
+        if isinstance(failure, StopNotEstablishedError):
+            self.live_exits.add(position.symbol)
+        if failure is not None:
+            raise failure
+        self.live_stops.add(position.symbol)
+        return EstablishedPosition(
+            position=position,
+            stop_client_order_id="STOP" + position.symbol,
+            stop_broker_order_id="BROKER-STOP-" + position.symbol,
+            established_at=now,
+        )
+
+
+class FakeCanceller:
+    """The gateway's cancel, recorded. Fails on demand."""
+
+    def __init__(self) -> None:
+        self.cancelled: list[str] = []
+        self.fail = False
+
+    async def cancel(self, client_order_id_: str) -> bool:
+        self.cancelled.append(client_order_id_)
+        if self.fail:
+            raise ConnectionError("cancel timed out")
+        return True
+
+
+class StubCalendar:
+    def squareoff_deadline(self, trade_date: dt.date, **_kwargs: Any) -> dt.datetime:
+        return DEADLINE
+
 
 class RecordingHalter:
     def __init__(self) -> None:
@@ -167,15 +212,18 @@ class RecordingHalter:
 class _Store:
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self.rows = rows or []
+        self.inserts: list[dict[str, Any]] = []
+        self.closes: list[dict[str, Any]] = []
 
     async def open_position(self, position: dict[str, Any]) -> int:
-        return 1
+        self.inserts.append(dict(position))
+        return len(self.inserts)
 
     async def open_positions(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self.rows]
 
     async def close_position(self, position_id: int, **kwargs: Any) -> None:
-        pass
+        self.closes.append({"position_id": position_id, **kwargs})
 
 
 class _Mirror:
@@ -189,13 +237,15 @@ class _Mirror:
         self.data.pop(symbol, None)
 
 
-def _manager(rows: list[dict[str, Any]] | None = None) -> tuple[PositionManager, _Mirror]:
+def _manager(
+    rows: list[dict[str, Any]] | None = None, *, protector: Any = None
+) -> tuple[PositionManager, _Mirror]:
     mirror = _Mirror()
     manager = PositionManager(
-        protector=None,  # type: ignore[arg-type]  # never used by these tests
+        protector=protector,
         store=_Store(rows),
         mirror=mirror,
-        calendar=None,
+        calendar=StubCalendar(),
     )
     return manager, mirror
 
@@ -208,6 +258,7 @@ def _reconciler(
     protector: FakeProtector | None = None,
     halter: RecordingHalter | None = None,
     audit: Any = None,
+    canceller: FakeCanceller | None = None,
 ) -> tuple[Reconciler, FakeBroker, FakeLedger, FakeProtector, RecordingHalter]:
     broker = broker or FakeBroker()
     ledger = ledger or FakeLedger()
@@ -216,9 +267,10 @@ def _reconciler(
     reconciler = Reconciler(
         broker=broker,
         ledger=ledger,
-        manager=manager or _manager()[0],
+        manager=manager or _manager(protector=protector)[0],
         protector=protector,  # type: ignore[arg-type]
         halter=halter,
+        canceller=canceller or FakeCanceller(),
         audit=audit,
         metrics=get_metrics(),
     )
@@ -900,6 +952,7 @@ class TestAc6SubmittingRows:
                 manager=_manager()[0],
                 protector=FakeProtector(),  # type: ignore[arg-type]
                 halter=RecordingHalter(),
+                canceller=FakeCanceller(),
                 submitting_grace_seconds=0,
             )
 
@@ -950,18 +1003,59 @@ class TestAc7UnbookedHoldings:
         _run(reconciler)
         assert protector.exits == []
 
-    def test_a_holding_whose_exit_is_already_working_is_not_exited_again(self) -> None:
-        cid = _cid()
-        reconciler, broker, _l, protector, _h = _reconciler(
-            ledger=FakeLedger([_row(cid, status="FILLED", filled=40)])
+    def _with_working_exit(self, *, exit_quantity: int):
+        """Our entry filled 40; our exit for ``exit_quantity`` is working, unfilled.
+
+        Modelled as a real order in the snapshot. The first version told the fake
+        protector that 'an exit is live', which is the question QA-E15-23 showed
+        was the wrong one: a FILLED exit also answers yes.
+        """
+        entry, exit_ = _cid(), _cid()
+        corr = uuid4()
+        reconciler, broker, _l, protector, halter = _reconciler(
+            ledger=FakeLedger(
+                [
+                    _row(entry, status="FILLED", filled=40, correlation=corr),
+                    _row(
+                        exit_,
+                        status="OPEN",
+                        side="SELL",
+                        intent="SQUAREOFF",
+                        quantity=exit_quantity,
+                        correlation=corr,
+                    ),
+                ]
+            )
         )
-        protector.live_exits = {"INFY"}
-        broker.orderbook = [_broker_order(cid, status=OrderStatus.FILLED, filled=40)]
+        broker.orderbook = [
+            _broker_order(entry, status=OrderStatus.FILLED, filled=40),
+            _broker_order(
+                exit_,
+                status=OrderStatus.OPEN,
+                side=Side.SELL,
+                quantity=exit_quantity,
+                broker_order_id="B-X",
+            ),
+        ]
         broker.positions = [_pos("INFY", quantity=40, bought=40)]
+        return reconciler, protector, halter
+
+    def test_a_holding_whose_exit_is_already_working_is_not_exited_again(self) -> None:
+        reconciler, protector, halter = self._with_working_exit(exit_quantity=40)
         _run(reconciler)
         assert protector.exits == []
+        assert halter.armed == []
 
-    def test_only_the_open_remainder_is_exited(self) -> None:
+    def test_a_working_exit_smaller_than_the_holding_does_not_cover_it(self) -> None:
+        """The control: 'an exit exists' is not 'the holding is covered'. The key
+        is spent, so the uncovered 15 cannot be exited - and must not be left."""
+        reconciler, protector, halter = self._with_working_exit(exit_quantity=25)
+        report = _run(reconciler)
+        assert protector.exits == []
+        assert [r for r, _ in halter.armed] == [HaltReason.NAKED_POSITION]
+        assert Drift.EXIT_SPENT in [d.kind for d in report.drifts]
+
+    def test_a_remainder_after_a_cancelled_exit_halts_rather_than_pretending(self) -> None:
         entry, exit_ = _cid(), _cid()
         corr = uuid4()
         reconciler, broker, _l, protector, _h = _reconciler(
@@ -984,8 +1078,16 @@ class TestAc7UnbookedHoldings:
             _broker_order(exit_, status=OrderStatus.CANCELLED, filled=15, side=Side.SELL),
         ]
         broker.positions = [_pos("INFY", quantity=25, bought=40, sold=15)]
-        _run(reconciler)
-        assert [t.quantity for t, _ in protector.exits] == [25]
+        report = _run(reconciler)
+        # This asserted an exit for 25 until E15-S12. The real system cannot send
+        # one: the day's SQUAREOFF key is spent, so the gateway would resume the
+        # cancelled exit instead of placing a new order, and the exit path would
+        # end in a halt. The test passed only because the fake exit_now accepted
+        # any call - it asserted a capability the system does not have. Halting,
+        # plainly and once, is what is actually possible.
+        assert protector.exits == []
+        assert report.halted
+        assert Drift.EXIT_SPENT in [d.kind for d in report.drifts]
 
     def test_a_short_fill_is_exited_as_a_short(self) -> None:
         cid = _cid()
@@ -1459,3 +1561,460 @@ class TestAStrangerIsAlertedOnce:
         report = _run(reconciler)
         assert [d.kind for d in report.drifts] == [Drift.UNKNOWN_POS]
         assert _counter("unknown_positions_total") == 2
+
+
+# ===========================================================================
+# E15-S12 — booking fills, closing exits, freezing partial entries
+# ===========================================================================
+
+from algotrader.execution.positions import EntryPlan  # noqa: E402
+from algotrader.execution.protective_stop import (  # noqa: E402
+    NakedPositionError,
+    StopNotEstablishedError,
+    exit_client_order_id,
+    stop_client_order_id,
+)
+
+TRADE_DATE = dt.date(2026, 8, 25)
+
+
+def _plan(stop: str = "1186.4500", quantity: int = 40, slot: int = 0) -> EntryPlan:
+    from algotrader.common.models.trading import SizingResult
+
+    return EntryPlan(
+        sizing=SizingResult(
+            quantity=quantity,
+            entry_price=Decimal("1200.0000"),
+            stop_price=Decimal(stop),
+            capital_at_risk=Decimal("542.00"),
+            binding_constraint="risk_per_trade",
+        ),
+        slot_index=slot,
+        is_cas_stock=False,
+    )
+
+
+def _booking(
+    *,
+    entry_status: OrderStatus = OrderStatus.FILLED,
+    filled: int = 40,
+    quantity: int = 40,
+    plan: EntryPlan | None = None,
+    price: str = "1201.5000",
+):
+    """Our entry at the broker, in the given state, with an optional plan."""
+    cid = _cid()
+    corr = uuid4()
+    protector = FakeProtector()
+    manager, mirror = _manager(protector=protector)
+    canceller = FakeCanceller()
+    reconciler, broker, ledger, _p, halter = _reconciler(
+        ledger=FakeLedger(
+            [_row(cid, status="SUBMITTED", quantity=quantity, filled=0, correlation=corr)]
+        ),
+        manager=manager,
+        protector=protector,
+        canceller=canceller,
+    )
+    broker.orderbook = [
+        _broker_order(cid, status=entry_status, filled=filled, quantity=quantity, price=price)
+    ]
+    broker.positions = [_pos("INFY", quantity=filled, bought=filled)]
+    if plan is not None:
+        manager.expect_fill(cid, plan)
+    return {
+        "cid": cid,
+        "corr": corr,
+        "reconciler": reconciler,
+        "broker": broker,
+        "ledger": ledger,
+        "protector": protector,
+        "manager": manager,
+        "mirror": mirror,
+        "canceller": canceller,
+        "halter": halter,
+    }
+
+
+class TestS12Ac1AFillWithAPlanIsBooked:
+    def test_a_filled_entry_with_a_plan_becomes_protected_this_cycle(self) -> None:
+        w = _booking(plan=_plan())
+        report = _run(w["reconciler"])
+        tracked = w["manager"].tracked("INFY")
+        assert isinstance(tracked, ProtectedPosition)
+        assert report.booked == ["INFY"]
+        assert Drift.BOOKED in [d.kind for d in report.drifts]
+        assert w["protector"].exits == [], "the fill was exited before it could be protected"
+
+    def test_it_is_booked_at_what_filled_and_the_price_it_filled_at(self) -> None:
+        w = _booking(
+            entry_status=OrderStatus.CANCELLED, filled=25, quantity=40, plan=_plan(quantity=40)
+        )
+        _run(w["reconciler"])
+        (attached,) = w["protector"].attached
+        assert attached.quantity == 25
+        assert attached.entry_price == Decimal("1201.5000")
+
+    def test_it_is_booked_under_our_correlation_not_the_brokers(self) -> None:
+        """The broker's copy of an order carries a correlation derived from its
+        truncated tag. Booked under that, the stop's key is derived from the
+        wrong id and step 5 exits the position this step just protected."""
+        w = _booking(plan=_plan())
+        _run(w["reconciler"])
+        tracked = w["manager"].tracked("INFY")
+        assert tracked is not None
+        assert tracked.position.correlation_id == w["corr"]
+
+    def test_a_booked_fill_is_not_exited_on_the_next_cycle_either(self) -> None:
+        w = _booking(plan=_plan())
+        w["protector"].live_stops = {"INFY"}
+        _run(w["reconciler"])
+        second = _run(w["reconciler"])
+        assert w["protector"].exits == []
+        assert second.booked == []
+
+    def test_the_plan_is_forgotten_once_used(self) -> None:
+        w = _booking(plan=_plan())
+        _run(w["reconciler"])
+        assert w["manager"].plan_for(w["cid"]) is None
+
+    def test_a_stop_that_cannot_be_established_leaves_the_fill_exiting(self) -> None:
+        w = _booking(plan=_plan())
+        w["protector"].attach_raises = {"INFY": StopNotEstablishedError("stop refused")}
+        report = _run(w["reconciler"])
+        assert isinstance(w["manager"].tracked("INFY"), ExitingPosition)
+        assert report.exited == ["INFY"]
+        assert report.booked == []
+
+    def test_a_naked_position_at_booking_marks_the_cycle_halted(self) -> None:
+        w = _booking(plan=_plan())
+        w["protector"].attach_raises = {"INFY": NakedPositionError("could not exit")}
+        report = _run(w["reconciler"])
+        assert report.halted
+
+
+class TestS12Ac2AFilledStopOrExitClosesThePosition:
+    def _held(self, tracked, *, fill_key: str, filled: int, price: str = "1190.0000"):
+        protector = FakeProtector()
+        manager, mirror = _manager(protector=protector)
+        _book(manager, tracked)
+        reconciler, broker, _l, _p, _h = _reconciler(manager=manager, protector=protector)
+        protector.live_stops = {"INFY"}
+        broker.orderbook = [
+            _broker_order(
+                fill_key,
+                status=OrderStatus.FILLED if filled >= 40 else OrderStatus.OPEN,
+                filled=filled,
+                side=Side.SELL,
+                price=price,
+            )
+        ]
+        return reconciler, manager, mirror
+
+    def test_a_filled_stop_closes_it_as_a_stop_with_its_pnl(self) -> None:
+        tracked = _protected("INFY")
+        key = stop_client_order_id(tracked.position, trade_date=TRADE_DATE)
+        reconciler, manager, mirror = self._held(tracked, fill_key=key, filled=40)
+        report = _run(reconciler)
+        assert manager.tracked("INFY") is None
+        assert report.closed == ["INFY"]
+        close = manager._store.closes[0]
+        assert close["exit_reason"] == "STOP"
+        assert close["realized_pnl"] == Decimal("-400.0000")
+        assert "INFY" not in mirror.data
+
+    def test_a_filled_emergency_exit_closes_it_as_unprotected(self) -> None:
+        tracked = ExitingPosition(position=_position("INFY"), because="stop refused")
+        key = exit_client_order_id(tracked.position, trade_date=TRADE_DATE)
+        reconciler, manager, _m = self._held(tracked, fill_key=key, filled=40)
+        _run(reconciler)
+        assert manager._store.closes[0]["exit_reason"] == "UNPROTECTED"
+
+    def test_a_partly_filled_stop_leaves_the_position_held(self) -> None:
+        """Reducing the book on a partial exit is E15-S08's."""
+        tracked = _protected("INFY")
+        key = stop_client_order_id(tracked.position, trade_date=TRADE_DATE)
+        reconciler, manager, _m = self._held(tracked, fill_key=key, filled=25)
+        report = _run(reconciler)
+        assert manager.tracked("INFY") is not None
+        assert report.closed == []
+
+    def test_a_restored_position_whose_stop_filled_while_down_closes(self) -> None:
+        tracked = UnverifiedPosition(position=_position("INFY"))
+        key = stop_client_order_id(tracked.position, trade_date=TRADE_DATE)
+        reconciler, manager, _m = self._held(tracked, fill_key=key, filled=40)
+        _run(reconciler)
+        assert manager.tracked("INFY") is None
+        assert manager._store.closes[0]["exit_reason"] == "STOP"
+
+    def test_an_unfilled_stop_closes_nothing(self) -> None:
+        """The control: a reconciler that closed every position would pass the
+        tests above."""
+        tracked = _protected("INFY")
+        key = stop_client_order_id(tracked.position, trade_date=TRADE_DATE)
+        reconciler, manager, _m = self._held(tracked, fill_key=key, filled=0)
+        _run(reconciler)
+        assert manager.tracked("INFY") is not None
+
+
+class TestS12Ac3NoPlanNoGuess:
+    def test_a_fill_with_no_plan_is_exited_not_booked(self) -> None:
+        w = _booking(plan=None)
+        report = _run(w["reconciler"])
+        assert w["protector"].attached == [], "a stop was guessed"
+        assert [(t.symbol, t.quantity) for t, _ in w["protector"].exits] == [("INFY", 40)]
+        assert report.booked == []
+
+
+class TestS12Ac4AWorkingPartialEntryIsFrozenFirst:
+    def test_it_is_cancelled_and_neither_booked_nor_exited(self) -> None:
+        w = _booking(entry_status=OrderStatus.OPEN, filled=40, quantity=100, plan=_plan())
+        report = _run(w["reconciler"])
+        assert w["canceller"].cancelled == [w["cid"]]
+        assert report.frozen == ["INFY"]
+        assert w["protector"].attached == []
+        assert w["protector"].exits == [], "exited while it could still grow (QA-E15-23)"
+
+    def test_once_frozen_it_is_booked_at_the_frozen_quantity(self) -> None:
+        w = _booking(
+            entry_status=OrderStatus.OPEN, filled=40, quantity=100, plan=_plan(quantity=100)
+        )
+        _run(w["reconciler"])
+        w["broker"].orderbook = [
+            _broker_order(
+                w["cid"], status=OrderStatus.CANCELLED, filled=70, quantity=100, price="1201.5000"
+            )
+        ]
+        w["broker"].positions = [_pos("INFY", quantity=70, bought=70)]
+        report = _run(w["reconciler"])
+        assert report.booked == ["INFY"]
+        assert w["protector"].attached[0].quantity == 70
+
+    def test_the_freeze_is_announced_once_and_retried(self) -> None:
+        w = _booking(entry_status=OrderStatus.OPEN, filled=40, quantity=100, plan=_plan())
+        first, second = _run(w["reconciler"]), _run(w["reconciler"])
+        assert [d.kind for d in first.drifts if d.kind is Drift.FREEZE] == [Drift.FREEZE]
+        assert Drift.FREEZE not in [d.kind for d in second.drifts]
+        assert w["canceller"].cancelled == [w["cid"], w["cid"]]
+
+    def test_an_entry_that_cannot_be_frozen_halts(self) -> None:
+        """Three cycles of trying, then a human: those shares have no stop."""
+        w = _booking(entry_status=OrderStatus.OPEN, filled=40, quantity=100, plan=_plan())
+        w["canceller"].fail = True
+        reports = [_run(w["reconciler"]) for _ in range(4)]
+        assert [r for r, _ in w["halter"].armed] == [HaltReason.NAKED_POSITION]
+        assert Drift.FREEZE_FAIL in [d.kind for d in reports[3].drifts]
+        assert not any(r.halted for r in reports[:3])
+
+    def test_a_failed_cancel_is_recorded_not_raised(self) -> None:
+        w = _booking(entry_status=OrderStatus.OPEN, filled=40, quantity=100, plan=_plan())
+        w["canceller"].fail = True
+        report = _run(w["reconciler"])
+        assert any("freezing INFY" in e for e in report.errors)
+
+    def test_a_working_entry_with_nothing_filled_is_left_alone(self) -> None:
+        """The control: nothing is held, so there is nothing to freeze."""
+        w = _booking(entry_status=OrderStatus.OPEN, filled=0, quantity=100, plan=_plan())
+        report = _run(w["reconciler"])
+        assert w["canceller"].cancelled == []
+        assert report.frozen == []
+
+    def test_an_entry_that_finished_unfilled_drops_its_plan(self) -> None:
+        w = _booking(entry_status=OrderStatus.CANCELLED, filled=0, quantity=100, plan=_plan())
+        _run(w["reconciler"])
+        assert w["manager"].plan_for(w["cid"]) is None
+
+
+class TestS12Ac5WhatCannotBeExitedHalts:
+    def test_our_exits_outrunning_our_entries_halt(self) -> None:
+        """Over-exited: the account is short shares this system never meant to hold."""
+        entry, exit_ = _cid(), _cid()
+        corr = uuid4()
+        reconciler, broker, _l, protector, halter = _reconciler(
+            ledger=FakeLedger(
+                [
+                    _row(entry, status="FILLED", filled=40, correlation=corr),
+                    _row(
+                        exit_,
+                        status="FILLED",
+                        side="SELL",
+                        intent="SQUAREOFF",
+                        filled=70,
+                        quantity=70,
+                        correlation=corr,
+                    ),
+                ]
+            )
+        )
+        broker.orderbook = [
+            _broker_order(entry, status=OrderStatus.FILLED, filled=40),
+            _broker_order(exit_, status=OrderStatus.FILLED, filled=70, quantity=70, side=Side.SELL),
+        ]
+        broker.positions = [_pos("INFY", quantity=-30, bought=40, sold=70)]
+        report = _run(reconciler)
+        assert [r for r, _ in halter.armed] == [HaltReason.NAKED_POSITION]
+        assert Drift.OVER_EXITED in [d.kind for d in report.drifts]
+        assert protector.exits == []
+
+    def test_a_stuck_holding_is_alerted_once_and_the_halt_re_armed(self) -> None:
+        entry, exit_ = _cid(), _cid()
+        corr = uuid4()
+        reconciler, broker, _l, _p, halter = _reconciler(
+            ledger=FakeLedger(
+                [
+                    _row(entry, status="FILLED", filled=40, correlation=corr),
+                    _row(
+                        exit_,
+                        status="CANCELLED",
+                        side="SELL",
+                        intent="SQUAREOFF",
+                        filled=15,
+                        correlation=corr,
+                    ),
+                ]
+            )
+        )
+        broker.orderbook = [
+            _broker_order(entry, status=OrderStatus.FILLED, filled=40),
+            _broker_order(exit_, status=OrderStatus.CANCELLED, filled=15, side=Side.SELL),
+        ]
+        broker.positions = [_pos("INFY", quantity=25, bought=40, sold=15)]
+        first, second = _run(reconciler), _run(reconciler)
+        assert Drift.EXIT_SPENT in [d.kind for d in first.drifts]
+        assert Drift.EXIT_SPENT not in [d.kind for d in second.drifts]
+        assert len(halter.armed) == 2
+        assert _counter("naked_positions_total") == 1
+
+
+class TestS12Ac6WhatIsNeverBooked:
+    def test_a_doubted_correlation_is_never_booked(self) -> None:
+        """REC-001: some of those shares may not be ours."""
+        w = _booking(plan=_plan())
+        w["broker"].orderbook.append(
+            _broker_order(w["cid"], status=OrderStatus.FILLED, filled=100, broker_order_id="THEIRS")
+        )
+        _run(w["reconciler"])
+        assert w["protector"].attached == []
+
+    def test_a_symbol_already_held_is_not_booked_twice(self) -> None:
+        """PositionAlreadyHeldError is a normal outcome (SIT-004), and the fill it
+        refused is exited as unbooked rather than left."""
+        w = _booking(plan=_plan())
+        _book(w["manager"], _protected("INFY"))
+        w["protector"].live_stops = {"INFY"}
+        first = _run(w["reconciler"])
+        second = _run(w["reconciler"])
+        assert first.booked == [] and first.errors == []
+        assert [t.quantity for t, _ in w["protector"].exits] == [40]
+        assert second.booked == []
+
+
+class TestS12TheCancellerIsRequired:
+    def test_a_zero_freeze_budget_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="before trying"):
+            Reconciler(
+                broker=FakeBroker(),
+                ledger=FakeLedger(),
+                manager=_manager()[0],
+                protector=FakeProtector(),  # type: ignore[arg-type]
+                halter=RecordingHalter(),
+                canceller=FakeCanceller(),
+                max_freeze_cycles=0,
+            )
+
+    def test_without_one_the_reconciler_cannot_be_built(self) -> None:
+        with pytest.raises(TypeError):
+            Reconciler(  # type: ignore[call-arg]
+                broker=FakeBroker(),
+                ledger=FakeLedger(),
+                manager=_manager()[0],
+                protector=FakeProtector(),  # type: ignore[arg-type]
+                halter=RecordingHalter(),
+            )
+
+
+class TestS12NothingSecretReachesTheAuditTable:
+    """REC-003: STRIDE against E15-S12's own diff. A drift detail is written to
+    decision_log, outside the logging layer's redaction."""
+
+    def test_a_booking_failure_records_the_type_not_the_brokers_text(self) -> None:
+        secret = "access_token=Zq7xT9vLmP2kR8wY4nB6cD1f"
+        w = _booking(plan=_plan())
+        w["protector"].attach_raises = {
+            "INFY": StopNotEstablishedError(f"stop refused. Cause: {secret}")
+        }
+        report = _run(w["reconciler"])
+        (event,) = [d for d in report.drifts if d.kind is Drift.UNPROTECTED]
+        assert "StopNotEstablishedError" in event.detail
+        assert "Zq7xT9" not in event.detail
+
+
+class TestS12TheSecondLayersHoldOnTheirOwn:
+    """Mutations M4 and M15 survived and were verified benign: each guard is a
+    SECOND layer behind another (step 3b's ``acted`` set; the single-match and
+    being-exited checks). Kept deliberately, as defence in depth against a
+    change to how the first layer is derived - and held here directly, because a
+    layer no test can detect missing is a layer that can go quietly.
+
+    The first version of the M15 test passed for the wrong reason: its fill had
+    no average price, so confirm_fill refused it and booking failed on THAT,
+    whatever the doubted check did. Each test here now asserts the cycle
+    recorded no errors, and the booking test has a control that books.
+    """
+
+    def _snapshot(self, *, status: OrderStatus, filled: int, quantity: int = 100):
+        cid, corr = _cid(), uuid4()
+        row = _row(cid, status="SUBMITTED", quantity=quantity, correlation=corr)
+        order = _broker_order(
+            cid, status=status, filled=filled, quantity=quantity, price="1200.0000"
+        )
+        return cid, corr, row, order
+
+    def test_step_5_will_not_exit_an_entry_that_is_still_growing(self) -> None:
+        reconciler, _b, _l, protector, _h = _reconciler()
+        *_ids, row, order = self._snapshot(status=OrderStatus.OPEN, filled=40)
+        report = rec.CycleReport(cycle_id=uuid4(), at=NOW)
+        asyncio.run(
+            reconciler._exit_unbooked(
+                [row],
+                {row["client_order_id"]: [order]},
+                report,
+                doubted=set(),
+                acted=set(),
+                trade_date=TRADE_DATE,
+                now=NOW,
+            )
+        )
+        assert protector.exits == []
+        assert report.errors == []
+
+    def _book_directly(self, *, doubted: bool):
+        protector = FakeProtector()
+        manager, _m = _manager(protector=protector)
+        reconciler, _b, _l, _p, _h = _reconciler(manager=manager, protector=protector)
+        cid, corr, row, order = self._snapshot(status=OrderStatus.FILLED, filled=40, quantity=40)
+        manager.expect_fill(cid, _plan())
+        report = rec.CycleReport(cycle_id=uuid4(), at=NOW)
+        asyncio.run(
+            reconciler._book_and_close(
+                [row],
+                {cid: [order]},
+                {cid[:20]: [order]},
+                report,
+                doubted={corr} if doubted else set(),
+                trade_date=TRADE_DATE,
+                now=NOW,
+            )
+        )
+        return protector, report
+
+    def test_step_3b_will_not_book_a_doubted_correlation(self) -> None:
+        protector, report = self._book_directly(doubted=True)
+        assert protector.attached == []
+        assert report.errors == [], "refused by an error, not by the doubted check"
+
+    def test_the_same_fill_undoubted_is_booked(self) -> None:
+        """The control that makes the test above mean something."""
+        protector, report = self._book_directly(doubted=False)
+        assert [p.symbol for p in protector.attached] == ["INFY"]
+        assert report.errors == []

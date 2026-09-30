@@ -1180,8 +1180,46 @@ attach does; one without a live stop is exited. A position already exiting is
 asked `exit_is_live` rather than exited again, because re-calling the exit path
 every 30 seconds logs a CRITICAL line and counts a failure every time.
 
-**A fill our orders explain but the book does not hold is unprotected**, and is
-exited. Until E15-S12 books fills, that is every fill.
+**Fills are booked, then protected (E15-S12).** Whoever submits an entry
+registers an `EntryPlan` — the approved sizing, slot and CAS flag, none of which
+the `orders` table carries — with the position manager. When a cycle sees that
+entry finished with a fill, it calls `open_from_fill` with the plan, which
+attaches the stop. This runs **before** the unbooked-exit step; the other order
+exits a fresh fill a cycle before it could be protected. Plans live in memory:
+the window from submission to booking is one cycle, and a restart inside it
+exits the fill rather than book it on a guessed stop — safe, at the cost of a
+trade. A durable plan table becomes the better trade if restarts during trading
+stop being rare.
+
+**A fill is booked under OUR identity, never the broker's.** The adapter maps
+Kite's 20-character tag back into an `Order` whose correlation id is *derived
+from the tag*. Booked from that, the position's stop key would be derived from
+the wrong id, and the next step would exit the position this one had just
+protected. Only the real adapter shows this, so it is proved in integration.
+
+**A working entry is frozen before anything is done with it.** Zerodha's
+support article on market price protection (fetched 30 Sep 2026) says the
+exchange "will either convert your order to a limit order, or cancel your
+order", so a partly filled entry can keep filling. Book it and the later shares
+have no stop; exit it and the later shares cannot be exited under the day's one
+`SQUAREOFF` key. So its remainder is cancelled through `OrderGateway.cancel` —
+the only path to a cancel, as `submit` is to a placement — and it is acted on
+once, when its quantity can no longer change. One that cannot be frozen in three
+cycles halts (`NAKED_POSITION`).
+
+**Only a WORKING exit covers a holding (QA-E15-23, CRITICAL).** The first
+version asked whether the holding's exit was "live", and `is_live` counts a
+FILLED order as live — so an exit that had sold the first 40 shares "covered" 30
+bought afterwards, and they stayed naked for the rest of the day, with no halt
+and no alert. Coverage is now the unfilled remainder of exits still working.
+Anything left uncovered when the exit key has already been used (`EXIT_SPENT`),
+or our exits outrunning our entries (`OVER_EXITED`), halts once and re-arms
+every cycle. A fill our orders explain, with no plan and no exit yet, is still
+exited at market.
+
+**What has filled leaves the book.** A stop that has filled closes its position
+with `STOP`; an emergency exit with `UNPROTECTED`. A PARTIAL stop or exit fill
+leaves the position held — reducing its quantity is E15-S08.
 
 **The book records what the loop did (SIT-006).** An exited position becomes
 `ExitingPosition` — the reconciler's counterpart to what `open_from_fill` does

@@ -96,18 +96,26 @@ from algotrader.broker.adapter import BrokerPosition
 from algotrader.common.audit import AuditEntry
 from algotrader.common.calendar import IST
 from algotrader.common.db.models import DecisionLog
-from algotrader.common.enums import Direction, OrderIntent, OrderStatus, Side
+from algotrader.common.enums import Direction, ExitReason, OrderIntent, OrderStatus, Side
 from algotrader.common.models.trading import Order
 from algotrader.common.text import one_safe_line
 from algotrader.execution.halt import HaltReason
 from algotrader.execution.order_state import is_legal
 from algotrader.execution.positions import (
     ExitingPosition,
+    PositionAlreadyHeldError,
     PositionManager,
     ProtectedPosition,
+    UnprotectableFillError,
     UnverifiedPosition,
 )
-from algotrader.execution.protective_stop import ProtectiveStop
+from algotrader.execution.protective_stop import (
+    NakedPositionError,
+    ProtectiveStop,
+    StopNotEstablishedError,
+    exit_client_order_id,
+    stop_client_order_id,
+)
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +154,13 @@ class Drift(StrEnum):
     UNBOOKED = "UNBOOKED"
     UNPROTECTED = "UNPROTECTED"
     PROTECTED = "PROTECTED"
+    # E15-S12
+    BOOKED = "BOOKED"
+    CLOSED = "CLOSED"
+    FREEZE = "FREEZE"
+    FREEZE_FAIL = "FREEZE_FAIL"
+    EXIT_SPENT = "EXIT_SPENT"
+    OVER_EXITED = "OVER_EXITED"
 
 
 def _assert_fits_audit_columns() -> None:
@@ -220,6 +235,12 @@ class OrderLedger(Protocol):
     ) -> None: ...
 
 
+class EntryCanceller(Protocol):
+    """Cancel what is still working of one of our orders (the gateway)."""
+
+    async def cancel(self, client_order_id_: str) -> bool: ...
+
+
 class Halter(Protocol):
     async def arm(
         self, reason: HaltReason, *, detail: str, armed_by: str, now: dt.datetime
@@ -292,11 +313,22 @@ class CycleReport:
     halted: bool = False
     exited: list[str] = field(default_factory=list)
     promoted: list[str] = field(default_factory=list)
+    booked: list[str] = field(default_factory=list)
+    closed: list[str] = field(default_factory=list)
+    frozen: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
-        return not (self.drifts or self.unknown or self.exited or self.errors)
+        return not (
+            self.drifts
+            or self.unknown
+            or self.exited
+            or self.booked
+            or self.closed
+            or self.frozen
+            or self.errors
+        )
 
 
 @dataclass(frozen=True)
@@ -522,8 +554,10 @@ class Reconciler:
         manager: PositionManager,
         protector: ProtectiveStop,
         halter: Halter,
+        canceller: EntryCanceller,
         audit: AuditSink | None = None,
         submitting_grace_seconds: float = 60.0,
+        max_freeze_cycles: int = 3,
         metrics: object | None = None,
     ) -> None:
         if submitting_grace_seconds <= 0:
@@ -539,6 +573,17 @@ class Reconciler:
         #: a reconciler that could be built without one would find the position
         #: and do nothing about it.
         self._halter = halter
+        #: REQUIRED (E15-S12). Without a way to cancel, a partly filled entry
+        #: that keeps filling can only be acted on while it is still growing -
+        #: which is QA-E15-23, a holding left naked for the rest of the day.
+        self._canceller = canceller
+        if max_freeze_cycles < 1:
+            raise ValueError("max_freeze_cycles below 1 would halt before trying to freeze")
+        self._max_freeze_cycles = max_freeze_cycles
+        #: Entry key -> cycles spent trying to freeze it.
+        self._freeze_attempts: dict[str, int] = {}
+        #: Correlations already halted on as un-exitable or over-exited.
+        self._reported_stuck: set[uuid.UUID] = set()
         self._audit = audit
         self._grace = dt.timedelta(seconds=submitting_grace_seconds)
         self._metrics = metrics
@@ -598,13 +643,27 @@ class Reconciler:
                 report.errors.append(f"order {row.get('client_order_id')}: {exc}")
                 log.error("reconciling order %s failed", row.get("client_order_id"), exc_info=True)
 
+        # -- 3b. freeze working partial entries, book finished ones, close ---
+        # what has filled. BEFORE steps 4 and 5 (E15-S12 constraint 1): run the
+        # unbooked-exit step first and a fresh fill is exited a cycle before it
+        # could have been protected.
+        acted = await self._book_and_close(
+            ours, matched, by_key, report, doubted=doubted, trade_date=trade_date, now=now
+        )
+
         # -- 4. every booked position has a live stop, or leaves -------------
         await self._check_protection(report, trade_date=trade_date, now=now)
 
         # -- 5. our fills the book does not hold: unprotected by definition ---
         # E15-S12's booking step belongs BEFORE this one.
         await self._exit_unbooked(
-            ours, matched, report, doubted=doubted, trade_date=trade_date, now=now
+            ours,
+            matched,
+            report,
+            doubted=doubted,
+            acted=acted,
+            trade_date=trade_date,
+            now=now,
         )
 
         for event in report.drifts:
@@ -785,6 +844,259 @@ class Reconciler:
         if event is not None:
             report.drifts.append(event)
 
+    # -- step 3b -------------------------------------------------------------
+
+    async def _book_and_close(
+        self,
+        ours: list[dict[str, Any]],
+        matched: dict[str, list[Order]],
+        by_key: dict[str, list[Order]],
+        report: CycleReport,
+        *,
+        doubted: set[uuid.UUID],
+        trade_date: dt.date,
+        now: dt.datetime,
+    ) -> set[uuid.UUID]:
+        """Close what has filled, freeze what is still growing, book what is done.
+
+        E15-S12. Returns the correlations acted on here, which step 5 must leave
+        alone this cycle: the orders this step just placed are not in the
+        snapshot step 5 reads, so step 5 would otherwise act on them twice.
+
+        **A working entry is never booked or exited.** Zerodha's own support
+        article says a protected market order's unfilled part is either
+        cancelled or converted to a limit order (fetched 30 Sep 2026), so a
+        partly filled entry can keep filling. Book it and the later shares have
+        no stop; exit it and the later shares cannot be exited under the day's
+        one SQUAREOFF key (QA-E15-23). So it is frozen - its remainder cancelled
+        - and acted on once, when its quantity can no longer change.
+        """
+        acted: set[uuid.UUID] = set()
+        await self._close_filled(by_key, report, trade_date=trade_date, now=now)
+
+        booked = {t.position.correlation_id for t in self._manager.open_positions()}
+        being_exited = {
+            row["correlation_id"] for row in ours if str(row["intent"]) != OrderIntent.ENTRY.value
+        }
+        for row in ours:
+            if str(row["intent"]) != OrderIntent.ENTRY.value:
+                continue
+            key = str(row["client_order_id"])
+            found = matched[key]
+            correlation = row["correlation_id"]
+            if len(found) != 1 or correlation in doubted:
+                continue
+            entry = found[0]
+            try:
+                if entry.filled_quantity == 0:
+                    if entry.status.is_terminal:
+                        self._manager.forget(key)
+                        self._freeze_attempts.pop(key, None)
+                    continue
+                if not entry.status.is_terminal:
+                    acted.add(correlation)
+                    await self._freeze(key, row, entry, report, now=now)
+                    continue
+                self._freeze_attempts.pop(key, None)
+                if correlation in booked or correlation in being_exited:
+                    self._manager.forget(key)
+                    continue
+                plan = self._manager.plan_for(key)
+                if plan is None:
+                    # No plan, no position: step 5 exits it rather than book it
+                    # on a guessed stop (AC3).
+                    continue
+                acted.add(correlation)
+                await self._book(key, row, entry, plan, report, trade_date=trade_date, now=now)
+            except Exception as exc:
+                report.errors.append(f"booking {row.get('symbol')}: {exc}")
+                log.error("booking entry %s failed", key, exc_info=True)
+        return acted
+
+    async def _book(
+        self,
+        key: str,
+        row: dict[str, Any],
+        entry: Order,
+        plan: Any,
+        report: CycleReport,
+        *,
+        trade_date: dt.date,
+        now: dt.datetime,
+    ) -> None:
+        # OUR identity, not the broker's. The broker's copy of an order carries a
+        # correlation id DERIVED FROM ITS TRUNCATED TAG. Booked from that, the
+        # stop's key would be derived from the wrong id, the booked set would
+        # never match our rows, and step 5 would exit the position this step had
+        # just protected.
+        fill = entry.model_copy(
+            update={"correlation_id": row["correlation_id"], "client_order_id": key}
+        )
+        symbol = fill.symbol
+        try:
+            await self._manager.open_from_fill(
+                fill,
+                sizing=plan.sizing,
+                slot_index=plan.slot_index,
+                trade_date=trade_date,
+                now=now,
+                is_cas_stock=plan.is_cas_stock,
+                is_fno=plan.is_fno,
+                strategy_id=plan.strategy_id,
+            )
+            report.booked.append(symbol)
+            report.drifts.append(
+                DriftEvent(
+                    kind=Drift.BOOKED,
+                    correlation_id=row["correlation_id"],
+                    symbol=symbol,
+                    detail=f"{fill.filled_quantity} filled by {key}; protected by a live stop",
+                )
+            )
+        except PositionAlreadyHeldError:
+            # A replay after a restart (SIT-004) - or a second entry on a symbol
+            # still held, which step 5 will exit as unbooked. Neither is a fault.
+            pass
+        except (StopNotEstablishedError, UnprotectableFillError) as exc:
+            report.exited.append(symbol)
+            # The exception's TYPE, not its text (REC-003). A
+            # StopNotEstablishedError's message embeds the broker's own error
+            # text, and a drift detail is written to decision_log - a sink the
+            # logging layer's redaction never sees. REC-002's rule, one sink along.
+            report.drifts.append(
+                DriftEvent(
+                    kind=Drift.UNPROTECTED,
+                    correlation_id=row["correlation_id"],
+                    symbol=symbol,
+                    detail=(
+                        f"{type(exc).__name__}: the fill could not be protected and was "
+                        f"exited at market"
+                    ),
+                )
+            )
+        except NakedPositionError as exc:
+            report.halted = True
+            report.errors.append(f"booking {symbol}: {one_safe_line(str(exc))}")
+        finally:
+            self._manager.forget(key)
+
+    async def _freeze(
+        self,
+        key: str,
+        row: dict[str, Any],
+        entry: Order,
+        report: CycleReport,
+        *,
+        now: dt.datetime,
+    ) -> None:
+        attempts = self._freeze_attempts.get(key, 0) + 1
+        self._freeze_attempts[key] = attempts
+        symbol = str(row["symbol"])
+        if attempts > self._max_freeze_cycles:
+            await self._stuck(
+                row["correlation_id"],
+                symbol,
+                Drift.FREEZE_FAIL,
+                f"{key} filled {entry.filled_quantity} of {entry.quantity} and could not be "
+                f"frozen in {self._max_freeze_cycles} cycles; those shares have no stop",
+                report,
+                now=now,
+            )
+            return
+        if attempts == 1:
+            report.drifts.append(
+                DriftEvent(
+                    kind=Drift.FREEZE,
+                    correlation_id=row["correlation_id"],
+                    symbol=symbol,
+                    detail=(
+                        f"{key} filled {entry.filled_quantity} of {entry.quantity} and is still "
+                        f"working; cancelling the remainder before acting on it"
+                    ),
+                )
+            )
+        report.frozen.append(symbol)
+        try:
+            await self._canceller.cancel(key)
+        except Exception as exc:
+            report.errors.append(f"freezing {symbol}: {one_safe_line(str(exc))}")
+            log.error("could not cancel the remainder of %s (attempt %d)", key, attempts)
+
+    async def _close_filled(
+        self,
+        by_key: dict[str, list[Order]],
+        report: CycleReport,
+        *,
+        trade_date: dt.date,
+        now: dt.datetime,
+    ) -> None:
+        """A position whose stop or emergency exit has FILLED leaves the book.
+
+        A stop fill closes with ``STOP``; an emergency exit's with
+        ``UNPROTECTED`` - E15-S05's ``confirm_exit`` defaults to the latter, and
+        passing it for a stop would file every stop-out as a failure to protect.
+        A PARTIAL fill leaves the position held: reducing the book's quantity is
+        E15-S08's partial exits.
+        """
+        for tracked in list(self._manager.open_positions()):
+            position = tracked.position
+            if isinstance(tracked, ExitingPosition):
+                key = exit_client_order_id(position, trade_date=trade_date)
+                reason = ExitReason.UNPROTECTED
+            else:
+                key = stop_client_order_id(position, trade_date=trade_date)
+                reason = ExitReason.STOP
+            found = by_key.get(self._broker.order_key(key), [])
+            if len(found) != 1 or found[0].filled_quantity < position.quantity:
+                continue
+            order = found[0].model_copy(
+                update={"correlation_id": position.correlation_id, "client_order_id": key}
+            )
+            try:
+                await self._manager.confirm_exit(order, now=now, reason=reason)
+                report.closed.append(position.symbol)
+                report.drifts.append(
+                    DriftEvent(
+                        kind=Drift.CLOSED,
+                        correlation_id=position.correlation_id,
+                        symbol=position.symbol,
+                        detail=f"{reason.value}: {order.filled_quantity} at {order.average_price}",
+                    )
+                )
+            except Exception as exc:
+                report.errors.append(f"closing {position.symbol}: {exc}")
+                log.error("closing %s failed", position.symbol, exc_info=True)
+
+    async def _stuck(
+        self,
+        correlation: uuid.UUID,
+        symbol: str,
+        kind: Drift,
+        detail: str,
+        report: CycleReport,
+        *,
+        now: dt.datetime,
+    ) -> None:
+        """Real shares this loop can neither protect nor exit. Halt, and say so once.
+
+        Re-armed every cycle while it persists, like an unknown position, so a
+        latch cleared by hand is set again; alerted once, so the alert is read.
+        """
+        report.halted = True
+        if correlation not in self._reported_stuck:
+            self._reported_stuck.add(correlation)
+            self._count("naked_positions_total")
+            log.critical("NAKED HOLDING %s: %s. Halting; this needs a human.", symbol, detail)
+            report.drifts.append(
+                DriftEvent(kind=kind, correlation_id=correlation, symbol=symbol, detail=detail)
+            )
+        await self._halter.arm(
+            HaltReason.NAKED_POSITION,
+            detail=one_safe_line(f"{symbol}: {detail}"),
+            armed_by="reconciler",
+            now=now,
+        )
+
     # -- step 4 ---------------------------------------------------------------
 
     async def _check_protection(
@@ -845,6 +1157,7 @@ class Reconciler:
         report: CycleReport,
         *,
         doubted: set[uuid.UUID],
+        acted: set[uuid.UUID],
         trade_date: dt.date,
         now: dt.datetime,
     ) -> None:
@@ -855,7 +1168,7 @@ class Reconciler:
                 groups.setdefault(row["correlation_id"], []).append((row, order))
 
         for correlation, members in groups.items():
-            if correlation in booked:
+            if correlation in booked or correlation in acted:
                 continue
             if correlation in doubted:
                 # Some of these shares may not be ours. The loop does not trade
@@ -865,24 +1178,57 @@ class Reconciler:
             entries = [(r, o) for r, o in members if str(r["intent"]) == OrderIntent.ENTRY.value]
             if not entries:
                 continue
+            if any(not o.status.is_terminal for _r, o in entries):
+                # Still growing: step 3b is freezing it. Acting now would size
+                # the exit to a number that is about to be wrong (QA-E15-23).
+                continue
             entry_row, entry = entries[0]
             direction = Direction.LONG if _signed(entry.side) > 0 else Direction.SHORT
-            opened = sum(o.filled_quantity for r, o in entries)
-            closed = sum(
-                o.filled_quantity for r, o in members if str(r["intent"]) != OrderIntent.ENTRY.value
-            )
+            exits = [(r, o) for r, o in members if str(r["intent"]) != OrderIntent.ENTRY.value]
+            opened = sum(o.filled_quantity for _r, o in entries)
+            closed = sum(o.filled_quantity for _r, o in exits)
             open_qty = opened - closed
-            if open_qty <= 0:
+            if open_qty == 0:
                 continue
-            holding = UnbookedHolding(
-                correlation_id=correlation,
-                symbol=entry.symbol,
-                direction=direction,
-                quantity=open_qty,
-            )
             try:
-                if await self._protector.exit_is_live(holding, trade_date=trade_date):
+                if open_qty < 0:
+                    await self._stuck(
+                        correlation,
+                        entry.symbol,
+                        Drift.OVER_EXITED,
+                        f"our exits sold {closed} against {opened} bought: the account is "
+                        f"{-open_qty} short on a position this system never meant to hold",
+                        report,
+                        now=now,
+                    )
                     continue
+                # Only a WORKING exit covers a holding. The first version asked
+                # whether the exit key's order was "live", and is_live counts a
+                # FILLED order as live - so an exit that had sold the first 40
+                # shares 'covered' 30 more that were bought afterwards, and they
+                # stayed naked for the rest of the day (QA-E15-23).
+                covering = sum(
+                    o.quantity - o.filled_quantity for _r, o in exits if not o.status.is_terminal
+                )
+                if open_qty <= covering:
+                    continue
+                if any(str(r["intent"]) == OrderIntent.SQUAREOFF.value for r, _o in exits):
+                    await self._stuck(
+                        correlation,
+                        entry.symbol,
+                        Drift.EXIT_SPENT,
+                        f"{open_qty} still held after the day's exit for this position was "
+                        f"used; the key cannot be used twice, so they cannot be exited",
+                        report,
+                        now=now,
+                    )
+                    continue
+                holding = UnbookedHolding(
+                    correlation_id=correlation,
+                    symbol=entry.symbol,
+                    direction=direction,
+                    quantity=open_qty,
+                )
                 report.drifts.append(
                     DriftEvent(
                         kind=Drift.UNBOOKED,

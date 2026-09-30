@@ -85,6 +85,8 @@ class RecordingPlacer:
         self.fail_with: Exception | None = None
         self.orderbook: dict[str, Order] = {}
         self.find_calls: list[str] = []
+        self.cancelled: list[str] = []
+        self.cancel_fails_with: Exception | None = None
 
     async def place_order(self, request: OrderRequest) -> str:
         self.submitted.append(request)
@@ -95,6 +97,11 @@ class RecordingPlacer:
     async def find_by_client_order_id(self, client_order_id: str) -> Order | None:
         self.find_calls.append(client_order_id)
         return self.orderbook.get(client_order_id)
+
+    async def cancel_order(self, broker_order_id: str) -> None:
+        if self.cancel_fails_with is not None:
+            raise self.cancel_fails_with
+        self.cancelled.append(broker_order_id)
 
     #: A distinct sentinel, because None is a MEANINGFUL broker order id
     #: here — it is the half-answer AC3 probes. Defaulting on None would
@@ -1089,3 +1096,63 @@ class TestARefusedOrderIsRecordedAsRefused:
         await _gateway(placer, store=store).submit_entry(_approved(), _rec(), trade_date=TRADE_DATE)
         assert store.rejections == []
         assert [r["status"] for r in store.rows.values()] == ["SUBMITTED"]
+
+
+# ===========================================================================
+# E15-S12 — cancel, the only path to cancelling an order
+# ===========================================================================
+
+
+def _listed(placer, status=OrderStatus.OPEN, broker_order_id="260825000999"):
+    request = _gateway().build_entry(_approved(), _rec(), trade_date=TRADE_DATE)
+    placer.orderbook[request.client_order_id] = _broker_order(request, broker_order_id).model_copy(
+        update={"status": status}
+    )
+    return request.client_order_id
+
+
+@_ASYNC
+class TestCancel:
+    async def test_a_working_order_is_cancelled_by_its_broker_id(self) -> None:
+        placer = RecordingPlacer()
+        cid = _listed(placer)
+        assert await _gateway(placer).cancel(cid) is True
+        assert placer.cancelled == ["260825000999"]
+
+    @pytest.mark.parametrize(
+        "status", [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED]
+    )
+    async def test_a_finished_order_is_not_cancelled(self, status: OrderStatus) -> None:
+        placer = RecordingPlacer()
+        cid = _listed(placer, status=status)
+        assert await _gateway(placer).cancel(cid) is False
+        assert placer.cancelled == []
+
+    async def test_an_order_the_broker_does_not_list_is_not_cancelled(self) -> None:
+        placer = RecordingPlacer()
+        assert await _gateway(placer).cancel("NOPE") is False
+        assert placer.cancelled == []
+
+    async def test_an_order_with_no_broker_id_is_not_cancelled(self) -> None:
+        placer = RecordingPlacer()
+        cid = _listed(placer, broker_order_id=None)
+        assert await _gateway(placer).cancel(cid) is False
+
+    async def test_the_rate_limiter_governs_cancels_too(self) -> None:
+        placer = RecordingPlacer()
+        cid = _listed(placer)
+
+        class Refuse:
+            async def allow(self) -> bool:
+                return False
+
+        with pytest.raises(RateLimitedError):
+            await _gateway(placer, limiter=Refuse()).cancel(cid)
+        assert placer.cancelled == []
+
+    async def test_a_refused_cancel_is_raised_for_the_caller_to_count(self) -> None:
+        placer = RecordingPlacer()
+        cid = _listed(placer)
+        placer.cancel_fails_with = ConnectionError("timed out")
+        with pytest.raises(ConnectionError):
+            await _gateway(placer).cancel(cid)

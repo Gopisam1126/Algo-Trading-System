@@ -134,11 +134,12 @@ sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
 order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
-the gateway are unbuilt: no square-off timer (E15-S06) and nothing that books
-an observed fill into the position manager (E15-S12), so **every fill is exited
-as unprotected until E15-S12 lands**. The order state machine (E15-S03),
-protective stop attachment (E15-S04), the position manager (E15-S05) and the
-reconciliation loop (E15-S09) now exist. **A gateway is not a trading
+the gateway are unbuilt: no square-off timer (E15-S06), and nothing yet
+registers an `EntryPlan` when an entry is sent - so in production every fill is
+still exited as unprotected until the pipeline wiring does. The order state
+machine (E15-S03), protective stop attachment (E15-S04), the position manager
+(E15-S05), the reconciliation loop (E15-S09) and fill booking (E15-S12) now
+exist. **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
@@ -476,6 +477,31 @@ Recorded because each was believed, written down, and wrong.
 - **"Net quantity tells you whether a position is explained."** Not across two
   separate reads. Net goes up on entries and down on exits, so a fill between
   the reads can move it either way; per-side cumulative quantities only grow.
+- **E15-S12 fill booking** — the reconciliation cycle books a finished entry
+  fill into the position manager from its registered `EntryPlan`, closes
+  positions whose stop or emergency exit has filled, and FREEZES a partly
+  filled entry that is still working before doing anything with it.
+
+- **"A live exit covers the holding."** Only a WORKING one does. `is_live`
+  counts a FILLED order as live, so an exit that had sold the first 40 shares
+  "covered" 30 bought afterwards, and they stayed naked for the rest of the day
+  with no halt and no alert. Found by probing, in E15-S09 code already on QA.
+  QA-E15-23, CRITICAL.
+- **"The broker's copy of our order is our order."** The Kite adapter derives
+  an order's correlation id from its truncated tag. Book a fill from that and
+  the stop key is wrong and the next step exits the position just protected.
+  Only the real adapter shows it.
+- **"A fake that accepts every call is a safe fake."** Two E15-S09 tests passed
+  because the fake `exit_now` accepted any exit - one asserted an exit the real
+  key rule makes impossible. A double more capable than the real thing proves
+  capabilities the system does not have. QA-E15-24.
+- **"Commit to see another session's rows."** Under READ COMMITTED a new
+  statement already sees them. Committing the test's session instead persisted
+  its rows past the rollback, and a later file counting rows failed - but only
+  in one file order. QA-E15-26. The same file then leaked the audit writer's
+  own committed rows, because its fixture cleaned `decision_log` at the start
+  of each test and not the end; masked since E15-S09 by which test ran last.
+  A fixture that shares a table leaves it as it found it, at BOTH ends. QA-E15-28.
 - **"The test that passed after I killed the orphans proves the orphans were
   the cause."** It proved nothing. SIT stalls on 22 and 24 Sep were blamed on
   two orphaned pytest processes; the full suite then hung again with none

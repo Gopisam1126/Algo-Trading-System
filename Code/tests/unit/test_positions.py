@@ -816,3 +816,79 @@ def _counter(name: str) -> float:
             if sample.name == name:
                 return sample.value
     raise AssertionError(f"{name} is registered nowhere")
+
+
+# ===========================================================================
+# E15-S12 — the entry plan registry
+# ===========================================================================
+
+from algotrader.execution.positions import EntryPlan  # noqa: E402
+
+
+def _entry_plan(stop: str = "1186.4500", quantity: int = 100) -> EntryPlan:
+    return EntryPlan(
+        sizing=_sizing(stop=stop).model_copy(update={"quantity": quantity}),
+        slot_index=0,
+        is_cas_stock=False,
+    )
+
+
+class TestTheEntryPlanRegistry:
+    def test_a_registered_plan_is_found_by_its_key(self) -> None:
+        manager, *_ = _manager()
+        plan = _entry_plan()
+        manager.expect_fill("K1", plan)
+        assert manager.plan_for("K1") is plan
+        assert manager.plan_for("K2") is None
+
+    def test_registering_the_same_plan_twice_is_harmless(self) -> None:
+        manager, *_ = _manager()
+        manager.expect_fill("K1", _entry_plan())
+        manager.expect_fill("K1", _entry_plan())
+        assert manager.plan_for("K1") is not None
+
+    def test_a_different_plan_under_one_key_is_refused(self) -> None:
+        """One key names one decision; a second plan would silently re-size it."""
+        from algotrader.execution.positions import PositionError
+
+        manager, *_ = _manager()
+        manager.expect_fill("K1", _entry_plan(stop="1186.4500"))
+        with pytest.raises(PositionError, match="one decision"):
+            manager.expect_fill("K1", _entry_plan(stop="1180.0000"))
+
+    def test_forgetting_removes_it(self) -> None:
+        manager, *_ = _manager()
+        manager.expect_fill("K1", _entry_plan())
+        manager.forget("K1")
+        manager.forget("K1")
+        assert manager.plan_for("K1") is None
+
+    def test_a_plan_sized_to_nothing_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="sized to nothing"):
+            _entry_plan(quantity=0)
+
+    def test_a_negative_slot_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="negative"):
+            EntryPlan(sizing=_sizing(), slot_index=-1, is_cas_stock=False)
+
+
+class TestTheCalendarIsRequiredUpFront:
+    """E15-S12: without one, the manager failed at its first booking instead."""
+
+    def test_no_calendar_is_refused_at_construction(self) -> None:
+        with pytest.raises(TypeError, match="squareoff_deadline"):
+            PositionManager(
+                protector=FakeProtector(),  # type: ignore[arg-type]
+                store=RecordingStore(),
+                mirror=RecordingMirror(),
+                calendar=None,
+            )
+
+    def test_a_calendar_without_deadlines_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="squareoff_deadline"):
+            PositionManager(
+                protector=FakeProtector(),  # type: ignore[arg-type]
+                store=RecordingStore(),
+                mirror=RecordingMirror(),
+                calendar=object(),
+            )
