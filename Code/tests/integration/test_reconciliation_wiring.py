@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from algotrader.broker.kite.trading import KiteTradingAdapter
 from algotrader.common.audit import AuditWriter
+from algotrader.common.calendar import MarketCalendar, load_holidays_with_status
 from algotrader.common.db import engine as db_engine
 from algotrader.common.db.repositories import (
     InstrumentRepository,
@@ -44,12 +45,13 @@ from algotrader.common.models.trading import OrderRequest, Position
 from algotrader.execution.gateway import GatewayPolicy, OrderGateway, client_order_id
 from algotrader.execution.halt import HaltController, HaltReason
 from algotrader.execution.positions import (
+    EntryPlan,
     PositionManager,
     ProtectedPosition,
     RedisMirror,
     UnverifiedPosition,
 )
-from algotrader.execution.protective_stop import ProtectiveStop
+from algotrader.execution.protective_stop import ProtectiveStop, stop_client_order_id
 from algotrader.execution.reconciliation import Drift, Reconciler, ReconciliationReadError
 
 pytestmark = [pytest.mark.integration]
@@ -74,6 +76,13 @@ async def session(engine: object) -> AsyncIterator[AsyncSession]:
         await s.commit()
         yield s
         await s.rollback()
+        # AND at the end. The audit writer commits in its own session, so its
+        # rows outlive this rollback; cleaning only at the start left the last
+        # test's drift rows for the NEXT file. test_repositories' empty-chain
+        # test found them once E15-S12's booking tests became the last ones to
+        # write here - the leak was there since E15-S09, masked by test order.
+        await s.execute(text("DELETE FROM decision_log"))
+        await s.commit()
 
 
 @pytest.fixture
@@ -124,6 +133,7 @@ class KiteAccount:
         self.book: list[dict[str, Any]] = []
         self.net: list[dict[str, Any]] = []
         self.placed: list[dict[str, Any]] = []
+        self.cancels: list[str] = []
 
     def place_order(self, **params: Any) -> str:
         self.placed.append(params)
@@ -148,8 +158,24 @@ class KiteAccount:
     def orders(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self.book]
 
+    def cancel_order(self, variety: str, order_id: str, **_kwargs: Any) -> str:
+        """Kite's cancel: what has filled stays filled, the rest is cancelled."""
+        self.cancels.append(order_id)
+        for row in self.book:
+            if row["order_id"] == order_id:
+                row["status"] = "CANCELLED"
+        return order_id
+
     def positions(self) -> dict[str, list[dict[str, Any]]]:
         return {"net": [dict(r) for r in self.net], "day": []}
+
+    def partial(self, tag: str, quantity: int, price: str) -> None:
+        """Part-filled and still working - Kite reports OPEN for both."""
+        for row in self.book:
+            if row["tag"] == tag:
+                row.update(status="OPEN", filled_quantity=quantity, average_price=price)
+                return
+        raise AssertionError(f"no order tagged {tag}")
 
     def fill(self, tag: str, quantity: int, price: str) -> None:
         for row in self.book:
@@ -185,7 +211,7 @@ class KiteAccount:
 class Wiring:
     """The real stack, over one Kite account."""
 
-    def __init__(self, session, instruments, redis, audit, account: KiteAccount) -> None:
+    def __init__(self, session, instruments, redis, audit, account: KiteAccount, calendar) -> None:
         self.account = account
         self.adapter = KiteTradingAdapter(
             auth=None, client=account, algo_id="", tick_size_for=instruments.tick_size
@@ -203,7 +229,7 @@ class Wiring:
             protector=self.protector,
             store=self.positions,
             mirror=RedisMirror(redis),
-            calendar=None,
+            calendar=calendar,
         )
         self.reconciler = Reconciler(
             broker=self.adapter,
@@ -211,6 +237,7 @@ class Wiring:
             manager=self.manager,
             protector=self.protector,
             halter=self.halter,
+            canceller=self.gateway,
             audit=audit.write,
         )
 
@@ -244,12 +271,23 @@ class Wiring:
 
 
 @pytest.fixture
-def wiring(session, instruments, redis, audit) -> Wiring:
-    return Wiring(session, instruments, redis, audit, KiteAccount())
+def calendar() -> MarketCalendar:
+    """The real shipped holiday list and deadline maths - booking needs them."""
+    path = Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml"
+    status = load_holidays_with_status(str(path))
+    return MarketCalendar(status.dates, covers_years=status.covers_years)
+
+
+@pytest.fixture
+def wiring(session, instruments, redis, audit, calendar) -> Wiring:
+    return Wiring(session, instruments, redis, audit, KiteAccount(), calendar)
 
 
 async def _drift_rows(session: AsyncSession) -> list[tuple[str, str]]:
-    await session.commit()  # the audit writer commits in its own session
+    # No commit. The audit writer commits in its OWN session, and under READ
+    # COMMITTED every new statement here already sees that. Committing this
+    # session instead persisted the test's orders and positions past its
+    # rollback, and a later file counting rows found them (E15-S12).
     rows = (
         await session.execute(text("SELECT stage, outcome FROM decision_log ORDER BY seq"))
     ).all()
@@ -577,3 +615,122 @@ class TestAnUnreadablePayloadIsNotActedOn:
         with pytest.raises(ReconciliationReadError, match="no action taken"):
             await wiring.run()
         assert not (await wiring.halter.state()).kill_switch
+
+
+# ===========================================================================
+# E15-S12 — booking fills against the real adapter, tables and cache
+# ===========================================================================
+
+
+def _entry_plan(quantity: int = 100) -> EntryPlan:
+    from algotrader.common.models.trading import SizingResult
+
+    return EntryPlan(
+        sizing=SizingResult(
+            quantity=quantity,
+            entry_price=Decimal("1200.0000"),
+            stop_price=Decimal("1186.4500"),
+            capital_at_risk=Decimal("1355.00"),
+            binding_constraint="risk_per_trade",
+        ),
+        slot_index=0,
+        is_cas_stock=False,
+    )
+
+
+class TestAFillIsBookedForReal:
+    async def _entered(self, wiring: Wiring, quantity: int = 40) -> tuple[uuid.UUID, str, str]:
+        corr = uuid.uuid4()
+        tag = await wiring.enter(corr, quantity=quantity)
+        key = client_order_id(
+            correlation_id=corr,
+            symbol="INFY",
+            side=Side.BUY,
+            intent=OrderIntent.ENTRY,
+            trade_date=TRADE_DATE,
+        )
+        wiring.manager.expect_fill(key, _entry_plan(quantity))
+        return corr, tag, key
+
+    async def test_a_filled_entry_is_booked_under_our_identity_not_the_adapters(
+        self, wiring: Wiring, session: AsyncSession
+    ) -> None:
+        """The seam only the real adapter has: it maps Kite's 20-character tag
+        back into an Order whose correlation id is DERIVED FROM THE TAG. Booked
+        from that, the position's stop key is wrong and the next step exits the
+        position it just protected. The row, the stop and the book must all
+        carry OUR correlation."""
+        corr, tag, _key = await self._entered(wiring)
+        wiring.account.fill(tag, 40, "1201.50")
+        wiring.account.hold("INFY", quantity=40, bought=40)
+        report = await wiring.run()
+
+        assert report.booked == ["INFY"]
+        assert report.exited == [], "the fill was exited instead of protected"
+        row = (
+            await session.execute(
+                text("SELECT correlation_id, quantity FROM positions WHERE status = 'OPEN'")
+            )
+        ).one()
+        assert (row.correlation_id, row.quantity) == (corr, 40)
+        position = wiring.manager.tracked("INFY").position
+        stop_tag = wiring.adapter.order_key(stop_client_order_id(position, trade_date=TRADE_DATE))
+        stops = [p for p in wiring.account.placed if p["order_type"] == "SL-M"]
+        assert [(p["tag"], p["quantity"]) for p in stops] == [(stop_tag, 40)]
+
+    async def test_a_second_cycle_leaves_the_booked_position_alone(self, wiring: Wiring) -> None:
+        _corr, tag, _key = await self._entered(wiring)
+        wiring.account.fill(tag, 40, "1201.50")
+        wiring.account.hold("INFY", quantity=40, bought=40)
+        await wiring.run()
+        second = await wiring.run()
+        assert second.booked == [] and second.exited == []
+        assert len([p for p in wiring.account.placed if p["transaction_type"] == "SELL"]) == 1
+
+    async def test_a_working_partial_is_cancelled_through_the_gateway_then_booked(
+        self, wiring: Wiring, session: AsyncSession
+    ) -> None:
+        """Freeze first, through the only path to a cancel; book once the
+        quantity can no longer change - at the frozen quantity."""
+        _corr, tag, _key = await self._entered(wiring, quantity=100)
+        wiring.account.partial(tag, 40, "1201.50")
+        wiring.account.hold("INFY", quantity=40, bought=40)
+        first = await wiring.run()
+        assert first.frozen == ["INFY"] and first.booked == [] and first.exited == []
+        assert len(wiring.account.cancels) == 1
+
+        report = await wiring.run()
+        assert report.booked == ["INFY"]
+        quantity = (
+            await session.execute(text("SELECT quantity FROM positions WHERE status = 'OPEN'"))
+        ).scalar_one()
+        assert quantity == 40
+
+    async def test_a_stopped_out_position_is_closed_in_the_table(
+        self, wiring: Wiring, session: AsyncSession
+    ) -> None:
+        corr, tag, _key = await self._entered(wiring)
+        wiring.account.fill(tag, 40, "1201.50")
+        wiring.account.hold("INFY", quantity=40, bought=40)
+        await wiring.run()
+
+        position = wiring.manager.tracked("INFY").position
+        stop_tag = wiring.adapter.order_key(stop_client_order_id(position, trade_date=TRADE_DATE))
+        wiring.account.fill(stop_tag, 40, "1190.00")
+        wiring.account.net[:] = []
+        wiring.account.hold("INFY", quantity=0, bought=40, sold=40)
+        report = await wiring.run()
+
+        assert report.closed == ["INFY"]
+        row = (
+            await session.execute(
+                text(
+                    "SELECT status, exit_reason, realized_pnl FROM positions "
+                    "WHERE correlation_id = :c"
+                ),
+                {"c": corr},
+            )
+        ).one()
+        assert (row.status, row.exit_reason) == ("CLOSED", "STOP")
+        assert Decimal(str(row.realized_pnl)) == Decimal("-460.00")
+        assert wiring.manager.tracked("INFY") is None

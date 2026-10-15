@@ -60,6 +60,7 @@ from algotrader.execution.halt import (
 )
 from algotrader.execution.order_state import IllegalTransitionError
 from algotrader.execution.positions import (
+    EntryPlan,
     ExitingPosition,
     PositionAlreadyHeldError,
     PositionManager,
@@ -3949,6 +3950,11 @@ class _ReconciledBroker:
         """A fill no order of ours placed - someone else on the account."""
         self._fill(symbol, Side.BUY, quantity)
 
+    async def cancel_order(self, broker_order_id: str) -> None:
+        for key, order in self.orders.items():
+            if order.broker_order_id == broker_order_id and not order.status.is_terminal:
+                self.orders[key] = order.model_copy(update={"status": OrderStatus.CANCELLED})
+
     def reject(self, client_order_id: str) -> None:
         self.orders[client_order_id] = self.orders[client_order_id].model_copy(
             update={"status": OrderStatus.REJECTED}
@@ -4122,6 +4128,7 @@ class TestSit19ASessionReconciledAllDay:
             manager=manager,
             protector=protector,
             halter=halter,
+            canceller=gateway,
             audit=sink,
             metrics=get_metrics(),
         )
@@ -4343,6 +4350,316 @@ class TestSit19ASessionReconciledAllDay:
                 stack["broker"].foreign_fill("WIPRO", 25)
 
         session, _stack, _reports = self._run_day(calendar, limit=20, before_cycle=stranger)
+        assert not re.search(
+            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
+            session.log_text,
+            re.IGNORECASE,
+        )
+
+
+# --------------------------------------------------------------------------
+# SIT-20 — a session whose fills are booked, protected and closed (E15-S12)
+# --------------------------------------------------------------------------
+
+
+class _PartialFillBroker(_ReconciledBroker):
+    """The session broker, with entries that fill in parts.
+
+    An entry fills ``first_fraction`` on arrival and stays working, as a
+    protected market order can (Zerodha, fetched 30 Sep 2026: the exchange
+    "will either convert your order to a limit order, or cancel your order").
+    ``race`` more shares fill between a cancel being SENT and it LANDING, which
+    is the case that made a working partial a moving target.
+    """
+
+    def __init__(self, *, first_fraction: Decimal, race: int = 0) -> None:
+        super().__init__()
+        self.first_fraction = first_fraction
+        self.race = race
+        self.pending_cancels: list[str] = []
+
+    async def place_order(self, request) -> str:
+        if request.intent is not OrderIntent.ENTRY:
+            return await super().place_order(request)
+        self.placed.append(request)
+        broker_order_id = f"B{len(self.placed):06d}"
+        first = max(1, int(request.quantity * self.first_fraction))
+        done = first >= request.quantity
+        self.orders[request.client_order_id] = _landed_order(request, broker_order_id).model_copy(
+            update={
+                "status": OrderStatus.FILLED if done else OrderStatus.OPEN,
+                "filled_quantity": min(first, request.quantity),
+                "average_price": Decimal("1200.0000"),
+            }
+        )
+        self._fill(request.symbol, request.side, min(first, request.quantity))
+        return broker_order_id
+
+    async def cancel_order(self, broker_order_id: str) -> None:
+        self.pending_cancels.append(broker_order_id)
+
+    def settle_cancels(self) -> None:
+        """Cancels land - after ``race`` more shares have filled on each."""
+        for key, order in list(self.orders.items()):
+            if order.broker_order_id not in self.pending_cancels or order.status.is_terminal:
+                continue
+            extra = min(self.race, order.quantity - order.filled_quantity)
+            if extra:
+                self._fill(order.symbol, order.side, extra)
+            self.orders[key] = order.model_copy(
+                update={
+                    "status": OrderStatus.CANCELLED,
+                    "filled_quantity": order.filled_quantity + extra,
+                }
+            )
+        self.pending_cancels.clear()
+
+    def trigger_stop(self, client_order_id: str, price: str = "1186.4500") -> None:
+        order = self.orders[client_order_id]
+        self.orders[client_order_id] = order.model_copy(
+            update={
+                "status": OrderStatus.FILLED,
+                "filled_quantity": order.quantity,
+                "average_price": Decimal(price),
+            }
+        )
+        self._fill(order.symbol, order.side, order.quantity)
+
+
+class TestSit20ASessionWhoseFillsAreBooked:
+    """SIT-19 ran the loop on a day that could not hold a position: every fill
+    was exited, because nothing booked it. E15-S12 books them. This asks what
+    only a whole day can answer about that:
+
+    * **Are no shares ever left naked across the day?** A partly filled entry is
+      a moving target. One unit test shows one being frozen; a day of them, each
+      racing its own cancel, is where a single mis-sized booking or exit leaves
+      shares without a stop.
+    * **Does the book agree with the broker at the end of the day** - every
+      position booked at what filled, every stop-out closed as a stop?
+    * **Does a restart book what it can prove and exit what it cannot?**
+
+    **The pipeline is the test**, again: nothing yet registers a plan when an
+    entry is sent, so this file does it, as that wiring will.
+    """
+
+    LIMIT = 20
+
+    @staticmethod
+    def _healthy() -> dict:
+        return {
+            "symbol_sector": "IT",
+            "correlations": {},
+            "available_margin": Decimal("400000"),
+            "margin_per_share": Decimal("240"),
+            "atr": Decimal("13.5000"),
+            "lot_size": 1,
+        }
+
+    def _session(self, calendar):
+        session = Session(
+            calendar,
+            TRADING_DAY,
+            checks=[
+                *build_precondition_checks(calendar, NO_TRADE_WINDOWS),
+                *build_eligibility_checks(),
+                *build_exposure_checks(
+                    max_correlated_positions=2,
+                    correlation_threshold=Decimal("0.7"),
+                    max_sector_exposure_pct=Decimal("40"),
+                    max_net_directional_exposure_pct=Decimal("60"),
+                ),
+                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                *build_margin_timing_checks(min_minutes_to_squareoff=30),
+            ],
+            **self._healthy(),
+        )
+        session.engine = RiskEngine(
+            checks=list(session.engine.checks),
+            sizer=build_sizer(_sizing_policy()),
+            audit=session.audit.append,
+        )
+        return session.run()
+
+    @staticmethod
+    def _stack(calendar, broker):
+        ledger = _SessionLedger()
+        gateway = OrderGateway(
+            broker,
+            policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+            store=ledger,
+        )
+        halter = HaltController(_SessionRedis())
+        protector = ProtectiveStop(gateway, halter=halter, metrics=get_metrics())
+        store = _SessionPositionStore()
+        manager = PositionManager(
+            protector=protector,
+            store=store,
+            mirror=_DictMirror(),
+            calendar=calendar,
+            metrics=get_metrics(),
+        )
+        audit: list = []
+
+        async def sink(entry) -> None:
+            audit.append(entry)
+
+        reconciler = Reconciler(
+            broker=broker,
+            ledger=ledger,
+            manager=manager,
+            protector=protector,
+            halter=halter,
+            canceller=gateway,
+            audit=sink,
+            metrics=get_metrics(),
+        )
+        return {
+            "broker": broker,
+            "ledger": ledger,
+            "gateway": gateway,
+            "halter": halter,
+            "protector": protector,
+            "store": store,
+            "manager": manager,
+            "reconciler": reconciler,
+            "audit": audit,
+        }
+
+    def _send(self, stack, index, decision, rec, ist_time, *, plan: bool = True) -> str:
+        """Send an entry and register its plan, as the pipeline will."""
+        cid = TestSit19ASessionReconciledAllDay._enter(stack, index, decision, rec, ist_time)
+        if plan:
+            stack["manager"].expect_fill(
+                cid, EntryPlan(sizing=decision.sizing, slot_index=index, is_cas_stock=False)
+            )
+        return cid
+
+    @staticmethod
+    def _cycle(stack, ist_time, *, seconds: int):
+        moment = _at(TRADING_DAY, ist_time.hour, ist_time.minute) + dt.timedelta(seconds=seconds)
+        return _run_async(stack["reconciler"].run_cycle(now=moment))
+
+    @staticmethod
+    def _naked(stack) -> dict[str, int]:
+        """Shares held at the broker that no working stop and no book entry cover."""
+        held = {s: n for s, n in stack["broker"].net().items() if n}
+        booked = {t.position.symbol: t.position.quantity for t in stack["manager"].open_positions()}
+        return {s: n - booked.get(s, 0) for s, n in held.items() if n != booked.get(s, 0)}
+
+    def _run_partial_day(self, calendar, *, race: int, plan: bool = True):
+        session = self._session(calendar)
+        broker = _PartialFillBroker(first_fraction=Decimal("0.4"), race=race)
+        stack = self._stack(calendar, broker)
+        signals = [
+            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            for t in sorted(session.decisions)
+            if session.decisions[t].approved
+        ][: self.LIMIT]
+        reports, cids = [], []
+        for index, (decision, rec, ist_time) in enumerate(signals):
+            cids.append(self._send(stack, index, decision, rec, ist_time, plan=plan))
+            reports.append(self._cycle(stack, ist_time, seconds=20))  # sees the partial
+            broker.settle_cancels()  # cancel lands
+            reports.append(self._cycle(stack, ist_time, seconds=50))  # books / exits
+        return stack, reports, signals, cids
+
+    # -- the day --------------------------------------------------------------
+
+    def test_every_partial_fill_is_frozen_then_booked_at_what_filled(self, calendar) -> None:
+        stack, reports, _signals, _cids = self._run_partial_day(calendar, race=7)
+        booked = {t.position.symbol: t.position.quantity for t in stack["manager"].open_positions()}
+        assert len(booked) == self.LIMIT
+        assert all(isinstance(t, ProtectedPosition) for t in stack["manager"].open_positions())
+        net = stack["broker"].net()
+        assert booked == {s: net[s] for s in booked}, "the book disagrees with the broker"
+        assert sum(len(r.frozen) for r in reports) == self.LIMIT
+
+    def test_no_shares_are_ever_left_naked_past_the_freeze(self, calendar) -> None:
+        """The day-scale form of QA-E15-23: after each entry's booking cycle,
+        nothing the broker holds is outside the book."""
+        stack, reports, _signals, _cids = self._run_partial_day(calendar, race=7)
+        assert self._naked(stack) == {}
+        assert not any(r.halted for r in reports)
+
+    def test_every_stop_matches_what_its_position_holds(self, calendar) -> None:
+        stack, _reports, _signals, _cids = self._run_partial_day(calendar, race=7)
+        held = {t.position.symbol: t.position.quantity for t in stack["manager"].open_positions()}
+        stops = [r for r in stack["broker"].placed if r.intent is OrderIntent.STOP]
+        assert {r.symbol: r.quantity for r in stops} == held
+
+    def test_stop_outs_across_the_day_close_as_stops_and_the_book_empties(self, calendar) -> None:
+        stack, _reports, _signals, _cids = self._run_partial_day(calendar, race=0)
+        for tracked in list(stack["manager"].open_positions()):
+            stack["broker"].trigger_stop(tracked.established.stop_client_order_id)
+        report = self._cycle(stack, dt.time(14, 0), seconds=0)
+        assert len(report.closed) == self.LIMIT
+        assert stack["manager"].open_positions() == []
+        assert set(stack["broker"].net().values()) == {0}
+        reasons = {r["exit_reason"] for r in stack["store"].rows.values()}
+        assert reasons == {"STOP"}
+
+    def test_without_plans_every_fill_is_exited_once_frozen(self, calendar) -> None:
+        """AC3 at session scale: nothing is booked on a guess, and nothing is
+        exited while it can still grow - so the exit is sized to what filled."""
+        stack, _reports, _signals, _cids = self._run_partial_day(calendar, race=7, plan=False)
+        assert stack["manager"].open_positions() == []
+        assert set(stack["broker"].net().values()) == {0}, "a partial was exited mid-growth"
+        exits = [r for r in stack["broker"].placed if r.intent is OrderIntent.SQUAREOFF]
+        assert len(exits) == self.LIMIT
+
+    def test_a_restart_books_what_it_can_prove_and_exits_what_it_cannot(self, calendar) -> None:
+        """Half the day's entries are sent and booked; the process restarts and
+        forgets its plans; the other half are sent before the new process has
+        any plan for them. The first half is restored and proved; the second is
+        exited, never guessed."""
+        session = self._session(calendar)
+        broker = _PartialFillBroker(first_fraction=Decimal("1"))
+        stack = self._stack(calendar, broker)
+        signals = [
+            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            for t in sorted(session.decisions)
+            if session.decisions[t].approved
+        ][:10]
+        for index, (decision, rec, ist_time) in enumerate(signals[:5]):
+            self._send(stack, index, decision, rec, ist_time)
+            self._cycle(stack, ist_time, seconds=30)
+
+        restarted = PositionManager(
+            protector=stack["protector"],
+            store=stack["store"],
+            mirror=_DictMirror(),
+            calendar=calendar,
+            metrics=get_metrics(),
+        )
+        _run_async(restarted.restore())
+        stack["manager"] = restarted
+        stack["reconciler"]._manager = restarted
+        for index, (decision, rec, ist_time) in enumerate(signals[5:], start=5):
+            self._send(stack, index, decision, rec, ist_time, plan=False)
+            self._cycle(stack, ist_time, seconds=30)
+
+        held = {t.position.symbol for t in restarted.open_positions()}
+        assert held == {f"SYM{i:04d}" for i in range(5)}
+        assert all(isinstance(t, ProtectedPosition) for t in restarted.open_positions())
+        net = stack["broker"].net()
+        assert all(net[f"SYM{i:04d}"] == 0 for i in range(5, 10)), "a planless fill was kept"
+
+    def test_no_credential_reached_the_log(self, calendar) -> None:
+        import re
+
+        session = self._session(calendar)
+        broker = _PartialFillBroker(first_fraction=Decimal("0.4"), race=7)
+        stack = self._stack(calendar, broker)
+        for index, t in enumerate(sorted(session.decisions)[:200]):
+            decision = session.decisions[t]
+            if not decision.approved:
+                continue
+            rec = _recommendation(_at(TRADING_DAY, t.hour, t.minute))
+            self._send(stack, index, decision, rec, t)
+            self._cycle(stack, t, seconds=20)
+            broker.settle_cancels()
+            self._cycle(stack, t, seconds=50)
         assert not re.search(
             r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
             session.log_text,

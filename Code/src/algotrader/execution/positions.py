@@ -74,6 +74,7 @@ from algotrader.execution.protective_stop import (
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "EntryPlan",
     "ExitingPosition",
     "FilledEntry",
     "Marks",
@@ -211,6 +212,37 @@ class UnprotectableFill:
     symbol: str
     direction: Direction
     quantity: int
+
+
+@dataclass(frozen=True)
+class EntryPlan:
+    """What the risk engine approved for an entry, carried to its fill (E15-S12).
+
+    ``open_from_fill`` needs the approved stop, the slot and the CAS flag, and
+    the ``orders`` table carries none of them - an order row describes what was
+    sent, not why. So whoever submits an entry registers its plan here, and the
+    reconciliation loop that later observes the fill looks it up by the entry's
+    idempotency key.
+
+    **In memory, deliberately.** The window between submission and booking is
+    one reconciliation cycle. A restart inside it loses the plan, and the fill
+    is then exited rather than booked with a guessed stop (AC3) - safe, at the
+    cost of one trade. A durable plan table would book it instead, for the price
+    of a migration; that becomes the right trade if restarts during trading
+    stop being rare.
+    """
+
+    sizing: SizingResult
+    slot_index: int
+    is_cas_stock: bool
+    is_fno: bool = False
+    strategy_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.sizing.quantity <= 0:
+            raise ValueError("a plan sized to nothing is not a plan for a position")
+        if self.slot_index < 0:
+            raise ValueError(f"slot_index {self.slot_index} is negative")
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +527,15 @@ class PositionManager:
         #: absent capability would read as a satisfied one.
         self._store = store
         self._mirror = mirror
+        #: Checked here, not at first use (E15-S12). Built without one, a
+        #: manager constructed fine and failed at its FIRST BOOKING - inside a
+        #: reconciliation cycle, as an error the cycle recorded and moved past,
+        #: which quietly turned every fill into an exit.
+        if not callable(getattr(calendar, "squareoff_deadline", None)):
+            raise TypeError(
+                "PositionManager needs a calendar with squareoff_deadline(); without "
+                "one no position can be opened, and the first fill would find out"
+            )
         self._calendar = calendar
         self._exit_buffer_minutes = exit_buffer_minutes
         #: A second staleness guard, on top of ``QuotePublisher.read_fresh``.
@@ -504,6 +545,10 @@ class PositionManager:
         self._max_quote_age_seconds = max_quote_age_seconds
         self._metrics = metrics
         self._book: dict[str, TrackedPosition] = {}
+        #: Entry idempotency key -> the plan approved for it. Bounded by the
+        #: day's entries; each is forgotten once its entry is booked or has
+        #: finished without filling.
+        self._plans: dict[str, EntryPlan] = {}
 
     # -- reading ------------------------------------------------------------
 
@@ -530,6 +575,29 @@ class PositionManager:
                 return None
             total += tracked.marks.unrealised_pnl
         return total
+
+    # -- plans ----------------------------------------------------------------
+
+    def expect_fill(self, client_order_id: str, plan: EntryPlan) -> None:
+        """Register what was approved for an entry, before or as it is sent.
+
+        One key names one decision. Registering a DIFFERENT plan under a key
+        already held is refused: the second would silently re-size a position
+        the first was approved for.
+        """
+        held = self._plans.get(client_order_id)
+        if held is not None and held != plan:
+            raise PositionError(
+                f"entry {client_order_id} already has a different plan; one "
+                f"idempotency key names one decision"
+            )
+        self._plans[client_order_id] = plan
+
+    def plan_for(self, client_order_id: str) -> EntryPlan | None:
+        return self._plans.get(client_order_id)
+
+    def forget(self, client_order_id: str) -> None:
+        self._plans.pop(client_order_id, None)
 
     # -- opening ------------------------------------------------------------
 
