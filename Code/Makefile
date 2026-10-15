@@ -85,8 +85,8 @@ secrets-scan:  ## Scan full git history for leaked secrets
 	gitleaks detect --source . --verbose
 
 .PHONY: audit
-audit:  ## Audit dependencies for known vulnerabilities
-	pip-audit
+audit:  ## Audit dependencies (same command as CI; accepted advisories: tests/security/test_dependency_hygiene.py)
+	pip-audit --skip-editable --ignore-vuln CVE-2026-106454
 
 .PHONY: security
 security: secrets-scan audit test-safety  ## Full security gate
