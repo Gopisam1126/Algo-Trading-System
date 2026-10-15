@@ -288,6 +288,14 @@ Recorded because each was believed, written down, and wrong.
   using a package is not the same as not having it.* B7 was closed by
   upgrading to 26.7.1 — the `==19.11.2` pin is declarative, not a runtime
   requirement.
+- **"A clean audit stays clean until the dependencies change."** The E15-S12
+  promotion failed QA's audit with no dependency change: four advisories
+  (three urllib3, one Twisted) were published between the DEV run and the QA
+  run. urllib3 was bumped to 2.8.0. Twisted has no fix and cannot be removed,
+  so `CVE-2026-106454` (IMAP4 *server* ReDoS in `twisted.mail`) is ignored by
+  ID — and `TestTheAcceptedTwistedAdvisory` proves it unreachable and fails
+  when Twisted's version moves. Never add an `--ignore-vuln` without adding it
+  to `ACCEPTED_ADVISORIES` and an executed reachability check beside it.
 - **"`Applicability` gates the strategy."** It was parsed, validated and folded
   into the content hash, then read by nothing. A TRENDING-only strategy fired
   freely in a rangebound market.

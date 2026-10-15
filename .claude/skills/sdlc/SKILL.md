@@ -286,7 +286,7 @@ Run the automated gates:
 
 ```bash
 bandit -r src/ --severity-level medium --confidence-level medium
-pip-audit --skip-editable          # NOT --strict; see DEPLOYMENT.md
+make audit                         # = CI's pip-audit: --skip-editable (NOT --strict) + accepted advisories; see DEPLOYMENT.md
 pytest tests/security/ -q
 ```
 

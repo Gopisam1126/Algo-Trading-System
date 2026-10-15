@@ -97,6 +97,25 @@ Two design decisions worth knowing:
     dependency as an error, and the local editable `algotrader` package is
     always skipped because it is not on PyPI — so `--strict` fails every run
     for a reason unrelated to vulnerabilities.
+  - **An ignored advisory is an executable claim, not a comment.** One is
+    accepted (15 Oct 2026): `--ignore-vuln CVE-2026-106454`, a ReDoS in
+    Twisted's IMAP4 *server* (`twisted.mail.imap4.wildcardToRegexp`). Twisted
+    arrives only through kiteconnect's `autobahn[twisted]` pin, cannot be
+    removed (`import kiteconnect` needs it), and has no patched release. It is
+    unreachable here: no IMAP server, the reactor never runs, and nothing
+    imports `twisted.mail`. `TestTheAcceptedTwistedAdvisory` in
+    `tests/security/test_dependency_hygiene.py` asserts every part of that —
+    loading every application module in a clean interpreter never pulls in
+    `twisted.mail` (with a control proving the probe would see it), no source
+    file imports Twisted, every audit site ignores **exactly** the accepted
+    set — and fails the moment Twisted's version moves, so a fixed release
+    gets the ignore removed instead of forgotten. `make audit` runs the same
+    command as CI; it did not until this was found.
+  - **An audit that passed on DEV can fail on QA with no code change.**
+    Advisories are published against the world, not against a commit. The
+    E15-S12 promotion went red two weeks after its DEV run passed because
+    three urllib3 advisories and the Twisted one were published in between.
+    A red audit on promotion is a new finding, not a flaky gate.
   - `bandit` is gated at **MEDIUM severity and MEDIUM confidence**. Every LOW
     in this codebase is an `assert` used for type narrowing behind an explicit
     guard, and nothing runs under `python -O`. Gating on LOW would be noise,
