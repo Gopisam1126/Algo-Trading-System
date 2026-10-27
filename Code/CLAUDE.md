@@ -143,7 +143,8 @@ exist. **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**2,083 tests, 92% coverage** — all pass locally with Docker running;
+Built and tested (**2,577 tests, 93% coverage** as of the 27 Oct 2026 whole-system
+verification — all pass locally with Docker running;
 without it the container-backed integration tests skip and coverage reads lower):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -293,9 +294,42 @@ Recorded because each was believed, written down, and wrong.
   (three urllib3, one Twisted) were published between the DEV run and the QA
   run. urllib3 was bumped to 2.8.0. Twisted has no fix and cannot be removed,
   so `CVE-2026-106454` (IMAP4 *server* ReDoS in `twisted.mail`) is ignored by
-  ID — and `TestTheAcceptedTwistedAdvisory` proves it unreachable and fails
-  when Twisted's version moves. Never add an `--ignore-vuln` without adding it
-  to `ACCEPTED_ADVISORIES` and an executed reachability check beside it.
+  ID — and `TestTheAcceptedTwistedAdvisories` proves it unreachable and fails
+  when Twisted's version moves. It recurred twelve days later (27 Oct 2026):
+  certifi, filelock, setuptools and five more Twisted server advisories - and
+  hours later, between the local audit and the CI run, msgpack and a Twisted
+  DNS-client advisory. Seven accepted IDs now, each mapped to its subsystem.
+  The local venv had also drifted from `constraints.txt` on 17 packages, and
+  the local lint skipped `migrations/`: install from constraints and run CI's
+  exact commands before trusting a local gate. Never add an `--ignore-vuln`
+  without adding it to `ACCEPTED_ADVISORIES` and an executed reachability
+  check beside it.
+- **"The fourteen checks plus the gateway make a decision safe to send."** A
+  `RiskDecision` carried no identity of what it decided, and the gateway took
+  it beside a recommendation in a separate argument. The SIT harness paired
+  every decision with a freshly minted recommendation for weeks and nothing
+  noticed (AUDIT-006, SIT-008). A decision now carries correlation id, symbol
+  and direction, and `build_entry` refuses a pair that does not match.
+- **"An unrecognised order status is handled."** It became `RECONCILE_REQUIRED`
+  - and `is_live`, a denylist, counted that as a protecting stop (AUDIT-009).
+  Liveness is an allowlist now. *When the vocabulary is the broker's, list
+  what you accept, never what you reject.*
+- **"Every strategy declaration is enforced."** `max_entries_per_day` (default
+  1 on every strategy), `entry_window`, `min_bars_since_open` and `sectors`
+  were enforced by nothing (AUDIT-012); `stop: r_multiple_target` compiled
+  (AUDIT-013). Grep for a field's readers before believing it binds.
+- **"Holding a credential in a SecretString keeps it out of the logs."** Only
+  if it IS held in one: `KiteFeed.access_token` was a plain `str` on a
+  dataclass whose repr prints it, and the redactor missed quoted keys and
+  Kite's `token key:secret` header (AUDIT-007, -008). A test now scans every
+  class in `src` for credential-named `str` fields.
+- **"The outlier filter only drops bad prints."** It dropped every print after
+  a genuine move bigger than its bound, for the rest of the session (AUDIT-011).
+  A filter whose baseline moves only on what it accepts can lock up.
+- **"The models describe the database."** Three indexes declared from `text()`
+  alone attached to no table and were built by nothing (AUDIT-019). The
+  schema is now compared with the migrations, and every declared Index must
+  be in the metadata.
 - **"`Applicability` gates the strategy."** It was parsed, validated and folded
   into the content hash, then read by nothing. A TRENDING-only strategy fired
   freely in a rangebound market.

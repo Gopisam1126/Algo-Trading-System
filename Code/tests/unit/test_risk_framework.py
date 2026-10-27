@@ -45,6 +45,11 @@ def _fresh_metrics() -> None:
     reset_metrics_for_testing()
 
 
+def _identity(rec: Recommendation) -> dict[str, object]:
+    """The three fields a RiskDecision carries about what it decided."""
+    return {"correlation_id": rec.correlation_id, "symbol": rec.symbol, "direction": rec.direction}
+
+
 def _rec(symbol: str = "INFY") -> Recommendation:
     return Recommendation(
         correlation_id=CID,
@@ -382,19 +387,25 @@ class TestCheckRegistrationIsValidated:
 class TestTheDecisionConstructors:
     def test_approve_requires_sizing_structurally(self) -> None:
         with pytest.raises(ValueError, match="must carry sizing"):
-            RiskDecision(approved=True, evaluated_at=NOW)
+            RiskDecision(**_identity(_rec()), approved=True, evaluated_at=NOW)
 
     def test_reject_requires_a_reason_structurally(self) -> None:
         with pytest.raises(ValueError, match="must carry a reject reason"):
-            RiskDecision(approved=False, evaluated_at=NOW)
+            RiskDecision(**_identity(_rec()), approved=False, evaluated_at=NOW)
 
     def test_approve_produces_a_coherent_decision(self) -> None:
-        decision = RiskDecision.approve(_sizing(), checks_passed=["a"], now=NOW)
+        decision = RiskDecision.approve(
+            _sizing(), recommendation=_rec(), checks_passed=["a"], now=NOW
+        )
         assert decision.approved and decision.reason is None
 
     def test_reject_produces_a_coherent_decision(self) -> None:
         decision = RiskDecision.reject(
-            RejectReason.NO_SLOT_AVAILABLE, detail="5 of 5 used", checks_passed=[], now=NOW
+            RejectReason.NO_SLOT_AVAILABLE,
+            recommendation=_rec(),
+            detail="5 of 5 used",
+            checks_passed=[],
+            now=NOW,
         )
         assert not decision.approved and decision.sizing is None
 
@@ -402,9 +413,146 @@ class TestTheDecisionConstructors:
         """A caller mutating its list afterwards must not rewrite history in a
         decision already recorded."""
         passed = ["a"]
-        decision = RiskDecision.approve(_sizing(), checks_passed=passed, now=NOW)
+        decision = RiskDecision.approve(
+            _sizing(), recommendation=_rec(), checks_passed=passed, now=NOW
+        )
         passed.append("b")
         assert decision.checks_passed == ["a"]
+
+
+class TestEveryDecisionSaysWhatItDecided:
+    """Every path out of the engine stamps the candidate's identity on the
+    decision, so the gateway can refuse it beside any other recommendation.
+    One test per exit, because a path that forgot would be the one used."""
+
+    REC = _rec(symbol="TCS")
+
+    def _assert_about(self, decision: RiskDecision) -> None:
+        assert decision.is_for(self.REC)
+        assert decision.correlation_id == self.REC.correlation_id
+        assert decision.symbol == "TCS"
+        assert decision.direction is self.REC.direction
+
+    def test_an_approval(self) -> None:
+        decision = RiskEngine(checks=[], sizer=_sizer()).evaluate(self.REC, _ctx())
+        assert decision.approved
+        self._assert_about(decision)
+
+    def test_a_check_refusal(self) -> None:
+        engine = RiskEngine(checks=[RiskCheck("no", _always(False))], sizer=_sizer())
+        self._assert_about(engine.evaluate(self.REC, _ctx()))
+
+    def test_a_check_that_raised(self) -> None:
+        engine = RiskEngine(
+            checks=[RiskCheck("explodes", TestABrokenCheckIsARefusalNotASkip._exploding)],
+            sizer=_sizer(),
+        )
+        self._assert_about(engine.evaluate(self.REC, _ctx()))
+
+    def test_no_sizer(self) -> None:
+        self._assert_about(RiskEngine(checks=[]).evaluate(self.REC, _ctx()))
+
+    def test_a_sizer_that_raised(self) -> None:
+        def boom(rec: Recommendation, ctx: RiskContext) -> SizingResult:
+            raise RuntimeError("sizing input went away")
+
+        self._assert_about(RiskEngine(checks=[], sizer=boom).evaluate(self.REC, _ctx()))
+
+    def test_a_zero_quantity(self) -> None:
+        engine = RiskEngine(checks=[], sizer=_sizer(quantity=0, binding="margin_cap"))
+        self._assert_about(engine.evaluate(self.REC, _ctx()))
+
+    def test_a_decision_is_not_for_another_candidate(self) -> None:
+        """The control on ``is_for``: a predicate answering True for anything
+        would satisfy every test above."""
+        decision = RiskEngine(checks=[], sizer=_sizer()).evaluate(self.REC, _ctx())
+        assert not decision.is_for(_rec(symbol="INFY"))
+
+
+class TestSlotCountsCannotInventCapacity:
+    """``slots_available`` is ``max(0, total - used)``. A negative ``used``
+    therefore read as a free slot on a book with none: 0 - (-1) = 1, and the
+    slot check passed. A broken counter must stop the evaluation instead."""
+
+    def test_the_fail_open_case_is_refused(self) -> None:
+        with pytest.raises(RiskContextError, match="FREE slot"):
+            _ctx(slots_total=0, slots_used=-1)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"slots_used": -1}, id="negative-used"),
+            pytest.param({"slots_total": -1, "slots_used": -2}, id="negative-total"),
+            pytest.param({"slots_used": True}, id="bool-used"),
+            pytest.param({"slots_total": 5.0}, id="float-total"),
+        ],
+    )
+    def test_any_non_count_is_refused(self, overrides) -> None:
+        with pytest.raises(RiskContextError):
+            _ctx(**overrides)
+
+    def test_an_honest_full_book_still_constructs_and_has_no_room(self) -> None:
+        """The control: zero free slots is a real state, refused by check 7
+        rather than by the context."""
+        ctx = _ctx(slots_total=5, slots_used=5)
+        assert ctx.slots_available == 0
+
+
+class TestAnOpenPositionCannotLoosenTheCaps:
+    """Each of these numbers is summed into an exposure total that a cap is
+    compared against. A bad one does not fail - it makes the cap read more
+    room than exists. So the position refuses to exist instead."""
+
+    @staticmethod
+    def _position(**overrides) -> OpenPosition:
+        base: dict = {
+            "symbol": "SBIN",
+            "direction": Direction.LONG,
+            "quantity": 100,
+            "entry_price": Decimal("800"),
+            "stop_price": Decimal("790"),
+            "sector": "BANK",
+        }
+        base.update(overrides)
+        return OpenPosition(**base)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"quantity": -100}, id="negative-quantity-counts-as-a-short"),
+            pytest.param({"quantity": 0}, id="zero-quantity-vanishes-from-totals"),
+            pytest.param({"quantity": True}, id="bool-quantity"),
+            pytest.param({"quantity": 100.0}, id="float-quantity"),
+            pytest.param({"entry_price": Decimal("NaN")}, id="nan-entry"),
+            pytest.param({"entry_price": Decimal("-800")}, id="negative-entry"),
+            pytest.param({"entry_price": Decimal("Infinity")}, id="infinite-entry"),
+            pytest.param({"stop_price": Decimal("0")}, id="zero-stop"),
+            pytest.param({"entry_price": 800.0}, id="float-entry"),
+            pytest.param({"symbol": ""}, id="no-symbol"),
+            pytest.param({"sector": "  "}, id="blank-sector"),
+            pytest.param({"direction": "LONG"}, id="direction-not-an-enum"),
+        ],
+    )
+    def test_a_position_that_would_shrink_a_total_is_refused(self, overrides) -> None:
+        with pytest.raises(RiskContextError):
+            self._position(**overrides)
+
+    def test_the_negative_quantity_would_have_loosened_the_sector_cap(self) -> None:
+        """Why it matters, stated as arithmetic: two real positions and one
+        corrupted one. Before the fix the corrupted one subtracted 80,000 from
+        the sector total; now it cannot be built at all."""
+        real = [self._position(symbol="SBIN"), self._position(symbol="PNB")]
+        ctx = _ctx(open_positions=tuple(real))
+        assert ctx.sector_exposure("BANK") == Decimal("160000")
+        with pytest.raises(RiskContextError, match="quantity -100"):
+            self._position(symbol="BOB", quantity=-100)
+
+    def test_an_honest_position_and_an_unknown_sector_still_construct(self) -> None:
+        """The control. Unknown sector stays representable as None - check 9
+        refuses it with its own message, and that path must keep working."""
+        assert self._position().notional == Decimal("80000")
+        assert self._position(sector=None).sector is None
+        assert self._position(direction=Direction.SHORT, stop_price=Decimal("810")).quantity == 100
 
 
 class TestTheContextRefusesIncoherentState:

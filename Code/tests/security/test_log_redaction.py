@@ -320,3 +320,140 @@ class TestTheOrderGatewaySwallowsAStoreFailureWithoutLeakingIt:
         rather than ``str(exc)``, that must not reopen the hole."""
         exc = RuntimeError(f"could not connect to {self.DSN}")
         assert "hunter2SuperSecret" not in render(redactor, {"error": exc})
+
+
+class TestTheShapesTheBrokerSdkActuallyLogs:
+    """Probed 27 Oct 2026 against the formats kiteconnect and a logged payload
+    produce. The assignment pattern (`key=value`, `key: value`) is defeated by
+    one closing quote, so JSON and Python's dict repr passed every credential
+    through in clear - api_key, request_token, checksum, access_token - and
+    Kite's own `token key:secret` header had no pattern at all."""
+
+    SECRETS = (
+        "kitekey123456",
+        "ReqTok0123456789abc",
+        "deadbeefcafebabe0123456789abcdef",
+        "AbCdEf0123456789xyz",
+        "pub0123456789abcdef",
+    )
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            pytest.param(
+                'Request: POST https://api.kite.trade/session/token {"api_key": "kitekey123456", '
+                '"request_token": "ReqTok0123456789abc", '
+                '"checksum": "deadbeefcafebabe0123456789abcdef"}',
+                id="kiteconnect-request-json",
+            ),
+            pytest.param(
+                'Request: GET https://api.kite.trade/orders {} {"X-Kite-Version": "3", '
+                '"Authorization": "token kitekey123456:AbCdEf0123456789xyz"}',
+                id="kiteconnect-auth-header",
+            ),
+            pytest.param(
+                '{"access_token": "AbCdEf0123456789xyz", "public_token": "pub0123456789abcdef"}',
+                id="session-response-json",
+            ),
+            pytest.param(
+                "{'access_token': 'AbCdEf0123456789xyz', 'user_id': 'AB1234'}",
+                id="python-dict-repr",
+            ),
+            pytest.param(
+                "Authorization: token kitekey123456:AbCdEf0123456789xyz",
+                id="raw-header-line",
+            ),
+            pytest.param(
+                "> GET /?api_key=kitekey123456&access_token=AbCdEf0123456789xyz HTTP/1.1",
+                id="websocket-request-line",
+            ),
+        ],
+    )
+    def test_no_credential_survives(self, line: str) -> None:
+        out = RedactingProcessor()._scrub_text(line)
+        leaked = [s for s in self.SECRETS if s in out]
+        assert not leaked, f"leaked {leaked}: {out}"
+
+    def test_a_registered_value_does_not_blind_the_patterns(self) -> None:
+        """The layers interfered. With the access token registered as a
+        SecretString, value-scrubbing ran first and turned the header into
+        "token <key>:***REDACTED***" - a shape the header pattern does not
+        match - so the api key stayed in the line. It passed alone and failed
+        in the suite, depending on whether an earlier test had registered the
+        token. Reproduced here deterministically."""
+        SecretString("AbCdEf0123456789xyz", name="KITE_ACCESS_TOKEN")
+        out = RedactingProcessor()._scrub_text(
+            "Authorization: token kitekey123456:AbCdEf0123456789xyz"
+        )
+        assert "kitekey123456" not in out
+        assert "AbCdEf0123456789xyz" not in out
+
+    def test_the_key_survives_so_the_line_says_what_was_hidden(self) -> None:
+        out = RedactingProcessor()._scrub_text('{"access_token": "AbCdEf0123456789xyz"}')
+        assert '"access_token"' in out and "REDACTED" in out
+
+    def test_ordinary_fields_are_not_eaten(self) -> None:
+        """The control. Instrument tokens are public ids, ``tokens`` is a list
+        of them, and an order's status is not a secret."""
+        line = (
+            '{"symbol": "INFY", "instrument_token": 408065, "tokens": [1, 2], "status": "COMPLETE"}'
+        )
+        assert RedactingProcessor()._scrub_text(line) == line
+
+
+class TestASecretStringScrubsItsOwnValue:
+    """``register_secret_values`` was never called anywhere, so the layer the
+    redactor calls "the real work" was empty. A SecretString now registers its
+    value when it is built - holding a credential properly is enough."""
+
+    def test_a_value_held_in_a_secretstring_is_scrubbed_with_no_key_to_match(self) -> None:
+        value = "ZxQw9876UnmatchablePlainValue"
+        SecretString(value, name="probe")
+        # No key name, no pattern shape - only the value itself identifies it.
+        out = RedactingProcessor()._scrub_text(f"handshake carried {value} in the payload")
+        assert value not in out
+
+    def test_the_longer_secret_is_scrubbed_whole(self) -> None:
+        """Longest first: scrubbing a secret that is a substring of another
+        before the other would leave the remainder in the line."""
+        short, long_ = "PrefixValue1", "PrefixValue1WithASuffix99"
+        SecretString(short, name="a")
+        SecretString(long_, name="b")
+        out = RedactingProcessor()._scrub_text(f"value={long_}")
+        assert "WithASuffix99" not in out
+
+    def test_a_short_value_is_not_registered(self) -> None:
+        """The control: a seven-character value would redact ordinary words."""
+        from algotrader.common.secrets import known_secret_values
+
+        SecretString("RELIANC", name="short")
+        assert "RELIANC" not in known_secret_values()
+
+
+class TestNoisyLibrariesStayQuietAtDebug:
+    def test_the_credential_bearing_loggers_are_on_the_list(self) -> None:
+        from algotrader.common.logging import NOISY_LIBRARIES
+
+        for name in ("websockets", "kiteconnect", "requests", "urllib3", "httpx"):
+            assert name in NOISY_LIBRARIES, name
+
+    def test_root_debug_does_not_turn_them_on(self) -> None:
+        """Pinned per logger, so a ROOT set to DEBUG cannot reach them. Levels
+        are saved and restored: this must not reconfigure logging for the rest
+        of the suite."""
+        import logging as std
+
+        from algotrader.common.logging import NOISY_LIBRARIES, quiet_noisy_libraries
+
+        root = std.getLogger()
+        saved_root = root.level
+        saved = {name: std.getLogger(name).level for name in NOISY_LIBRARIES}
+        try:
+            root.setLevel(std.DEBUG)
+            quiet_noisy_libraries()
+            for name in NOISY_LIBRARIES:
+                assert std.getLogger(name).getEffectiveLevel() == std.WARNING, name
+        finally:
+            root.setLevel(saved_root)
+            for name, level in saved.items():
+                std.getLogger(name).setLevel(level)

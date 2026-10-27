@@ -89,10 +89,15 @@ def _int(params: Mapping[str, Any], name: str, default: Any = None) -> int:
     value = params.get(name, default)
     if value is None:
         raise PrimitiveError(f"missing required integer parameter {name!r}")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise PrimitiveError(f"parameter {name!r} is not an integer: {_echo(value)}") from exc
+    # A real int and nothing else. `int(value)` silently truncated 14.7 to 14
+    # (while the content hash kept 14.7), accepted "14" and True, and let
+    # OverflowError escape for an infinity - an exception type this module's
+    # callers do not catch. The DSL now refuses all of these at compile time;
+    # this is the same rule at the point of use, for a document that reached
+    # the evaluator some other way.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PrimitiveError(f"parameter {name!r} must be a whole number, got {_echo(value)}")
+    return value
 
 
 def _bool(params: Mapping[str, Any], name: str, default: bool) -> bool:

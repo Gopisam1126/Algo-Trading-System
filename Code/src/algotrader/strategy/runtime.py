@@ -40,6 +40,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+from algotrader.common.calendar import IST
 from algotrader.common.enums import Direction, Timeframe
 from algotrader.common.models.trading import Trigger
 from algotrader.indicators.engine import HISTORICAL_INDICATORS, IndicatorEngine, default_indicators
@@ -448,6 +449,72 @@ class StrategyEvaluator:
                 False,
                 f"regime {ctx.regime.value} is not in the strategy's "
                 f"{[r.value for r in applicability.regimes]}",
+            )
+        return self._within_declared_constraints(ctx)
+
+    def _within_declared_constraints(self, ctx: EvalContext) -> ApplicabilityCheck:
+        """The rest of what a strategy declares about where it may act.
+
+        Until 27 Oct 2026 four of these were parsed, validated, folded into the
+        content hash - and read by nothing: ``Applicability.sectors``,
+        ``entry_window``, ``min_bars_since_open`` and ``max_entries_per_day``.
+        The regime check above was added for the same reason (a declaration
+        consulted by nothing), and these are its siblings. Every "unknown" here
+        is a refusal, for the same reason an unknown regime is: the strategy was
+        validated inside these bounds, and running it where they cannot be
+        established is running it outside them.
+        """
+        applicability = self.document.applicability
+        constraints = self.document.constraints
+
+        if applicability.sectors is not None:
+            if ctx.sector is None:
+                return ApplicabilityCheck(
+                    False,
+                    f"sector is unknown; the strategy is restricted to {applicability.sectors}",
+                )
+            if ctx.sector not in applicability.sectors:
+                return ApplicabilityCheck(
+                    False,
+                    f"sector {ctx.sector!r} is not in the strategy's {applicability.sectors}",
+                )
+
+        window = constraints.window_times()
+        if window is not None:
+            start, end = window
+            now_ist = ctx.now.astimezone(IST).time()
+            if not (start <= now_ist < end):
+                return ApplicabilityCheck(
+                    False,
+                    f"{now_ist:%H:%M} IST is outside the strategy's entry window "
+                    f"{start:%H:%M}-{end:%H:%M} (start inclusive, end exclusive)",
+                )
+
+        if constraints.min_bars_since_open > 0:
+            if ctx.bars_since_open is None:
+                return ApplicabilityCheck(
+                    False,
+                    f"bars since open is unknown; the strategy needs at least "
+                    f"{constraints.min_bars_since_open}",
+                )
+            if ctx.bars_since_open < constraints.min_bars_since_open:
+                return ApplicabilityCheck(
+                    False,
+                    f"only {ctx.bars_since_open} bar(s) since the open; the strategy "
+                    f"waits for {constraints.min_bars_since_open}",
+                )
+
+        if ctx.entries_today is None:
+            return ApplicabilityCheck(
+                False,
+                f"entries made today are uncounted, so max_entries_per_day "
+                f"({constraints.max_entries_per_day}) cannot be enforced",
+            )
+        if ctx.entries_today >= constraints.max_entries_per_day:
+            return ApplicabilityCheck(
+                False,
+                f"{ctx.entries_today} entr(y/ies) already today; the strategy allows "
+                f"{constraints.max_entries_per_day}",
             )
         return ApplicabilityCheck(True)
 

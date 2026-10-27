@@ -39,6 +39,12 @@ from algotrader.common.models.trading import (
     Trigger,
 )
 
+#: What a decision was made about. Every RiskDecision carries it, so the tests
+#: of the coherence rules supply it and the rule under test is the only thing
+#: wrong with each object (a missing identity would fail first, for the wrong
+#: reason).
+_DECIDED_ABOUT = {"correlation_id": uuid.uuid4(), "symbol": "INFY", "direction": Direction.LONG}
+
 
 def _position(
     direction: Direction,
@@ -221,11 +227,12 @@ class TestRiskDecisionCoherence:
 
     def test_an_approved_decision_without_sizing_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="must carry sizing"):
-            RiskDecision(approved=True, evaluated_at=dt.datetime.now(dt.UTC))
+            RiskDecision(**_DECIDED_ABOUT, approved=True, evaluated_at=dt.datetime.now(dt.UTC))
 
     def test_an_approved_decision_carrying_a_reject_reason_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="must not carry a reject reason"):
             RiskDecision(
+                **_DECIDED_ABOUT,
                 approved=True,
                 sizing=self._sizing(),
                 reason=RejectReason.STALE_DATA,
@@ -235,15 +242,21 @@ class TestRiskDecisionCoherence:
     def test_a_rejected_decision_without_a_reason_is_refused(self) -> None:
         """A rejection with no reason cannot be explained or acted on."""
         with pytest.raises(ValidationError, match="must carry a reject reason"):
-            RiskDecision(approved=False, evaluated_at=dt.datetime.now(dt.UTC))
+            RiskDecision(**_DECIDED_ABOUT, approved=False, evaluated_at=dt.datetime.now(dt.UTC))
 
     def test_a_coherent_approval_parses(self) -> None:
-        d = RiskDecision(approved=True, sizing=self._sizing(), evaluated_at=dt.datetime.now(dt.UTC))
+        d = RiskDecision(
+            **_DECIDED_ABOUT,
+            approved=True,
+            sizing=self._sizing(),
+            evaluated_at=dt.datetime.now(dt.UTC),
+        )
         assert d.sizing is not None
         assert d.sizing.notional == Decimal("10000")
 
     def test_a_coherent_rejection_parses(self) -> None:
         d = RiskDecision(
+            **_DECIDED_ABOUT,
             approved=False,
             reason=RejectReason.STALE_DATA,
             evaluated_at=dt.datetime.now(dt.UTC),

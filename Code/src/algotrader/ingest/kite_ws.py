@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 
 import websockets
 
+from algotrader.common.secrets import SecretString
 from algotrader.ingest.kite_protocol import (
     Mode,
     ProtocolError,
@@ -105,7 +106,13 @@ class FeedStats:
     frames: int = 0
     ticks: int = 0
     protocol_errors: int = 0
+    #: When the last frame carrying DATA arrived. Not set by a heartbeat:
+    #: it used to be, which meant a connection that stayed up while the
+    #: subscribed ticks stopped flowing read as fresh every second. A
+    #: heartbeat proves the socket is alive; only a tick proves the data is.
     last_tick_at: dt.datetime | None = None
+    #: When the broker last proved the connection alive.
+    last_heartbeat_at: dt.datetime | None = None
     connected_since: dt.datetime | None = None
 
     def seconds_since_last_tick(self, *, now: dt.datetime | None = None) -> float | None:
@@ -124,7 +131,12 @@ class KiteFeed:
     """
 
     api_key: str
-    access_token: str
+    #: A ``SecretString``, revealed only where the URL is built. It was a plain
+    #: ``str`` on a dataclass, whose generated ``__repr__`` prints every field -
+    #: so any ``log.info("%s", feed)`` or a repr in a traceback wrote the
+    #: broker bearer credential in clear (invariant 4: SecretString, and
+    #: nothing else, holds a credential).
+    access_token: SecretString
     tokens: list[int]
     mode: Mode = Mode.FULL
     url: str = KITE_WS_URL
@@ -139,6 +151,12 @@ class KiteFeed:
     stats: FeedStats = field(default_factory=FeedStats)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.access_token, SecretString):
+            raise TypeError(
+                "KiteFeed.access_token must be a SecretString. A plain str on this "
+                "dataclass is printed by its repr - the credential would reach any "
+                "log line or traceback that renders the feed."
+            )
         if not self.tokens:
             raise ValueError("no instrument tokens to subscribe to")
         if len(self.tokens) > MAX_TOKENS_PER_CONNECTION:
@@ -165,7 +183,8 @@ class KiteFeed:
             opened_at: dt.datetime | None = None
             try:
                 async with websockets.connect(
-                    stream_url(self.url, self.api_key, self.access_token),
+                    # The one reveal. Handed straight to the socket; never held.
+                    stream_url(self.url, self.api_key, self.access_token.reveal()),
                     open_timeout=10,
                     close_timeout=5,
                     ping_interval=20,
@@ -249,8 +268,9 @@ class KiteFeed:
                 continue
 
             if len(message) <= 2:
-                # Kite's heartbeat: a one-byte frame. Proof of life, not data.
-                self.stats.last_tick_at = dt.datetime.now(dt.UTC)
+                # Kite's heartbeat: a one-byte frame. Proof of life, not data -
+                # so it must not touch last_tick_at (see FeedStats).
+                self.stats.last_heartbeat_at = dt.datetime.now(dt.UTC)
                 continue
 
             self.stats.frames += 1

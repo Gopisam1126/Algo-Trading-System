@@ -12,6 +12,25 @@ engine, which is not ready at session start. At 09:15, exactly when prints are
 most erratic, the ATR term is unavailable. If that resolved to "no limit" the
 filter would be inert precisely when it is needed. It resolves to the 2% floor
 instead, and :meth:`OutlierFilter.cold_start` says so explicitly.
+
+**A level that persists is real** (27 Oct 2026). The filter compares each
+print with the last one it ACCEPTED, and only an accepted print moves that
+baseline - so it had no way back from a genuine move larger than its bound.
+A stock that opened and ran 3% before ATR was loaded had every later print
+rejected for the rest of the session (probed: 0 of 199 accepted), and a bad
+FIRST print became a baseline that rejected every good one after it (0 of
+99). The instrument froze at a stale price while the rejection count read as
+routine. Now :data:`REBASELINE_CONFIRMATIONS` consecutive prints at a new
+level, each within the bound of the one before, re-anchor the filter. One
+bad print still never gets through - the next ordinary print clears it -
+and the circuit band stays absolute: a price the exchange would not print
+never confirms anything.
+
+**Cumulative volume restarts every session.** The monotonic-volume check
+compared with the last volume seen for the instrument on ANY day, so a
+pipeline that lived past midnight rejected the whole next session as
+"volume went backwards" until today's total passed yesterday's (probed: 0 of
+50). It now compares only within one IST trading day.
 """
 
 from __future__ import annotations
@@ -22,6 +41,7 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from algotrader.common.calendar import IST
 from algotrader.common.models.market import Tick
 from algotrader.ingest.kite_protocol import RawTick
 
@@ -37,6 +57,12 @@ COLD_START_MOVE_PCT = Decimal("2.0")
 
 #: Multiplier applied to ATR% once it is available.
 ATR_MULTIPLE = Decimal(5)
+
+#: Consecutive prints at a new level - each within the move bound of the one
+#: before it - that make the level real. Three, because one is a bad print,
+#: two can be a burst of them, and three in a row that agree with each other
+#: is what the exchange is printing.
+REBASELINE_CONFIRMATIONS = 3
 
 
 class RejectReason(str):
@@ -93,12 +119,16 @@ class TickValidator:
 
     max_skew_seconds: float = MAX_CLOCK_SKEW_SECONDS
     rejections: RejectionLog = field(default_factory=RejectionLog)
-    #: Last accepted cumulative volume per instrument. Volume is monotonic
-    #: within a session; a decrease means a stale or replayed packet.
-    _last_volume: dict[int, int] = field(default_factory=dict)
+    #: Last accepted cumulative volume per instrument, WITH the IST trading
+    #: day it belongs to. Volume is monotonic within a session; a decrease
+    #: within one day means a stale or replayed packet, but across days it is
+    #: just the new session starting from zero.
+    _last_volume: dict[int, tuple[dt.date, int]] = field(default_factory=dict)
 
     def check(self, tick: RawTick, *, now: dt.datetime | None = None) -> str | None:
         """``None`` when the tick is acceptable, otherwise the reason."""
+        moment = tick.exchange_timestamp or now or dt.datetime.now(dt.UTC)
+        session_day = moment.astimezone(IST).date()
         if tick.last_price is None or tick.last_price == 0:
             self.rejections.record(NULL_PRICE, f"token={tick.instrument_token}")
             return NULL_PRICE
@@ -114,7 +144,8 @@ class TickValidator:
                     NEGATIVE_VOLUME, f"token={tick.instrument_token} vol={tick.volume}"
                 )
                 return NEGATIVE_VOLUME
-            previous = self._last_volume.get(tick.instrument_token)
+            last = self._last_volume.get(tick.instrument_token)
+            previous = last[1] if last is not None and last[0] == session_day else None
             if previous is not None and tick.volume < previous:
                 # Cumulative session volume cannot fall. A decrease is a replayed
                 # or out-of-order packet, and accepting it would make any
@@ -136,7 +167,7 @@ class TickValidator:
                 return CLOCK_SKEW
 
         if tick.volume is not None:
-            self._last_volume[tick.instrument_token] = tick.volume
+            self._last_volume[tick.instrument_token] = (session_day, tick.volume)
         return None
 
 
@@ -227,6 +258,12 @@ class OutlierFilter:
     _atr_pct: dict[int, Decimal] = field(default_factory=dict)
     #: token -> (lower, upper) circuit prices for the session
     _circuit: dict[int, tuple[Decimal, Decimal]] = field(default_factory=dict)
+    #: token -> (latest print at a candidate new level, consecutive count).
+    _candidate: dict[int, tuple[Decimal, int]] = field(default_factory=dict)
+    #: Every time a persistent level re-anchored the filter. Not a rejection,
+    #: so it is kept out of ``rejection_summary``; counted because a symbol
+    #: that re-anchors repeatedly is one whose feed deserves a look.
+    rebaselines: RejectionLog = field(default_factory=RejectionLog)
 
     def set_atr_pct(self, token: int, atr_pct: Decimal) -> None:
         """Called by the indicator engine once ATR is ready for this symbol."""
@@ -275,6 +312,23 @@ class OutlierFilter:
         move_pct = abs(tick.last_price - previous) / previous * Decimal(100)
         limit = self.threshold_pct(tick.instrument_token)
         if move_pct > limit:
+            if self._confirms_a_new_level(tick.instrument_token, tick.last_price, limit):
+                self._last_price[tick.instrument_token] = tick.last_price
+                self._candidate.pop(tick.instrument_token, None)
+                self.rebaselines.record(
+                    "rebaselined",
+                    f"token={tick.instrument_token} {previous} -> {tick.last_price} "
+                    f"after {REBASELINE_CONFIRMATIONS} consistent prints",
+                )
+                log.warning(
+                    "outlier filter re-anchored token %s from %s to %s: %d consecutive "
+                    "prints agreed on the new level",
+                    tick.instrument_token,
+                    previous,
+                    tick.last_price,
+                    REBASELINE_CONFIRMATIONS,
+                )
+                return None
             self.rejections.record(
                 OUTLIER,
                 f"token={tick.instrument_token} {previous} -> {tick.last_price} "
@@ -283,8 +337,31 @@ class OutlierFilter:
             )
             return OUTLIER
 
+        # An ordinary print: any candidate level was a bad print or two, and
+        # the run that would have confirmed it is broken.
+        self._candidate.pop(tick.instrument_token, None)
         self._last_price[tick.instrument_token] = tick.last_price
         return None
+
+    def _confirms_a_new_level(self, token: int, price: Decimal, limit: Decimal) -> bool:
+        """Count this print toward a candidate level; True once it is real.
+
+        Each print must sit within ``limit`` of the PREVIOUS candidate print,
+        not of the first, so a level that keeps moving in the same direction
+        - a stock still running - is followed rather than reset each tick.
+        A print that disagrees starts a new candidate of its own.
+        """
+        candidate = self._candidate.get(token)
+        if candidate is not None:
+            reference, count = candidate
+            if abs(price - reference) / reference * Decimal(100) <= limit:
+                count += 1
+                if count >= REBASELINE_CONFIRMATIONS:
+                    return True
+                self._candidate[token] = (price, count)
+                return False
+        self._candidate[token] = (price, 1)
+        return REBASELINE_CONFIRMATIONS <= 1
 
 
 # ---------------------------------------------------------------------------

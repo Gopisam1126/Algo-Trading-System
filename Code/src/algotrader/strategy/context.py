@@ -111,6 +111,20 @@ class EvalContext:
     #: ("NIFTY", "BANKNIFTY") to match the ``index_not_opposing`` enum.
     index_change_pct: dict[str, Decimal] = field(default_factory=dict)
     sector_rank: int | None = None
+    #: The candidate's sector, for ``Applicability.sectors``. ``None`` means
+    #: unclassified, and a strategy restricted to named sectors does not apply
+    #: to an instrument whose sector nobody knows.
+    sector: str | None = None
+
+    # -- the strategy's own history today -----------------------------------
+    #: Entries THIS strategy has already made in THIS symbol today, counted by
+    #: the caller from the order book (E15-S13 wiring). ``None`` means nobody
+    #: counted, and the strategy then does not apply: ``max_entries_per_day``
+    #: defaults to 1 on every strategy and was enforced by nothing until 27 Oct
+    #: 2026, so a strategy stopped out could re-enter the same name again and
+    #: again. A count is a claim that someone looked; "unknown" must not read as
+    #: "none yet" - the AUDIT-005 rule, applied here.
+    entries_today: int | None = None
 
     # -- news (E08) ---------------------------------------------------------
     news_score: float | None = None
@@ -119,6 +133,14 @@ class EvalContext:
     def __post_init__(self) -> None:
         if self.now.tzinfo is None:
             raise ContextError("EvalContext.now must be timezone-aware")
+        if self.entries_today is not None and (
+            not isinstance(self.entries_today, int)
+            or isinstance(self.entries_today, bool)
+            or self.entries_today < 0
+        ):
+            raise ContextError(
+                f"entries_today must be a non-negative int, got {self.entries_today!r}"
+            )
         if self.last_price <= 0:
             raise ContextError(f"last_price must be positive, got {self.last_price}")
         if self.tick_size <= 0:

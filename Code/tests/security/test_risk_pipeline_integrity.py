@@ -27,8 +27,11 @@ import ast
 import re
 from pathlib import Path
 from typing import ClassVar
+from uuid import uuid4
 
 import pytest
+
+from algotrader.common.enums import Direction
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "algotrader"
 ENGINE = SRC / "execution" / "risk" / "framework.py"
@@ -47,7 +50,13 @@ class TestApprovalIsUnrepresentableWithoutSizing:
         from algotrader.common.models.trading import RiskDecision
 
         with pytest.raises(ValueError, match="must carry sizing"):
-            RiskDecision(approved=True, evaluated_at=dt.datetime.now(dt.UTC))
+            RiskDecision(
+                correlation_id=uuid4(),
+                symbol="INFY",
+                direction=Direction.LONG,
+                approved=True,
+                evaluated_at=dt.datetime.now(dt.UTC),
+            )
 
     def test_an_approval_carrying_a_reject_reason_does_not_construct(self) -> None:
         """A decision that is both approved and rejected is incoherent, and
@@ -68,6 +77,9 @@ class TestApprovalIsUnrepresentableWithoutSizing:
         )
         with pytest.raises(ValueError, match="must not carry a reject reason"):
             RiskDecision(
+                correlation_id=uuid4(),
+                symbol="INFY",
+                direction=Direction.LONG,
                 approved=True,
                 sizing=sizing,
                 reason=RejectReason.KILL_SWITCH_ACTIVE,

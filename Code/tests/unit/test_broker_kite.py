@@ -148,6 +148,34 @@ class TestPriceAndTimeConversion:
         assert mapping.status_in("REJECTED") is OrderStatus.REJECTED
         assert mapping.status_in("TRIGGER PENDING") is OrderStatus.OPEN
 
+    @pytest.mark.parametrize(
+        ("kite", "ours"),
+        [
+            # Every interim status in Kite's own table (fetched 27 Oct 2026).
+            ("PUT ORDER REQ RECEIVED", OrderStatus.SUBMITTED),
+            ("VALIDATION PENDING", OrderStatus.SUBMITTED),
+            ("OPEN PENDING", OrderStatus.SUBMITTED),
+            ("MODIFY VALIDATION PENDING", OrderStatus.OPEN),
+            ("MODIFY PENDING", OrderStatus.OPEN),
+            ("TRIGGER PENDING", OrderStatus.OPEN),
+            ("CANCEL PENDING", OrderStatus.OPEN),
+            ("AMO REQ RECEIVED", OrderStatus.SUBMITTED),
+            # And the final ones it names.
+            ("OPEN", OrderStatus.OPEN),
+            ("COMPLETE", OrderStatus.FILLED),
+            ("CANCELLED", OrderStatus.CANCELLED),
+            ("REJECTED", OrderStatus.REJECTED),
+        ],
+    )
+    def test_every_documented_status_is_modelled(self, kite: str, ours: OrderStatus) -> None:
+        """Three of these used to fall through to RECONCILE_REQUIRED. Since an
+        unrecognised status is no longer protection (``is_live`` is an
+        allowlist), an unmapped DOCUMENTED status would exit a healthy
+        position on ordinary broker behaviour - CANCEL PENDING on a stop the
+        operator is moving, for instance."""
+        assert mapping.status_in(kite) is ours
+        assert mapping.status_in(kite.lower()) is ours
+
 
 class TestTickRoundingHasADirection:
     """Rounding direction is not cosmetic — it decides who pays the spread."""
@@ -209,6 +237,30 @@ class TestOrderSubmission:
         adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(place_order=""))
         with pytest.raises(AmbiguousOrderError, match="Reconcile by tag"):
             await adapter.place_order(_request())
+
+    @pytest.mark.parametrize("returned", [None, "   "], ids=["null", "whitespace"])
+    async def test_a_null_order_id_is_ambiguous_not_broker_order_none(self, returned) -> None:
+        """``str(None)`` is "None", which is truthy, so the old guard let a null
+        id through as broker order "None" - recorded as landed under an id that
+        names nothing."""
+        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(place_order=returned))
+        with pytest.raises(AmbiguousOrderError, match="Reconcile by tag"):
+            await adapter.place_order(_request())
+
+    @pytest.mark.parametrize("missing", ["order_id", "tradingsymbol"])
+    async def test_an_order_row_without_its_identity_is_refused_not_named_none(
+        self, missing: str
+    ) -> None:
+        """Before, a missing ``order_id`` became broker order "None" and a
+        missing ``tradingsymbol`` became the symbol "None" - which passes the
+        symbol allowlist. The recovery path would then have ADOPTED it."""
+        row = _order_row(tag=mapping.broker_tag("b" * 32))
+        del row[missing]
+        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=[row]))
+        with pytest.raises(mapping.MappingError, match=missing):
+            await adapter.find_by_client_order_id("b" * 32)
+        # The modelled orderbook skips it rather than losing every other row.
+        assert await adapter.fetch_orderbook() == []
 
     async def test_a_network_failure_while_placing_is_ambiguous(self) -> None:
         import kiteconnect.exceptions as kx
@@ -392,6 +444,26 @@ class TestReadPath:
         adapter = KiteMarketDataAdapter(auth=_auth(), client=FakeKite(instruments=rows))
         got = await adapter.fetch_instruments()
         assert [i.symbol for i in got] == ["INFY", "TCS"]
+
+    async def test_an_instrument_that_cannot_state_its_grid_is_skipped_not_defaulted(
+        self,
+    ) -> None:
+        """The sync used to store 0.05 for a row with no tick size (or a tick
+        of 0) - the hardcoded fallback the trading adapter refuses by design,
+        moved upstream where that refusal could not see it. A real 0.01 tick
+        is the control: NSE prices many names on a 0.01 grid, and it must
+        survive exactly."""
+        rows = [
+            {"tradingsymbol": "NOTICK", "instrument_token": 1, "lot_size": 1},
+            {"tradingsymbol": "ZEROTICK", "instrument_token": 2, "tick_size": 0, "lot_size": 1},
+            {"tradingsymbol": "NULLTICK", "instrument_token": 3, "tick_size": None, "lot_size": 1},
+            {"tradingsymbol": "NOLOT", "instrument_token": 4, "tick_size": 0.05},
+            {"tradingsymbol": "PENNY", "instrument_token": 5, "tick_size": 0.01, "lot_size": 1},
+        ]
+        adapter = KiteMarketDataAdapter(auth=_auth(), client=FakeKite(instruments=rows))
+        got = await adapter.fetch_instruments()
+        assert [i.symbol for i in got] == ["PENNY"]
+        assert got[0].tick_size == Decimal("0.01")
 
     async def test_an_unsupported_timeframe_is_refused(self) -> None:
         from algotrader.common.enums import Timeframe

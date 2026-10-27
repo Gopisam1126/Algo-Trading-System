@@ -358,6 +358,32 @@ class TestAc3AcceptanceIsNotLiveness:
     async def test_absence_is_not_live(self) -> None:
         assert not is_live(None)
 
+    @pytest.mark.parametrize("status", list(OrderStatus), ids=lambda s: s.value)
+    async def test_live_is_an_allowlist_over_every_status(self, status: OrderStatus) -> None:
+        """Every member, so a status added to the enum later is classified by
+        the allowlist rather than slipping through a denylist that never named
+        it - which is how RECONCILE_REQUIRED came to count as protection."""
+        expected = status in {
+            OrderStatus.SUBMITTED,
+            OrderStatus.OPEN,
+            OrderStatus.PARTIAL,
+            OrderStatus.FILLED,
+        }
+        assert is_live(_order("x" * 32, status=status)) is expected
+
+    async def test_a_stop_in_a_status_nobody_modelled_is_exited_not_trusted(self) -> None:
+        """The failure the denylist allowed, end to end. Kite reports a status
+        the mapping does not know; it becomes RECONCILE_REQUIRED; before the
+        fix that returned an EstablishedPosition - "the broker confirmed a live
+        stop" - on the strength of a status no one could interpret."""
+        gateway = FakeGateway()
+        gateway.auto_list = False
+        cid = stop_client_order_id(_position(), trade_date=TRADE_DATE)
+        gateway.orderbook[cid] = _order(cid, status=OrderStatus.RECONCILE_REQUIRED)
+        with pytest.raises(StopNotEstablishedError, match="RECONCILE_REQUIRED"):
+            await _attacher(gateway).attach(_position(), trade_date=TRADE_DATE, now=NOW)
+        assert len(gateway.exits) == 1, "an uninterpretable stop must lead to an exit"
+
     async def test_no_established_position_is_returned_when_not_live(self) -> None:
         """AC3 stated structurally: the caller gets an exception, not an object
         it might use."""

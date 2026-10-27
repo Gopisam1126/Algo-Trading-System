@@ -172,6 +172,16 @@ def split_frame(frame: bytes) -> list[bytes]:
             )
         packets.append(frame[offset : offset + length])
         offset += length
+    if offset != len(frame):
+        # Bytes the declared packets do not account for. The docstring always
+        # promised that lengths which do not add up are rejected, and only
+        # the SHORT case was: a frame with trailing bytes parsed
+        # "successfully", which is a misaligned read or a protocol change
+        # wearing the shape of a good frame.
+        raise ProtocolError(
+            f"frame carries {len(frame) - offset} byte(s) after its {count} declared "
+            f"packet(s); the lengths do not account for the whole frame"
+        )
     return packets
 
 

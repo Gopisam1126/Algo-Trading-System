@@ -27,6 +27,7 @@ from decimal import Decimal
 
 import pytest
 
+from algotrader.common.secrets import SecretString
 from algotrader.ingest import kite_ws
 from algotrader.ingest.kite_protocol import Mode, ProtocolError
 from algotrader.ingest.kite_ws import (
@@ -39,6 +40,8 @@ from algotrader.ingest.kite_ws import (
 )
 
 TOKEN = 408065
+#: The broker credential, held as the feed requires it.
+_TOKEN = SecretString("test-access-token", name="KITE_ACCESS_TOKEN")
 NOW = dt.datetime(2026, 8, 20, 5, 0, tzinfo=dt.UTC)
 
 
@@ -118,10 +121,44 @@ async def _drain(feed: KiteFeed, limit: int) -> list[object]:
     return out
 
 
+class TestTheFeedNeverHoldsThePlainToken:
+    """Invariant 4. ``access_token`` was a ``str`` field on a dataclass, and a
+    dataclass's generated repr prints every field."""
+
+    def test_a_plain_string_token_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="SecretString"):
+            KiteFeed(api_key="k", access_token="AbCdEf0123456789xyz", tokens=[TOKEN])  # type: ignore[arg-type]
+
+    def test_rendering_the_feed_does_not_render_the_token(self) -> None:
+        secret = "AbCdEf0123456789xyz"
+        feed = KiteFeed(
+            api_key="k", access_token=SecretString(secret, name="KITE_ACCESS_TOKEN"), tokens=[TOKEN]
+        )
+        for rendered in (repr(feed), str(feed), f"{feed}", f"{feed!r}"):
+            assert secret not in rendered
+
+
+class TestAHeartbeatIsNotData:
+    @pytest.mark.asyncio
+    async def test_a_heartbeat_alone_does_not_make_the_data_look_fresh(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep
+    ) -> None:
+        """A connection that stays up while the subscribed ticks stop flowing
+        is exactly when "seconds since last tick" must grow. Heartbeats used to
+        reset it every second."""
+        socket = FakeSocket([b"\x00", b"\x00", ConnectionError("closed")])
+        monkeypatch.setattr(kite_ws.websockets, "connect", FakeConnect([socket]))
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=1)
+        await _drain(feed, 1)
+        assert feed.stats.last_heartbeat_at is not None, "the heartbeat was seen"
+        assert feed.stats.last_tick_at is None, "a heartbeat is not a tick"
+        assert feed.stats.seconds_since_last_tick() is None
+
+
 class TestConstructionRefusesImpossibleConfigurations:
     def test_no_tokens_is_refused(self) -> None:
         with pytest.raises(ValueError, match="no instrument tokens"):
-            KiteFeed(api_key="k", access_token="t", tokens=[])
+            KiteFeed(api_key="k", access_token=_TOKEN, tokens=[])
 
     def test_too_many_tokens_for_one_connection_is_refused(self) -> None:
         """Kite caps a connection at 3000 tokens. Silently exceeding it means
@@ -129,13 +166,13 @@ class TestConstructionRefusesImpossibleConfigurations:
         with pytest.raises(ValueError, match="exceeds Kite's"):
             KiteFeed(
                 api_key="k",
-                access_token="t",
+                access_token=_TOKEN,
                 tokens=list(range(MAX_TOKENS_PER_CONNECTION + 1)),
             )
 
     def test_the_cap_itself_is_allowed(self) -> None:
         feed = KiteFeed(
-            api_key="k", access_token="t", tokens=list(range(MAX_TOKENS_PER_CONNECTION))
+            api_key="k", access_token=_TOKEN, tokens=list(range(MAX_TOKENS_PER_CONNECTION))
         )
         assert len(feed.tokens) == MAX_TOKENS_PER_CONNECTION
 
@@ -167,7 +204,7 @@ class TestTheFeedYieldsTicks:
     async def test_a_tick_comes_through(self, monkeypatch: pytest.MonkeyPatch, no_sleep) -> None:
         connect = FakeConnect([FakeSocket([_ltp_frame()])])
         monkeypatch.setattr(kite_ws.websockets, "connect", connect)
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=1)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=1)
         items = await _drain(feed, 1)
         assert items[0].instrument_token == TOKEN
         assert items[0].last_price == Decimal("2500.00")
@@ -179,7 +216,7 @@ class TestTheFeedYieldsTicks:
         socket = FakeSocket([_ltp_frame()])
         monkeypatch.setattr(kite_ws.websockets, "connect", FakeConnect([socket]))
         feed = KiteFeed(
-            api_key="k", access_token="t", tokens=[TOKEN], mode=Mode.FULL, max_attempts=1
+            api_key="k", access_token=_TOKEN, tokens=[TOKEN], mode=Mode.FULL, max_attempts=1
         )
         await _drain(feed, 1)
         assert len(socket.sent) == 2
@@ -195,7 +232,10 @@ class TestTheFeedYieldsTicks:
         connect = FakeConnect([FakeSocket([_ltp_frame()])])
         monkeypatch.setattr(kite_ws.websockets, "connect", connect)
         feed = KiteFeed(
-            api_key="k", access_token="SUPERSECRETTOKEN", tokens=[TOKEN], max_attempts=1
+            api_key="k",
+            access_token=SecretString("SUPERSECRETTOKEN"),
+            tokens=[TOKEN],
+            max_attempts=1,
         )
         with caplog.at_level("DEBUG"):
             await _drain(feed, 1)
@@ -208,7 +248,7 @@ class TestTheFeedYieldsTicks:
     ) -> None:
         socket = FakeSocket([b"\x00", _ltp_frame()])
         monkeypatch.setattr(kite_ws.websockets, "connect", FakeConnect([socket]))
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=1)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=1)
         items = await _drain(feed, 1)
         assert len(items) == 1
         assert feed.stats.last_tick_at is not None
@@ -221,7 +261,7 @@ class TestTheFeedYieldsTicks:
         response is to count it loudly, not to parse around it."""
         socket = FakeSocket([b"\x00\x05garbage", _ltp_frame()])
         monkeypatch.setattr(kite_ws.websockets, "connect", FakeConnect([socket]))
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=1)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=1)
         items = await _drain(feed, 1)
         assert feed.stats.protocol_errors == 1
         assert items[0].instrument_token == TOKEN
@@ -237,7 +277,7 @@ class TestTheGapIsAlwaysAnnounced:
         first = FakeSocket([_ltp_frame(), ConnectionError("dropped")])
         second = FakeSocket([_ltp_frame(paise=260_000)])
         monkeypatch.setattr(kite_ws.websockets, "connect", FakeConnect([first, second]))
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=3)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=3)
 
         items = await _drain(feed, 3)
         kinds = [type(i).__name__ for i in items]
@@ -253,7 +293,7 @@ class TestTheGapIsAlwaysAnnounced:
             "connect",
             FakeConnect([first, ConnectionError("refused"), FakeSocket([_ltp_frame()])]),
         )
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=5)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=5)
         items = await _drain(feed, 2)
         gap = next(i for i in items if isinstance(i, FeedGap))
         assert gap.attempts >= 2
@@ -268,7 +308,7 @@ class TestTheGapIsAlwaysAnnounced:
         monkeypatch.setattr(
             kite_ws.websockets, "connect", FakeConnect([FakeSocket([_ltp_frame()])])
         )
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=1)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=1)
         items = await _drain(feed, 1)
         assert not any(isinstance(i, FeedGap) for i in items)
 
@@ -279,7 +319,7 @@ class TestTheGapIsAlwaysAnnounced:
             "connect",
             FakeConnect([FakeSocket([ConnectionError("x")]), FakeSocket([_ltp_frame()])]),
         )
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=4)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=4)
         await _drain(feed, 2)
         assert feed.stats.reconnects == 1
         assert feed.stats.connects == 2
@@ -299,7 +339,7 @@ class TestTheSilentSocketIsTreatedAsDead:
         )
         feed = KiteFeed(
             api_key="k",
-            access_token="t",
+            access_token=_TOKEN,
             tokens=[TOKEN],
             idle_timeout_seconds=0.05,
             max_attempts=4,
@@ -335,7 +375,7 @@ class TestBackoffResetsAfterAHealthyConnection:
         )
         feed = KiteFeed(
             api_key="k",
-            access_token="t",
+            access_token=_TOKEN,
             tokens=[TOKEN],
             healthy_after_seconds=60.0,
             backoff=BackoffPolicy(initial_seconds=1.0, multiplier=2.0, jitter=0.0),
@@ -379,7 +419,7 @@ class TestGivingUp:
             "connect",
             FakeConnect([ConnectionError("no")] * 10),
         )
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=3)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=3)
         items = [item async for item in feed.stream()]
         assert items == []
 
@@ -414,7 +454,7 @@ class TestOpenFeedAlwaysClosesTheSocket:
         broker problem rather than as our leak."""
         socket = FakeSocket([_ltp_frame()])
         monkeypatch.setattr(kite_ws.websockets, "connect", FakeConnect([socket]))
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=1)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=1)
 
         async with open_feed(feed) as stream:
             await stream.__anext__()
@@ -428,7 +468,7 @@ class TestOpenFeedAlwaysClosesTheSocket:
         monkeypatch.setattr(
             kite_ws.websockets, "connect", FakeConnect([FakeSocket([_ltp_frame()])])
         )
-        feed = KiteFeed(api_key="k", access_token="t", tokens=[TOKEN], max_attempts=1)
+        feed = KiteFeed(api_key="k", access_token=_TOKEN, tokens=[TOKEN], max_attempts=1)
         with pytest.raises(RuntimeError):
             async with open_feed(feed) as stream:
                 await stream.__anext__()

@@ -40,11 +40,12 @@ from algotrader.broker.adapter import (
     DuplicateBrokerOrderError,
     MarginSnapshot,
     OrderRejectedError,
+    RateLimitError,
 )
 from algotrader.broker.kite import mapping
 from algotrader.broker.kite.errors import classify
 from algotrader.broker.kite.market_data import KiteReads
-from algotrader.broker.ratelimit import BrokerRateLimiter
+from algotrader.broker.ratelimit import BrokerRateLimiter, RateLimitExceededError
 from algotrader.common.enums import OrderType, Side
 from algotrader.common.models.trading import Order, OrderRequest
 
@@ -99,7 +100,16 @@ class KiteTradingAdapter(KiteReads):
         so an unrecognised failure fails closed.
         """
         if self._limiter is not None:
-            await self._limiter.acquire_order()
+            try:
+                await self._limiter.acquire_order()
+            except RateLimitExceededError as exc:
+                # Into the taxonomy. The limiter's own type is a bare
+                # RuntimeError that no caller of this adapter handles, so a
+                # refusal surfaced as an unknown exception after the gateway
+                # had already recorded SUBMITTING - a row saying "in flight"
+                # about an order that was never sent. RateLimitError means
+                # exactly "refused before reaching the exchange".
+                raise RateLimitError(str(exc)) from None
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
         except Exception as exc:
@@ -211,7 +221,10 @@ class KiteTradingAdapter(KiteReads):
             params["tag"],
         )
         result = await self._mutate(self._client.place_order, **params)
-        broker_order_id = str(result)
+        # `str(None)` is "None", which is truthy: the old `if not str(result)`
+        # guard let a null id through as broker order "None", and the gateway
+        # would have recorded the order as landed under an id that names nothing.
+        broker_order_id = "" if result is None else str(result).strip()
         if not broker_order_id:
             raise AmbiguousOrderError(
                 f"broker returned no order id for tag {params['tag']}; the order may "
@@ -396,16 +409,22 @@ class KiteTradingAdapter(KiteReads):
         from uuid import UUID, uuid5
 
         tag = str(row.get("tag") or "")
+        # Required, not `str(row.get(...))`: that rendered a missing field as
+        # the string "None" - a broker order id that names nothing, and a
+        # symbol that passes the symbol allowlist. The row would then be
+        # matched, adopted and acted on as though it described a real order.
+        order_id = str(mapping.require_field(row, "order_id", what="an order row"))
+        symbol = str(mapping.require_field(row, "tradingsymbol", what="an order row"))
         # The broker does not carry our correlation id, so derive a stable one
         # from the tag rather than inventing a random one that would break
         # audit threading on every reconciliation pass.
         namespace = UUID("00000000-0000-0000-0000-000000000000")
-        correlation = uuid5(namespace, tag or str(row.get("order_id")))
+        correlation = uuid5(namespace, tag or order_id)
         return Order(
-            client_order_id=tag or str(row.get("order_id")),
-            broker_order_id=str(row.get("order_id")),
+            client_order_id=tag or order_id,
+            broker_order_id=order_id,
             correlation_id=correlation,
-            symbol=str(row.get("tradingsymbol")),
+            symbol=symbol,
             side=mapping.side_in(str(row["transaction_type"])),
             order_type=mapping.order_type_in(str(row["order_type"])),
             product=mapping.product_in(str(row["product"])),

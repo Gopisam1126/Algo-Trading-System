@@ -53,7 +53,24 @@ the constraint is recorded on that story rather than left to be discovered.
 
 ## What counts as live
 
-Present in the broker's orderbook, and not ``REJECTED`` or ``CANCELLED``.
+Present in the broker's orderbook in a status that **positively** means working
+or done: ``SUBMITTED``, ``OPEN``, ``PARTIAL`` or ``FILLED``. Nothing else.
+
+It was a denylist until 27 Oct 2026 - live meant "not ``REJECTED`` or
+``CANCELLED``" - and that made every status nobody had modelled read as
+protection. ``mapping.status_in`` turns any Kite status it does not recognise
+into ``RECONCILE_REQUIRED``, and Kite documents statuses the table did not map
+(``CANCEL PENDING``, ``MODIFY VALIDATION PENDING``, ``AMO REQ RECEIVED``) and
+says "there may be other values as well". So a stop in an unmodelled state was
+an ``EstablishedPosition`` - a type whose whole meaning is "the broker confirmed
+a live stop" - on the strength of a status no one could interpret. An allowlist
+fails closed on the next undocumented value instead of on none of them.
+
+The cost is deliberate and bounded: a stop the broker reports in an
+unrecognised state is treated as not protecting, so the position is exited
+(and an exit in an unrecognised state halts). The documented intermediate
+states are mapped explicitly in ``mapping._STATUS_IN`` so ordinary broker
+behaviour never reaches that path.
 
 ``SUBMITTED`` — Kite's validation-pending states — counts as live *at this
 moment*, and that is deliberate rather than lax. An order still validating has
@@ -90,10 +107,12 @@ __all__ = [
     "stop_client_order_id",
 ]
 
-#: Statuses that mean the stop is NOT protecting anything. Everything else —
-#: including the validation-pending states — counts as live; see the module
-#: docstring for why, and for what closes the window that leaves.
-_NOT_LIVE = frozenset({OrderStatus.REJECTED, OrderStatus.CANCELLED})
+#: The ONLY statuses that count as live. An allowlist, so a status nobody
+#: modelled - ``RECONCILE_REQUIRED`` above all - is not protection. See the
+#: module docstring for the denylist this replaced and why it failed open.
+_LIVE = frozenset(
+    {OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIAL, OrderStatus.FILLED}
+)
 
 
 class StopFailureError(RuntimeError):
@@ -206,9 +225,9 @@ def is_live(order: Order | None) -> bool:
 
     ``None`` — the broker does not list it — is NOT live. Acceptance is not
     liveness, and an order the broker will not show us is one we cannot claim
-    is working.
+    is working. Neither is a status we cannot interpret.
     """
-    return order is not None and order.status not in _NOT_LIVE
+    return order is not None and order.status in _LIVE
 
 
 class ProtectiveStop:

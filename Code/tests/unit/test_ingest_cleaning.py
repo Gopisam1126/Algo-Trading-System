@@ -302,3 +302,124 @@ class TestTheDedupMapIsBounded:
         for i in range(50):
             d.is_duplicate(_raw(volume=1000 + i))
         assert len(d._seen[TOKEN]) <= 4
+
+
+class TestALevelThatPersistsIsReal:
+    """The outlier filter compared each print with the last ACCEPTED one, and
+    only an accepted print moved that baseline - so it had no way back from a
+    genuine move larger than its bound. Probed before the fix: a real 3% move
+    at the open accepted 0 of the next 199 prints; a bad first print rejected
+    0 of 99 good ones after it. The instrument froze at a stale price.
+
+    The rule now: ``REBASELINE_CONFIRMATIONS`` consecutive prints, each within
+    the bound of the one before, make a level real. The controls below matter
+    as much as the fix - a single bad print must still never get through."""
+
+    N = cleaning.REBASELINE_CONFIRMATIONS
+
+    def test_a_genuine_move_is_followed_after_the_confirming_prints(self) -> None:
+        f = cleaning.OutlierFilter()
+        assert f.check(_raw("100.00")) is None
+        results = [f.check(_raw(p)) for p in ("103.00", "103.05", "103.10", "103.15")]
+        assert results[: self.N - 1] == [cleaning.OUTLIER] * (self.N - 1)
+        assert results[self.N - 1 :] == [None] * (len(results) - self.N + 1)
+        assert f._last_price[TOKEN] == Decimal("103.15")
+
+    def test_a_bad_first_print_does_not_hold_the_instrument_hostage(self) -> None:
+        f = cleaning.OutlierFilter()
+        assert f.check(_raw("150.00")) is None  # nothing to compare the first with
+        results = [f.check(_raw("100.00")) for _ in range(self.N + 2)]
+        assert results[-1] is None, "good prints never recovered from a bad first print"
+        assert f._last_price[TOKEN] == Decimal("100.00")
+
+    def test_a_still_running_stock_is_followed_not_reset_each_tick(self) -> None:
+        """Each print is compared with the PREVIOUS candidate print, so a level
+        that keeps moving the same way still confirms."""
+        f = cleaning.OutlierFilter()
+        assert f.check(_raw("100.00")) is None
+        prints = ["103.0", "104.0", "105.0", "106.0"]
+        assert [f.check(_raw(p)) for p in prints][-1] is None
+
+    # -- controls -----------------------------------------------------------
+
+    def test_one_bad_print_between_good_ones_is_still_rejected(self) -> None:
+        f = cleaning.OutlierFilter()
+        assert f.check(_raw("100.00")) is None
+        assert f.check(_raw("150.00")) == cleaning.OUTLIER
+        assert f.check(_raw("100.10")) is None
+        assert f.check(_raw("150.00")) == cleaning.OUTLIER, "the run was broken; no credit kept"
+        assert f._last_price[TOKEN] == Decimal("100.10")
+
+    def test_a_burst_shorter_than_the_confirmation_count_never_lands(self) -> None:
+        f = cleaning.OutlierFilter()
+        assert f.check(_raw("100.00")) is None
+        for _ in range(self.N - 1):
+            assert f.check(_raw("150.00")) == cleaning.OUTLIER
+        assert f.check(_raw("100.05")) is None
+        assert f._last_price[TOKEN] == Decimal("100.05")
+
+    def test_bad_prints_separated_by_good_ones_never_accumulate(self) -> None:
+        """Confirmation means CONSECUTIVE. An ordinary print in between breaks
+        the run, so a recurring bad level - a stale quote resurfacing every
+        few ticks - never adds up to a re-anchor."""
+        f = cleaning.OutlierFilter()
+        assert f.check(_raw("100.00")) is None
+        for _ in range(self.N + 3):
+            assert f.check(_raw("150.00")) == cleaning.OUTLIER
+            assert f.check(_raw("100.00")) is None
+        assert f._last_price[TOKEN] == Decimal("100.00")
+
+    def test_prints_that_disagree_with_each_other_never_confirm(self) -> None:
+        """Wild prints in different directions are noise, not a level."""
+        f = cleaning.OutlierFilter()
+        assert f.check(_raw("100.00")) is None
+        for p in ("150", "60", "150", "60", "150", "60"):
+            assert f.check(_raw(p)) == cleaning.OUTLIER
+
+    def test_the_circuit_band_is_absolute_and_never_confirms(self) -> None:
+        f = cleaning.OutlierFilter()
+        f.set_circuit(TOKEN, Decimal("90"), Decimal("110"))
+        assert f.check(_raw("100.00")) is None
+        for _ in range(self.N + 3):
+            assert f.check(_raw("120.00")) == cleaning.CROSSED_CIRCUIT
+
+    def test_a_reanchor_is_counted_but_is_not_a_rejection(self) -> None:
+        p = cleaning.CleaningPipeline()
+        assert p.process(_raw("100.00", volume=1), "X", now=NOW) is not None
+        for i, price in enumerate(("103.0", "103.0", "103.0"), start=2):
+            p.process(_raw(price, volume=i), "X", now=NOW)
+        assert p.outliers.rebaselines.total == 1
+        assert "rebaselined" not in p.rejection_summary
+        assert p.rejection_summary.get(cleaning.OUTLIER) == self.N - 1
+
+
+class TestVolumeRestartsEverySession:
+    """Cumulative volume is monotonic within a session and starts again the
+    next. The check compared across days, so a pipeline that outlived
+    midnight rejected the whole next session (probed: 0 of 50)."""
+
+    YESTERDAY = dt.datetime(2026, 8, 19, 9, 59, tzinfo=dt.UTC)  # 15:29 IST
+    TODAY = dt.datetime(2026, 8, 20, 3, 46, tzinfo=dt.UTC)  # 09:16 IST
+
+    def test_the_next_session_starts_from_zero(self) -> None:
+        v = cleaning.TickValidator()
+        assert v.check(_raw(volume=5_000_000, ts=self.YESTERDAY), now=self.YESTERDAY) is None
+        assert v.check(_raw(volume=1_000, ts=self.TODAY), now=self.TODAY) is None
+
+    def test_within_one_session_a_decrease_is_still_refused(self) -> None:
+        """The control: the per-session reset must not disable the check."""
+        v = cleaning.TickValidator()
+        assert v.check(_raw(volume=5_000, ts=self.TODAY), now=self.TODAY) is None
+        later = self.TODAY + dt.timedelta(seconds=5)
+        assert v.check(_raw(volume=4_000, ts=later), now=later) == cleaning.VOLUME_WENT_BACKWARDS
+
+    def test_the_session_is_the_ist_day_not_the_utc_one(self) -> None:
+        """18:00 and 19:00 UTC on 19 Aug share a UTC date but not an IST one:
+        23:30 IST on the 19th, then 00:30 IST on the 20th. The exchange keeps
+        the IST day, so the second is a new session and a lower cumulative
+        volume is correct there. Keyed on the UTC date, this would be refused."""
+        late = dt.datetime(2026, 8, 19, 18, 0, tzinfo=dt.UTC)  # 23:30 IST, 19 Aug
+        after_ist_midnight = dt.datetime(2026, 8, 19, 19, 0, tzinfo=dt.UTC)  # 00:30 IST, 20 Aug
+        v = cleaning.TickValidator(max_skew_seconds=10**9)
+        assert v.check(_raw(volume=5_000, ts=late), now=late) is None
+        assert v.check(_raw(volume=4_000, ts=after_ist_midnight), now=after_ist_midnight) is None

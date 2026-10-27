@@ -21,7 +21,7 @@ from typing import Any
 
 import structlog
 
-from algotrader.common.secrets import REDACTED, SecretString
+from algotrader.common.secrets import REDACTED, SecretString, known_secret_values
 
 #: Patterns that look like credentials regardless of where they came from.
 #:
@@ -65,6 +65,24 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
         r"(?i)\b(api[_-]?key|secret|password|passwd|token|totp|access_token)\b\s*[:=]\s*\S+"
     ),
+    # A credential under a QUOTED key - JSON ("api_key": "...") and Python's
+    # dict repr ({'access_token': '...'}). The assignment pattern above needs
+    # `key=` or `key:` directly after the name, and the closing quote broke it:
+    # probed 27 Oct 2026, kiteconnect's own debug format and a logged session
+    # payload both passed the api_key, request_token, checksum and access_token
+    # through in clear. The key survives so the line still says WHAT was
+    # redacted; only the value goes.
+    re.compile(
+        r"""(?P<pre>(?P<q>["'])"""
+        r"(?:[A-Za-z0-9_\-]*(?:api[_-]?key|api[_-]?secret|secret|password|passwd|totp"
+        r"|checksum|signature|authorization|private[_-]?key)"
+        r"|(?:access|request|refresh|public|feed|session)_token|enctoken|token)"
+        r"""(?P=q)\s*:\s*)(?:"[^"]*"|'[^']*'|[^\s,}\]]+)""",
+        re.I,
+    ),
+    # Kite's own Authorization header value: "token <api_key>:<access_token>".
+    # No key name precedes the secret, so nothing above could match it.
+    re.compile(r"(?i)\b(?:token|enctoken)\s+[A-Za-z0-9]{4,}:[A-Za-z0-9]{6,}"),
 ]
 
 #: Patterns that keep surrounding context instead of replacing the whole match.
@@ -72,6 +90,8 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
 _PARTIAL_REDACTIONS: dict[int, str] = {
     # index of the connection-URI pattern -> keep scheme/user/host, mask password
     5: r"\g<pre>" + REDACTED + r"\g<post>",
+    # the quoted-key pattern -> keep the key, mask the value
+    7: r'\g<pre>"' + REDACTED + '"',
 }
 
 #: Field names whose values are always redacted, whatever they contain.
@@ -112,14 +132,23 @@ class RedactingProcessor:
         self._known.update(v for v in values if len(v) >= 8)
 
     def _scrub_text(self, text: str) -> str:
-        for value in self._known:
-            if value in text:
-                text = text.replace(value, REDACTED)
+        # Patterns FIRST, on the text as it arrived. Value-scrubbing first
+        # changed the shape the patterns look for: with the access token
+        # already replaced, "token <key>:<secret>" became "token <key>:***",
+        # the header pattern no longer matched, and the api key beside it was
+        # left in the line. Found as a test that passed alone and failed in
+        # the suite - an earlier test had registered the token's value.
         for index, pattern in enumerate(_SECRET_PATTERNS):
             # Most patterns replace the whole match; a few keep context around
             # the secret (see _PARTIAL_REDACTIONS) so the message stays useful.
             replacement = _PARTIAL_REDACTIONS.get(index, REDACTED)
             text = pattern.sub(replacement, text)
+        # Then every known value, longest first: if one secret contains
+        # another, scrubbing the short one first would leave the rest of the
+        # long one in the line.
+        for value in sorted(self._known | known_secret_values(), key=len, reverse=True):
+            if value in text:
+                text = text.replace(value, REDACTED)
         return text
 
     def _scrub_value(self, key: str, value: Any) -> Any:
@@ -248,8 +277,31 @@ def configure_logging(
 
     structlog.contextvars.bind_contextvars(service=service)
 
-    # These libraries log request bodies at DEBUG — never enable that here.
-    for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "anthropic"):
+    quiet_noisy_libraries()
+
+
+#: Libraries that log request lines or bodies at DEBUG. `websockets` logs the
+#: request line, which for the market feed carries the access token as a query
+#: parameter; `kiteconnect` logs every request with its Authorization header
+#: when its debug flag is on; `requests` sits under it. Pinned at WARNING so
+#: turning the ROOT logger to DEBUG to chase a problem cannot turn them on too.
+#: The redactor still scrubs whatever does get through - this is the layer in
+#: front of it.
+NOISY_LIBRARIES: tuple[str, ...] = (
+    "httpx",
+    "httpcore",
+    "urllib3",
+    "asyncio",
+    "anthropic",
+    "websockets",
+    "kiteconnect",
+    "requests",
+)
+
+
+def quiet_noisy_libraries() -> None:
+    """Pin every library in :data:`NOISY_LIBRARIES` at WARNING."""
+    for noisy in NOISY_LIBRARIES:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

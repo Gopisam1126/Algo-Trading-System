@@ -116,6 +116,9 @@ def ctx(snapshot: MultiTimeframeSnapshot, opening_range: OpeningRange):
             # which fire() now enforces. Tests that care about a missing or
             # wrong regime override this explicitly.
             "regime": Regime.TRENDING,
+            # Stated, not defaulted: "no entries yet today" is a claim the
+            # wiring makes from the order book. Uncounted refuses to fire.
+            "entries_today": 0,
         }
         base.update(overrides)
         return EvalContext(**base)
@@ -1089,3 +1092,103 @@ _STRUCTURE_STOP_STRATEGY = STRATEGY_YAML.replace(_BREAKOUT_CONDITION, "").replac
     "stop: {primitive: atr_stop, params: {multiplier: 1.5, period: 14}}",
     "stop: {primitive: structure_stop, params: {level: prev_day_high, buffer_pct: 0.1}}",
 )
+
+
+class TestDeclaredConstraintsBindTheRuntime:
+    """Four declarations were parsed, validated, hashed - and read by nothing:
+    ``Applicability.sectors``, ``entry_window``, ``min_bars_since_open`` and
+    ``max_entries_per_day``. The last defaults to 1 on EVERY strategy, so a
+    strategy stopped out could re-enter the same symbol again and again in one
+    day while its document said once. Each case: the declaration binds, an
+    unknown input refuses, and a control shows the strategy still fires."""
+
+    @staticmethod
+    def _with(document, **updates):
+        """A copy of the fixture strategy with constraints/applicability changed."""
+        constraints = document.constraints.model_copy(update=updates.pop("constraints", {}))
+        applicability = document.applicability.model_copy(update=updates.pop("applicability", {}))
+        return document.model_copy(
+            update={"constraints": constraints, "applicability": applicability}
+        )
+
+    # -- max_entries_per_day ------------------------------------------------
+
+    def test_entries_already_at_the_limit_stop_the_strategy(self, document, ctx) -> None:
+        ev = StrategyEvaluator(document)
+        assert document.constraints.max_entries_per_day == 1
+        check = ev.applies_to(ctx(entries_today=1))
+        assert check.applies is False and "already today" in str(check.reason)
+        assert ev.fire(ctx(entries_today=1), correlation_id=CID) is None
+
+    def test_uncounted_entries_refuse_rather_than_read_as_none(self, document, ctx) -> None:
+        check = StrategyEvaluator(document).applies_to(ctx(entries_today=None))
+        assert check.applies is False and "uncounted" in str(check.reason)
+
+    def test_a_higher_limit_admits_the_next_entry(self, document, ctx) -> None:
+        ev = StrategyEvaluator(self._with(document, constraints={"max_entries_per_day": 3}))
+        assert ev.applies_to(ctx(entries_today=2)).applies is True
+        assert ev.applies_to(ctx(entries_today=3)).applies is False
+
+    # -- entry_window -------------------------------------------------------
+
+    def test_the_entry_window_is_start_inclusive_end_exclusive(self, document, ctx) -> None:
+        """NOW is 10:30 IST. Windows around it, in IST, the day the exchange keeps."""
+        cases = {
+            ("10:30", "11:00"): True,  # starts exactly now
+            ("09:30", "10:30"): False,  # ends exactly now
+            ("09:15", "10:00"): False,  # already over
+            ("11:00", "12:00"): False,  # not yet
+            ("09:30", "11:00"): True,
+        }
+        for window, expected in cases.items():
+            ev = StrategyEvaluator(self._with(document, constraints={"entry_window": window}))
+            assert ev.applies_to(ctx()).applies is expected, window
+
+    # -- min_bars_since_open ------------------------------------------------
+
+    def test_the_strategy_waits_for_its_bars(self, document, ctx) -> None:
+        ev = StrategyEvaluator(self._with(document, constraints={"min_bars_since_open": 6}))
+        assert ev.applies_to(ctx(bars_since_open=3)).applies is False
+        assert ev.applies_to(ctx(bars_since_open=None)).applies is False
+        assert ev.applies_to(ctx(bars_since_open=6)).applies is True
+
+    # -- sectors ------------------------------------------------------------
+
+    def test_a_sector_restriction_binds_and_unknown_refuses(self, document, ctx) -> None:
+        ev = StrategyEvaluator(self._with(document, applicability={"sectors": ["IT"]}))
+        assert ev.applies_to(ctx(sector="IT")).applies is True
+        assert ev.applies_to(ctx(sector="BANK")).applies is False
+        assert ev.applies_to(ctx(sector=None)).applies is False
+
+    # -- controls -----------------------------------------------------------
+
+    def test_with_no_restrictions_declared_the_strategy_fires(self, document, ctx) -> None:
+        """The control on the whole class: a runtime that refused everything
+        would pass every test above."""
+        assert StrategyEvaluator(document).fire(ctx(), correlation_id=CID) is not None
+
+    def test_a_negative_entry_count_is_refused_by_the_context(self, ctx) -> None:
+        with pytest.raises(ContextError, match="entries_today"):
+            ctx(entries_today=-1)
+
+
+class TestAnIntegerParameterIsNeverTruncatedAtRuntime:
+    """The DSL refuses these at compile time; this is the same rule at the
+    point of use, for a document that reached the evaluator another way.
+    ``int(14.7)`` used to run as 14, and ``int(inf)`` raised OverflowError -
+    an exception type nothing in the signal loop catches."""
+
+    @pytest.mark.parametrize("period", [14.7, float("inf"), True, "20"])
+    def test_a_non_int_period_is_a_primitive_error(self, ctx, period) -> None:
+        from algotrader.strategy.primitives.evaluators import PrimitiveError
+
+        condition = Condition(primitive="price_above_ma", params={"period": period})
+        with pytest.raises(PrimitiveError, match="whole number"):
+            evaluate_condition(condition, ctx())
+
+    def test_an_int_period_evaluates(self, ctx) -> None:
+        """The control."""
+        result = evaluate_condition(
+            Condition(primitive="price_above_ma", params={"period": 20}), ctx()
+        )
+        assert result.primitive == "price_above_ma"

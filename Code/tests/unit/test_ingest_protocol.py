@@ -149,6 +149,21 @@ class TestFrameSplitting:
         with pytest.raises(kp.ProtocolError, match="declares 44 bytes"):
             kp.split_frame(struct.pack(">HH", 1, 44) + b"x" * 10)
 
+    @pytest.mark.parametrize("trailing", [b"\x00", b"\x00\x08", _ltp_packet()])
+    def test_bytes_the_packets_do_not_account_for_are_refused(self, trailing: bytes) -> None:
+        """The other half of "lengths that do not add up". Only the SHORT case
+        was refused; a frame with bytes left over parsed as though it were
+        whole, which is what a misaligned read looks like from inside."""
+        with pytest.raises(kp.ProtocolError, match="do not account for the whole frame"):
+            kp.split_frame(_frame(_ltp_packet()) + trailing)
+
+    def test_an_exact_frame_still_splits(self) -> None:
+        """The control: the trailing-bytes check must not refuse a whole frame."""
+        assert kp.split_frame(_frame(_ltp_packet(), _quote_packet())) == [
+            _ltp_packet(),
+            _quote_packet(),
+        ]
+
 
 class TestIndexPackets:
     def test_an_index_quote_carries_no_volume(self) -> None:
