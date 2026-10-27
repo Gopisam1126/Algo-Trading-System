@@ -31,6 +31,7 @@ from algotrader.broker.adapter import (
     AmbiguousOrderError,
     DuplicateBrokerOrderError,
     OrderRejectedError,
+    RateLimitError,
 )
 from algotrader.broker.kite import mapping
 from algotrader.broker.kite.auth import KiteAuthManager
@@ -40,7 +41,6 @@ from algotrader.broker.kite.trading import KiteTradingAdapter
 from algotrader.broker.ratelimit import (
     BrokerRateLimiter,
     RateLimitConfig,
-    RateLimitExceededError,
 )
 from algotrader.common.db import engine as db_engine
 from algotrader.common.db.repositories import InstrumentRepository
@@ -242,7 +242,10 @@ class TestTheRateLimiterGatesTheRealOrderPath:
         async def attempt(n: int) -> bool:
             try:
                 await adapter.place_order(_request(client_order_id=f"{n:032x}"))
-            except RateLimitExceededError:
+            # The adapter speaks the broker taxonomy: a refused token is
+            # RateLimitError ("refused before reaching the exchange"), not the
+            # limiter's own RuntimeError that no caller handles.
+            except RateLimitError:
                 return False
             return True
 
@@ -267,7 +270,7 @@ class TestTheRateLimiterGatesTheRealOrderPath:
             limiter=BrokerRateLimiter(r, RateLimitConfig(orders_per_second=1, order_burst=1)),
         )
         await adapter.place_order(_request(client_order_id="a" * 32))
-        with pytest.raises(RateLimitExceededError):
+        with pytest.raises(RateLimitError):
             await adapter.place_order(_request(client_order_id="b" * 32))
         assert len(client.placed) == 1
 

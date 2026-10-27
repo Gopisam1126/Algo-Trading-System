@@ -226,6 +226,9 @@ class Pipeline:
             "snapshot": self.engine.snapshot(SYMBOL),
             "opening_range": self.opening_range,
             "regime": Regime.TRENDING,
+            # Stated, not defaulted: "no entries yet today" is a claim the
+            # wiring makes from the order book. Uncounted refuses to fire.
+            "entries_today": 0,
         }
         base.update(overrides)
         return EvalContext(**base)

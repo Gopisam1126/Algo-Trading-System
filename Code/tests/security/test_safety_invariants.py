@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import ClassVar
 from uuid import UUID
 
@@ -120,6 +121,93 @@ class TestSecretsCannotLeak:
             raise RuntimeError(f"auth failed for {secret}")
         except RuntimeError as exc:
             assert "hunter2" not in str(exc)
+
+
+def _credential_fields_typed_as_str(source: str) -> list[str]:
+    """Class fields named like a credential whose annotation is a plain ``str``.
+
+    Every test above proves ``SecretString`` cannot leak. None proved that
+    credentials are actually HELD in one: ``KiteFeed.access_token`` was a
+    ``str`` on a dataclass, whose generated ``__repr__`` prints every field,
+    and it sat there through every audit because the only structural check
+    looked at ``BrokerSession`` alone. This looks at every class in ``src``.
+    """
+    import ast
+
+    #: Names that end in "token" and are identifiers, not credentials - each
+    #: with its reason, so this is an assessed list rather than a hiding place.
+    not_credentials = {
+        # Kite's numeric id for an instrument, stored as text. Public; it is
+        # in the instrument dump every account downloads.
+        "broker_token",
+        # The same id as an int, on the wire.
+        "instrument_token",
+    }
+
+    def credential_like(name: str) -> bool:
+        lowered = name.lower()
+        if lowered in not_credentials:
+            return False
+        if any(word in lowered for word in ("secret", "password", "passwd", "totp", "private_key")):
+            return True
+        # access_token, request_token, refresh_token, feed_token, enctoken -
+        # but NOT instrument tokens (ints) or a list of them, which the type
+        # check below excludes anyway.
+        return lowered == "token" or lowered.endswith("_token") or lowered == "enctoken"
+
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            if not (isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)):
+                continue
+            annotation = ast.unparse(stmt.annotation)
+            if not credential_like(stmt.target.id) or "SecretString" in annotation:
+                continue
+            if "str" in annotation.replace("SecretString", ""):
+                offenders.append(f"{node.name}.{stmt.target.id}: {annotation}")
+    return offenders
+
+
+class TestCredentialsAreHeldAsSecrets:
+    """Invariant 4, structurally: SecretString, and nothing else, holds one."""
+
+    def test_no_class_in_src_holds_a_credential_as_a_plain_str(self) -> None:
+        src = Path(__file__).resolve().parents[2] / "src" / "algotrader"
+        offenders = [
+            f"{path.relative_to(src)}: {hit}"
+            for path in sorted(src.rglob("*.py"))
+            for hit in _credential_fields_typed_as_str(path.read_text(encoding="utf-8"))
+        ]
+        assert not offenders, (
+            f"credential fields typed as str: {offenders}. A str field is printed by "
+            f"a dataclass or pydantic repr; hold it as SecretString and reveal it at "
+            f"the point of use."
+        )
+
+    def test_the_scan_finds_the_shape_it_exists_for(self) -> None:
+        """The control. ``KiteFeed`` as it was must be caught; the lookalikes
+        that are not credentials must not be."""
+        caught = _credential_fields_typed_as_str(
+            "class KiteFeed:\n"
+            "    api_key: str\n"
+            "    access_token: str\n"
+            "    tokens: list[int]\n"
+            "    instrument_token: int\n"
+            "class Session:\n"
+            "    token: SecretString | None\n"
+            "    totp_secret: str | None = None\n"
+        )
+        assert caught == ["KiteFeed.access_token: str", "Session.totp_secret: str | None"]
+
+    def test_the_feed_holds_its_token_as_a_secret(self) -> None:
+        from algotrader.ingest.kite_ws import KiteFeed
+
+        assert KiteFeed.__dataclass_fields__["access_token"].type in (
+            "SecretString",
+            SecretString,
+        )
 
 
 class TestConfigCannotDisableSafety:

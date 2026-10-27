@@ -661,7 +661,7 @@ class RiskEngine:
             if not result.passed:
                 return RiskDecision.reject(check.name, result.reason)
         sizing = self.sizer.compute(rec, self.state)
-        return RiskDecision.approve(sizing)
+        return RiskDecision.approve(sizing)   # stamped with rec's identity — see below
 
     CHECKS = [
         check_kill_switch_inactive,       # C8
@@ -680,6 +680,18 @@ class RiskEngine:
         check_time_to_squareoff_deadline, # enough runway for the trade to work
     ]
 ```
+
+**A decision says what it decided** (27 Oct 2026, AUDIT-006). Every
+`RiskDecision` carries the `correlation_id`, `symbol` and `direction` of the
+recommendation it was evaluated with, and `OrderGateway.build_entry` refuses a
+decision offered beside any other recommendation (`DecisionMismatchError`).
+The decision and the recommendation reach the gateway as two arguments, and
+until then nothing tied them together: an approval for one candidate sent
+beside another's recommendation would have built an order for the second at
+the first one's size. The SIT harness did exactly that for weeks (SIT-008).
+The production engine must also be built by one factory that registers all
+fourteen checks — `RiskEngine(checks=[], sizer=...)` approves everything, a
+test affordance that must never be the production shape (E15-S13).
 
 **Position sizing (deterministic, ATR-based):**
 
@@ -750,6 +762,12 @@ Every clamp is applied and the binding constraint is recorded in the audit log �
     applies to the emergency exit itself — trusting the exit's acceptance while
     distrusting the stop's would be indefensible, since the exit is the only
     thing between a naked position and the square-off deadline.
+  - **Live is an allowlist** (27 Oct 2026, AUDIT-009): `SUBMITTED`, `OPEN`,
+    `PARTIAL` or `FILLED`, nothing else. It was "not `REJECTED` or
+    `CANCELLED`", which made every status the mapping could not interpret
+    (`RECONCILE_REQUIRED`) read as a protecting stop. Every interim status
+    Kite documents is mapped explicitly; an undocumented one exits the
+    position, and an exit in an undocumented state halts.
   - **`stop_price` NOT NULL (BR-1) does not mean a stop ORDER exists.** The
     column records the price the sizer chose, and it is populated whether or
     not any order is protecting the position. Those are different facts, and

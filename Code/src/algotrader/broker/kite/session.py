@@ -48,7 +48,7 @@ async def exchange_request_token(
     request_token: str,
     *,
     api_secret: SecretString,
-) -> str:
+) -> None:
     """Complete the redirect login: request_token -> access_token.
 
     The final step of E02-S01. The ``request_token`` arrives on the callback
@@ -56,9 +56,12 @@ async def exchange_request_token(
     is why the exchange happens server-side here rather than anywhere the token
     has already travelled.
 
-    Returns the access token, having already adopted it into ``auth``. The raw
-    value is returned only so a caller can hand it to a client factory; it is
-    not persisted by this function and must not be persisted by the caller.
+    The access token is adopted into ``auth`` - as a ``SecretString`` - and
+    NOT returned. It used to be returned as a plain ``str`` "so a caller can
+    hand it to a client factory", which made this function a third place the
+    raw credential existed, in a module whose whole claim is that there are
+    two. A caller wanting a client calls :func:`build_client`, which reveals
+    it at the point of use.
     """
     if not request_token:
         raise AuthenticationError("no request_token supplied; the callback carried nothing")
@@ -83,4 +86,3 @@ async def exchange_request_token(
         )
     auth.adopt_token(access_token)
     log.info("redirect login completed for %s", data.get("user_id", "unknown"))
-    return access_token

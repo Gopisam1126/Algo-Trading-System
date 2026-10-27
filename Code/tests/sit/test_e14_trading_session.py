@@ -236,6 +236,13 @@ class Session:
         self.deadline = ctx_overrides.pop("squareoff_deadline", None) or _at(day, 15, 5)
         self.ctx_overrides = ctx_overrides
         self.decisions: dict[dt.time, object] = {}
+        #: The recommendation each minute was EVALUATED with (SIT-008). The
+        #: submission sites used to mint a fresh one beside the stored
+        #: decision - a different correlation id every time - so every
+        #: gateway submission in this file paired a decision with a
+        #: recommendation it was not made about. Nothing noticed until the
+        #: decision carried its own identity and the gateway refused the pair.
+        self.recommendations: dict[dt.time, Recommendation] = {}
         self.log_text = ""
 
     def run(self, start=(8, 0), end=(16, 0), *, mutate=None):
@@ -276,7 +283,9 @@ class Session:
                 if mutate is not None:
                     mutate(ist_time, kwargs)
                 ctx = RiskContext(**kwargs)  # type: ignore[arg-type]
-                self.decisions[ist_time] = self.engine.evaluate(_recommendation(moment), ctx)
+                rec = _recommendation(moment)
+                self.recommendations[ist_time] = rec
+                self.decisions[ist_time] = self.engine.evaluate(rec, ctx)
                 moment += dt.timedelta(minutes=1)
         finally:
             root.removeHandler(handler)
@@ -2438,7 +2447,7 @@ class TestSit14ASessionThatReachesABroker:
                 _run_async(
                     gateway.submit_entry(
                         decision,
-                        _recommendation(_at(TRADING_DAY, ist_time.hour, ist_time.minute)),
+                        session.recommendations[ist_time],
                         trade_date=TRADING_DAY,
                     )
                 )
@@ -2523,7 +2532,7 @@ class TestSit14ASessionThatReachesABroker:
             _run_async(
                 gateway.submit_entry(
                     decision,
-                    _recommendation(_at(TRADING_DAY, ist_time.hour, ist_time.minute)),
+                    session.recommendations[ist_time],
                     trade_date=TRADING_DAY,
                 )
             )
@@ -2572,10 +2581,7 @@ class TestSit14ASessionThatReachesABroker:
         assert approved, "nothing was approved, so the property is untested"
 
         # One set of signals, minted once — this is what makes it a replay.
-        signals = [
-            (decision, _recommendation(_at(TRADING_DAY, t.hour, t.minute)))
-            for t, decision in approved
-        ]
+        signals = [(decision, session.recommendations[t]) for t, decision in approved]
 
         def submit_all() -> list[str]:
             broker = _RecordingBroker()
@@ -2678,7 +2684,7 @@ class TestSit15ASessionThatSurvivesATimeout:
         helper, so it catches every new caller too.
         """
         return [
-            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)))
+            (session.decisions[t], session.recommendations[t])
             for t in sorted(session.decisions)
             if session.decisions[t].approved
         ]
@@ -2810,7 +2816,7 @@ class TestSit16ASessionThatRefusesToResumeWhatItCannotResume:
     @staticmethod
     def _signals(session) -> list:
         return [
-            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)))
+            (session.decisions[t], session.recommendations[t])
             for t in sorted(session.decisions)
             if session.decisions[t].approved
         ]
@@ -3059,7 +3065,7 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
         test would prove nothing while passing.
         """
         return [
-            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            (session.decisions[t], session.recommendations[t], t)
             for t in sorted(session.decisions)
             if session.decisions[t].approved
         ]
@@ -3543,7 +3549,7 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
     def _signals(session) -> list:
         """The day's approved signals, minted ONCE — SIT-15's note applies."""
         return [
-            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            (session.decisions[t], session.recommendations[t], t)
             for t in sorted(session.decisions)
             if session.decisions[t].approved
         ]
@@ -4094,7 +4100,7 @@ class TestSit19ASessionReconciledAllDay:
     @staticmethod
     def _signals(session) -> list:
         return [
-            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            (session.decisions[t], session.recommendations[t], t)
             for t in sorted(session.decisions)
             if session.decisions[t].approved
         ]
@@ -4552,7 +4558,7 @@ class TestSit20ASessionWhoseFillsAreBooked:
         broker = _PartialFillBroker(first_fraction=Decimal("0.4"), race=race)
         stack = self._stack(calendar, broker)
         signals = [
-            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            (session.decisions[t], session.recommendations[t], t)
             for t in sorted(session.decisions)
             if session.decisions[t].approved
         ][: self.LIMIT]
@@ -4617,7 +4623,7 @@ class TestSit20ASessionWhoseFillsAreBooked:
         broker = _PartialFillBroker(first_fraction=Decimal("1"))
         stack = self._stack(calendar, broker)
         signals = [
-            (session.decisions[t], _recommendation(_at(TRADING_DAY, t.hour, t.minute)), t)
+            (session.decisions[t], session.recommendations[t], t)
             for t in sorted(session.decisions)
             if session.decisions[t].approved
         ][:10]
@@ -4655,7 +4661,7 @@ class TestSit20ASessionWhoseFillsAreBooked:
             decision = session.decisions[t]
             if not decision.approved:
                 continue
-            rec = _recommendation(_at(TRADING_DAY, t.hour, t.minute))
+            rec = session.recommendations[t]
             self._send(stack, index, decision, rec, t)
             self._cycle(stack, t, seconds=20)
             broker.settle_cancels()

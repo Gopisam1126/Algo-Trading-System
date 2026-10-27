@@ -147,12 +147,28 @@ _SIDE_IN = {v: k for k, v in _SIDE_OUT.items()}
 
 #: Kite status -> ours. Kite's vocabulary is smaller and its OPEN covers both
 #: working and partially-filled; the fill quantity disambiguates downstream.
+#:
+#: Every interim status Kite documents is here (kite.trade/docs/connect/v3/orders,
+#: fetched 27 Oct 2026). Three were missing until then - MODIFY VALIDATION
+#: PENDING, CANCEL PENDING, AMO REQ RECEIVED - and fell through to
+#: RECONCILE_REQUIRED, which ``protective_stop.is_live`` now treats as NOT
+#: live. Mapping the documented ones keeps ordinary broker behaviour off that
+#: fail-closed path; Kite also says "there may be other values as well", and
+#: those still land there.
 _STATUS_IN: dict[str, OrderStatus] = {
     "PUT ORDER REQ RECEIVED": OrderStatus.SUBMITTED,
+    "AMO REQ RECEIVED": OrderStatus.SUBMITTED,
     "VALIDATION PENDING": OrderStatus.SUBMITTED,
     "OPEN PENDING": OrderStatus.SUBMITTED,
+    # A modification under RMS validation: the order itself is still working.
+    "MODIFY VALIDATION PENDING": OrderStatus.OPEN,
     "MODIFY PENDING": OrderStatus.OPEN,
     "TRIGGER PENDING": OrderStatus.OPEN,
+    # "Order's cancellation request is pending registration at the exchange":
+    # it can still fill until the exchange confirms, so it is still working.
+    # A stop in this state is about to stop protecting; the next cycle sees
+    # CANCELLED and acts, which is the same 30-second window any rejection has.
+    "CANCEL PENDING": OrderStatus.OPEN,
     "OPEN": OrderStatus.OPEN,
     "COMPLETE": OrderStatus.FILLED,
     "CANCELLED": OrderStatus.CANCELLED,

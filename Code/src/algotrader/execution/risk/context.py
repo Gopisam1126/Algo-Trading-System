@@ -48,6 +48,44 @@ class OpenPosition:
     stop_price: Decimal
     sector: str | None = None
 
+    def __post_init__(self) -> None:
+        """Every number here is summed into an exposure total a cap is checked
+        against, so a bad one makes the cap LOOSER rather than failing.
+
+        A negative quantity is a long that counts as a short: it subtracts its
+        notional from the sector total and from net exposure, so the sector cap
+        and the net cap both read more room than exists. Zero quietly drops a
+        held position from every total. A NaN price makes every comparison
+        raise far from here; a negative one is the same subtraction again.
+        ``RiskContext`` already refuses a non-finite number on its own fields
+        (QA-SEC-34) - these are the same numbers one level down, which that
+        check never looked inside.
+        """
+        if not self.symbol:
+            raise RiskContextError("an open position must name its symbol")
+        if not isinstance(self.direction, Direction):
+            raise RiskContextError(f"position direction {self.direction!r} is not a Direction")
+        if not isinstance(self.quantity, int) or isinstance(self.quantity, bool):
+            raise RiskContextError(f"position quantity must be an int, got {self.quantity!r}")
+        if self.quantity <= 0:
+            raise RiskContextError(
+                f"position {self.symbol} has quantity {self.quantity}. An open position "
+                f"holds shares; zero or fewer would shrink every exposure total and "
+                f"loosen every cap computed from them."
+            )
+        for name in ("entry_price", "stop_price"):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+                raise RiskContextError(
+                    f"position {self.symbol} has {name} {value!r}; it must be a positive "
+                    f"finite Decimal, because notional is summed into the exposure caps"
+                )
+        if self.sector is not None and not self.sector.strip():
+            raise RiskContextError(
+                f"position {self.symbol} has a blank sector. Unknown is None - which the "
+                f"sector check refuses - and a blank string would be a sector of its own."
+            )
+
     @property
     def notional(self) -> Decimal:
         return self.entry_price * self.quantity
@@ -316,6 +354,15 @@ class RiskContext:
                 f"the counter is broken, and a broken counter must not read as "
                 f"a clean streak."
             )
+        for name in ("slots_total", "slots_used"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise RiskContextError(
+                    f"{name} is {value!r}. Slot counts are non-negative integers; a "
+                    f"negative slots_used made slots_available read as a FREE slot "
+                    f"when none existed (0 total - (-1) used = 1), so check 7 passed "
+                    f"on a book with no capacity at all."
+                )
         if self.slots_used > self.slots_total:
             raise RiskContextError(
                 f"slots_used {self.slots_used} exceeds slots_total "

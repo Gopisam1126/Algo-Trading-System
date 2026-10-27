@@ -150,6 +150,15 @@ constraints:
   min_bars_since_open: 3
 ```
 
+**Every field above binds** (27 Oct 2026, AUDIT-012/013). Until then
+`max_entries_per_day`, `entry_window`, `min_bars_since_open` and
+`applicability.sectors` were parsed, validated and hashed, and read by nothing;
+`StrategyEvaluator.applies_to` now enforces each, and an input it cannot
+establish refuses — the caller must state `entries_today` from the order book,
+because uncounted must not read as "none yet". The entry window is IST,
+start-inclusive and end-exclusive. Each exit slot takes only its own kind of
+exit primitive (`exit_role`), so `stop: r_multiple_target` no longer compiles.
+
 ### 3.2 The primitive library
 
 Primitives are hand-written, unit-tested Python functions with declared parameter schemas and bounds. **The AI may only reference primitives that exist; it cannot define new ones.** Adding a primitive is a human code change with review.

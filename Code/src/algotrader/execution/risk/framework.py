@@ -219,6 +219,7 @@ class RiskEngine:
             decision = RiskDecision.reject(
                 outcome.reason,
                 detail=outcome.detail,
+                recommendation=rec,
                 checks_passed=passed,
                 now=ctx.now,
             )
@@ -267,6 +268,7 @@ class RiskEngine:
                     "every risk check passed but no sizer is configured, so no "
                     "quantity can be computed. Refusing rather than defaulting."
                 ),
+                recommendation=rec,
                 checks_passed=passed,
                 now=ctx.now,
             )
@@ -282,6 +284,7 @@ class RiskEngine:
             decision = RiskDecision.reject(
                 RejectReason.RISK_ENGINE_FAULT,
                 detail=f"sizing raised {type(exc).__name__}: {exc}"[:400],
+                recommendation=rec,
                 checks_passed=passed,
                 now=ctx.now,
             )
@@ -309,6 +312,7 @@ class RiskEngine:
                     f"sizing produced quantity 0; binding constraint was "
                     f"{sizing.binding_constraint}"
                 ),
+                recommendation=rec,
                 checks_passed=passed,
                 now=ctx.now,
             )
@@ -327,7 +331,9 @@ class RiskEngine:
             )
             return decision
 
-        decision = RiskDecision.approve(sizing, checks_passed=passed, now=ctx.now)
+        decision = RiskDecision.approve(
+            sizing, recommendation=rec, checks_passed=passed, now=ctx.now
+        )
         metrics.approved()
         self._audit(rec, decision, stopped_by=None, ctx=ctx)
         log.info(

@@ -341,19 +341,28 @@ def size_position(rec: Recommendation, ctx: RiskContext, policy: SizingPolicy) -
         target_price = entry - reward
 
     if stop_price <= 0 or target_price <= 0:
-        # A stop distance wider than the price itself. Possible for a penny
-        # stock with an enormous ATR, and `Price` requires gt=0, so building
-        # the result would raise somewhere less informative than here.
+        # A stop distance wider than the price itself (a long's stop below
+        # zero), or a short whose R-multiple target lands at or below zero.
+        # Possible for a penny stock with an enormous ATR, and `Price` requires
+        # gt=0, so building the result would raise somewhere less informative
+        # than here. The message names WHICH, because "stop distance not less
+        # than entry" was reported for the target case too and sent an
+        # operator to the wrong number.
+        why = (
+            f"stop distance {stop_distance} is not less than the entry price {entry}"
+            if stop_price <= 0
+            else (
+                f"the {policy.target_r_multiple}R target is {target_price}, at or below "
+                f"zero for a short at {entry} with a {stop_distance} stop"
+            )
+        )
         return SizingResult(
             quantity=0,
             entry_price=entry,
             stop_price=entry,
             target_price=None,
             capital_at_risk=Decimal(0),
-            binding_constraint=(
-                f"stop distance {stop_distance} is not less than the entry "
-                f"price {entry}; no position is sizeable"
-            ),
+            binding_constraint=f"{why}; no position is sizeable",
         )
 
     return SizingResult(

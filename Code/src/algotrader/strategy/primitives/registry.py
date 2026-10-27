@@ -273,6 +273,7 @@ PRIMITIVES: list[PrimitiveSpec] = [
     PrimitiveSpec(
         name="atr_stop",
         category="exit",
+        exit_role="stop",
         description="Stop placed at an ATR multiple from entry.",
         params=[
             _p("multiplier", "float", lo="0.5", hi="5"),
@@ -283,6 +284,7 @@ PRIMITIVES: list[PrimitiveSpec] = [
     PrimitiveSpec(
         name="structure_stop",
         category="exit",
+        exit_role="stop",
         description="Stop placed beyond a structural level.",
         params=[
             _p(
@@ -304,12 +306,14 @@ PRIMITIVES: list[PrimitiveSpec] = [
     PrimitiveSpec(
         name="r_multiple_target",
         category="exit",
+        exit_role="target",
         description="Profit target at an R multiple of initial risk.",
         params=[_p("r", "float", lo="0.5", hi="10")],
     ),
     PrimitiveSpec(
         name="trail_after_r",
         category="exit",
+        exit_role="trail",
         description="Begin trailing the stop once N R of profit is reached.",
         params=[
             _p("activate_at_r", "float", lo="0.1", hi="10"),
@@ -319,6 +323,7 @@ PRIMITIVES: list[PrimitiveSpec] = [
     PrimitiveSpec(
         name="squareoff_deadline",
         category="exit",
+        exit_role="time",
         description="Exit before the broker's per-stock auto square-off. "
         "Required on every strategy — non-removable.",
         params=[],

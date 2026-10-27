@@ -28,11 +28,16 @@ from collections.abc import AsyncIterator
 from decimal import Decimal
 from typing import Any
 
-from algotrader.broker.adapter import AuthenticationError, BrokerSession, ReadOnlyGuard
+from algotrader.broker.adapter import (
+    AuthenticationError,
+    BrokerSession,
+    RateLimitError,
+    ReadOnlyGuard,
+)
 from algotrader.broker.kite import mapping
 from algotrader.broker.kite.auth import KiteAuthManager
 from algotrader.broker.kite.errors import classify
-from algotrader.broker.ratelimit import BrokerRateLimiter
+from algotrader.broker.ratelimit import BrokerRateLimiter, RateLimitExceededError
 from algotrader.common.enums import Exchange, Timeframe
 from algotrader.common.models.market import Bar, Instrument, Tick
 
@@ -103,7 +108,12 @@ class KiteReads:
         an ambiguous one.
         """
         if self._limiter is not None:
-            await self._limiter.acquire_data()
+            try:
+                await self._limiter.acquire_data()
+            except RateLimitExceededError as exc:
+                # Into the taxonomy, as on the order path: callers handle
+                # BrokerError subclasses, not the limiter's own RuntimeError.
+                raise RateLimitError(str(exc)) from None
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
         except Exception as exc:
@@ -126,8 +136,19 @@ class KiteReads:
                         symbol=str(row["tradingsymbol"]),
                         exchange=mapping.exchange_in(row.get("exchange", exchange)),
                         broker_token=str(row["instrument_token"]),
-                        lot_size=int(row.get("lot_size") or 1),
-                        tick_size=Decimal(str(row.get("tick_size") or "0.05")),
+                        # Both REQUIRED. `or "0.05"` was the hardcoded fallback
+                        # the trading adapter refuses by design ("right for
+                        # most of the market and silently wrong for the rest")
+                        # - moved one step upstream, where that refusal could
+                        # not see it: the sync stored 0.05 for any row missing
+                        # a tick (or carrying 0), and the adapter then snapped
+                        # stops to a grid the exchange may reject. A row that
+                        # cannot state its own grid is skipped and logged below,
+                        # so a rising count says the dump's shape has moved.
+                        lot_size=int(mapping.require_field(row, "lot_size", what="an instrument")),
+                        tick_size=Decimal(
+                            str(mapping.require_field(row, "tick_size", what="an instrument"))
+                        ),
                     )
                 )
             except (KeyError, ValueError, mapping.MappingError) as exc:

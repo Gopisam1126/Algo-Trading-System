@@ -65,6 +65,7 @@ def _ctx(**kw) -> EvalContext:
         "direction": Direction.LONG,
         "last_price": Decimal("100"),
         "snapshot": _snapshot(),
+        "entries_today": 0,
     }
     base.update(kw)
     return EvalContext(**base)

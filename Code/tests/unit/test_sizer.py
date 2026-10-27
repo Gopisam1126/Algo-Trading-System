@@ -376,6 +376,15 @@ class TestAC4AZeroQuantityRejects:
         assert result.quantity == 0
         assert "not less than the entry price" in result.binding_constraint
 
+    def test_a_short_whose_target_lands_below_zero_says_so(self) -> None:
+        """Entry 10, ATR 4 x 1.5 = a 6.0 stop distance: the stop (16) is fine,
+        the 2R target is 10 - 12 = -2. The refusal is right; the message used
+        to blame the stop distance, which is not the number at fault."""
+        result = _size(rec=_rec(direction=Direction.SHORT, entry="10.00"), atr=Decimal("4.0000"))
+        assert result.quantity == 0
+        assert "target" in result.binding_constraint
+        assert "stop distance 6.0000 is not less than" not in result.binding_constraint
+
 
 class TestAC5TheStopComesFromATRNotTheRecommendation:
     def test_the_stop_is_atr_times_the_multiplier_from_entry(self) -> None:

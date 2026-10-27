@@ -194,7 +194,7 @@ class TestTheBuildEnvironmentIsAudited:
                 version = md.version(name)
             except md.PackageNotFoundError:
                 continue
-            if name == "setuptools" and _version_tuple(version) < (78, 1, 1):
+            if name == "setuptools" and _version_tuple(version) < (84, 1, 0):
                 stale.append(f"{name}=={version}")
         assert not stale, (
             f"build backend carries known advisories: {stale}. "
@@ -282,18 +282,40 @@ class TestLoadingAConfigDoesNotDragInTheBrokerStack:
         )
 
 
-#: Advisories the dependency audit is told to ignore, each with the package and
-#: the exact version it was assessed against. An ignore is a CLAIM — "this
-#: vulnerability is present but unreachable" — and the class below makes the
-#: claim executable instead of leaving it in a comment that outlives its truth.
-ACCEPTED_ADVISORIES: dict[str, tuple[str, str]] = {
-    # Twisted IMAP4 server ReDoS (GHSA-8pqf-f4m5-798g, CVSS 4.3). No patched
-    # release exists (checked 15 Oct 2026). See TestTheAcceptedTwistedAdvisory.
-    "CVE-2026-106454": ("twisted", "26.4.0"),
+#: Advisories the dependency audit is told to ignore. Each maps to the package,
+#: the exact version it was assessed against, and the SUBPACKAGE the vulnerable
+#: code lives in. An ignore is a CLAIM — "this vulnerability is present but
+#: unreachable" — and the class below makes each claim executable instead of
+#: leaving it in a comment that outlives its truth.
+#:
+#: Every one is in a Twisted *server* subsystem this process never loads.
+#: Assessed 15 Oct 2026 (the first) and 27 Oct 2026 (the other five). On 27 Oct
+#: the five were fixed only in 26.10.0rc1/rc2 — a pre-release, not pinned into a
+#: system that moves money when the vulnerable code cannot run anyway.
+ACCEPTED_ADVISORIES: dict[str, tuple[str, str, str]] = {
+    # IMAP4 server: LIST/LSUB wildcard compiled as a regex (ReDoS).
+    "CVE-2026-106454": ("twisted", "26.4.0", "twisted.mail"),
+    # IMAP4 server: negative literal size loops parseNestedParens forever.
+    "CVE-2026-115774": ("twisted", "26.4.0", "twisted.mail"),
+    # XML element stream (XMPP): an unclosed container grows without bound.
+    "CVE-2026-115775": ("twisted", "26.4.0", "twisted.words"),
+    # IRC server: per-connection line buffer has no maximum.
+    "CVE-2026-115776": ("twisted", "26.4.0", "twisted.words"),
+    # Telnet transport: subnegotiation buffer has no maximum.
+    "CVE-2026-115778": ("twisted", "26.4.0", "twisted.conch"),
+    # HTTP server: bare CR/LF in a header value hides a header (smuggling).
+    "CVE-2026-115877": ("twisted", "26.4.0", "twisted.web"),
 }
 
-#: The package the accepted Twisted advisory lives in.
-VULNERABLE_TWISTED_PACKAGE = "twisted.mail"
+#: The module each subsystem's advisory is actually in — imported by the
+#: control to prove the probe would see it.
+VULNERABLE_MODULES = (
+    "twisted.mail.imap4",
+    "twisted.words.xish.domish",
+    "twisted.words.protocols.irc",
+    "twisted.conch.telnet",
+    "twisted.web.http",
+)
 
 
 def _twisted_modules_loaded_by_the_application(prelude: str = "") -> list[str]:
@@ -303,8 +325,8 @@ def _twisted_modules_loaded_by_the_application(prelude: str = "") -> list[str]:
     A subprocess for the same reason as the config check above: the parent's
     ``sys.modules`` reflects whatever the rest of the suite imported. Walking
     every package rather than naming entry points means a new module that
-    reaches for ``twisted.mail`` is caught without anyone remembering to list
-    it here.
+    reaches for a vulnerable subsystem is caught without anyone remembering to
+    list it here.
     """
     program = (
         "import importlib, pkgutil, sys\n"
@@ -326,6 +348,11 @@ def _twisted_modules_loaded_by_the_application(prelude: str = "") -> list[str]:
     return [name for name in result.stdout.strip().split(",") if name]
 
 
+def _within(module: str, package: str) -> bool:
+    prefix = package.split(".")
+    return module.split(".")[: len(prefix)] == prefix
+
+
 def _twisted_imports_in(source: str) -> list[str]:
     """Every import of twisted or autobahn in a piece of source."""
     found: list[str] = []
@@ -340,25 +367,36 @@ def _twisted_imports_in(source: str) -> list[str]:
     return found
 
 
-class TestTheAcceptedTwistedAdvisory:
-    """CVE-2026-106454: ``wildcardToRegexp()`` in ``twisted/mail/imap4.py``
-    compiles an IMAP LIST/LSUB pattern as a regex without escaping it, so an
-    authenticated IMAP client can send a catastrophic-backtracking pattern and
-    stall a Twisted IMAP SERVER's reactor. Affected: every Twisted <= 26.4.0.
-    Patched: none — the advisory lists no fixed release.
+def _audit_invocations(text: str) -> list[str]:
+    """Every pip-audit command in a shell-ish file, with backslash
+    continuations joined so a command split over lines is read whole.
+    Comment lines and YAML keys such as ``name: pip-audit`` are not commands."""
+    joined = re.sub(r"[ \t]*\\\r?\n\s*", " ", text)
+    return [
+        line.strip()
+        for line in joined.splitlines()
+        if line.strip().startswith("pip-audit ") or line.strip() == "pip-audit"
+    ]
+
+
+class TestTheAcceptedTwistedAdvisories:
+    """Six advisories against Twisted 26.4.0, all in its SERVER subsystems:
+    the IMAP4 server (two), the XMPP XML stream, the IRC server, the telnet
+    transport and the HTTP server. See ACCEPTED_ADVISORIES for each.
 
     Twisted is here only because kiteconnect pins ``autobahn[twisted]`` and
-    imports ``.ticker`` unconditionally (see the B7 classes above). So, unlike
-    autobahn, it cannot be upgraded past the finding, and it cannot be removed:
-    ``import kiteconnect`` fails without it.
+    imports ``.ticker`` unconditionally (see the B7 classes above). It cannot
+    be removed — ``import kiteconnect`` fails without it — and on the day each
+    was assessed no stable release fixed it.
 
-    What makes it safe is that the vulnerable code cannot run here. Exploiting
-    it needs a Twisted IMAP4 server accepting authenticated sessions; this
-    system runs no IMAP server, never runs the Twisted reactor, and never
-    imports ``twisted.mail`` at all. The audit therefore ignores exactly this
-    ID — and each part of that argument is asserted below, because the lesson
-    of QA-SEC-24 is that "we do not use it" was once recorded as fact and was
-    false.
+    What makes them safe is that the vulnerable code cannot run here. Every one
+    needs a Twisted server of that protocol accepting connections; this system
+    runs none, never runs the Twisted reactor, and never even imports
+    ``twisted.mail``, ``twisted.words``, ``twisted.conch`` or ``twisted.web``.
+    The audit therefore ignores exactly these IDs — never the package, so any
+    OTHER Twisted advisory still fails the gate — and each part of that
+    argument is asserted below, because the lesson of QA-SEC-24 is that "we do
+    not use it" was once recorded as fact and was false.
     """
 
     @staticmethod
@@ -366,19 +404,9 @@ class TestTheAcceptedTwistedAdvisory:
         return (Path(__file__).resolve().parents[2].joinpath(*parts)).read_text(encoding="utf-8")
 
     def _audit_commands(self) -> dict[str, list[str]]:
-        """Every pip-audit invocation, per audit site. Comment lines and the
-        artifact's ``name: pip-audit`` are not invocations."""
-        sites = {
-            "ci.yml": self._read("..", ".github", "workflows", "ci.yml"),
-            "Makefile": self._read("Makefile"),
-        }
         return {
-            site: [
-                line.strip()
-                for line in text.splitlines()
-                if line.strip().startswith("pip-audit ") or line.strip() == "pip-audit"
-            ]
-            for site, text in sites.items()
+            "ci.yml": _audit_invocations(self._read("..", ".github", "workflows", "ci.yml")),
+            "Makefile": _audit_invocations(self._read("Makefile")),
         }
 
     def test_every_audit_ignores_exactly_the_accepted_set(self) -> None:
@@ -401,11 +429,25 @@ class TestTheAcceptedTwistedAdvisory:
                 assert "--skip-editable" in line, f"{site}: `{line}`"
                 assert "--strict" not in line, f"{site}: `{line}`"
 
+    def test_a_continued_command_is_read_whole(self) -> None:
+        """Control for the reader above: a command split with backslashes is
+        one command, and comments and YAML keys are not commands."""
+        text = (
+            "# pip-audit is a gate\n"
+            "  name: pip-audit\n"
+            "  pip-audit --skip-editable \\\n"
+            "    --ignore-vuln A \\\n"
+            "    --ignore-vuln B | tee out\n"
+        )
+        assert _audit_invocations(text) == [
+            "pip-audit --skip-editable --ignore-vuln A --ignore-vuln B | tee out"
+        ]
+
     def test_the_assessment_is_of_the_installed_version(self) -> None:
-        """The re-assessment trigger. The assessment holds for one version;
-        when Twisted moves, someone must decide again — a fixed release means
-        the ignore comes OUT, an unfixed one means these checks are re-read."""
-        for advisory, (package, assessed) in ACCEPTED_ADVISORIES.items():
+        """The re-assessment trigger. An assessment holds for one version; when
+        Twisted moves, someone must decide again — a fixed release means the
+        ignore comes OUT, an unfixed one means these checks are re-read."""
+        for advisory, (package, assessed, _) in ACCEPTED_ADVISORIES.items():
             installed = md.version(package)
             assert installed == assessed, (
                 f"{package} is {installed}, but {advisory} was assessed against "
@@ -416,34 +458,44 @@ class TestTheAcceptedTwistedAdvisory:
 
     def test_the_constraints_pin_the_assessed_version(self) -> None:
         constraints = self._read("constraints.txt").lower()
-        for package, assessed in ACCEPTED_ADVISORIES.values():
+        for package, assessed, _ in ACCEPTED_ADVISORIES.values():
             assert f"{package}=={assessed}" in constraints
 
-    def test_the_vulnerable_package_is_never_loaded(self) -> None:
+    def test_no_vulnerable_subsystem_is_ever_loaded(self) -> None:
         loaded = _twisted_modules_loaded_by_the_application()
         assert loaded, (
             "no Twisted module loaded at all — kiteconnect no longer drags it "
             "in, so this probe is not measuring anything. Re-assess whether "
             "Twisted is still a dependency."
         )
-        prefix = VULNERABLE_TWISTED_PACKAGE.split(".")
-        reached = [n for n in loaded if n.split(".")[: len(prefix)] == prefix]
-        assert not reached, (
-            f"{reached} is loaded by the application. CVE-2026-106454 lives "
-            f"there and is ignored by the audit ONLY because it was unreachable."
-        )
+        for advisory, (_, _, subsystem) in ACCEPTED_ADVISORIES.items():
+            reached = [n for n in loaded if _within(n, subsystem)]
+            assert not reached, (
+                f"{reached} is loaded by the application. {advisory} lives in "
+                f"{subsystem} and is ignored by the audit ONLY because that "
+                f"subsystem was unreachable."
+            )
 
-    def test_the_probe_sees_the_vulnerable_package_when_it_is_loaded(self) -> None:
+    def test_the_probe_sees_every_vulnerable_module_when_it_is_loaded(self) -> None:
         """The control. Without it, a probe that reported nothing — wrong
         prefix, a walk that silently skipped everything — would pass the test
-        above forever."""
-        loaded = _twisted_modules_loaded_by_the_application("import twisted.mail.imap4")
-        assert "twisted.mail.imap4" in loaded
+        above forever. One subprocess imports all five modules."""
+        loaded = _twisted_modules_loaded_by_the_application(
+            "\n".join(f"import {m}" for m in VULNERABLE_MODULES)
+        )
+        for module in VULNERABLE_MODULES:
+            assert module in loaded, module
+
+    def test_every_accepted_subsystem_has_a_module_the_control_loads(self) -> None:
+        """Keeps the control honest as the list grows: an advisory whose
+        subsystem the control never imports is an unprobed claim."""
+        for advisory, (_, _, subsystem) in ACCEPTED_ADVISORIES.items():
+            assert any(_within(m, subsystem) for m in VULNERABLE_MODULES), advisory
 
     def test_no_application_code_imports_twisted(self) -> None:
-        """The stronger claim behind "no IMAP server": nothing here touches
-        Twisted or autobahn directly. The live feed is ``websockets`` against
-        the documented binary protocol (ingest/kite_protocol.py)."""
+        """The stronger claim behind "no server": nothing here touches Twisted
+        or autobahn directly. The live feed is ``websockets`` against the
+        documented binary protocol (ingest/kite_protocol.py)."""
         src = Path(__file__).resolve().parents[2] / "src"
         offenders = [
             f"{path.relative_to(src)} -> {name}"

@@ -648,11 +648,19 @@ class DecisionLog(Base):
 
 
 # "Why isn't it trading?" is the highest-value debugging query in the system.
+#
+# Bound to its COLUMNS (27 Oct 2026). Declared from `text()` expressions alone,
+# this Index attached to no table: it was never in the metadata, so neither
+# `create_all` nor Alembic's comparator saw it, no migration ever created it,
+# and its predicate filtered on 'REJECT' while the risk engine writes
+# 'rejected'. It did not exist and would have indexed nothing if it had.
+# tests/integration/test_schema_matches_models.py now fails on any Index the
+# metadata does not carry.
 Index(
     "ix_audit_reason",
-    text("reason_code"),
-    text("ts DESC"),
-    postgresql_where=text("outcome = 'REJECT'"),
+    DecisionLog.reason_code,
+    DecisionLog.ts.desc(),
+    postgresql_where=text("outcome = 'rejected'"),
 )
 
 
@@ -740,7 +748,8 @@ class StrategyTrial(Base):
 
 
 #: Newest trials first — the DSR count and the "what did I just run" view.
-Index("ix_trial_ts", text("trial_ts DESC"))
+# Bound to its column for the same reason as ix_audit_reason.
+Index("ix_trial_ts", StrategyTrial.trial_ts.desc())
 
 
 class StrategyValidation(Base):
@@ -828,7 +837,8 @@ class TradeJournal(Base):
     __table_args__ = (Index("ix_journal_setup", "setup_type", "market_regime"),)
 
 
-Index("ix_journal_date", text("trade_date DESC"))
+# Bound to its column for the same reason as ix_audit_reason.
+Index("ix_journal_date", TradeJournal.trade_date.desc())
 
 
 #: Tables the application role must be able to modify. The two that are

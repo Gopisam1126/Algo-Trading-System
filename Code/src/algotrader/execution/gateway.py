@@ -92,7 +92,12 @@ from decimal import Decimal
 from typing import Any, Final, Protocol
 from uuid import UUID
 
-from algotrader.broker.adapter import AmbiguousOrderError, OrderRejectedError
+from algotrader.broker.adapter import (
+    AmbiguousOrderError,
+    BrokerError,
+    OrderRejectedError,
+    RateLimitError,
+)
 from algotrader.common.enums import (
     Direction,
     OrderIntent,
@@ -185,6 +190,15 @@ class GatewayError(RuntimeError):
 
 class NotApprovedError(GatewayError):
     """A decision that was not approved was offered for submission."""
+
+
+class DecisionMismatchError(GatewayError):
+    """A decision was offered with a recommendation it was not made about.
+
+    The approved quantity is a fact about ONE candidate - its symbol, its
+    direction, its stop distance. Sent for another, it is an order nobody
+    approved, and every object involved would still validate on its own.
+    """
 
 
 class RateLimitedError(GatewayError):
@@ -446,12 +460,26 @@ class OrderGateway:
             # is what that row means and querying is the right response to it.
             await self._reject(cid, exc)
             raise
+        except RateLimitError as exc:
+            # The other failure whose outcome we KNOW: refused before it reached
+            # the exchange - by the adapter's own token bucket, or by Kite's
+            # 429. Left alone it was the SIT-003 shape again, one layer down: a
+            # SUBMITTING row for an order that never left, which reconciliation
+            # hunts every cycle. Recorded REJECTED, and the caller gets the same
+            # RateLimitedError the gateway's own limiter raises, because the
+            # meaning is the same - nothing was sent, and the signal is stale.
+            await self._reject(cid, exc)
+            raise RateLimitedError(
+                f"{cid} was refused by a rate limit before it reached the exchange "
+                f"({one_safe_line(str(exc))}). Recorded as REJECTED; nothing is in "
+                f"flight and nothing will be retried."
+            ) from exc
 
         await self._attach(cid, broker_order_id)
         log.info("submitted %s for %s as broker order %s", cid, request.symbol, broker_order_id)
         return broker_order_id
 
-    async def _reject(self, cid: str, exc: OrderRejectedError) -> None:
+    async def _reject(self, cid: str, exc: BrokerError) -> None:
         """Record a definitive refusal. Never raises (SIT-003).
 
         Swallowing follows :meth:`_attach`'s reasoning one step further: the
@@ -721,6 +749,17 @@ class OrderGateway:
         about an order is wrong here, and a caller reviewing what would be sent
         should not have to send it to find out.
         """
+        if not decision.is_for(recommendation):
+            # Checked FIRST, before approval: a rejection for another candidate
+            # is just as much a sign of crossed wiring, and naming the mismatch
+            # is more useful than "not approved".
+            raise DecisionMismatchError(
+                f"the decision is about {decision.symbol} {decision.direction.value} "
+                f"(correlation {decision.correlation_id}) but the recommendation is "
+                f"{recommendation.symbol} {recommendation.direction.value} (correlation "
+                f"{recommendation.correlation_id}). Refusing: the approved quantity "
+                f"was sized for the decision's candidate, not this one."
+            )
         if not decision.approved:
             raise NotApprovedError(
                 f"decision for {recommendation.symbol} was not approved "

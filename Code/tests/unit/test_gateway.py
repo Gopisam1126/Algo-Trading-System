@@ -31,6 +31,7 @@ from algotrader.broker.adapter import (
     AmbiguousOrderError,
     DuplicateBrokerOrderError,
     OrderRejectedError,
+    RateLimitError,
 )
 from algotrader.common.enums import (
     AIVerdict,
@@ -51,6 +52,7 @@ from algotrader.common.models.trading import (
 )
 from algotrader.execution.gateway import (
     CLIENT_ORDER_ID_LENGTH,
+    DecisionMismatchError,
     GatewayError,
     GatewayPolicy,
     NotApprovedError,
@@ -236,8 +238,14 @@ def _rec(
     )
 
 
-def _approved(quantity: int = 83) -> RiskDecision:
+def _approved(quantity: int = 83, rec: Recommendation | None = None) -> RiskDecision:
+    """An approval ABOUT ``rec`` (default: ``_rec()``). A decision carries the
+    identity of what it decided, and the gateway refuses a mismatched pair."""
+    about = rec or _rec()
     return RiskDecision(
+        correlation_id=about.correlation_id,
+        symbol=about.symbol,
+        direction=about.direction,
         approved=True,
         sizing=SizingResult(
             quantity=quantity,
@@ -252,8 +260,19 @@ def _approved(quantity: int = 83) -> RiskDecision:
     )
 
 
-def _rejected(reason: RejectReason = RejectReason.NO_SLOT_AVAILABLE) -> RiskDecision:
-    return RiskDecision(approved=False, reason=reason, detail="no free slot", evaluated_at=NOW)
+def _rejected(
+    reason: RejectReason = RejectReason.NO_SLOT_AVAILABLE, rec: Recommendation | None = None
+) -> RiskDecision:
+    about = rec or _rec()
+    return RiskDecision(
+        correlation_id=about.correlation_id,
+        symbol=about.symbol,
+        direction=about.direction,
+        approved=False,
+        reason=reason,
+        detail="no free slot",
+        evaluated_at=NOW,
+    )
 
 
 def _gateway(placer=None, limiter=None, store=None, **policy_overrides):
@@ -292,9 +311,8 @@ class TestAc1AnApprovedDecisionBecomesAnOrder:
         placer = RecordingPlacer()
         gateway = _gateway(placer)
         await gateway.submit_entry(_approved(), _rec(), trade_date=TRADE_DATE)
-        await gateway.submit_entry(
-            _approved(), _rec(direction=Direction.SHORT), trade_date=TRADE_DATE
-        )
+        short = _rec(direction=Direction.SHORT)
+        await gateway.submit_entry(_approved(rec=short), short, trade_date=TRADE_DATE)
         assert [o.side for o in placer.submitted] == [Side.BUY, Side.SELL]
 
     async def test_the_entry_is_a_market_order(self) -> None:
@@ -325,7 +343,14 @@ class TestAc1AnApprovedDecisionBecomesAnOrder:
         asserts the rung that actually holds.
         """
         with pytest.raises(ValidationError, match="must carry sizing"):
-            RiskDecision(approved=True, sizing=None, evaluated_at=NOW)
+            RiskDecision(
+                correlation_id=CID,
+                symbol="INFY",
+                direction=Direction.LONG,
+                approved=True,
+                sizing=None,
+                evaluated_at=NOW,
+            )
 
     async def test_a_zero_quantity_approval_is_refused(self) -> None:
         with pytest.raises(NotApprovedError, match="quantity 0"):
@@ -435,9 +460,8 @@ class TestAc3TheRateLimiter:
         limiter = Limiter(allowed=3)
         gateway = _gateway(placer, limiter=limiter)
         for _ in range(3):
-            await gateway.submit_entry(
-                _approved(), _rec(correlation_id=uuid4()), trade_date=TRADE_DATE
-            )
+            fresh = _rec(correlation_id=uuid4())
+            await gateway.submit_entry(_approved(rec=fresh), fresh, trade_date=TRADE_DATE)
         assert limiter.calls == 3
         assert len(placer.submitted) == 3
 
@@ -457,13 +481,11 @@ class TestAc3TheRateLimiter:
         placer = RecordingPlacer()
         gateway = _gateway(placer, limiter=Limiter(allowed=2))
         for _ in range(2):
-            await gateway.submit_entry(
-                _approved(), _rec(correlation_id=uuid4()), trade_date=TRADE_DATE
-            )
+            fresh = _rec(correlation_id=uuid4())
+            await gateway.submit_entry(_approved(rec=fresh), fresh, trade_date=TRADE_DATE)
         with pytest.raises(RateLimitedError):
-            await gateway.submit_entry(
-                _approved(), _rec(correlation_id=uuid4()), trade_date=TRADE_DATE
-            )
+            fresh = _rec(correlation_id=uuid4())
+            await gateway.submit_entry(_approved(rec=fresh), fresh, trade_date=TRADE_DATE)
         assert len(placer.submitted) == 2
 
     async def test_the_limiter_is_consulted_after_the_order_is_valid(self) -> None:
@@ -504,6 +526,51 @@ class TestAc4TheControl:
             _approved(), _rec(), trade_date=TRADE_DATE
         )
         assert len(placer.submitted) == 1
+
+
+@_ASYNC
+class TestADecisionIsOnlyEverSentForWhatItDecided:
+    """The decision and the recommendation reach the gateway as two arguments.
+
+    Before, nothing tied them together: an approval for 1,200 shares of one
+    candidate, handed in beside another candidate's recommendation, built an
+    order for the second at the first one's size - and every object involved
+    validated on its own. A decision now carries what it decided, and the
+    gateway refuses a pair that does not match.
+    """
+
+    @pytest.mark.parametrize(
+        "crossed",
+        [
+            pytest.param({"symbol": "TCS"}, id="another-symbol"),
+            pytest.param({"direction": Direction.SHORT}, id="the-other-direction"),
+            pytest.param({"correlation_id": UUID(int=7)}, id="another-signal"),
+        ],
+    )
+    async def test_a_crossed_pair_is_refused_and_nothing_is_sent(self, crossed) -> None:
+        placer, store = RecordingPlacer(), RecordingStore()
+        approved_for = _rec()
+        offered_with = _rec(**crossed)
+        with pytest.raises(DecisionMismatchError, match="Refusing"):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(rec=approved_for), offered_with, trade_date=TRADE_DATE
+            )
+        assert placer.submitted == []
+        assert store.inserts == [], "a refused pairing must not leave an order row"
+
+    async def test_a_crossed_rejection_names_the_mismatch_not_the_rejection(self) -> None:
+        """Crossed wiring is the finding; "not approved" would hide it."""
+        with pytest.raises(DecisionMismatchError):
+            _gateway().build_entry(_rejected(rec=_rec()), _rec(symbol="TCS"), trade_date=TRADE_DATE)
+
+    async def test_the_matching_pair_builds(self) -> None:
+        """The control: identity checking that refused everything would pass
+        the tests above."""
+        rec = _rec(symbol="TCS", direction=Direction.SHORT, correlation_id=UUID(int=7))
+        request = _gateway().build_entry(_approved(rec=rec), rec, trade_date=TRADE_DATE)
+        assert request.symbol == "TCS"
+        assert request.side is Side.SELL
+        assert request.correlation_id == UUID(int=7)
 
 
 @_ASYNC
@@ -692,7 +759,8 @@ class TestAc2TheSameDecisionTwiceIsOneOrder:
         placer, store = RecordingPlacer(), RecordingStore()
         gateway = _gateway(placer, store=store)
         await gateway.submit_entry(_approved(), _rec(), trade_date=TRADE_DATE)
-        await gateway.submit_entry(_approved(), _rec(correlation_id=uuid4()), trade_date=TRADE_DATE)
+        fresh = _rec(correlation_id=uuid4())
+        await gateway.submit_entry(_approved(rec=fresh), fresh, trade_date=TRADE_DATE)
         assert len(placer.submitted) == 2
 
 
@@ -1096,6 +1164,89 @@ class TestARefusedOrderIsRecordedAsRefused:
         await _gateway(placer, store=store).submit_entry(_approved(), _rec(), trade_date=TRADE_DATE)
         assert store.rejections == []
         assert [r["status"] for r in store.rows.values()] == ["SUBMITTED"]
+
+
+@_ASYNC
+class TestARateLimitAfterTheRecordIsRecordedAsRefused:
+    """The SIT-003 shape one layer down (27 Oct 2026).
+
+    The gateway's own limiter refuses BEFORE TX1, so its refusal leaves no row.
+    But the Kite adapter takes a token from the account-wide bucket inside
+    ``place_order`` - AFTER TX1 - and Kite's own 429 arrives there too. Both
+    raised past the gateway and left SUBMITTING on an order that never left,
+    which reconciliation then hunts every cycle.
+    """
+
+    async def test_a_refused_token_leaves_a_rejected_row_not_an_in_flight_one(self) -> None:
+        placer, store = RecordingPlacer(), RecordingStore()
+        placer.fail_with = RateLimitError("order rate limit reached; refused rather than queued")
+        with pytest.raises(RateLimitedError, match="Recorded as REJECTED"):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        (row,) = store.rows.values()
+        assert row["status"] == "REJECTED"
+        ((_cid, reason),) = store.rejections
+        assert reason is not None and "rate limit" in reason
+
+    async def test_the_refused_signal_is_never_sent_later(self) -> None:
+        """Stale by definition: REJECTED has no move to SUBMITTED, so the same
+        decision cannot queue up behind the bucket and fire on old reasoning."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        placer.fail_with = RateLimitError("429")
+        with pytest.raises(RateLimitedError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        placer.fail_with = None
+        attempted = len(placer.submitted)  # the refused attempt itself
+        with pytest.raises(IllegalTransitionError):
+            await _gateway(placer, store=store).submit_entry(
+                _approved(), _rec(), trade_date=TRADE_DATE
+            )
+        assert len(placer.submitted) == attempted, "a refused signal was sent again"
+
+
+@_ASYNC
+class TestTheAdapterSpeaksTheTaxonomy:
+    """The limiter's own exception is a bare RuntimeError; callers of the
+    adapter handle BrokerError subclasses. Both adapter paths translate it."""
+
+    class _Refusing:
+        async def acquire_order(self) -> float:
+            from algotrader.broker.ratelimit import RateLimitExceededError
+
+            raise RateLimitExceededError("order", tokens_left=0.0)
+
+        async def acquire_data(self) -> float:
+            from algotrader.broker.ratelimit import RateLimitExceededError
+
+            raise RateLimitExceededError("data", tokens_left=0.0)
+
+    def _adapter(self):
+        from algotrader.broker.kite.trading import KiteTradingAdapter
+
+        class _NeverCalled:
+            def place_order(self, **_kw):
+                raise AssertionError("the broker must not be called after a refused token")
+
+            def orders(self):
+                raise AssertionError("the broker must not be called after a refused token")
+
+        adapter = KiteTradingAdapter.__new__(KiteTradingAdapter)
+        adapter._client = _NeverCalled()
+        adapter._limiter = self._Refusing()  # type: ignore[assignment]
+        return adapter
+
+    async def test_a_refused_order_token_is_a_rate_limit_error(self) -> None:
+        adapter = self._adapter()
+        with pytest.raises(RateLimitError):
+            await adapter._mutate(adapter._client.place_order)
+
+    async def test_a_refused_data_token_is_a_rate_limit_error(self) -> None:
+        adapter = self._adapter()
+        with pytest.raises(RateLimitError):
+            await adapter._call(adapter._client.orders)
 
 
 # ===========================================================================

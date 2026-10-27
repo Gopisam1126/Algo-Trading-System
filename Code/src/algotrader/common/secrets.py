@@ -24,6 +24,27 @@ from typing import Any, Final
 
 REDACTED: Final = "***REDACTED***"
 
+#: Values shorter than this are not scrubbed by value: an eight-character floor
+#: keeps a short secret from redacting every ordinary word that contains it.
+MIN_SCRUB_LENGTH: Final = 8
+
+#: Every ``SecretString`` value long enough to scrub, registered when the
+#: secret is constructed. The log redactor reads it on every line.
+#:
+#: Before this, value-scrubbing depended on someone calling
+#: ``logging.register_secret_values`` at startup - and nothing did. The layer
+#: the redactor documents as "the real work" was never fed, so only its regex
+#: BACKSTOP stood between a credential and the log. Registering here means
+#: holding a credential the way invariant 4 requires is, by itself, enough for
+#: its value to be scrubbed wherever it later appears - including inside text
+#: a third-party SDK formats where no key name survives to match on.
+_KNOWN_VALUES: set[str] = set()
+
+
+def known_secret_values() -> frozenset[str]:
+    """A snapshot of every registered secret value, for the log redactor."""
+    return frozenset(_KNOWN_VALUES)
+
 
 class SecretString:
     """A string that refuses to render itself.
@@ -42,6 +63,8 @@ class SecretString:
     def __init__(self, value: str, *, name: str = "secret") -> None:
         self._value = value
         self._name = name
+        if len(value) >= MIN_SCRUB_LENGTH:
+            _KNOWN_VALUES.add(value)
 
     # -- Rendering is always redacted --------------------------------------
 

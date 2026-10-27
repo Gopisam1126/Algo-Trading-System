@@ -220,6 +220,17 @@ class RiskDecision(_Frozen):
     from "blocked at the last gate".
     """
 
+    #: WHAT was decided. Without these three, a decision was a free-floating
+    #: "yes, 1,200 shares" that the gateway took alongside a recommendation in
+    #: a separate argument - and nothing tied the two together. Pairing an
+    #: approval with the wrong recommendation would have sent the approved
+    #: quantity for another symbol, or the other direction, and every object
+    #: involved would have validated. The gateway now refuses a decision whose
+    #: identity is not the recommendation's (``OrderGateway.build_entry``).
+    correlation_id: UUID
+    symbol: str
+    direction: Direction
+
     approved: bool
     reason: RejectReason | None = None
     detail: str | None = None
@@ -228,6 +239,7 @@ class RiskDecision(_Frozen):
     evaluated_at: datetime
 
     _utc = field_validator("evaluated_at")(_require_utc)
+    _symbol_is_safe = field_validator("symbol")(_validate_symbol)
 
     @field_validator("detail")
     @classmethod
@@ -248,11 +260,20 @@ class RiskDecision(_Frozen):
             raise ValueError("a rejected decision must carry a reject reason")
         return self
 
+    def is_for(self, recommendation: Recommendation) -> bool:
+        """Whether this decision was made about ``recommendation``."""
+        return (
+            self.correlation_id == recommendation.correlation_id
+            and self.symbol == recommendation.symbol
+            and self.direction is recommendation.direction
+        )
+
     @classmethod
     def approve(
         cls,
         sizing: SizingResult,
         *,
+        recommendation: Recommendation,
         checks_passed: list[str],
         now: datetime,
     ) -> RiskDecision:
@@ -272,6 +293,9 @@ class RiskDecision(_Frozen):
         # rather than a gap. Kept because the guarantee should not depend on a
         # validation detail that a future field-type change could remove.
         return cls(
+            correlation_id=recommendation.correlation_id,
+            symbol=recommendation.symbol,
+            direction=recommendation.direction,
             approved=True,
             sizing=sizing,
             checks_passed=list(checks_passed),
@@ -283,6 +307,7 @@ class RiskDecision(_Frozen):
         cls,
         reason: RejectReason,
         *,
+        recommendation: Recommendation,
         detail: str,
         checks_passed: list[str],
         now: datetime,
@@ -295,6 +320,9 @@ class RiskDecision(_Frozen):
         on.
         """
         return cls(
+            correlation_id=recommendation.correlation_id,
+            symbol=recommendation.symbol,
+            direction=recommendation.direction,
             approved=False,
             reason=reason,
             detail=detail,

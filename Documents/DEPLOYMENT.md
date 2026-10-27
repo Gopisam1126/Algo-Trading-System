@@ -97,25 +97,36 @@ Two design decisions worth knowing:
     dependency as an error, and the local editable `algotrader` package is
     always skipped because it is not on PyPI — so `--strict` fails every run
     for a reason unrelated to vulnerabilities.
-  - **An ignored advisory is an executable claim, not a comment.** One is
-    accepted (15 Oct 2026): `--ignore-vuln CVE-2026-106454`, a ReDoS in
-    Twisted's IMAP4 *server* (`twisted.mail.imap4.wildcardToRegexp`). Twisted
-    arrives only through kiteconnect's `autobahn[twisted]` pin, cannot be
-    removed (`import kiteconnect` needs it), and has no patched release. It is
-    unreachable here: no IMAP server, the reactor never runs, and nothing
-    imports `twisted.mail`. `TestTheAcceptedTwistedAdvisory` in
-    `tests/security/test_dependency_hygiene.py` asserts every part of that —
-    loading every application module in a clean interpreter never pulls in
-    `twisted.mail` (with a control proving the probe would see it), no source
-    file imports Twisted, every audit site ignores **exactly** the accepted
-    set — and fails the moment Twisted's version moves, so a fixed release
-    gets the ignore removed instead of forgotten. `make audit` runs the same
-    command as CI; it did not until this was found.
+  - **An ignored advisory is an executable claim, not a comment.** Six are
+    accepted, all against Twisted 26.4.0 and all in its *server* subsystems:
+    `CVE-2026-106454` and `-115774` (IMAP4, `twisted.mail`), `-115775` (XMPP
+    XML stream) and `-115776` (IRC, both `twisted.words`), `-115778` (telnet,
+    `twisted.conch`), `-115877` (HTTP header smuggling, `twisted.web`). The
+    first was assessed 15 Oct 2026 with no patched release; the other five on
+    27 Oct 2026, when the only fix was the pre-release 26.10.0rc1/rc2 - not
+    pinned into a system that moves money when the vulnerable code cannot run.
+    Twisted arrives only through kiteconnect's `autobahn[twisted]` pin and
+    cannot be removed (`import kiteconnect` needs it). Every advisory needs a
+    Twisted server of its protocol; this process runs none and imports none of
+    those four subsystems. `TestTheAcceptedTwistedAdvisories` in
+    `tests/security/test_dependency_hygiene.py` maps each ID to its subsystem
+    and asserts every part of that - loading every application module in a
+    clean interpreter never pulls in any of them (with a control importing all
+    five vulnerable modules), no source file imports Twisted, every audit site
+    ignores **exactly** the accepted set - and fails the moment Twisted's
+    version moves, so 26.10.0 final gets the ignores removed instead of
+    forgotten. Each ID is ignored individually, never the package: any other
+    Twisted advisory still fails the gate. `make audit` runs the same command
+    as CI.
   - **An audit that passed on DEV can fail on QA with no code change.**
     Advisories are published against the world, not against a commit. The
     E15-S12 promotion went red two weeks after its DEV run passed because
     three urllib3 advisories and the Twisted one were published in between.
     A red audit on promotion is a new finding, not a flaky gate.
+    It happened again twelve days later: on 27 Oct 2026 certifi (a compromised
+    CA still trusted - the trust store for every broker TLS connection),
+    filelock, setuptools and five more Twisted advisories, none of which
+    existed when the previous run passed.
   - `bandit` is gated at **MEDIUM severity and MEDIUM confidence**. Every LOW
     in this codebase is an `assert` used for type narrowing behind an explicit
     guard, and nothing runs under `python -O`. Gating on LOW would be noise,

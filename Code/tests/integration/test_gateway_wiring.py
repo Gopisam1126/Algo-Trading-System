@@ -227,8 +227,12 @@ class TestTheGatewayAndTheAdapterAgree:
             policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
             store=OrderRepository(session, instruments),
         )
+        cid = uuid.uuid4()
         broker_id = await gateway.submit_entry(
             RiskDecision(
+                correlation_id=cid,
+                symbol="INFY",
+                direction=Direction.LONG,
                 approved=True,
                 sizing=SizingResult(
                     quantity=83,
@@ -240,7 +244,7 @@ class TestTheGatewayAndTheAdapterAgree:
                 evaluated_at=now,
             ),
             Recommendation(
-                correlation_id=uuid.uuid4(),
+                correlation_id=cid,
                 symbol="INFY",
                 strategy_id="orb_long_v1",
                 direction=Direction.LONG,
@@ -292,8 +296,12 @@ class TestTheGatewayAndTheRealOrderStoreAgree:
         )
 
         now = dt.datetime(2026, 8, 25, 6, 30, tzinfo=dt.UTC)
+        cid = uuid.uuid4()
         return (
             RiskDecision(
+                correlation_id=cid,
+                symbol=symbol,
+                direction=Direction.LONG,
                 approved=True,
                 sizing=SizingResult(
                     quantity=83,
@@ -305,7 +313,7 @@ class TestTheGatewayAndTheRealOrderStoreAgree:
                 evaluated_at=now,
             ),
             Recommendation(
-                correlation_id=uuid.uuid4(),
+                correlation_id=cid,
                 symbol=symbol,
                 strategy_id="orb_long_v1",
                 direction=Direction.LONG,
