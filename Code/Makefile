@@ -89,7 +89,8 @@ audit:  ## Audit dependencies (same command as CI; accepted advisories: tests/se
 	pip-audit --skip-editable \
 	  --ignore-vuln CVE-2026-106454 --ignore-vuln CVE-2026-115774 \
 	  --ignore-vuln CVE-2026-115775 --ignore-vuln CVE-2026-115776 \
-	  --ignore-vuln CVE-2026-115778 --ignore-vuln CVE-2026-115877
+	  --ignore-vuln CVE-2026-115778 --ignore-vuln CVE-2026-115877 \
+	  --ignore-vuln CVE-2026-83813
 
 .PHONY: security
 security: secrets-scan audit test-safety  ## Full security gate

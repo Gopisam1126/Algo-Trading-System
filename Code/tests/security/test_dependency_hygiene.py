@@ -288,10 +288,12 @@ class TestLoadingAConfigDoesNotDragInTheBrokerStack:
 #: unreachable" — and the class below makes each claim executable instead of
 #: leaving it in a comment that outlives its truth.
 #:
-#: Every one is in a Twisted *server* subsystem this process never loads.
-#: Assessed 15 Oct 2026 (the first) and 27 Oct 2026 (the other five). On 27 Oct
-#: the five were fixed only in 26.10.0rc1/rc2 — a pre-release, not pinned into a
-#: system that moves money when the vulnerable code cannot run anyway.
+#: Every one is in a Twisted subsystem this process never loads - six servers
+#: and the DNS client. Assessed 15 Oct 2026 (the first) and 27 Oct 2026 (the
+#: rest; CVE-2026-83813 was published between the local audit and the CI run
+#: that morning). On 27 Oct they were fixed only in 26.10.0rc1/rc2 — a
+#: pre-release, not pinned into a system that moves money when the vulnerable
+#: code cannot run anyway.
 ACCEPTED_ADVISORIES: dict[str, tuple[str, str, str]] = {
     # IMAP4 server: LIST/LSUB wildcard compiled as a regex (ReDoS).
     "CVE-2026-106454": ("twisted", "26.4.0", "twisted.mail"),
@@ -305,6 +307,11 @@ ACCEPTED_ADVISORIES: dict[str, tuple[str, str, str]] = {
     "CVE-2026-115778": ("twisted", "26.4.0", "twisted.conch"),
     # HTTP server: bare CR/LF in a header value hides a header (smuggling).
     "CVE-2026-115877": ("twisted", "26.4.0", "twisted.web"),
+    # DNS client: a response is accepted on the 16-bit transaction id alone
+    # (cache poisoning). Twisted's reactor resolves through the system
+    # resolver by default; twisted.names is used only when installed
+    # explicitly, and nothing here does - or runs the reactor at all.
+    "CVE-2026-83813": ("twisted", "26.4.0", "twisted.names"),
 }
 
 #: The module each subsystem's advisory is actually in — imported by the
@@ -315,6 +322,7 @@ VULNERABLE_MODULES = (
     "twisted.words.protocols.irc",
     "twisted.conch.telnet",
     "twisted.web.http",
+    "twisted.names.dns",
 )
 
 

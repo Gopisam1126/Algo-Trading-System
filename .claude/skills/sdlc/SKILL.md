@@ -319,7 +319,13 @@ You are the QA lead. The question is **"does the whole thing still hold".**
 
 ```bash
 cd Code
-ruff check src/ tests/ scripts/ && ruff format --check src/ tests/
+# The environment CI builds - not whatever the venv drifted to. On 27 Oct 2026
+# the local venv differed from constraints.txt on 17 packages, so local audits
+# checked versions nothing ships.
+pip install -c constraints.txt -e ".[dev]" && pip install --no-deps --upgrade "autobahn==26.7.1"
+# CI's exact commands. `src/ tests/ scripts/` skipped migrations/, and a new
+# migration failed CI's `ruff check .` after a "green" local gate.
+ruff check . && ruff format --check .
 mypy src/
 pytest tests/ -q --cov=src/algotrader --cov-report=term
 make test-safety

@@ -205,15 +205,17 @@ jobs:
             --ignore-vuln CVE-2026-106454 --ignore-vuln CVE-2026-115774 \
             --ignore-vuln CVE-2026-115775 --ignore-vuln CVE-2026-115776 \
             --ignore-vuln CVE-2026-115778 --ignore-vuln CVE-2026-115877 \
+            --ignore-vuln CVE-2026-83813 \
             | tee pip-audit.txt
           status=${PIPESTATUS[0]}
           pip-audit --skip-editable \
             --ignore-vuln CVE-2026-106454 --ignore-vuln CVE-2026-115774 \
             --ignore-vuln CVE-2026-115775 --ignore-vuln CVE-2026-115776 \
             --ignore-vuln CVE-2026-115778 --ignore-vuln CVE-2026-115877 \
+            --ignore-vuln CVE-2026-83813 \
             --format=json --output=pip-audit.json || true
           echo "--- versions of interest ---"
-          python -c "import importlib.metadata as m;[print(' ',n,m.version(n)) for n in ('autobahn','kiteconnect','twisted','urllib3','setuptools','bandit','pip')]"
+          python -c "import importlib.metadata as m;[print(' ',n,m.version(n)) for n in ('autobahn','kiteconnect','twisted','urllib3','certifi','msgpack','setuptools','bandit','pip')]"
           exit "$status"
 
       - name: Static application security testing

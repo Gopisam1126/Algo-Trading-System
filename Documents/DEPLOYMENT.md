@@ -97,22 +97,24 @@ Two design decisions worth knowing:
     dependency as an error, and the local editable `algotrader` package is
     always skipped because it is not on PyPI — so `--strict` fails every run
     for a reason unrelated to vulnerabilities.
-  - **An ignored advisory is an executable claim, not a comment.** Six are
-    accepted, all against Twisted 26.4.0 and all in its *server* subsystems:
-    `CVE-2026-106454` and `-115774` (IMAP4, `twisted.mail`), `-115775` (XMPP
-    XML stream) and `-115776` (IRC, both `twisted.words`), `-115778` (telnet,
-    `twisted.conch`), `-115877` (HTTP header smuggling, `twisted.web`). The
-    first was assessed 15 Oct 2026 with no patched release; the other five on
-    27 Oct 2026, when the only fix was the pre-release 26.10.0rc1/rc2 - not
-    pinned into a system that moves money when the vulnerable code cannot run.
-    Twisted arrives only through kiteconnect's `autobahn[twisted]` pin and
-    cannot be removed (`import kiteconnect` needs it). Every advisory needs a
-    Twisted server of its protocol; this process runs none and imports none of
-    those four subsystems. `TestTheAcceptedTwistedAdvisories` in
+  - **An ignored advisory is an executable claim, not a comment.** Seven are
+    accepted, all against Twisted 26.4.0, all in subsystems this process never
+    loads: `CVE-2026-106454` and `-115774` (IMAP4 server, `twisted.mail`),
+    `-115775` (XMPP XML stream) and `-115776` (IRC server, both
+    `twisted.words`), `-115778` (telnet, `twisted.conch`), `-115877` (HTTP
+    server header smuggling, `twisted.web`), `-83813` (DNS client,
+    `twisted.names`). The first was assessed 15 Oct 2026 with no patched
+    release; the rest on 27 Oct 2026, when the only fix was the pre-release
+    26.10.0rc1/rc2 - not pinned into a system that moves money when the
+    vulnerable code cannot run. Twisted arrives only through kiteconnect's
+    `autobahn[twisted]` pin and cannot be removed (`import kiteconnect` needs
+    it). This process runs no Twisted server, never installs the `twisted.names`
+    resolver, never runs the reactor, and imports none of those five
+    subsystems. `TestTheAcceptedTwistedAdvisories` in
     `tests/security/test_dependency_hygiene.py` maps each ID to its subsystem
     and asserts every part of that - loading every application module in a
     clean interpreter never pulls in any of them (with a control importing all
-    five vulnerable modules), no source file imports Twisted, every audit site
+    six vulnerable modules), no source file imports Twisted, every audit site
     ignores **exactly** the accepted set - and fails the moment Twisted's
     version moves, so 26.10.0 final gets the ignores removed instead of
     forgotten. Each ID is ignored individually, never the package: any other
@@ -126,7 +128,16 @@ Two design decisions worth knowing:
     It happened again twelve days later: on 27 Oct 2026 certifi (a compromised
     CA still trusted - the trust store for every broker TLS connection),
     filelock, setuptools and five more Twisted advisories, none of which
-    existed when the previous run passed.
+    existed when the previous run passed. And within the same morning: the
+    DEV run of the fix found msgpack (CVE-2026-114613) and a sixth Twisted
+    advisory (`-83813`) published between the local audit and the push.
+  - **Audit the environment CI builds, not the one your venv drifted to.**
+    The same day showed the local venv differing from `constraints.txt` on
+    17 packages, so a local audit checked versions nothing ships. Install with
+    `pip install -c constraints.txt -e ".[dev]"` plus the autobahn override
+    before trusting a local gate - and reproduce a CI-only finding in the
+    `python:3.11-slim-bookworm` image, which is how this one was diagnosed
+    (job logs need repository admin rights).
   - `bandit` is gated at **MEDIUM severity and MEDIUM confidence**. Every LOW
     in this codebase is an `assert` used for type narrowing behind an explicit
     guard, and nothing runs under `python -O`. Gating on LOW would be noise,

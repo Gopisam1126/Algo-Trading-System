@@ -296,8 +296,12 @@ Recorded because each was believed, written down, and wrong.
   so `CVE-2026-106454` (IMAP4 *server* ReDoS in `twisted.mail`) is ignored by
   ID — and `TestTheAcceptedTwistedAdvisories` proves it unreachable and fails
   when Twisted's version moves. It recurred twelve days later (27 Oct 2026):
-  certifi, filelock, setuptools and five more Twisted server advisories, now
-  six accepted IDs, each mapped to its subsystem. Never add an `--ignore-vuln`
+  certifi, filelock, setuptools and five more Twisted server advisories - and
+  hours later, between the local audit and the CI run, msgpack and a Twisted
+  DNS-client advisory. Seven accepted IDs now, each mapped to its subsystem.
+  The local venv had also drifted from `constraints.txt` on 17 packages, and
+  the local lint skipped `migrations/`: install from constraints and run CI's
+  exact commands before trusting a local gate. Never add an `--ignore-vuln`
   without adding it to `ACCEPTED_ADVISORIES` and an executed reachability
   check beside it.
 - **"The fourteen checks plus the gateway make a decision safe to send."** A
