@@ -140,17 +140,19 @@ sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
 order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
-the gateway are unbuilt: no square-off timer (E15-S06), and nothing yet
-registers an `EntryPlan` when an entry is sent - so in production every fill is
-still exited as unprotected until the pipeline wiring does. The order state
-machine (E15-S03), protective stop attachment (E15-S04), the position manager
-(E15-S05), the reconciliation loop (E15-S09) and fill booking (E15-S12) now
-exist. **A gateway is not a trading
+the gateway are unbuilt: no square-off timer (E15-S06), no process entrypoint
+(`python -m algotrader.execution`, which docker-compose runs, has no
+`__main__` - no service does yet), and three risk inputs with no producer
+(service health E20-S05, live ATR, per-share margin), so the production engine
+rejects every signal until they exist. The order state machine (E15-S03),
+protective stop attachment (E15-S04), the position manager (E15-S05), the
+reconciliation loop (E15-S09), fill booking (E15-S12) and the execution
+service that drives them from `stream:signals` (E15-S13) now exist. **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**2,577 tests, 93% coverage** as of the 27 Oct 2026 whole-system
-verification — all pass locally with Docker running;
+Built and tested (**2,731 tests, 93% coverage** as of E15-S13, 28 Oct 2026 —
+all pass locally with Docker running;
 without it the container-backed integration tests skip and coverage reads lower):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
@@ -529,6 +531,26 @@ Recorded because each was believed, written down, and wrong.
   fill into the position manager from its registered `EntryPlan`, closes
   positions whose stop or emergency exit has filled, and FREEZES a partly
   filled entry that is still working before doing anything with it.
+- **E15-S13 execution service** — `execution/service.py` consumes
+  `stream:signals`, evaluates with the factory-built engine (it accepts none
+  from a caller), and registers each entry's plan and pending slot BEFORE
+  sending it. One asyncio lock serialises signals and reconciliation cycles;
+  `start()` restores the book before the first cycle; signals are refused
+  until a cycle has succeeded. The context is built by
+  `execution/session_context.py`, where every unreadable input is `None`.
+
+- **"Single-threaded asyncio is serialized."** Not across an `await`. A cycle
+  that ran between the broker accepting a MARKET entry and the plan being
+  registered would exit the fill. One lock, held by both, makes §9.1 true.
+- **"A plan is released when its entry ends."** Only when the broker LISTS the
+  entry as ended. One that never reached it was written `SUBMIT_FAILED` and
+  its plan - now also a pending slot - was held for the rest of the day.
+- **"The risk engine refuses a vetoed signal."** None of the fourteen checks
+  reads `ai_verdict`. The service refuses a VETO before the engine is asked.
+- **"Reconciling an empty book exits what it held."** Not when a stop is
+  working - step 5 counts it as cover. The real cost is quieter: the position
+  never enters the book, so no time exit walks it and no risk context counts
+  it as held. Found when the AC3 control test asserted the louder failure.
 
 - **"A live exit covers the holding."** Only a WORKING one does. `is_live`
   counts a FILLED order as live, so an exit that had sold the first 40 shares

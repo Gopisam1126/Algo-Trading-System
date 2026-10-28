@@ -53,6 +53,11 @@ MIN_STRATEGY_TRIALS = 50  # below this, statistics are meaningless
 MAX_PBO_ALLOWED = Decimal("0.6")  # Probability of Backtest Overfitting
 MAX_ACTIVE_STRATEGIES = 12
 MIN_EXIT_BUFFER_MINUTES = 1
+#: The oldest a Recommendation may be when the execution service acts on it
+#: (E15-S13). The entry is a MARKET order sized from the trigger price, so a
+#: signal acted on late is sized for a price that has moved - and the stop
+#: distance is measured from a price the fill never saw.
+MAX_SIGNAL_AGE_SECONDS = 300
 
 
 def _assert_below_registration_threshold(cap: int, threshold: int) -> None:
@@ -479,6 +484,10 @@ class ExecutionConfig(_Model):
     #: Zerodha rejects unprotected market orders from 1 Apr 2026, and 0 is
     #: explicitly rejected, so this may not be zero.
     market_protection: Decimal = Decimal("-1")
+
+    #: How old a Recommendation may be when execution acts on it. Older ones
+    #: are refused as STALE_DATA rather than traded late (E15-S13).
+    max_signal_age_seconds: int = Field(default=60, ge=1, le=MAX_SIGNAL_AGE_SECONDS)
 
     @field_validator("max_orders_per_second")
     @classmethod

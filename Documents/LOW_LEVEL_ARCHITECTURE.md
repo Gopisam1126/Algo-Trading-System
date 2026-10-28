@@ -1258,6 +1258,39 @@ module reads the `stage`, `outcome` and `service` widths off the real model at
 import and refuses to load if any label it can write would not fit —
 `UNKNOWN_POSITION` is 16 characters against `String(12)`.
 
+**The execution service is the caller (E15-S13).** `execution/service.py`
+consumes `stream:signals` (group `execution-svc`, acknowledged only after the
+outcome is recorded), evaluates each `Recommendation` with the engine
+`build_risk_engine` assembles — the service builds it itself and accepts none
+from a caller — and for an approval claims a slot, registers the `EntryPlan`
+**and** a pending entry, and only then sends. Its rules:
+
+- **One lock for signals and cycles.** `ReconciliationLoop` takes the service's
+  lock as its `guard` and re-reads the clock once it holds it. On asyncio,
+  single-threaded is not serialized: every `await` lets the other loop in.
+- **Sent but not booked counts as held.** `PendingEntries` (pruned from the
+  manager's plans on every read, never maintained beside them) makes an
+  in-flight entry a held symbol, an occupied slot and exposure in the risk
+  context, and `PendingAwareSlots` keeps the allocator off its index.
+- **A plan is released exactly when the entry stops being pending** — booked,
+  ended unfilled, or written `SUBMIT_FAILED` (reconciliation now forgets the
+  plan there too; before, an entry that never landed held its slot all day).
+  A send refused by a limiter or the broker, or never recorded, releases it at
+  once; an unknown outcome keeps it, so a late fill is booked, not exited.
+- **Restore, then reconcile, then trade.** `start()` restores the book and runs
+  one cycle; signals are refused until a cycle has succeeded since start.
+- **Refused before the engine, audited under stage `EXECUTION`:** a mode that
+  places no orders (`alert_only`, `approval`), an AI `VETO` (no check reads the
+  verdict), a signal older than `execution.max_signal_age_seconds` (hard cap
+  300 s) or dated more than 5 s ahead, a duplicate (an order row already exists
+  for its key — re-evaluating could re-size an order already sent), and a
+  context that cannot be built (unknown instrument, unreadable slots).
+- **Missing live inputs reach the engine as `None`.** `NoProducerYet` answers
+  service health (E20-S05), live ATR and per-share margin as unknown, so the
+  engine rejects every signal until those producers exist. Surveillance flags
+  T2T, ASM, GSM and F&O ban all block (a recorded assumption); a missing daily
+  row is unknown eligibility, and its deadline assumes CAS, the earlier one.
+
 ---
 
 ## 9. Concurrency & Process Model
@@ -1269,7 +1302,7 @@ import and refuses to load if any label it can write would not fit —
 | `market-ingest` | Single event loop. One WebSocket task, one processing task, bounded `asyncio.Queue` between them (backpressure: if the queue fills, drop the *oldest* ticks and log — freshness beats completeness for quotes). |
 | `ti-engine` | Event loop + `ProcessPoolExecutor` for warm-up only. Per-symbol updates are cheap enough to stay on the loop. |
 | `signal-engine` | Event loop. AI calls dispatched with `asyncio.gather` across symbols, bounded by a `Semaphore(config.ai.max_concurrent)` to respect API rate limits. |
-| `execution-svc` | **Single-threaded, strictly serialized.** All order operations pass through one queue processed sequentially. Concurrency here buys nothing and risks double-entry races. This is a deliberate performance sacrifice for correctness. |
+| `execution-svc` | **Single-threaded, strictly serialized.** All order operations pass through one queue processed sequentially. Concurrency here buys nothing and risks double-entry races. This is a deliberate performance sacrifice for correctness. Made structural in E15-S13: one `asyncio.Lock` held by every signal and every reconciliation cycle. |
 | `premarket-job` | `ProcessPoolExecutor` for the MTF stage; event loop elsewhere. |
 
 ### 9.2 Distributed locking

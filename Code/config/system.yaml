@@ -151,6 +151,9 @@ execution:
   order_type: limit
   limit_offset_pct: 0.05
   order_timeout_sec: 30
+  max_signal_age_seconds: 60      # older Recommendations are refused, not
+                                  # traded late: the entry is MARKET and sized
+                                  # from the trigger price. Hard cap 300.
 
   no_trade_windows:
     - ["09:15", "09:20"]          # opening noise
