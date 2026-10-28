@@ -23,9 +23,13 @@ venv:  ## Create the virtualenv
 	@echo "Activate with: source $(VENV)/bin/activate   (Windows: $(VENV)\\Scripts\\activate)"
 
 .PHONY: install
-install:  ## Install runtime + dev dependencies
-	$(PY) -m pip install --upgrade pip
-	$(PY) -m pip install -e ".[dev]"
+install:  ## Install runtime + dev dependencies (the environment CI builds)
+	@# The SAME three steps as every CI install job, in the same order. This
+	@# installed `-e ".[dev]"` UNCONSTRAINED until 28 Oct 2026, so a developer
+	@# environment resolved its own versions - 17 packages differed from
+	@# constraints.txt, and local audits checked versions nothing ships.
+	$(PY) -m pip install --upgrade pip setuptools wheel
+	$(PY) -m pip install -c constraints.txt -e ".[dev]"
 	$(MAKE) patch-deps
 
 .PHONY: install-research
@@ -45,13 +49,15 @@ patch-deps:  ## Replace kiteconnect's vulnerable autobahn pin (B7 / CVE-2020-356
 
 .PHONY: fmt
 fmt:  ## Auto-format and fix lint issues
-	ruff format src tests
-	ruff check --fix src tests
+	ruff format .
+	ruff check --fix .
 
 .PHONY: lint
-lint:  ## Lint without fixing
-	ruff format --check src tests
-	ruff check src tests
+lint:  ## Lint without fixing - CI's exact commands
+	@# `.`, not `src tests`: CI lints the whole tree, and a narrower local lint
+	@# let a migration's import-order error through a "green" gate (AUDIT-022).
+	ruff format --check .
+	ruff check .
 
 .PHONY: types
 types:  ## Static type check
@@ -74,7 +80,7 @@ cov:  ## Test with coverage; risk modules must be at 100%
 	pytest --cov --cov-report=term-missing --cov-report=html
 
 .PHONY: check
-check: lint types test  ## Everything CI runs
+check: lint types test  ## CI's quality and test jobs (security: `make security`; the image build and secret scan run in CI)
 
 # --- Security --------------------------------------------------------------
 

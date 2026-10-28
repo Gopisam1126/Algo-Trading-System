@@ -87,10 +87,16 @@ Prefer a failing test over a comment asserting correctness.
 ## Before you commit
 
 ```bash
-make check          # lint + types + tests
-make test-safety    # the invariants above
-make doctor         # config and compliance posture
+ruff check . && ruff format --check .       # = make lint - CI's exact commands
+mypy src                                    # = make types
+pytest tests/ -q                            # = make test; Docker up, 0 skipped
+python scripts/doctor.py                    # = make doctor; Datastores FAIL is expected without secrets
 ```
+
+Direct forms, because `make` is not installed on the Windows development
+machine. The venv must be the one CI builds: `pip install -c constraints.txt
+-e ".[dev]"` then the autobahn override (`make install` does both). The full
+procedure, including the audit and promotion, is the /sdlc skill.
 
 Never commit a `.env`, a credential, or anything under `data/`.
 
