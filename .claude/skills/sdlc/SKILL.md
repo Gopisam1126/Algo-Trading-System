@@ -29,9 +29,21 @@ Where they disagree on process, the standard wins and this file is corrected.
 Not "unless CI is green". Not "unless SIT passed". **Only when the user says
 so, in this conversation, in response to being asked.**
 
-`promote.yml` already carries an unconditional `exit 1` on the PROD path. That
-gate stays. Do not remove it, do not work around it, do not suggest removing
-it. When SIT is clean, report that PROD is *ready* and **stop**.
+Two gates hold this structurally, and both stay — do not remove them, do not
+work around them, do not suggest removing them:
+
+- `promote.yml` (the owner's route) carries an unconditional `exit 1` on the
+  PROD path until the pre-live checklist is signed off.
+- `scripts/promote.py` — the tool *this* lifecycle promotes with — refuses
+  every promotion except DEV → QA before it touches git. Until 28 Oct 2026 it
+  accepted any `--to`, so `--from DEV --to PROD` would have pushed DEV
+  straight to PROD while this rule cited a workflow the script never runs.
+
+GitHub branch protection is **not** enabled on PROD (`protected: false`,
+checked 28 Oct 2026). Turning it on is the owner's action and is recommended:
+it is the only gate that also covers a hand-typed `git push`.
+
+When SIT is clean, report that PROD is *ready* and **stop**.
 
 ### 2. Do not get stuck.
 
@@ -51,14 +63,29 @@ truth from the code, the tracker and CI, in that order of authority.
 git fetch -q origin
 git rev-parse --short origin/DEV origin/QA HEAD
 git status --short
-git log --no-merges --oneline origin/QA..origin/DEV     # unpromoted work
+git log --no-merges --oneline origin/QA..origin/DEV     # commits QA has not seen
+python scripts/promote.py --from DEV --to QA --dry-run  # is anything DEPLOYABLE unpromoted?
 ```
+
+The `git log` line lists every DEV commit QA has not absorbed — including
+commits that only touch stripped paths (the tracker update after SIT), which
+never get a QA commit because there is nothing to promote. Those will list
+forever and are not unpromoted work. The dry run answers the real question:
+"nothing to do" means everything deployable is on QA.
 
 Then, in the repo:
 
 - **What is built** — line counts per package under `Code/src/algotrader`. An
   `__init__.py`-only package is *empty*, whatever the tracker says.
-- **What CI says** — the latest run per branch, via the GitHub Actions API.
+- **What CI says** — the latest run per branch, via the GitHub Actions API
+  (`api.github.com/repos/Gopisam1126/Algo-Trading-System/actions/runs`).
+  Unauthenticated, it allows 60 requests an hour: poll no faster than every
+  90 seconds. Job **logs** need repository admin rights, so a CI-only failure
+  is diagnosed by reproducing the job (Phase 9), not by reading its log.
+- **What the machine has** — Docker running (`docker info`), because the
+  integration and SIT suites skip without it. `make` is **not** installed on
+  the Windows development machine, so every command here is given in its
+  direct form; the Makefile targets are equivalents for Linux.
 - **What the tracker says** — `Documents/BACKLOG_Tracker.xlsx`, sheets
   `Backlog`, `Blockers`, `QA Results`, `Security Findings`, `SIT Defects`.
 
@@ -84,7 +111,7 @@ dependencies, risk tier, estimate, notes, build concerns.
 | | Gate |
 |---|---|
 | R1 | The item exists in the tracker with an ID, estimate, risk tier and priority. Work with no story? **Create the story first.** |
-| R2 | Dependencies are `Closed` — checked in the tracker, not remembered |
+| R2 | Dependencies are `QA-Success` or `Closed` — checked in the tracker, not remembered |
 | R3 | No open blocker covers it |
 | R4 | The governing design document has been read **this session** |
 | R5 | You can state the acceptance criteria without looking them up |
@@ -101,6 +128,23 @@ needs in production. Only the first blocks.
 > recorded on the story, and the work proceeded the same day.
 
 Correct a mis-stated dependency in the tracker, write down why, and continue.
+
+### The status lifecycle
+
+The `Reference` sheet defines four statuses; this is when each is set.
+
+| Status | Set when | By |
+|---|---|---|
+| `New` | Captured, not yet started | anyone |
+| `Development Completed` | Code complete but QA not signed off — or delivered in part, with the remainder recorded on the row | this lifecycle |
+| `QA-Success` | Promoted to QA, CI green on DEV and QA, SIT clean on the QA tree | this lifecycle (Phase 11) |
+| `Closed` | Accepted by the owner — in practice, reached PROD | **the owner only** |
+
+R2 accepts `QA-Success` because nothing has reached `Closed` since E01: PROD
+is gated on the owner, so "Closed" as a dependency rule would have blocked
+every story since — and every E14/E15 story was rightly started on
+`QA-Success` dependencies. (Until 28 Oct 2026 this table did not exist and
+R2 said `Closed`.)
 
 ### Value and scope
 
@@ -222,9 +266,10 @@ or guarded; no new cycle; no undeclared capability.
 
 ### Non-negotiable invariants
 
-Enforced in code, tested in `tests/security/test_safety_invariants.py`. Wanting
-to relax one means you have probably found a design conflict — stop and raise
-it.
+Enforced in code, tested under `tests/security/` — `test_safety_invariants.py`
+and its neighbours (`test_strategy_execution_safety.py` carries 3 and 5).
+Wanting to relax one means you have probably found a design conflict — stop
+and raise it.
 
 1. `Recommendation` never gains a sizing field.
 2. Hard bounds in `common/config.py` are code, not configuration.
@@ -237,7 +282,8 @@ Plus: `Decimal` for all money; timezone-aware UTC everywhere with IST only at
 display and market-hours boundaries; bars aligned to the 09:15 session start;
 per-stock square-off deadlines.
 
-**Exit gate:** `ruff check`, `ruff format --check`, `mypy src` all clean.
+**Exit gate:** `ruff check .`, `ruff format --check .`, `mypy src` all clean —
+CI's exact commands, over the whole tree (a narrower lint missed a migration).
 
 ---
 
@@ -285,10 +331,21 @@ compromised.** Ask what the worst outcome is.
 Run the automated gates:
 
 ```bash
-bandit -r src/ --severity-level medium --confidence-level medium
-make audit                         # = CI's pip-audit: --skip-editable (NOT --strict) + accepted advisories; see DEPLOYMENT.md
+cd Code
+bandit -r src/ -q --severity-level medium --confidence-level medium
+# pip-audit exactly as CI runs it: --skip-editable (NOT --strict), plus the
+# assessed ignores - DERIVED from ACCEPTED_ADVISORIES, the one list the
+# hygiene test holds ci.yml and the Makefile to, so this line cannot go stale.
+python -m pip_audit --skip-editable $(python -c "from tests.security.test_dependency_hygiene import ACCEPTED_ADVISORIES as A; print(' '.join('--ignore-vuln ' + i for i in A))")
 pytest tests/security/ -q
 ```
+
+**Re-run the audit immediately before pushing.** Advisories are published
+against the world, not against a commit: on 27 Oct 2026 they landed between a
+clean local run and the CI run twice in one morning. A red audit is a new
+finding, never a flake. An advisory that cannot be fixed is accepted only by
+ID, in `ACCEPTED_ADVISORIES`, with an executed reachability check beside it —
+see `DEPLOYMENT.md`.
 
 Then STRIDE-lite against the diff:
 
@@ -319,18 +376,35 @@ You are the QA lead. The question is **"does the whole thing still hold".**
 
 ```bash
 cd Code
+docker info --format '{{.ServerVersion}}'   # Docker MUST be up - see "0 skipped" below
 # The environment CI builds - not whatever the venv drifted to. On 27 Oct 2026
 # the local venv differed from constraints.txt on 17 packages, so local audits
-# checked versions nothing ships.
+# checked versions nothing ships. (= `make install`, which now does the same.)
+python -m pip install --upgrade pip setuptools wheel
 pip install -c constraints.txt -e ".[dev]" && pip install --no-deps --upgrade "autobahn==26.7.1"
 # CI's exact commands. `src/ tests/ scripts/` skipped migrations/, and a new
 # migration failed CI's `ruff check .` after a "green" local gate.
 ruff check . && ruff format --check .
-mypy src/
-pytest tests/ -q --cov=src/algotrader --cov-report=term
-make test-safety
-make doctor
+mypy src
+pytest tests/ -q --cov=src/algotrader --cov-report=term   # includes tests/security
+python scripts/doctor.py                                  # = make doctor; see below
 ```
+
+**"Green" means `N passed`, with 0 failed, 0 errors, and 0 skipped.** Without
+Docker the integration and SIT suites *skip*, and pytest still exits 0: on
+15 Oct 2026 a run reported success with 332 skipped and coverage at 85%
+against the real 93%. A skip count above zero is a red gate.
+
+**`doctor.py` on a development machine** fails the *Datastores* section and
+warns under *Secrets*, *SEBI compliance* and *Network*, because the deployment
+secrets are not there — that is expected, and it exits 1 for it. Any FAIL in
+*Configuration*, *Broker SDK*, *Market calendar* or *Strategies* is a real
+breakage and blocks the gate. It is also the deployment pre-flight ("run
+before every trading day"), which belongs to Phase 12.
+
+**Never pass `-p no:logging` to a run that includes the whole suite.** It
+removes the `caplog` fixture, and every test using it *errors* — 14 of them on
+27 Oct 2026, mistaken for a moment for a broken QA tree.
 
 ### Mutation testing — required for 🔴 safety-critical items
 
@@ -341,7 +415,25 @@ fails. A surviving mutation is a hole in the *tests*.
 Write the harness to `scratchpad/`, run it, revert every mutation, and record
 the result. When a mutation survives, **verify why before fixing** — one
 survivor here turned out benign, because Pydantic already copied the list the
-mutation targeted.
+mutation targeted; another (27 Oct 2026, YAML aliases) was benign and still
+exposed an untested edge, which got its own test.
+
+Three harness rules, each learned the hard way:
+
+- **Restore byte-for-byte** (`read_bytes` / `write_bytes`). On Windows,
+  `write_text` turns LF into CRLF, so a "reverted" file is not the original —
+  and the harness's own before/after digest then reports the tree changed.
+- **Run nothing else while it runs.** It edits `src/`; a test run reading the
+  tree at the same time measures a mutation, not the code.
+- **Give each mutation a name and a targeted test set,** and print
+  killed/total plus the byte-identical check at the end.
+
+**The commonest survivor is a test passing for the wrong reason.** Twice so
+far a test asserted only "it refused" while an *earlier* check was the one
+refusing — QA-E15-27, and the `promote.py` CI check on 28 Oct 2026, whose
+test fed a fake `git` that made the divergence check refuse first. Build the
+fixture so the check under test is the only thing that *can* refuse, and
+assert the refusal's reason, not just its exit code.
 
 > Two survivors on the first run of the strategy suite were the same shape:
 > the tests called a helper directly rather than the path that calls it, so
@@ -357,8 +449,8 @@ mutation targeted.
 - **No test may depend on a defect existing.** Two BR-20 tests used the
   incomplete holiday list as their fixture and went quiet when it was fixed.
 
-**Exit gate:** every gate green in one run; mutation score recorded; coverage
-flat or better.
+**Exit gate:** every gate green in one run, 0 skipped; mutation score
+recorded; coverage flat or better.
 
 ---
 
@@ -370,7 +462,7 @@ flat or better.
 |---|---|
 | S1 | All four QA rounds passed |
 | S2 | Findings recorded in `QA Results` and `Security Findings` |
-| S3 | Story status updated; any new stories created for discovered work |
+| S3 | Story status updated (see the status lifecycle in Phase 1); any new stories created for discovered work |
 | S4 | Documents updated **in the same commit** as the behaviour they describe |
 | S5 | Commit message records what was found, including falsified beliefs |
 | S6 | Pre-commit sweep: no `.env`, no credential, nothing under `data/` |
@@ -384,25 +476,59 @@ git add -A && git commit -F - <<'EOF'
 <what was believed and turned out false>
 <test counts before and after>
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+<the attribution line this session's instructions specify>
 EOF
 git push origin DEV
 ```
 
+The attribution line is whatever the session's instructions say — on
+28 Oct 2026, `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. It
+changes with the model, so it is not hard-coded here; `promote.py` carries the
+same line in its `ATTRIBUTION` constant.
+
 **Wait for CI to go green on DEV before promoting.** Poll the Actions API; do
-not assume.
+not assume. (`promote.py` now refuses unless CI passed DEV's head, so
+promoting early fails rather than slipping through.)
+
+**Two CI jobs have no routine local equivalent:** the runtime image build and
+the gitleaks secret scan. If a change touches `ops/Dockerfile`,
+`constraints.txt` or `pyproject.toml`, also run
+`docker build -f ops/Dockerfile .` locally before pushing.
+
+**When CI fails and the local gate is green,** reproduce the failing job in
+the image CI uses — the logs need admin rights, and guessing wastes a cycle.
+Copy `pyproject.toml`, `constraints.txt`, `README.md` and `src/` to a scratch
+directory, then run CI's install and the failing command inside
+`python:3.11-slim-bookworm`:
+
+```bash
+docker run --rm -v "<scratch>:/w" -w /w python:3.11-slim-bookworm bash -c '
+  python -m pip install -q --upgrade pip setuptools wheel
+  pip install -q -c constraints.txt -e ".[dev]"
+  pip install -q --no-deps --upgrade "autobahn==26.7.1"
+  <the failing CI command>'
+```
+
+On Git Bash for Windows, prefix with `MSYS_NO_PATHCONV=1` and pass the mount
+as `pwd -W` output. This is how the 27 Oct 2026 CI-only audit failure was
+found in one run.
 
 ### Promote
 
 ```bash
-python scripts/promote.py --from DEV --to QA
+python scripts/promote.py --from DEV --to QA            # --dry-run to preview
 ```
 
-This strips `Documents/` from the QA tree, refuses on divergence, never
-force-pushes, and verifies the pushed tree against a freshly recomputed
-expected tree. **Do not hand-roll a promotion with `commit-tree`.**
+It performs DEV → QA and nothing else (PROD is always refused); refuses unless
+CI passed DEV's head commit; refuses on divergence; strips `Documents/`,
+`scripts/tracker/` and `.claude/` from the QA tree; never force-pushes; and
+verifies the pushed tree against a freshly recomputed expected one. When DEV
+is ahead only by commits to stripped paths — the tracker update after SIT —
+it reports "nothing to do", which is correct. **Do not hand-roll a promotion
+with `commit-tree`.**
 
-**Exit gate:** CI green on both DEV and QA; `Documents/` absent from QA.
+**Exit gate:** CI green on both DEV and QA; `Documents/`, `scripts/tracker/`
+and `.claude/` absent from QA.
 
 ---
 
@@ -431,10 +557,37 @@ the right thing when something goes wrong".
 - **Idempotency and restart** — kill the process mid-flight and restart. State
   restored from a snapshot must equal state rebuilt from history.
 
+### How to run it against the QA tree
+
+The scenarios live in `Code/tests/sit/`. "Against QA" means the code under
+test is the **QA branch's**, not the DEV working copy — run it from a detached
+worktree, with that tree's `src` first on the path:
+
+```bash
+SP=<scratchpad>                                   # never inside the repo
+git fetch -q origin && git worktree add --detach "$SP/qa" origin/QA
+cd "$SP/qa/Code"
+PY="<repo>/Code/.venv/Scripts/python.exe"         # the constrained venv
+PYTHONPATH="$PWD/src" "$PY" -c "import algotrader; print(algotrader.__file__)"   # must print the worktree
+PYTHONPATH="$PWD/src" "$PY" -m pytest tests/sit -q -p no:cacheprovider
+# a broad change (several components) -> run tests/ instead of tests/sit
+cd - && git worktree remove --force "$SP/qa" && git worktree prune
+```
+
+Docker must be up. On Windows the SIT module keeps one `asyncio.Runner` for
+the module, because a fresh `asyncio.run` per call builds a loopback-socket
+pair that can hang; keep that pattern when adding scenarios.
+
 ### SIT is allowed to find things QA cannot
 
 That is the point. A SIT defect is not a QA failure — it is evidence that the
 seam only exists in the assembled system. Record it as such.
+
+**The harness can carry the defect it should catch.** For weeks every gateway
+submission in the SIT suite paired a stored decision with a freshly minted
+recommendation, and nothing noticed until the decision carried its own
+identity (SIT-008). A scenario must hand each component what the real caller
+would — keep the object the upstream step produced, never rebuild a lookalike.
 
 **Exit gate:** every SIT scenario either passes or has a logged defect with a
 severity. **A CRITICAL or HIGH SIT defect blocks the PROD recommendation.**
@@ -463,7 +616,9 @@ Every SIT defect goes to **both** places, in the same working session.
 | Backlog item raised | Story ID, if the fix is its own work |
 
 Then: **raise a backlog story** for any defect not fixed in the same session,
-and add a row to `QA Results` if the fix changed behaviour.
+and add a row to `QA Results` if the fix changed behaviour. With SIT clean and
+recorded, set the story to `QA-Success` — and record the QA commit, the DEV
+commit it came from and the SIT counts on the row.
 
 ### 2. The tracker artifact
 
@@ -476,12 +631,23 @@ python scripts/tracker/build_tracker.py     # json -> scripts/tracker/tracker.ht
 
 Then publish `scripts/tracker/tracker.html` to the **same URL** —
 `https://claude.ai/code/artifact/624dca55-aa60-47a1-94c2-73be9571cdaf` — via
-the Artifact tool with `url` set. Never create a second tracker artifact.
+the Artifact tool with `url` set. Never create a second tracker artifact *on
+your own*.
+
+**If that publish is refused** — a 404, or "not writable": an artifact belongs
+to the claude.ai account that created it, and the owner has switched accounts
+more than once (this URL has been unreachable from the account in use since
+15 Oct 2026) — do not silently create a new one, and do not stop either. The
+workbook is the system of record and is already updated; say the live view is
+stale, and **ask the owner** whether to publish a new artifact under the
+current account. On a yes, publish without `url` and replace the URL in this
+paragraph in the same commit, so the next session republishes to it.
 
 Both scripts resolve their paths from their own location and live in the repo,
 **not** in a scratchpad. That is deliberate: the earlier versions lived in a
 session temp directory and were lost when it was cleared. A skill that
-instructs running a file cannot point at one that evaporates.
+instructs running a file cannot point at one that evaporates. Their outputs
+(`tracker_data.json`, `tracker.html`) are git-ignored and rebuilt each time.
 
 ### The bug bar
 
@@ -508,8 +674,13 @@ Report:
 - What was delivered, and the acceptance criteria it satisfies.
 - QA results across all four rounds, with the mutation score.
 - SIT results, and every defect with its severity and status.
-- Whether `Documents/PRE_LIVE_CHECKLIST.md` is satisfied.
-- What still needs the user: credentials, static IP, broker paperwork.
+- Whether `Documents/PRE_LIVE_CHECKLIST.md` is satisfied — count the ticked
+  items, do not recall them.
+- What `scripts/doctor.py` says on the machine that would trade — the
+  deployment pre-flight, where *Datastores*, *Secrets* and *Network* must pass
+  too.
+- What still needs the user: credentials, static IP, broker paperwork, and
+  GitHub branch protection on PROD if it is still off.
 
 Then say plainly whether PROD is *ready*, and **ask**. Do not promote. Do not
 prepare the promotion command as if it were about to run.
@@ -547,27 +718,28 @@ is this actually a blocker? Say so rather than grinding.
 
 A clean stop with less delivered beats a broken tree with more. Before ending
 any session: full gate, tracker updated, documents updated, committed, pushed,
-promoted if green. Then state what was done, what was found, what is next, and
-what is blocked.
+CI green, promoted if the deployable tree changed (`promote.py` says "nothing
+to do" when only stripped paths did). Then state what was done, what was
+found, what is next, and what is blocked.
 
 ---
 
 ## Quick reference
 
 ```
-P0  Orient           git + code + CI + tracker; reconcile
-P1  Business         DoR R1-R5; falsifiable criteria; scope
+P0  Orient           git + code + CI + tracker + Docker; reconcile
+P1  Business         DoR R1-R5 (deps QA-Success+); falsifiable criteria; scope
 P2  Research         triangulate; resolve or escalate blockers
 P3  Architecture     design record; structure over discipline
 P4  Development      contracts -> probe -> code -> control
 P5  QA-1 component   probe rule, control, properties
 P6  QA-2 integration real neighbours, real seams
-P7  QA-3 adversarial bandit, pip-audit, STRIDE
-P8  QA-4 regression  full gate, mutation on 🔴, coverage
-P9  Sign-off         commit, push, CI green, promote.py
-P10 SIT              QA branch, degraded deps, session shape
-P11 SIT logging      SIT Defects sheet + artifact republish
-P12 PROD             STOP. Report. Ask.
+P7  QA-3 adversarial bandit, pip-audit (derived ignores), STRIDE
+P8  QA-4 regression  constrained venv, CI's commands, 0 skipped, mutation on 🔴
+P9  Sign-off         commit, push, CI green, promote.py (DEV->QA only)
+P10 SIT              QA worktree, degraded deps, session shape
+P11 SIT logging      SIT Defects sheet, QA-Success, artifact republish (or ask)
+P12 PROD             STOP. Report (checklist, doctor). Ask.
 ```
 
 **Reference:** `Documents/ENGINEERING_STANDARD.md` (invariants, verification

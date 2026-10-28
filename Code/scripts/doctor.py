@@ -50,15 +50,26 @@ def section(title: str) -> None:
     print("-" * len(title))
 
 
+#: The interpreter CI and the runtime image run (ci.yml PYTHON_VERSION, the
+#: Dockerfile's python:3.11-slim-bookworm, mypy's python_version). This used to
+#: recommend "3.12+" - advice that would have moved a developer onto an
+#: interpreter nothing ships, so their tests described a different system.
+SHIPPED_PYTHON = (3, 11)
+
+
 def check_python(r: Report) -> None:
     section("Environment")
     v = sys.version_info
-    if v >= (3, 12):
+    shipped = ".".join(map(str, SHIPPED_PYTHON))
+    if v[:2] == SHIPPED_PYTHON:
         r.ok(f"Python {v.major}.{v.minor}.{v.micro}")
-    elif v >= (3, 11):
-        r.warn(f"Python {v.major}.{v.minor}.{v.micro}", "3.12+ recommended")
+    elif v[:2] > SHIPPED_PYTHON:
+        r.warn(
+            f"Python {v.major}.{v.minor}.{v.micro}",
+            f"CI and the image run {shipped}; a newer local interpreter tests what nothing ships",
+        )
     else:
-        r.fail(f"Python {v.major}.{v.minor} is too old", "3.11 minimum")
+        r.fail(f"Python {v.major}.{v.minor} is too old", f"{shipped} is what ships")
 
 
 def check_dependencies(r: Report) -> None:

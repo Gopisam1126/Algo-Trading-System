@@ -24,6 +24,19 @@ the branch.
 
 **Safety.** Never force-pushes. Refuses to run if the target has commits the
 source does not, because that would silently discard them.
+
+**It promotes DEV -> QA and nothing else** (28 Oct 2026). It used to accept any
+``--from``/``--to``, so ``--from DEV --to PROD`` would have pushed DEV's whole
+tree - Documents, the lifecycle driver and all - straight to PROD, skipping QA,
+while the /sdlc skill's first rule ("never push to PROD") cited promote.yml's
+``exit 1`` as the gate: a workflow this script never goes through. The rule was
+held up by an instruction alone. PROD is the owner's act, through promote.yml,
+which stays blocked on the pre-live checklist.
+
+**And only a commit CI has passed.** The paragraph above names "promoting a
+commit CI never saw" as one of three ways promotion goes wrong, and nothing here
+checked it. The source commit's CI run is now asked for, and anything but a
+completed, successful run - including the API being unreachable - refuses.
 """
 
 from __future__ import annotations
@@ -58,6 +71,76 @@ EXCLUDED: dict[str, tuple[str, ...]] = {
     # how it came to be.
     "QA": ("Documents", "scripts/tracker", ".claude"),
 }
+
+#: The only promotions this script performs. PROD is deliberately absent: it
+#: is promoted by the owner, through promote.yml, behind the pre-live checklist.
+ALLOWED: frozenset[tuple[str, str]] = frozenset({("DEV", "QA")})
+
+#: The workflow whose run must have succeeded on the source commit.
+CI_WORKFLOW = "CI"
+
+#: Attribution for the promotion commit this script writes.
+ATTRIBUTION = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+
+
+def refusal(source: str, target: str) -> str | None:
+    """Why this promotion must not happen, or ``None`` if it may."""
+    if target.upper() == "PROD":
+        return (
+            "REFUSING: this script never promotes to PROD. PROD means real capital; "
+            "it is the owner's decision, made through promote.yml, which stays "
+            "blocked until Documents/PRE_LIVE_CHECKLIST.md is signed off."
+        )
+    if (source, target) not in ALLOWED:
+        allowed = ", ".join(f"{s}->{t}" for s, t in sorted(ALLOWED))
+        return f"REFUSING: {source}->{target} is not a promotion this script performs ({allowed})."
+    return None
+
+
+def ci_verdict(runs: list[dict[str, object]], sha: str) -> str | None:
+    """``None`` if the CI workflow's latest run on ``sha`` succeeded, else why not.
+
+    Takes the decoded ``workflow_runs`` list so it is testable without a network.
+    The latest run wins: a re-run that passed after a failure is a pass.
+    """
+    mine = [
+        r for r in runs if r.get("head_sha") == sha and r.get("name") == CI_WORKFLOW
+    ]
+    if not mine:
+        return (
+            f"no {CI_WORKFLOW} run found for {sha[:12]} - CI has not seen this commit"
+        )
+    latest = max(mine, key=lambda r: str(r.get("created_at") or ""))
+    if latest.get("status") != "completed":
+        return f"{CI_WORKFLOW} on {sha[:12]} is still {latest.get('status')}"
+    if latest.get("conclusion") != "success":
+        return f"{CI_WORKFLOW} on {sha[:12]} concluded {latest.get('conclusion')!r}"
+    return None
+
+
+def fetch_runs(remote: str, sha: str) -> list[dict[str, object]]:
+    """The Actions runs for ``sha``, from GitHub's public API.
+
+    Raises on any failure: an unanswered question is not a green build.
+    """
+    import json
+    import re
+    import urllib.request
+
+    url = git("remote", "get-url", remote)
+    match = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url)
+    if match is None:
+        raise SystemExit(
+            f"REFUSING: cannot read a GitHub owner/repo from remote {url!r}"
+        )
+    owner, repo = match.groups()
+    api = f"https://api.github.com/repos/{owner}/{repo}/actions/runs?head_sha={sha}&per_page=20"
+    request = urllib.request.Request(
+        api, headers={"Accept": "application/vnd.github+json"}
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.load(response)
+    return list(payload.get("workflow_runs", []))
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -124,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     remote, source, target = args.remote, args.source, args.target
+    # Before ANY git command: a refused promotion touches nothing.
+    refused = refusal(source, target)
+    if refused:
+        print(refused)
+        return 1
     excluded = EXCLUDED.get(target, ())
 
     print(f"Promoting {source} -> {target}")
@@ -133,6 +221,22 @@ def main(argv: list[str] | None = None) -> int:
     target_ref = f"{remote}/{target}"
     source_sha = git("rev-parse", source_ref)
     target_sha = git("rev-parse", target_ref)
+
+    # --- CI must have passed this exact commit ------------------------------
+    try:
+        why_not = ci_verdict(fetch_runs(remote, source_sha), source_sha)
+    except SystemExit:
+        raise
+    # Deliberately total: a network error, a rate limit and a malformed reply all
+    # mean "we do not know whether CI passed", and that must refuse, not pass.
+    except Exception as exc:  # noqa: BLE001
+        why_not = (
+            f"could not ask GitHub whether CI passed ({type(exc).__name__}: {exc})"
+        )
+    if why_not:
+        print(f"\nREFUSING: {why_not}. Promote only a commit CI has passed.")
+        return 1
+    print(f"  {CI_WORKFLOW} passed on {source_sha[:12]}")
 
     # --- divergence -------------------------------------------------------
     # Only non-merge commits count: every promotion is itself a merge commit on
@@ -179,7 +283,8 @@ def main(argv: list[str] | None = None) -> int:
             if excluded
             else ""
         )
-        + "\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+        + "\n"
+        + ATTRIBUTION
     )
     commit = git("commit-tree", tree, "-p", target_sha, "-p", source_sha, "-m", message)
     git("push", "-q", remote, f"{commit}:refs/heads/{target}")

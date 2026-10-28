@@ -102,7 +102,7 @@ starting anyway.
 | | Gate |
 |---|---|
 | R1 | The item exists in `BACKLOG_Tracker.xlsx` with an ID, estimate, risk tier and priority. Work with no story? **Create the story first.** |
-| R2 | Its dependencies are `Closed` — checked in the tracker, not from memory |
+| R2 | Its dependencies are `QA-Success` or `Closed` — checked in the tracker, not from memory. (`Closed` alone, as this said until 28 Oct 2026, would have blocked every story since E01: `Closed` means owner-accepted, in practice PROD, and PROD is gated on the owner. The /sdlc skill's Phase 1 tabulates when each status is set.) |
 | R3 | No open blocker covers it. An absolute blocker means stop and document, never work around |
 | R4 | The governing design document has been read **this session** |
 | R5 | You can state the acceptance criteria without looking them up |
@@ -265,10 +265,16 @@ guesses.
 ```bash
 ruff check . && ruff format --check .
 mypy src
-bandit -r src/ --severity-level medium --confidence-level medium
-pip-audit --skip-editable            # NOT --strict; see DEPLOYMENT.md
+bandit -r src/ -q --severity-level medium --confidence-level medium
+# NOT --strict (see DEPLOYMENT.md), and with the assessed ignores derived from
+# the one list the hygiene test holds CI and the Makefile to:
+python -m pip_audit --skip-editable $(python -c "from tests.security.test_dependency_hygiene import ACCEPTED_ADVISORIES as A; print(' '.join('--ignore-vuln ' + i for i in A))")
 pytest tests/security/ -q
 ```
+
+Run them in the environment CI builds (`pip install -c constraints.txt -e
+".[dev]"` plus the autobahn override), and re-run the audit just before
+pushing — advisories land between runs.
 
 A finding that is genuinely safe gets a **suppression backed by an executed
 check**, never a bare comment. When SQL identifiers had to be interpolated, the
@@ -330,13 +336,21 @@ the *switch*: each role asks questions the others do not.
 ### 7.1 The gate
 
 ```bash
-make check          # lint + types + tests
-make test-safety    # the invariants
-make doctor         # config and compliance posture
+ruff check . && ruff format --check .        # = make lint (CI's exact commands)
+mypy src                                     # = make types
+pytest tests/ -q --cov=src/algotrader        # = make test; includes tests/security
+python scripts/doctor.py                     # = make doctor
 ```
 
-Everything green. A red gate cannot gate anything, so a persistently red check
-is worse than no check — fix it or delete it, never normalise it.
+Given directly because `make` is not installed on the Windows development
+machine; the Makefile targets are equivalents for Linux.
+
+Everything green — which for pytest means **0 skipped**: without Docker the
+integration and SIT suites skip and the run still exits 0. `doctor.py` on a
+development machine fails *Datastores* for want of deployment secrets; that is
+expected, while a FAIL in *Configuration*, *Broker SDK*, *Market calendar* or
+*Strategies* is real. A red gate cannot gate anything, so a persistently red
+check is worse than no check — fix it or delete it, never normalise it.
 
 ### 7.2 The commit message
 
@@ -364,8 +378,12 @@ Promotion to QA asserts *this commit is deployable*. Before promoting:
 | P5 | Tracker updated — findings recorded, blockers moved |
 | P6 | `git log --no-merges origin/DEV..origin/QA` is **empty** (QA has not diverged) |
 | P7 | The promotion message states what was verified, not just what changed |
+| P8 | CI passed on the exact DEV commit being promoted |
 
-After promoting, confirm the trees are identical.
+`scripts/promote.py` enforces P6 and P8 itself and refuses any promotion but
+DEV → QA, so PROD cannot be reached through it (28 Oct 2026 — it previously
+accepted any target). After promoting, it confirms the QA tree is DEV's minus
+the stripped paths.
 
 ---
 
@@ -516,11 +534,12 @@ REVIEW
 [ ] Six roles, deliberately switched
 
 SHIP
-[ ] make check / test-safety / doctor
+[ ] The §7.1 gate, in the environment CI builds - 0 skipped
+[ ] The audit re-run just before pushing
 [ ] Tracker: QA Results, Security Findings, Blockers
 [ ] Documents updated in the same commit
 [ ] Commit message records findings and falsified beliefs
-[ ] Promotion checks P1-P7; trees identical afterwards
+[ ] Promotion checks P1-P8 (promote.py enforces P6, P8); trees identical afterwards
 ```
 
 ---

@@ -182,6 +182,18 @@ class TestTheBuildEnvironmentIsAudited:
         dockerfile = self._read("ops", "Dockerfile")
         assert "--upgrade pip setuptools wheel" in dockerfile
 
+    def test_make_install_builds_the_environment_ci_builds(self) -> None:
+        """The developer install site, which these tests did not cover. It
+        installed unconstrained and upgraded only pip, so a local venv
+        resolved its own versions - 17 differed from constraints.txt on 27 Oct
+        2026 and local audits checked packages nothing ships (AUDIT-022)."""
+        makefile = self._read("Makefile")
+        install = makefile.split("\ninstall:", 1)[1].split("\n.PHONY", 1)[0]
+        assert "--upgrade pip setuptools wheel" in install
+        assert '-c constraints.txt -e ".[dev]"' in install
+        assert "patch-deps" in install
+        assert f"autobahn=={EXPECTED_AUTOBAHN}" in makefile
+
     def test_the_locally_installed_build_backend_is_not_vulnerable(self) -> None:
         """A weak local check — it cannot see the runner's versions — but it
         catches a developer whose environment has drifted far enough to
