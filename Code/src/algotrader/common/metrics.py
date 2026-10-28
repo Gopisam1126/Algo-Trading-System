@@ -152,6 +152,30 @@ class Metrics:
             "halts the session. Any non-zero value is an incident.",
             registry=self.registry,
         )
+        # -- square-off (E15-S06) -------------------------------------------
+        self.squareoff_exits_total = Counter(
+            "squareoff_exits_total",
+            "Time exits placed at a position's square-off deadline.",
+            registry=self.registry,
+        )
+        self.positions_overdue_total = Counter(
+            "positions_overdue_total",
+            "Positions still held a minute past their square-off deadline. Each "
+            "is alerted once; the broker's own square-off is minutes away.",
+            registry=self.registry,
+        )
+        self.squareoff_timer_stalls_total = Counter(
+            "squareoff_timer_stalls_total",
+            "Times the reconciliation path found the square-off timer silent and "
+            "ran its sweep itself. Any non-zero value means the timer loop died.",
+            registry=self.registry,
+        )
+        self.positions_not_held_total = Counter(
+            "positions_not_held_total",
+            "Book positions the broker does not hold, found before an exit. Each "
+            "halts, and nothing is sent: exiting one would open a naked position.",
+            registry=self.registry,
+        )
 
     def rejected(self, check: str, reason: str) -> None:
         self.signals_rejected_total.labels(check=check, reason=reason).inc()

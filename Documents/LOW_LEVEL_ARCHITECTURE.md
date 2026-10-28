@@ -854,7 +854,56 @@ def squareoff_deadline(symbol: Symbol, status: InstrumentDailyStatus) -> datetim
     return today_at(base) - timedelta(minutes=config.risk.exit_buffer_minutes)
 ```
 
-Deadlines are stored in the Redis sorted set `timer:squareoff`. A single timer loop polls `ZRANGEBYSCORE timer:squareoff -inf now` each second — one loop for all positions, not one task per position.
+**The square-off timer (E15-S06, `execution/squareoff.py`).** The deadline is
+computed once, at open, and stored on the position (`squareoff_deadline` is NOT
+NULL). The timer computes nothing: one sweep of the **book** each second acts
+on every position whose stored deadline has passed. *Superseded design:* this
+section used to specify a Redis sorted set `timer:squareoff` polled with
+`ZRANGEBYSCORE`. That is a second copy of the deadline, added and removed by
+different code paths — a missed add is a position with no time exit, the exact
+failure the timer exists to prevent — so it was not built; the key remains
+defined and unused. Since E15-S06 a `Position` also refuses a deadline that is
+not on its opening IST day by 15:30, so a hand-edited row cannot postpone its
+own exit.
+
+At a position's deadline the sweep, holding the execution service's lock:
+
+1. reads the stop — if it has filled at all, it is triggered and already a
+   market order, and it *is* the exit;
+2. reads the broker's MIS holding — **nothing is ever exited beyond what the
+   broker holds** (below);
+3. cancels the stop, and sends nothing until the broker shows it terminal
+   (Kite reports CANCEL PENDING as OPEN, which counts as live, so the
+   reconciler cannot add an exit in the gap either) — two working exits could
+   both fill and leave the account short;
+4. sends a MARKET exit with market protection under the `SQUAREOFF` key (shared
+   with the emergency exit: that key is unused for every position the timer
+   acts on, because a position becomes EXITING the moment it is used), verifies
+   it live, and marks the position `ExitingPosition(reason=TIME)`;
+5. falls back to `ProtectiveStop.exit_now` if the time exit cannot be
+   established — the stop is gone, so this is the naked case and it halts if
+   the fallback fails too.
+
+Reconciliation confirms the fill and closes the record with the reason the book
+carries (`TIME`, or `UNPROTECTED` for an emergency exit). A position still held
+a minute past its deadline is alerted once (`positions_overdue_total`). A halt
+never stops the timer: halts stop new risk, never the exit path.
+
+**Liveness.** The sweep runs from its own one-second loop *and* after every
+reconciliation cycle and reconnect, so a dead loop costs a cycle, not a forced
+square-off; the reconciliation path reports the loop going quiet
+(`squareoff_timer_stalls_total`), and a loop that crashes stops the service's
+TaskGroup, which restarts, restores and sweeps.
+
+**Never exit what the broker does not hold (E15-S06, CRITICAL, found in
+design).** Both reconciliation's step 4 and the timer size an exit as
+`min(book, broker)`. A positions row left OPEN after the broker closed the
+position outside our view — its own MIS square-off while the process was down
+— was restored the next morning as an `UnverifiedPosition` with no live stop,
+and step 4 *exited* it: a MARKET sell of shares the account did not hold,
+opening a naked short. Now a holding the broker does not have sends nothing
+and halts (`HaltReason.POSITION_NOT_HELD`, re-armed every cycle, alerted once);
+a partial one exits what is held and halts.
 
 **Exit precedence** (first match wins): kill switch → hard deadline → stop hit → target hit → trailing stop → AI thesis invalidation → manual.
 

@@ -62,6 +62,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from algotrader.common.config import MIN_EXIT_BUFFER_MINUTES
 from algotrader.common.enums import Direction, ExitReason, PositionStatus
 from algotrader.common.models.trading import Order, Position, SizingResult
 from algotrader.common.text import one_safe_line
@@ -387,6 +388,11 @@ class ExitingPosition:
     position: Position
     because: str
     marks: Marks = Marks()
+    #: What the close will be recorded as once the exit fills (E15-S06). An
+    #: emergency exit is UNPROTECTED; the square-off timer's is TIME. Both
+    #: exits share the SQUAREOFF key, so the order cannot say which it was -
+    #: the book has to.
+    reason: ExitReason = ExitReason.UNPROTECTED
 
     @property
     def status(self) -> PositionStatus:
@@ -537,6 +543,19 @@ class PositionManager:
                 "one no position can be opened, and the first fill would find out"
             )
         self._calendar = calendar
+        #: Refused below the hard bound (E15-S06). AppConfig already enforces it
+        #: on the config value, but this parameter defaults on its own and a
+        #: caller could pass anything: 0 puts OUR deadline ON the broker's, and
+        #: the time exit would race the broker's forced square-off it exists to
+        #: beat.
+        if (
+            not isinstance(exit_buffer_minutes, int)
+            or exit_buffer_minutes < MIN_EXIT_BUFFER_MINUTES
+        ):
+            raise ValueError(
+                f"exit_buffer_minutes is {exit_buffer_minutes!r}; it must be an int of at "
+                f"least {MIN_EXIT_BUFFER_MINUTES}, so our deadline precedes the broker's"
+            )
         self._exit_buffer_minutes = exit_buffer_minutes
         #: A second staleness guard, on top of ``QuotePublisher.read_fresh``.
         #: Deliberate duplication: marking is what the daily-loss halt reads,
@@ -858,8 +877,14 @@ class PositionManager:
         await self._mirror.write(position.symbol, PositionSnapshot.of(promoted))
         return promoted
 
-    async def mark_exiting(self, symbol: str, *, because: str) -> ExitingPosition:
-        """Record that a held position is being exited because it is unprotected.
+    async def mark_exiting(
+        self,
+        symbol: str,
+        *,
+        because: str,
+        reason: ExitReason = ExitReason.UNPROTECTED,
+    ) -> ExitingPosition:
+        """Record that a held position is being exited - unprotected, or on time.
 
         The reconciler's counterpart to what ``open_from_fill`` does when attach
         fails (SIT-006). Without it, a position whose stop the broker had just
@@ -876,7 +901,10 @@ class PositionManager:
         if isinstance(current, ExitingPosition):
             return current
         exiting = ExitingPosition(
-            position=current.position, because=one_safe_line(because), marks=current.marks
+            position=current.position,
+            because=one_safe_line(because),
+            marks=current.marks,
+            reason=reason,
         )
         self._book[symbol] = exiting
         await self._mirror.write(symbol, PositionSnapshot.of(exiting))

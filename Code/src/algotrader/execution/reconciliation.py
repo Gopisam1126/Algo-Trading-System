@@ -128,6 +128,7 @@ __all__ = [
     "ReconciliationReadError",
     "UnknownPosition",
     "broker_target",
+    "held_by_broker",
 ]
 
 #: The audit stage every drift event is written under (§8.3 names it).
@@ -161,6 +162,8 @@ class Drift(StrEnum):
     FREEZE_FAIL = "FREEZE_FAIL"
     EXIT_SPENT = "EXIT_SPENT"
     OVER_EXITED = "OVER_EXITED"
+    # E15-S06
+    NOT_HELD = "NOT_HELD"
 
 
 def _assert_fits_audit_columns() -> None:
@@ -339,6 +342,28 @@ class UnbookedHolding:
     symbol: str
     direction: Direction
     quantity: int
+
+
+def held_by_broker(positions: Sequence[BrokerPosition], holding: Any) -> int:
+    """How many of this holding's shares the broker holds, in its direction.
+
+    E15-S06. Every exit is sized from the BOOK, and the book can be wrong: a
+    row left OPEN after the broker closed the position outside our view - its
+    own MIS square-off while this process was down, a stop that filled unseen
+    - is restored as a position, and exiting it SELLS shares we do not own.
+    Asking the broker first turns that naked short into a halt. Only our
+    product on our exchange counts: the account also holds the owner's own
+    delivery shares, which are not ours to exit.
+    """
+    net = sum(
+        p.quantity
+        for p in positions
+        if p.symbol == holding.symbol
+        and p.exchange == TRADED_EXCHANGE
+        and p.product == TRADED_PRODUCT
+    )
+    signed = net if holding.direction is Direction.LONG else -net
+    return max(0, signed)
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +609,9 @@ class Reconciler:
         self._freeze_attempts: dict[str, int] = {}
         #: Correlations already halted on as un-exitable or over-exited.
         self._reported_stuck: set[uuid.UUID] = set()
+        #: Correlations already alerted as held in the book and not at the
+        #: broker (E15-S06). The halt re-arms every cycle; the alert does not.
+        self._reported_not_held: set[uuid.UUID] = set()
         self._audit = audit
         self._grace = dt.timedelta(seconds=submitting_grace_seconds)
         self._metrics = metrics
@@ -652,7 +680,7 @@ class Reconciler:
         )
 
         # -- 4. every booked position has a live stop, or leaves -------------
-        await self._check_protection(report, trade_date=trade_date, now=now)
+        await self._check_protection(positions, report, trade_date=trade_date, now=now)
 
         # -- 5. our fills the book does not hold: unprotected by definition ---
         # E15-S12's booking step belongs BEFORE this one.
@@ -1052,7 +1080,9 @@ class Reconciler:
             position = tracked.position
             if isinstance(tracked, ExitingPosition):
                 key = exit_client_order_id(position, trade_date=trade_date)
-                reason = ExitReason.UNPROTECTED
+                # The book says why it is exiting (E15-S06): the timer's exit
+                # and the emergency exit share this key.
+                reason = tracked.reason
             else:
                 key = stop_client_order_id(position, trade_date=trade_date)
                 reason = ExitReason.STOP
@@ -1107,10 +1137,47 @@ class Reconciler:
             now=now,
         )
 
+    async def _not_held(
+        self, position: Any, held: int, report: CycleReport, *, now: dt.datetime
+    ) -> None:
+        """The book holds more than the broker. Halt; alert once (E15-S06).
+
+        Re-armed every cycle while it persists, like an unknown position, so a
+        latch cleared by hand comes back until the record is put right.
+        """
+        report.halted = True
+        detail = (
+            f"the book holds {position.quantity} {position.direction.value} and the broker "
+            f"{held}; only what the broker holds is exited, and a human must close the record"
+        )
+        if position.correlation_id not in self._reported_not_held:
+            self._reported_not_held.add(position.correlation_id)
+            self._count("positions_not_held_total")
+            log.critical("POSITION NOT HELD %s: %s. Halting.", position.symbol, detail)
+            report.drifts.append(
+                DriftEvent(
+                    kind=Drift.NOT_HELD,
+                    correlation_id=position.correlation_id,
+                    symbol=position.symbol,
+                    detail=detail,
+                )
+            )
+        await self._halter.arm(
+            HaltReason.POSITION_NOT_HELD,
+            detail=one_safe_line(f"{position.symbol}: {detail}"),
+            armed_by="reconciler",
+            now=now,
+        )
+
     # -- step 4 ---------------------------------------------------------------
 
     async def _check_protection(
-        self, report: CycleReport, *, trade_date: dt.date, now: dt.datetime
+        self,
+        positions: Sequence[BrokerPosition],
+        report: CycleReport,
+        *,
+        trade_date: dt.date,
+        now: dt.datetime,
     ) -> None:
         """Every booked position, every cycle (E15-S04's constraint 4).
 
@@ -1150,10 +1217,26 @@ class Reconciler:
                     # here rather than be skipped silently by a loop whose job
                     # is to look at every one of them.
                     assert_never(tracked)
-                await self._exit(position, because, report, trade_date=trade_date, now=now)
+                # Never exit more than the broker holds (E15-S06): the book can
+                # name a position the broker closed outside our view.
+                held = held_by_broker(positions, position)
+                if held == 0:
+                    await self._not_held(position, held, report, now=now)
+                    continue
+                target: Any = position
+                if held < position.quantity:
+                    target = UnbookedHolding(
+                        correlation_id=position.correlation_id,
+                        symbol=position.symbol,
+                        direction=position.direction,
+                        quantity=held,
+                    )
+                await self._exit(target, because, report, trade_date=trade_date, now=now)
                 # The exit is live (exit_now verifies it, and raises having
                 # halted if it is not). The book must now SAY so (SIT-006).
                 await self._manager.mark_exiting(position.symbol, because=because)
+                if held < position.quantity:
+                    await self._not_held(position, held, report, now=now)
             except Exception as exc:
                 report.errors.append(f"protection {position.symbol}: {exc}")
                 log.error("protection check for %s failed", position.symbol, exc_info=True)

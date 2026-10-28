@@ -113,6 +113,12 @@ class HaltReason(StrEnum):
     #: warrant stopping. Not UNKNOWN_POSITION: the shares here carry our key,
     #: and naming them unknown would send an operator looking for a stranger.
     DUPLICATE_ORDER = "DUPLICATE_ORDER"
+    #: The book holds a position the broker does not (E15-S06) - the inverse
+    #: of UNKNOWN_POSITION. A row left OPEN after the broker closed the
+    #: position outside our view: its own MIS square-off while we were down, a
+    #: stop that filled unseen. Exiting it would SELL shares we do not own, so
+    #: nothing is sent and the session halts for a human to close the record.
+    POSITION_NOT_HELD = "POSITION_NOT_HELD"
 
 
 #: Which latch each reason writes to. Three latches rather than one flag,

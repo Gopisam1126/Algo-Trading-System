@@ -418,6 +418,13 @@ Docker the integration and SIT suites *skip*, and pytest still exits 0: on
 15 Oct 2026 a run reported success with 332 skipped and coverage at 85%
 against the real 93%. A skip count above zero is a red gate.
 
+**Report pytest's own exit code, never a pipe's.** `pytest ... | sort | uniq`
+exits with `uniq`'s code: on 28 Oct 2026 a run with 14 failures read "exit code
+0", and the owner caught it, not the process. Capture `$?` on the line straight
+after pytest (`pytest ... > log 2>&1; echo "exit $?" >> log`) or read
+`${PIPESTATUS[0]}`, and say "failed" until a run of the WHOLE suite after the
+fix says otherwise — a re-run of one file proves that file.
+
 **`doctor.py` on a development machine** fails the *Datastores* section and
 warns under *Secrets*, *SEBI compliance* and *Network*, because the deployment
 secrets are not there — that is expected, and it exits 1 for it. Any FAIL in

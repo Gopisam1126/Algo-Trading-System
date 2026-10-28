@@ -140,14 +140,15 @@ sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
 order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
-the gateway are unbuilt: no square-off timer (E15-S06), no process entrypoint
+the gateway are unbuilt: no process entrypoint
 (`python -m algotrader.execution`, which docker-compose runs, has no
 `__main__` - no service does yet), and three risk inputs with no producer
 (service health E20-S05, live ATR, per-share margin), so the production engine
 rejects every signal until they exist. The order state machine (E15-S03),
 protective stop attachment (E15-S04), the position manager (E15-S05), the
-reconciliation loop (E15-S09), fill booking (E15-S12) and the execution
-service that drives them from `stream:signals` (E15-S13) now exist. **A gateway is not a trading
+reconciliation loop (E15-S09), fill booking (E15-S12), the execution
+service that drives them from `stream:signals` (E15-S13) and the square-off
+timer that gives every position its time exit (E15-S06) now exist. **A gateway is not a trading
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
@@ -551,6 +552,26 @@ Recorded because each was believed, written down, and wrong.
   working - step 5 counts it as cover. The real cost is quieter: the position
   never enters the book, so no time exit walks it and no risk context counts
   it as held. Found when the AC3 control test asserted the louder failure.
+- **E15-S06 square-off timer** — `execution/squareoff.py` sweeps the BOOK each
+  second (and after every reconciliation cycle, as a backstop) and, at each
+  position's stored deadline, cancels the stop, waits until the broker shows
+  it terminal, then sends a protected MARKET exit and marks the position
+  `ExitingPosition(reason=TIME)`. No Redis sorted set: that would be a second
+  copy of the deadline, and a missed add is a position with no time exit.
+
+- **"A restored position is one the broker holds."** Not if the broker closed
+  it while we were down - its own MIS square-off leaves our row OPEN. The next
+  morning step 4 found no live stop and EXITED it: a MARKET sell of shares the
+  account did not hold, a naked short. Every exit is now `min(book, broker)`
+  and a holding the broker lacks halts (`POSITION_NOT_HELD`). Found designing
+  E15-S06, in E15-S09 code. CRITICAL, AUDIT-030.
+- **"A position's deadline is a deadline."** `Position` accepted any instant,
+  so a hand-edited row could postpone its own time exit forever. It now refuses
+  a deadline off its opening IST day or after 15:30.
+- **"A piped pytest reports pytest's exit code."** It reports the last command
+  in the pipe. A run with 14 failures read `exit code 0` through `| sort |
+  uniq` - caught by the owner, not by the process. Capture `$?` straight after
+  pytest, or `${PIPESTATUS[0]}`.
 
 - **"A live exit covers the holding."** Only a WORKING one does. `is_live`
   counts a FILLED order as live, so an exit that had sold the first 40 shares

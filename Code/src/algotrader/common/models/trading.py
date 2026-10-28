@@ -487,6 +487,30 @@ class Position(_Frozen):
             raise ValueError("short stop must be above entry")
         return self
 
+    @model_validator(mode="after")
+    def _an_intraday_deadline(self) -> Position:
+        """The deadline falls on the IST day the position opened, by the close.
+
+        E15-S06. The square-off timer acts on THIS value and computes nothing
+        itself (E15-S05's constraint 1), so a deadline that is wrong is a time
+        exit that never comes: a row edited by hand, or corrupted, to read next
+        week would be held past every square-off with the timer reporting
+        nothing due. Every deadline MarketCalendar produces is the trading
+        date's, before 15:30 - anything else did not come from it. The same
+        rule RiskContext applies to the deadline it is handed.
+        """
+        from algotrader.common.calendar import IST, MARKET_CLOSE
+
+        opened = self.opened_at.astimezone(IST)
+        deadline = self.squareoff_deadline.astimezone(IST)
+        if deadline.date() != opened.date() or deadline.time() > MARKET_CLOSE:
+            raise ValueError(
+                f"squareoff_deadline {deadline:%Y-%m-%d %H:%M} IST is not an intraday "
+                f"deadline for a position opened {opened:%Y-%m-%d %H:%M} IST: it must be "
+                f"the same day, by {MARKET_CLOSE:%H:%M}"
+            )
+        return self
+
     @property
     def risk_per_share(self) -> Decimal:
         return abs(self.entry_price - self.stop_price)

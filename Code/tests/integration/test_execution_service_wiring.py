@@ -238,7 +238,10 @@ class Facts:
 class Stack:
     """The real execution stack over one Kite account."""
 
-    def __init__(self, session, instruments, redis, audit, calendar, account=None) -> None:
+    def __init__(
+        self, session, instruments, redis, audit, calendar, account=None, clock=None
+    ) -> None:
+        self.clock = clock or (lambda: NOW)
         self.account = account or KiteAccount()
         self.adapter = KiteTradingAdapter(
             auth=None, client=self.account, algo_id="", tick_size_for=instruments.tick_size
@@ -273,6 +276,8 @@ class Stack:
             gateway=self.gateway,
             manager=self.manager,
             reconciler=self.reconciler,
+            protector=self.protector,
+            broker=self.adapter,
             halts=self.halts,
             margins=self.adapter,
             store=RepositoryContextStore(
@@ -283,7 +288,7 @@ class Stack:
             orders=self.orders,
             redis=redis,
             facts=Facts(),
-            clock=lambda: NOW,
+            clock=self.clock,
             audit=audit.write,
         )
         self.source = RedisSignalSource(redis, block_ms=50)
@@ -640,3 +645,89 @@ class TestTheNewRepositoryReads:
     async def test_closed_since_refuses_a_naive_instant(self, stack: Stack) -> None:
         with pytest.raises(ValueError, match="timezone-aware"):
             await stack.positions.closed_since(dt.datetime(2026, 8, 25, 5, 0))
+
+
+# ===========================================================================
+# E15-S06 - the square-off timer against the real adapter, tables and halt
+# ===========================================================================
+
+
+def _at_ist(day: dt.date, hour: int, minute: int, second: int = 0) -> dt.datetime:
+    from algotrader.common.calendar import IST
+
+    return dt.datetime.combine(day, dt.time(hour, minute, second), tzinfo=IST).astimezone(dt.UTC)
+
+
+class TestS06TheTimeExitForReal:
+    async def test_at_its_deadline_a_position_is_squared_off_and_closed_as_time(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        clock = {"now": NOW}
+        stack = Stack(session, instruments, redis, audit, calendar, clock=lambda: clock["now"])
+        await stack.service.start()
+        await stack.publish(_rec("INFY"))
+        await stack.consume_one()
+        (entry,) = stack.account.placed
+        stack.account.fill(entry["tag"], entry["quantity"], "1200.50")
+        stack.account.hold("INFY", quantity=entry["quantity"])
+        await stack.service.tick()
+        assert isinstance(stack.manager.tracked("INFY"), ProtectedPosition)
+
+        clock["now"] = _at_ist(TRADE_DATE, 15, 15)  # 15:20 minus the buffer
+        await stack.service.sweep()
+
+        stop = next(p for p in stack.account.placed if p["order_type"] == "SL-M")
+        stop_row = next(r for r in stack.account.book if r["tag"] == stop["tag"])
+        assert stop_row["status"] == "CANCELLED", "the stop went first"
+        exit_ = stack.account.placed[-1]
+        assert (exit_["transaction_type"], exit_["order_type"], exit_["quantity"]) == (
+            "SELL",
+            "MARKET",
+            entry["quantity"],
+        )
+        assert exit_["market_protection"] == -1.0, "Zerodha rejects an unprotected MARKET"
+
+        stack.account.fill(exit_["tag"], exit_["quantity"], "1210.00")
+        stack.account.net[0]["quantity"] = 0
+        stack.account.net[0]["day_sell_quantity"] = entry["quantity"]
+        clock["now"] = _at_ist(TRADE_DATE, 15, 15, 30)
+        await stack.service.on_reconnect()
+
+        assert stack.manager.open_positions() == []
+        row = (await session.execute(text("SELECT status, exit_reason FROM positions"))).one()
+        assert (row.status, row.exit_reason) == ("CLOSED", "TIME")
+        rows = await _audit_rows(session)
+        assert ("SQUAREOFF", "TIME_EXIT") in rows
+        assert ("RECONCILIATION_DRIFT", "CLOSED") in rows
+        assert not (await stack.halts.state()).any_halted
+
+    async def test_yesterdays_open_row_is_not_sold_this_morning(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        """The defect found designing this story: a row left OPEN after the
+        broker's own square-off. Restored the next morning with no live stop,
+        both reconciliation and the timer would have SOLD 40 shares the account
+        does not hold. Now nothing is sent and the session halts."""
+        yesterday = dt.date(2026, 8, 24)
+        morning = _at_ist(TRADE_DATE, 9, 30)
+        stack = Stack(session, instruments, redis, audit, calendar, clock=lambda: morning)
+        await stack.positions.open_position(
+            {
+                "correlation_id": uuid.uuid4(),
+                "symbol": "INFY",
+                "slot_index": 0,
+                "direction": "LONG",
+                "quantity": 40,
+                "entry_price": Decimal("1200.0000"),
+                "stop_price": Decimal("1186.4500"),
+                "opened_at": _at_ist(yesterday, 10, 0),
+                "squareoff_deadline": _at_ist(yesterday, 15, 15),
+            }
+        )
+        await stack.service.start()
+
+        assert stack.account.placed == [], "an order here sells shares we do not own"
+        state = await stack.halts.state()
+        assert state.kill_switch
+        assert state.records["kill_switch"].reason is HaltReason.POSITION_NOT_HELD
+        assert ("RECONCILIATION_DRIFT", "NOT_HELD") in await _audit_rows(session)
