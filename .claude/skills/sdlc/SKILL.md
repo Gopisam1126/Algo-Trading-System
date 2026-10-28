@@ -77,11 +77,17 @@ Then, in the repo:
 
 - **What is built** — line counts per package under `Code/src/algotrader`. An
   `__init__.py`-only package is *empty*, whatever the tracker says.
-- **What CI says** — the latest run per branch, via the GitHub Actions API
-  (`api.github.com/repos/Gopisam1126/Algo-Trading-System/actions/runs`).
-  Unauthenticated, it allows 60 requests an hour: poll no faster than every
-  90 seconds. Job **logs** need repository admin rights, so a CI-only failure
-  is diagnosed by reproducing the job (Phase 9), not by reading its log.
+- **What CI says** — the latest run per branch. **Watch it on the public
+  Actions page, not the API:** `github.com/Gopisam1126/Algo-Trading-System/actions?query=branch%3ADEV`
+  carries each run's state in `aria-label="completed successfully: Run N of
+  CI. <commit subject>"` and does not count against any quota. The REST API
+  (`api.github.com/.../actions/runs`) allows 60 unauthenticated requests an
+  hour per IP, and `promote.py` spends one on its CI check — on 28 Oct 2026
+  status polling used the whole hour and the promotion had to wait for the
+  reset (it refused, correctly). `curl api.github.com/rate_limit` is free and
+  shows what is left. Job **logs** need repository admin rights, so a CI-only
+  failure is diagnosed by reproducing the job (Phase 9), not by reading its
+  log.
 - **What the machine has** — Docker running (`docker info`), because the
   integration and SIT suites skip without it. `make` is **not** installed on
   the Windows development machine, so every command here is given in its
@@ -573,6 +579,12 @@ PYTHONPATH="$PWD/src" "$PY" -m pytest tests/sit -q -p no:cacheprovider
 # a broad change (several components) -> run tests/ instead of tests/sit
 cd - && git worktree remove --force "$SP/qa" && git worktree prune
 ```
+
+If the removal fails with "Permission denied" on `.git/worktrees/qa`: the
+repository — and so its `.git` — sits under OneDrive, which marks the
+worktree's metadata read-only. Remove it from PowerShell with
+`Remove-Item -Recurse -Force "<repo>\.git\worktrees\qa"`, then
+`git worktree prune` (28 Oct 2026).
 
 Docker must be up. On Windows the SIT module keeps one `asyncio.Runner` for
 the module, because a fresh `asyncio.run` per call builds a loopback-socket
