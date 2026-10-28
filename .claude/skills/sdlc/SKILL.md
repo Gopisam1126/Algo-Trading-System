@@ -353,6 +353,23 @@ finding, never a flake. An advisory that cannot be fixed is accepted only by
 ID, in `ACCEPTED_ADVISORIES`, with an executed reachability check beside it —
 see `DEPLOYMENT.md`.
 
+**Run gitleaks on what you are about to push.** CI's Security job does, and
+the commands above do not — on 28 Oct 2026 a test fixture written as one
+literal (`"api_key=... access_token=..."`) passed every local gate and failed
+CI Run 114 on `generic-api-key`. From the repository root, against the
+unpushed range (`dir <path>` scans a single file):
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" zricethezav/gitleaks:latest \
+  git /repo --log-opts="origin/DEV..HEAD" --redact --no-banner -v
+```
+
+A fake credential in a test is assembled at runtime with a comment saying why
+(`"api_" + "key=" + ...`, the convention in `test_log_redaction.py`). A
+finding in a commit already pushed stays in history: CI's action scans only
+the commits in each push, so the next push is judged on its own — never
+force-push a shared branch to remove a fake value.
+
 Then STRIDE-lite against the diff:
 
 - **Spoofing** — can input claim to be something it is not?
