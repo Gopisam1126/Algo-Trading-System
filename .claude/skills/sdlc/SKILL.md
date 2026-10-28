@@ -61,7 +61,7 @@ truth from the code, the tracker and CI, in that order of authority.
 
 ```bash
 git fetch -q origin
-git rev-parse --short origin/DEV origin/QA HEAD
+git rev-parse origin/DEV origin/QA HEAD | cut -c1-7   # NOT --short: it takes one revision and fails on three
 git status --short
 git log --no-merges --oneline origin/QA..origin/DEV     # commits QA has not seen
 python scripts/promote.py --from DEV --to QA --dry-run  # is anything DEPLOYABLE unpromoted?
