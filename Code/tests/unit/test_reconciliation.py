@@ -21,6 +21,7 @@ from algotrader.broker.adapter import BrokerPosition
 from algotrader.common.audit import AuditEntry
 from algotrader.common.enums import (
     Direction,
+    ExitReason,
     OrderIntent,
     OrderStatus,
     OrderType,
@@ -601,6 +602,51 @@ def _protected(symbol: str = "INFY") -> ProtectedPosition:
     )
 
 
+def _held_all(broker: FakeBroker, ledger: FakeLedger, manager: PositionManager) -> None:
+    """Make every booked position real: the entry that bought it, and the
+    broker holding it produced (E15-S06).
+
+    Before the not-held guard these tests booked positions the broker did not
+    hold - a state no session produces - and the exits they assert were sized
+    from the book alone. Exiting a holding the broker does not have is a
+    naked short, so the guard now halts there instead; the fixtures say what a
+    real session would."""
+    from algotrader.execution.gateway import client_order_id
+
+    for tracked in manager.open_positions():
+        position = tracked.position
+        cid = client_order_id(
+            correlation_id=position.correlation_id,
+            symbol=position.symbol,
+            side=Side.BUY,
+            intent=OrderIntent.ENTRY,
+            trade_date=NOW.date(),
+        )
+        ledger.rows.append(
+            _row(
+                cid,
+                status="FILLED",
+                filled=position.quantity,
+                quantity=position.quantity,
+                correlation=position.correlation_id,
+                symbol=position.symbol,
+            )
+        )
+        broker.orderbook.append(
+            _broker_order(
+                cid,
+                status=OrderStatus.FILLED,
+                filled=position.quantity,
+                quantity=position.quantity,
+                symbol=position.symbol,
+                broker_order_id=f"B-{position.symbol}",
+            )
+        )
+        broker.positions.append(
+            _pos(position.symbol, quantity=position.quantity, bought=position.quantity)
+        )
+
+
 class TestAc3EveryPositionEveryCycle:
     def test_a_live_stop_is_left_alone(self) -> None:
         manager, _m = _manager()
@@ -616,6 +662,7 @@ class TestAc3EveryPositionEveryCycle:
         manager, _m = _manager()
         _book(manager, _protected("INFY"))
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         report = _run(reconciler)
         assert [t.symbol for t, _ in protector.exits] == ["INFY"]
         assert Drift.UNPROTECTED in [d.kind for d in report.drifts]
@@ -625,6 +672,7 @@ class TestAc3EveryPositionEveryCycle:
         for sym in ("INFY", "TCS", "WIPRO"):
             _book(manager, _protected(sym))
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         protector.live_stops = {"TCS"}
         _run(reconciler)
         assert sorted(t.symbol for t, _ in protector.exits) == ["INFY", "WIPRO"]
@@ -636,6 +684,7 @@ class TestAc3EveryPositionEveryCycle:
         for sym in ("INFY", "TCS"):
             _book(manager, _protected(sym))
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         protector.exit_raises = {"INFY": RuntimeError("exit refused")}
         report = _run(reconciler)
         assert sorted(t.symbol for t, _ in protector.exits) == ["INFY", "TCS"]
@@ -649,6 +698,7 @@ class TestAc3EveryPositionEveryCycle:
         _book(manager, tracked)
         mirror.data["INFY"] = {"protection": "ProtectedPosition"}
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         _run(reconciler)
         assert [t.symbol for t, _ in protector.exits] == ["INFY"]
 
@@ -658,6 +708,7 @@ class TestAc3EveryPositionEveryCycle:
         manager, _m = _manager()
         _book(manager, ExitingPosition(position=_position("INFY"), because="stop refused"))
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         protector.live_exits = {"INFY"}
         _run(reconciler)
         assert protector.exits == []
@@ -666,6 +717,7 @@ class TestAc3EveryPositionEveryCycle:
         manager, _m = _manager()
         _book(manager, ExitingPosition(position=_position("INFY"), because="stop refused"))
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         _run(reconciler)
         assert [t.symbol for t, _ in protector.exits] == ["INFY"]
 
@@ -692,6 +744,7 @@ class TestAc4UnverifiedIsResolved:
         manager, _m = _manager()
         _book(manager, UnverifiedPosition(position=_position("INFY")))
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         _run(reconciler)
         assert [t.symbol for t, _ in protector.exits] == ["INFY"]
         # This line asserted UnverifiedPosition until SIT-006 - the test had
@@ -1173,6 +1226,7 @@ class TestAc8AuditedAndFits:
         _book(manager, _protected("TCS"))
         reconciler, broker, _l, protector, halter = _reconciler(manager=manager, audit=broken)
         broker.positions = [_pos("WIPRO", quantity=25, bought=25)]
+        _held_all(broker, _l, manager)
         report = _run(reconciler)
         assert report.halted
         assert [r for r, _ in halter.armed] == [HaltReason.UNKNOWN_POSITION]
@@ -1490,6 +1544,7 @@ class TestAnExitedPositionSaysSo:
         manager, mirror = _manager()
         _book(manager, _protected("INFY"))
         reconciler, _b, _l, _p, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         _run(reconciler)
         assert isinstance(manager.tracked("INFY"), ExitingPosition)
         assert mirror.data["INFY"].protection == "ExitingPosition"
@@ -1498,6 +1553,7 @@ class TestAnExitedPositionSaysSo:
         manager, _m = _manager()
         _book(manager, _protected("INFY"))
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         _run(reconciler)
         protector.live_exits = {"INFY"}
         _run(reconciler)
@@ -1509,6 +1565,7 @@ class TestAnExitedPositionSaysSo:
         manager, _m = _manager()
         _book(manager, _protected("INFY"))
         reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        _held_all(_b, _l, manager)
         protector.exit_raises = {"INFY": RuntimeError("exit refused")}
         _run(reconciler)
         assert isinstance(manager.tracked("INFY"), ProtectedPosition)
@@ -2124,3 +2181,106 @@ class TestS13TheLoopHoldsTheGuard:
         loop, cycles = self._loop(None, [NOW])
         asyncio.run(loop.on_reconnect())
         assert cycles == [NOW]
+
+
+# ---------------------------------------------------------------------------
+# E15-S06 - never exit what the broker does not hold; close a time exit as TIME
+# ---------------------------------------------------------------------------
+
+
+class TestS06OnlyWhatTheBrokerHoldsIsExited:
+    """A positions row left OPEN after the broker closed the position outside
+    our view - its own MIS square-off while we were down - is restored as a
+    position with no live stop. Step 4 exited it: a MARKET sell of shares the
+    account did not hold, which opens a naked short."""
+
+    def test_a_restored_position_the_broker_does_not_hold_is_not_exited(self) -> None:
+        manager, _m = _manager()
+        _book(manager, UnverifiedPosition(position=_position("INFY")))
+        reconciler, _b, _l, protector, halter = _reconciler(manager=manager)
+        report = _run(reconciler)
+        assert protector.exits == [], "an exit here would sell 40 shares we do not own"
+        assert report.halted
+        assert [r for r, _ in halter.armed] == [HaltReason.POSITION_NOT_HELD]
+        assert Drift.NOT_HELD in [d.kind for d in report.drifts]
+
+    def test_the_halt_re_arms_every_cycle_and_the_alert_does_not(self) -> None:
+        manager, _m = _manager()
+        _book(manager, UnverifiedPosition(position=_position("INFY")))
+        reconciler, _b, _l, _p, halter = _reconciler(manager=manager)
+        first = _run(reconciler)
+        second = _run(reconciler)
+        assert [r for r, _ in halter.armed].count(HaltReason.POSITION_NOT_HELD) == 2
+        assert Drift.NOT_HELD in [d.kind for d in first.drifts]
+        assert Drift.NOT_HELD not in [d.kind for d in second.drifts]
+        assert _counter("positions_not_held_total") == 1
+
+    def test_a_partial_holding_is_exited_for_what_is_held_and_halts(self) -> None:
+        manager, _m = _manager()
+        _book(manager, UnverifiedPosition(position=_position("INFY")))
+        reconciler, broker, ledger, protector, halter = _reconciler(manager=manager)
+        _held_all(broker, ledger, manager)
+        broker.positions = [_pos("INFY", quantity=25, bought=40, sold=15)]
+        _run(reconciler)
+        ((target, _because),) = protector.exits
+        assert target.quantity == 25
+        assert HaltReason.POSITION_NOT_HELD in [r for r, _ in halter.armed]
+
+    def test_a_held_position_is_exited_in_full_as_before(self) -> None:
+        """The control: the guard changes nothing for a position the broker has."""
+        manager, _m = _manager()
+        _book(manager, UnverifiedPosition(position=_position("INFY")))
+        reconciler, broker, ledger, protector, halter = _reconciler(manager=manager)
+        _held_all(broker, ledger, manager)
+        _run(reconciler)
+        ((target, _because),) = protector.exits
+        assert target.quantity == 40
+        assert halter.armed == []
+
+    def test_only_our_product_on_our_exchange_counts(self) -> None:
+        manager, _m = _manager()
+        _book(manager, UnverifiedPosition(position=_position("INFY")))
+        reconciler, broker, _l, protector, halter = _reconciler(manager=manager)
+        broker.positions = [_pos("INFY", quantity=40, bought=40, product="CNC")]
+        _run(reconciler)
+        assert protector.exits == []
+        assert HaltReason.POSITION_NOT_HELD in [r for r, _ in halter.armed]
+
+    def test_held_by_broker_reads_a_short_by_its_sign(self) -> None:
+        from algotrader.execution.reconciliation import held_by_broker
+
+        short = _position("INFY").model_copy(
+            update={"direction": Direction.SHORT, "stop_price": Decimal("1213.5500")}
+        )
+        assert held_by_broker([_pos("INFY", quantity=-40, sold=40)], short) == 40
+        assert held_by_broker([_pos("INFY", quantity=40, bought=40)], short) == 0
+
+
+class TestS06ATimeExitIsClosedAsTime:
+    def _exiting(self, reason: ExitReason):
+        manager, _m = _manager()
+        position = _position("INFY")
+        _book(manager, ExitingPosition(position=position, because="deadline", reason=reason))
+        store = manager._store
+        reconciler, broker, ledger, protector, _h = _reconciler(manager=manager)
+        _held_all(broker, ledger, manager)
+        from algotrader.execution.protective_stop import exit_client_order_id
+
+        key = exit_client_order_id(position, trade_date=NOW.date())
+        broker.orderbook.append(
+            _broker_order(
+                key, status=OrderStatus.FILLED, side=Side.SELL, filled=40, price="1210.0000"
+            )
+        )
+        protector.live_exits = {"INFY"}
+        _run(reconciler)
+        return store
+
+    def test_the_timers_exit_closes_the_position_as_time(self) -> None:
+        store = self._exiting(ExitReason.TIME)
+        assert [c["exit_reason"] for c in store.closes] == ["TIME"]
+
+    def test_an_emergency_exit_still_closes_as_unprotected(self) -> None:
+        """The control: the reason comes from the book, not from the key."""
+        store = self._exiting(ExitReason.UNPROTECTED)
+        assert [c["exit_reason"] for c in store.closes] == ["UNPROTECTED"]

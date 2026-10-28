@@ -103,6 +103,13 @@ from algotrader.execution.session_context import (
     SessionFacts,
 )
 from algotrader.execution.slots import SlotManager
+from algotrader.execution.squareoff import (
+    EmergencyExit,
+    PositionsReader,
+    SquareOffTimer,
+    TimerGateway,
+    TimerReport,
+)
 
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
@@ -195,7 +202,9 @@ class SignalResult:
 # ---------------------------------------------------------------------------
 
 
-class EntryGateway(Protocol):
+class EntryGateway(TimerGateway, Protocol):
+    """The gateway as this service uses it: entries, and the timer's exits."""
+
     def build_entry(
         self, decision: RiskDecision, recommendation: Recommendation, *, trade_date: dt.date
     ) -> OrderRequest: ...
@@ -255,6 +264,8 @@ class ExecutionService:
         gateway: EntryGateway,
         manager: PositionManager,
         reconciler: Reconciler,
+        protector: EmergencyExit,
+        broker: PositionsReader,
         halts: HaltSource,
         margins: MarginSource,
         store: ContextStore,
@@ -265,6 +276,8 @@ class ExecutionService:
         audit: AuditSink | None = None,
         sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
         reconcile_interval_seconds: float = 30.0,
+        squareoff_interval_seconds: float = 1.0,
+        squareoff_stall_seconds: float = 10.0,
     ) -> None:
         self._mode = config.system.mode
         self._max_age = dt.timedelta(seconds=config.execution.max_signal_age_seconds)
@@ -312,6 +325,26 @@ class ExecutionService:
             sleep=sleep,
             guard=self._guard,
         )
+        #: REQUIRED and built here, like the loop: a service that could run
+        #: without its square-off timer would hold positions past their time
+        #: exit (invariant 5) with nothing in its constructor to say so.
+        self._timer = SquareOffTimer(
+            gateway=gateway,
+            broker=broker,
+            manager=manager,
+            protector=protector,
+            halter=halts,
+            audit=audit,
+            metrics=get_metrics(),
+            sleep=sleep,
+        )
+        self._timer_interval = squareoff_interval_seconds
+        self._stall_after = dt.timedelta(seconds=squareoff_stall_seconds)
+        #: Beat by the dedicated one-second loop ONLY. The backstop sweeps after
+        #: every cycle too, so the timer's own last_tick_at cannot tell a live
+        #: loop from a dead one.
+        self._timer_heartbeat: dt.datetime | None = None
+        self._stall_reported = False
         self._restored = False
         self._reconciled = False
 
@@ -356,14 +389,54 @@ class ExecutionService:
         report = await self._loop.on_reconnect()
         if report is not None:
             self._reconciled = True
+        await self.sweep()
         return report
 
     async def tick(self) -> CycleReport | None:
-        """One scheduled reconciliation iteration (nothing outside hours)."""
+        """One scheduled reconciliation iteration, then the square-off backstop."""
         report = await self._loop.tick()
         if report is not None:
             self._reconciled = True
+        self._check_timer_liveness()
+        await self.sweep()
         return report
+
+    async def sweep(self) -> TimerReport | None:
+        """One square-off sweep, under the lock, once the book is restored.
+
+        Not gated on ``ready``: a position past its deadline must be exited
+        even when reconciliation is failing - the timer checks the stop and
+        the broker's holding itself. Gated on the restore, because before it
+        the book is empty and there is nothing true to act on.
+        """
+        if not self._restored:
+            return None
+        async with self._guard:
+            return await self._timer.tick(self._clock())
+
+    def _check_timer_liveness(self) -> None:
+        """The story's build concern 1: watch the timer loop independently.
+
+        Only once the dedicated loop has beaten: before ``run`` starts it there
+        is no loop to be silent. The sweep that follows in ``tick`` covers a
+        dead loop either way; this is what makes the death visible.
+        """
+        beat = self._timer_heartbeat
+        if beat is None:
+            return
+        now = self._clock()
+        if now - beat <= self._stall_after:
+            self._stall_reported = False
+            return
+        if self._stall_reported or not self._calendar.is_market_open(now):
+            return
+        self._stall_reported = True
+        get_metrics().squareoff_timer_stalls_total.inc()
+        log.critical(
+            "SQUARE-OFF TIMER SILENT for %ss; the reconciliation path is sweeping "
+            "in its place every cycle",
+            int((now - beat).total_seconds()),
+        )
 
     async def run(self, source: SignalSource, stop: asyncio.Event) -> None:
         """Start, then consume signals and reconcile until ``stop`` is set.
@@ -375,12 +448,19 @@ class ExecutionService:
         await self.start()
         async with asyncio.TaskGroup() as group:
             group.create_task(self._reconcile_until(stop))
+            group.create_task(self._squareoff_until(stop))
             group.create_task(self._consume_until(source, stop))
 
     async def _reconcile_until(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             await self.tick()
             await self._sleep(self._interval)
+
+    async def _squareoff_until(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            self._timer_heartbeat = self._clock()
+            await self.sweep()
+            await self._sleep(self._timer_interval)
 
     async def _consume_until(self, source: SignalSource, stop: asyncio.Event) -> None:
         await source.start()

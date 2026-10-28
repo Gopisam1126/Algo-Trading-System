@@ -254,6 +254,26 @@ class Reconciler:
         return rec_mod.CycleReport(cycle_id=uuid4(), at=now)
 
 
+class Holdings:
+    """The broker's net positions, for the square-off timer's holding check."""
+
+    def __init__(self) -> None:
+        self.positions: list[Any] = []
+
+    async def fetch_positions(self) -> list[Any]:
+        return list(self.positions)
+
+
+class Emergency:
+    """ProtectiveStop.exit_now, recorded."""
+
+    def __init__(self) -> None:
+        self.exits: list[tuple[Any, str]] = []
+
+    async def exit_now(self, target, *, trade_date, now, because) -> None:
+        self.exits.append((target, because))
+
+
 class Clock:
     def __init__(self, now: dt.datetime = NOW) -> None:
         self.now = now
@@ -294,6 +314,8 @@ class Harness:
             calendar=_calendar(),
         )
         self.reconciler = Reconciler(self.ref)
+        self.holdings = Holdings()
+        self.emergency = Emergency()
         self.clock = Clock()
         self.audit: list[AuditEntry] = []
         self.service = ExecutionService(
@@ -302,6 +324,8 @@ class Harness:
             gateway=self.gateway,
             manager=self.manager,
             reconciler=self.reconciler,  # type: ignore[arg-type]
+            protector=self.emergency,
+            broker=self.holdings,
             halts=self.halts,
             margins=Margins(),
             store=self.store,
@@ -914,6 +938,8 @@ class TestTheSignalAgeLimit:
             gateway=h.gateway,
             manager=h.manager,
             reconciler=h.reconciler,  # type: ignore[arg-type]
+            protector=h.emergency,
+            broker=h.holdings,
             halts=h.halts,
             margins=Margins(),
             store=h.store,
@@ -1005,3 +1031,90 @@ class TestNothingSecretReachesTheAuditTable:
         assert result.outcome is Outcome.REFUSED
         assert "ConnectionError" in result.detail
         assert "hunter2pass" not in self._details(h)
+
+
+# ---------------------------------------------------------------------------
+# E15-S06 - the square-off timer is part of the service
+# ---------------------------------------------------------------------------
+
+
+def _counter_value(name: str) -> float:
+    from algotrader.common.metrics import get_metrics
+
+    return getattr(get_metrics(), name)._value.get()
+
+
+class TestS06TheTimerRunsInsideTheService:
+    async def test_every_reconciliation_tick_also_sweeps(self) -> None:
+        """The backstop: a dead timer loop leaves positions exited a cycle late,
+        not left for the broker."""
+        h = await Harness().started()
+        h.clock.now = NOW + dt.timedelta(seconds=30)
+        await h.service.tick()
+        assert h.service._timer.last_tick_at == NOW + dt.timedelta(seconds=30)
+
+    async def test_a_reconnect_sweeps_too(self) -> None:
+        """A restart past a deadline must not wait for the first scheduled tick."""
+        h = Harness()
+        await h.service.start()
+        assert h.service._timer.last_tick_at == NOW
+
+    async def test_nothing_is_swept_before_the_book_is_restored(self) -> None:
+        h = Harness()
+        assert await h.service.sweep() is None
+        assert h.service._timer.last_tick_at is None
+
+    async def test_a_sweep_runs_even_when_reconciliation_is_failing(self) -> None:
+        """A position past its deadline is exited whatever the cycle says: the
+        timer checks the stop and the broker's holding itself."""
+        h = Harness()
+        h.reconciler.raises = ConnectionError("broker unreachable")
+        await h.service.start()
+        assert not h.service.ready
+        assert await h.service.sweep() is not None
+
+    async def test_a_silent_timer_loop_is_reported_once(self) -> None:
+        h = await Harness().started()
+        h.service._timer_heartbeat = NOW - dt.timedelta(seconds=11)
+        await h.service.tick()
+        await h.service.tick()
+        assert _counter_value("squareoff_timer_stalls_total") == 1
+
+    async def test_a_beating_loop_is_not_reported(self) -> None:
+        """The control: a heartbeat inside the window is a live loop."""
+        h = await Harness().started()
+        h.service._timer_heartbeat = NOW - dt.timedelta(seconds=9)
+        await h.service.tick()
+        assert _counter_value("squareoff_timer_stalls_total") == 0
+
+    async def test_before_the_loop_has_ever_beaten_there_is_nothing_to_report(self) -> None:
+        h = await Harness().started()
+        await h.service.tick()
+        assert _counter_value("squareoff_timer_stalls_total") == 0
+
+    async def test_a_recovered_loop_can_be_reported_again(self) -> None:
+        h = await Harness().started()
+        h.service._timer_heartbeat = NOW - dt.timedelta(seconds=20)
+        await h.service.tick()
+        h.service._timer_heartbeat = NOW
+        await h.service.tick()
+        h.service._timer_heartbeat = NOW - dt.timedelta(seconds=20)
+        await h.service.tick()
+        assert _counter_value("squareoff_timer_stalls_total") == 2
+
+    async def test_the_run_loop_beats_the_heartbeat(self) -> None:
+        h = Harness()
+        stop = asyncio.Event()
+
+        class Quiet(Source):
+            async def next_batch(self) -> list[Delivery]:
+                await asyncio.sleep(0)
+                stop.set()
+                return []
+
+        async def no_sleep(_seconds: float) -> None:
+            await asyncio.sleep(0)
+
+        h.service._sleep = no_sleep
+        await h.service.run(Quiet(), stop)
+        assert h.service._timer_heartbeat is not None

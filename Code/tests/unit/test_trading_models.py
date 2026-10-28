@@ -52,7 +52,10 @@ def _position(
     stop: str,
     quantity: int = 100,
 ) -> Position:
-    now = dt.datetime.now(dt.UTC)
+    # 10:30 IST on a trading day, deadline 15:15 IST the same day. Was the wall
+    # clock plus five hours, which is not an intraday deadline after 10:30 IST
+    # - E15-S06's Position validator refuses a deadline on another day.
+    now = dt.datetime(2026, 8, 25, 5, 0, tzinfo=dt.UTC)
     return Position(
         correlation_id=uuid.uuid4(),
         symbol="INFY",
@@ -62,7 +65,7 @@ def _position(
         entry_price=Decimal(entry),
         stop_price=Decimal(stop),
         opened_at=now,
-        squareoff_deadline=now + dt.timedelta(hours=5),
+        squareoff_deadline=dt.datetime(2026, 8, 25, 9, 45, tzinfo=dt.UTC),
     )
 
 
@@ -340,3 +343,46 @@ class TestOrderProgress:
     def test_completion_follows_the_status_not_the_quantity(self) -> None:
         assert self._order(100, 100, OrderStatus.FILLED).is_complete
         assert not self._order(100, 40, OrderStatus.OPEN).is_complete
+
+
+class TestADeadlineIsIntraday:
+    """E15-S06. The square-off timer acts on the stored deadline and computes
+    nothing itself, so a deadline that is not today's is a time exit that never
+    comes - a hand-edited or corrupted row would be held past every square-off."""
+
+    def _at(self, opened: dt.datetime, deadline: dt.datetime) -> Position:
+        return Position(
+            correlation_id=uuid.uuid4(),
+            symbol="INFY",
+            slot_index=0,
+            direction=Direction.LONG,
+            quantity=10,
+            entry_price=Decimal("1000"),
+            stop_price=Decimal("990"),
+            opened_at=opened,
+            squareoff_deadline=deadline,
+        )
+
+    OPENED = dt.datetime(2026, 8, 25, 5, 0, tzinfo=dt.UTC)  # 10:30 IST
+
+    def test_a_same_day_deadline_before_the_close_is_accepted(self) -> None:
+        """The control: every deadline MarketCalendar produces."""
+        position = self._at(self.OPENED, dt.datetime(2026, 8, 25, 9, 45, tzinfo=dt.UTC))
+        assert position.squareoff_deadline.hour == 9
+
+    def test_a_deadline_next_week_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="not an intraday deadline"):
+            self._at(self.OPENED, dt.datetime(2026, 9, 1, 9, 45, tzinfo=dt.UTC))
+
+    def test_a_deadline_after_the_close_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="by 15:30"):
+            self._at(self.OPENED, dt.datetime(2026, 8, 25, 10, 5, tzinfo=dt.UTC))  # 15:35 IST
+
+    def test_the_day_is_the_ist_day_not_the_utc_day(self) -> None:
+        """Both deadlines below share the opening's UTC date (25 Aug). Only the
+        first shares its IST date: 19:00 UTC is 00:30 IST on the 26th, so a
+        UTC-day rule would accept it and an IST-day rule refuses it."""
+        opened = dt.datetime(2026, 8, 25, 3, 50, tzinfo=dt.UTC)  # 09:20 IST, 25 Aug
+        assert self._at(opened, dt.datetime(2026, 8, 25, 9, 45, tzinfo=dt.UTC))
+        with pytest.raises(ValueError, match="not an intraday deadline"):
+            self._at(opened, dt.datetime(2026, 8, 25, 19, 0, tzinfo=dt.UTC))

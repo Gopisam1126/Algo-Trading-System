@@ -299,6 +299,8 @@ class Day:
             gateway=gateway,
             manager=self.manager,
             reconciler=reconciler,
+            protector=protector,
+            broker=adapter,
             halts=self.halts,
             margins=adapter,
             store=RepositoryContextStore(
@@ -453,16 +455,26 @@ class TestSit21ASessionDrivenByTheExecutionService:
             (Outcome.REJECTED, RejectReason.NO_TRADE_WINDOW)
         ]
 
-        # Every entry the broker received is protected, with one stop each.
-        entries = [p for p in day.account.placed if p["order_type"] == "MARKET"]
+        # Every entry the broker received was protected by one stop, and then
+        # - since E15-S06 - squared off at its own deadline and closed as TIME.
+        entries = [p for p in day.account.placed if p["transaction_type"] == "BUY"]
         assert sorted(p["tradingsymbol"] for p in entries) == ["INFY", "TCS"]
-        for symbol in ("INFY", "TCS"):
-            assert isinstance(day.manager.tracked(symbol), ProtectedPosition), symbol
         assert _stops(day.account) == {p["tradingsymbol"]: p["quantity"] for p in entries}
-        assert not any(
-            p["transaction_type"] == "SELL" and p["order_type"] == "MARKET"
+        exits = [
+            p
             for p in day.account.placed
-        ), "something was exited"
+            if p["transaction_type"] == "SELL" and p["order_type"] == "MARKET"
+        ]
+        assert {p["tradingsymbol"]: p["quantity"] for p in exits} == {
+            p["tradingsymbol"]: p["quantity"] for p in entries
+        }, "each position is exited once, for what it held"
+        assert day.manager.open_positions() == [], "a position survived its deadline"
+        closed = (
+            await session.execute(
+                text("SELECT status, exit_reason FROM positions ORDER BY slot_index")
+            )
+        ).all()
+        assert [(r.status, r.exit_reason) for r in closed] == [("CLOSED", "TIME")] * 2
 
         # Every signal is explainable from the audit table alone.
         audited = await _audited(session)
@@ -530,3 +542,143 @@ class TestSit21ASessionDrivenByTheExecutionService:
             p["transaction_type"] == "SELL" and p["order_type"] == "MARKET"
             for p in day.account.placed
         ), "a halt must never disable protection"
+
+
+# ---------------------------------------------------------------------------
+# SIT-22 - the square-off timer across a session (E15-S06)
+# ---------------------------------------------------------------------------
+
+
+def _working_sells(account: SettlingAccount, symbol: str) -> int:
+    """Sell orders for this symbol that could still fill: a working stop or exit."""
+    return sum(
+        1
+        for row in account.book
+        if row["tradingsymbol"] == symbol
+        and row["transaction_type"] == "SELL"
+        and row["status"] in ("OPEN", "TRIGGER PENDING")
+    )
+
+
+class TestSit22NoPositionSurvivesItsDeadline:
+    async def test_every_position_leaves_at_its_own_deadline_and_never_twice(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        day = Day(session, instruments, redis, audit, calendar, clock=Clock(_ist(9, 30)))
+        await day.service.start()
+        exits_at: dict[str, dt.datetime] = {}
+        worst: dict[str, int] = {}
+
+        async def watch(now: dt.datetime) -> None:
+            for row in day.account.placed:
+                key = row["tradingsymbol"]
+                if row["transaction_type"] == "SELL" and row["order_type"] == "MARKET":
+                    exits_at.setdefault(key, now)
+            for symbol in ("INFY", "TCS", "HDFCBANK"):
+                worst[symbol] = max(worst.get(symbol, 0), _working_sells(day.account, symbol))
+
+        await day.walk(
+            _ist(15, 30),
+            {
+                _ist(10, 0): [_rec("INFY", _ist(10, 0))],  # non-CAS: 15:15
+                _ist(10, 5): [_rec("TCS", _ist(10, 5))],  # CAS: 15:05
+                _ist(14, 0): [_rec("HDFCBANK", _ist(14, 0))],  # non-CAS, late entry
+            },
+            at_each_minute=watch,
+        )
+        # The exit is placed IN the deadline's minute and seen by the next one.
+        assert exits_at == {
+            "TCS": _ist(15, 6),
+            "INFY": _ist(15, 16),
+            "HDFCBANK": _ist(15, 16),
+        }
+        assert worst == {"INFY": 1, "TCS": 1, "HDFCBANK": 1}, "a stop and an exit both working"
+        assert day.manager.open_positions() == []
+        rows = (
+            await session.execute(text("SELECT exit_reason FROM positions ORDER BY slot_index"))
+        ).all()
+        assert [r.exit_reason for r in rows] == ["TIME", "TIME", "TIME"]
+        assert all(held["quantity"] == 0 for held in day.account.net.values()), "flat at close"
+        assert not (await day.halts.state()).any_halted
+
+    async def test_a_restart_after_the_deadline_still_squares_off_before_the_broker(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        clock = Clock(_ist(9, 30))
+        first = Day(session, instruments, redis, audit, calendar, clock=clock)
+        await first.service.start()
+        await first.walk(_ist(15, 10), {_ist(10, 0): [_rec("INFY", _ist(10, 0))]})
+        assert isinstance(first.manager.tracked("INFY"), ProtectedPosition)
+
+        # Down across the deadline; back at 15:17, three minutes before Zerodha.
+        clock.now = _ist(15, 17)
+        second = Day(
+            session, instruments, redis, audit, calendar, account=first.account, clock=clock
+        )
+        await second.service.start()
+        exits = [
+            p
+            for p in second.account.placed
+            if p["transaction_type"] == "SELL" and p["order_type"] == "MARKET"
+        ]
+        (entry,) = [p for p in second.account.placed if p["transaction_type"] == "BUY"]
+        assert [(p["tradingsymbol"], p["quantity"]) for p in exits] == [
+            ("INFY", entry["quantity"])
+        ], "the restart squared off at once, once, for what was held"
+        await second.walk(_ist(15, 20))
+        assert second.manager.open_positions() == []
+        (row,) = (await session.execute(text("SELECT exit_reason FROM positions"))).all()
+        assert row.exit_reason == "TIME"
+
+    async def test_a_kill_switch_does_not_stop_the_time_exits(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        day = Day(session, instruments, redis, audit, calendar, clock=Clock(_ist(9, 30)))
+        await day.service.start()
+
+        async def operator(now: dt.datetime) -> None:
+            if now == _ist(14, 0):
+                await day.halts.arm(HaltReason.MANUAL, detail="drill", armed_by="sit", now=now)
+
+        await day.walk(
+            _ist(15, 30),
+            {_ist(10, 0): [_rec("INFY", _ist(10, 0))]},
+            at_each_minute=operator,
+        )
+        assert (await day.halts.state()).kill_switch
+        assert day.manager.open_positions() == [], "a halt must never disable the exit path"
+        (row,) = (await session.execute(text("SELECT exit_reason FROM positions"))).all()
+        assert row.exit_reason == "TIME"
+
+    async def test_yesterdays_open_row_halts_the_morning_and_nothing_is_sold_all_day(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        """The defect found designing this story, as a session: the broker
+        squared yesterday's position off while we were down, and the row stayed
+        OPEN. Before the fix the first cycle of the morning SOLD 40 shares the
+        account did not hold."""
+        yesterday = dt.date(2026, 8, 24)
+        day = Day(session, instruments, redis, audit, calendar, clock=Clock(_ist(9, 10)))
+        positions = PositionRepository(session, instruments)
+        await positions.open_position(
+            {
+                "correlation_id": uuid.uuid4(),
+                "symbol": "INFY",
+                "slot_index": 0,
+                "direction": "LONG",
+                "quantity": 40,
+                "entry_price": Decimal("1200.0000"),
+                "stop_price": Decimal("1186.4500"),
+                "opened_at": dt.datetime.combine(yesterday, dt.time(10, 0), tzinfo=IST),
+                "squareoff_deadline": dt.datetime.combine(yesterday, dt.time(15, 15), tzinfo=IST),
+            }
+        )
+        await day.service.start()
+        late = _rec("TCS", _ist(11, 0))
+        await day.walk(_ist(15, 30), {_ist(11, 0): [late]})
+
+        assert day.account.placed == [], "nothing was sent all day"
+        state = await day.halts.state()
+        assert state.records["kill_switch"].reason is HaltReason.POSITION_NOT_HELD
+        (result,) = day.results[late.correlation_id]
+        assert result.reason is RejectReason.KILL_SWITCH_ACTIVE
