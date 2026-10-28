@@ -2018,3 +2018,109 @@ class TestS12TheSecondLayersHoldOnTheirOwn:
         protector, report = self._book_directly(doubted=False)
         assert [p.symbol for p in protector.attached] == ["INFY"]
         assert report.errors == []
+
+
+# ---------------------------------------------------------------------------
+# E15-S13 — an entry that never landed releases its plan
+# ---------------------------------------------------------------------------
+
+
+class TestS13AnEntryThatNeverLandedReleasesItsPlan:
+    """The execution service counts a pending plan as an occupied slot. A plan
+    for an entry that never reached the broker was dropped by nothing: step 3b
+    only forgets plans for entries the broker lists, and this one is listed
+    nowhere - so its slot stayed occupied for the rest of the day."""
+
+    def _never_landed(self, *, age: dt.timedelta):
+        cid = _cid()
+        manager, _m = _manager()
+        reconciler, _b, ledger, _p, _h = _reconciler(
+            ledger=FakeLedger(
+                [_row(cid, status="SUBMITTING", placed_at=NOW - age, broker_order_id=None)]
+            ),
+            manager=manager,
+        )
+        manager.expect_fill(cid, _plan())
+        report = _run(reconciler)
+        return cid, manager, ledger, report
+
+    def test_submit_failed_forgets_the_entrys_plan(self) -> None:
+        cid, manager, ledger, report = self._never_landed(age=dt.timedelta(minutes=3))
+        assert [w["status"] for w in ledger.writes] == ["SUBMIT_FAILED"]
+        assert Drift.SUBMIT_FAIL in [d.kind for d in report.drifts]
+        assert manager.plan_for(cid) is None
+
+    def test_inside_the_grace_window_the_plan_is_kept(self) -> None:
+        """The control: the request may still be in flight, and a fill that
+        arrives must find its plan or it is exited instead of protected."""
+        cid, manager, ledger, _report = self._never_landed(age=dt.timedelta(seconds=20))
+        assert ledger.writes == []
+        assert manager.plan_for(cid) is not None
+
+    def test_another_entrys_plan_is_untouched(self) -> None:
+        cid, manager, _l, _r = self._never_landed(age=dt.timedelta(minutes=3))
+        other = _cid()
+        manager.expect_fill(other, _plan(slot=1))
+        assert manager.plan_for(cid) is None
+        assert manager.plan_for(other) is not None
+
+    def test_a_late_landing_after_submit_failed_is_not_booked(self) -> None:
+        """Should it land after all, nothing books it on a guess - the plan is
+        gone, so the fill is exited (the AC3 rule)."""
+        cid, manager, ledger, _report = self._never_landed(age=dt.timedelta(minutes=3))
+        protector = FakeProtector()
+        reconciler, broker, _l, _p, _h = _reconciler(
+            ledger=ledger, manager=manager, protector=protector
+        )
+        broker.orderbook = [_broker_order(cid, status=OrderStatus.FILLED, filled=40)]
+        broker.positions = [_pos("INFY", quantity=40, bought=40)]
+        _run(reconciler)
+        assert protector.attached == []
+        assert manager.tracked("INFY") is None or not isinstance(
+            manager.tracked("INFY"), ProtectedPosition
+        )
+
+
+class TestS13TheLoopHoldsTheGuard:
+    """The execution service passes its signal lock as the loop's guard, so a
+    cycle cannot start in the middle of a send (§9.1)."""
+
+    def _loop(self, guard: asyncio.Lock | None, clock: list[dt.datetime]):
+        cycles: list[dt.datetime] = []
+
+        class Recon:
+            async def run_cycle(self, *, now: dt.datetime) -> rec.CycleReport:
+                cycles.append(now)
+                return rec.CycleReport(cycle_id=uuid4(), at=now)
+
+        loop = ReconciliationLoop(
+            Recon(),  # type: ignore[arg-type]
+            calendar=_Calendar(),
+            halter=RecordingHalter(),
+            clock=lambda: clock[0],
+            guard=guard,
+        )
+        return loop, cycles
+
+    def test_a_cycle_waits_while_the_guard_is_held_and_reads_the_clock_after(self) -> None:
+        async def scenario() -> list[dt.datetime]:
+            guard = asyncio.Lock()
+            clock = [NOW]
+            loop, cycles = self._loop(guard, clock)
+            await guard.acquire()
+            task = asyncio.create_task(loop.on_reconnect())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert cycles == [], "the cycle ran while the guard was held"
+            clock[0] = NOW + dt.timedelta(seconds=9)
+            guard.release()
+            await task
+            return cycles
+
+        assert asyncio.run(scenario()) == [NOW + dt.timedelta(seconds=9)]
+
+    def test_without_a_guard_the_loop_runs_as_before(self) -> None:
+        """The control: None leaves existing callers unchanged."""
+        loop, cycles = self._loop(None, [NOW])
+        asyncio.run(loop.on_reconnect())
+        assert cycles == [NOW]

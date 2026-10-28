@@ -841,6 +841,16 @@ class Reconciler:
                 average_price=write.average_price,
                 broker_order_id=write.broker_order_id,
             )
+            if write.status is OrderStatus.SUBMIT_FAILED:
+                # An entry that never reached the broker will never fill, so its
+                # plan is released here (E15-S13). Step 3b only forgets plans for
+                # entries the broker LISTS as finished; this one is listed
+                # nowhere, and its plan would have held the entry's slot -
+                # which the execution service counts as occupied while a plan
+                # is pending - for the rest of the day. Should it land after
+                # all, the fill finds no plan and is exited, never booked on a
+                # guess: the AC3 rule, unchanged.
+                self._manager.forget(str(row["client_order_id"]))
         if event is not None:
             report.drifts.append(event)
 
@@ -1344,6 +1354,7 @@ class ReconciliationLoop:
         interval_seconds: float = 30.0,
         max_consecutive_failures: int = 3,
         sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+        guard: asyncio.Lock | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
@@ -1359,6 +1370,12 @@ class ReconciliationLoop:
         self._interval = interval_seconds
         self._max_failures = max_consecutive_failures
         self._sleep = sleep
+        #: Held for the whole of every cycle (E15-S13). The execution service
+        #: passes the lock its signal handler holds, so a cycle never runs
+        #: between an entry being sent and its plan and pending slot being
+        #: recorded - §9.1's "strictly serialized", made structural. None
+        #: leaves the loop as it was for callers with nothing to serialise.
+        self._guard = guard
         self.consecutive_failures = 0
 
     async def tick(self) -> CycleReport | None:
@@ -1382,6 +1399,16 @@ class ReconciliationLoop:
             await self._sleep(self._interval)
 
     async def _run(self, now: dt.datetime) -> CycleReport | None:
+        if self._guard is None:
+            return await self._run_cycle(now)
+        async with self._guard:
+            # The clock is read again once the guard is held. Waiting for it can
+            # take a whole signal's handling, and a cycle stamped with the
+            # instant it QUEUED would judge the grace window of an entry sent
+            # after that instant - from before the entry existed.
+            return await self._run_cycle(self._clock())
+
+    async def _run_cycle(self, now: dt.datetime) -> CycleReport | None:
         try:
             report = await self._reconciler.run_cycle(now=now)
         except Exception as exc:

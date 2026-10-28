@@ -206,6 +206,26 @@ class InstrumentRepository:
         self._by_symbol[name] = symbol_id
         return str(name)
 
+    async def profile(self, symbol: str) -> dict[str, Any] | None:
+        """What the risk context needs about an instrument: sector and lot size.
+
+        ``None`` when the symbol is not in the master - unknown, which the
+        caller refuses on. The sector is returned as stored, ``None`` included:
+        an unclassified instrument is a fact the sector check refuses with its
+        own message, and inventing a sector here would hide it (E15-S13).
+        """
+        row = (
+            await self._session.execute(
+                select(Instrument.sector, Instrument.lot_size).where(
+                    Instrument.tradingsymbol == symbol
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        sector, lot_size = row
+        return {"sector": sector, "lot_size": int(lot_size)}
+
     async def upsert(self, instruments: Sequence[dict[str, Any]]) -> int:
         """Insert or update instruments from the daily broker sync.
 
@@ -1002,6 +1022,30 @@ class PositionRepository:
                 max_adverse_excursion=max_adverse_excursion,
             )
         )
+
+    async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]:
+        """Positions closed at or after ``since``, oldest first (E15-S13).
+
+        The loss checks read today's realised P&L and the current losing
+        streak, and both are facts about CLOSED trades - an open position's
+        P&L is unrealised and lives in the book. Oldest first, so the streak
+        is counted backwards from the end without a re-sort.
+        """
+        if since.tzinfo is None:
+            raise ValueError("closed_since needs a timezone-aware instant")
+        rows = (
+            (
+                await self._session.execute(
+                    select(Position)
+                    .where(Position.status == PositionStatus.CLOSED.value)
+                    .where(Position.closed_at >= since)
+                    .order_by(Position.closed_at, Position.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [await self._position_to_dict(r) for r in rows]
 
     async def _position_to_dict(self, row: Position) -> dict[str, Any]:
         return {

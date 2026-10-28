@@ -210,3 +210,45 @@ class TestFailClosedIsStructural:
         audit_block = text.split("def _audit")[1]
         assert "log.exception" in audit_block
         assert "return decision" not in audit_block
+
+
+class TestTheProductionEngineComesFromTheFactory:
+    """E15-S13 / QA-VER-01. ``RiskEngine(checks=[])`` is a legitimate test
+    shape and, in production, an engine that approves everything. So outside
+    the factory nothing in ``src/`` may construct one - read from the AST, so
+    a mention in a comment or docstring is not a construction."""
+
+    FACTORY = SRC / "execution" / "risk" / "factory.py"
+    SERVICE = SRC / "execution" / "service.py"
+
+    @staticmethod
+    def _calls(path: Path, name: str) -> int:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        count = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if called == name:
+                count += 1
+        return count
+
+    def test_only_the_factory_constructs_a_risk_engine(self) -> None:
+        offenders = [
+            str(path.relative_to(SRC))
+            for path in _python_files()
+            if path != self.FACTORY and self._calls(path, "RiskEngine")
+        ]
+        assert not offenders, (
+            "a RiskEngine is constructed outside execution/risk/factory.py, so a "
+            "production engine could run without all fourteen checks: " + ", ".join(offenders)
+        )
+
+    def test_the_factory_does_construct_one(self) -> None:
+        """The control: without it the scan above passes if the factory stops
+        building an engine at all."""
+        assert self._calls(self.FACTORY, "RiskEngine") == 1
+
+    def test_the_execution_service_builds_its_engine_through_the_factory(self) -> None:
+        assert self._calls(self.SERVICE, "build_risk_engine") == 1
