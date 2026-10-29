@@ -11,7 +11,7 @@ environment, which pip permits with a warning.
 So the fix is a post-install replacement:
 
     pip install -c constraints.txt -e ".[dev]"
-    pip install --no-deps --upgrade "autobahn==26.7.1"
+    pip install --no-deps --upgrade "autobahn==26.10.2"
 
 which is applied in `ci.yml`, `ops/Dockerfile` and the `Makefile`. Four places,
 and a control that has to be remembered in four places will eventually be
@@ -38,9 +38,16 @@ import pytest
 #: injection in the WebSocket client).
 FIRST_PATCHED_AUTOBAHN = (20, 12, 3)
 
+#: First release fixing CVE-2026-116579 / GHSA-pjh6-c8mg-3x7m (published 28 Oct
+#: 2026): permessage-brotli inflated a whole frame before the message-size
+#: check, so one 421-byte frame cost a SERVER ~545 MiB. Unreachable here - this
+#: system runs no autobahn server and enables no compression extension - and
+#: fixed anyway, because a fix existed and acceptance is for what cannot be.
+BROTLI_FIX_AUTOBAHN = (26, 10, 1)
+
 #: What the install steps pin to. Kept explicit so a drift between this file
 #: and the install commands is visible rather than inferred.
-EXPECTED_AUTOBAHN = "26.7.1"
+EXPECTED_AUTOBAHN = "26.10.2"
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -67,6 +74,19 @@ class TestAutobahnIsNotTheVulnerableVersion:
             f'    pip install --no-deps --upgrade "autobahn=={EXPECTED_AUTOBAHN}"\n\n'
             f"See pyproject.toml, .github/workflows/ci.yml and ops/Dockerfile."
         )
+
+    def test_the_installed_autobahn_carries_the_brotli_fix(self) -> None:
+        """26.7.1 cleared CVE-2020-35678 and carries CVE-2026-116579; a
+        rollback to it must fail here, not only in the audit job."""
+        try:
+            installed = md.version("autobahn")
+        except md.PackageNotFoundError:  # pragma: no cover - autobahn is a transitive dep
+            pytest.skip("autobahn is not installed in this environment")
+        assert _version_tuple(installed) >= BROTLI_FIX_AUTOBAHN, (
+            f"autobahn {installed} carries CVE-2026-116579; install "
+            f'"autobahn=={EXPECTED_AUTOBAHN}" (see pyproject.toml)'
+        )
+        assert _version_tuple(EXPECTED_AUTOBAHN) >= BROTLI_FIX_AUTOBAHN
 
     def test_kiteconnect_still_imports_under_the_replacement(self) -> None:
         """The whole reason the replacement is safe.
@@ -124,7 +144,7 @@ class TestTheInstallSitesAgree:
         assert f"autobahn=={EXPECTED_AUTOBAHN}" in self._read("ops", "Dockerfile")
 
     def test_constraints_records_what_resolution_produces(self) -> None:
-        """Not 26.7.1: constraining autobahn to the replacement makes the
+        """Not 26.10.2: constraining autobahn to the replacement makes the
         resolution itself impossible, which is the bug this whole file
         documents."""
         constraints = self._read("constraints.txt")

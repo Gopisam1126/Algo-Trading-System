@@ -17,9 +17,11 @@ restart that restores the real table before the real cycle.
 from __future__ import annotations
 
 import datetime as dt
+import math
+import random
 import uuid
 from collections.abc import AsyncIterator
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,7 @@ from algotrader.common.calendar import MarketCalendar, load_holidays_with_status
 from algotrader.common.config import AppConfig
 from algotrader.common.db import engine as db_engine
 from algotrader.common.db.repositories import (
+    BarRepository,
     DailyStatusRepository,
     InstrumentRepository,
     OrderRepository,
@@ -46,13 +49,22 @@ from algotrader.common.enums import (
     OrderType,
     Product,
     Side,
+    Timeframe,
 )
 from algotrader.common.events import stream as streams
 from algotrader.common.events.envelope import Envelope
+from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import OrderRequest, Position, Recommendation
 from algotrader.common.redis import keys
 from algotrader.execution.gateway import GatewayPolicy, OrderGateway, client_order_id
 from algotrader.execution.halt import HaltController, HaltReason
+from algotrader.execution.live_inputs import (
+    BrokerMarginPerShare,
+    DailyCloseCorrelations,
+    LiveSessionFacts,
+    PublishedATR,
+    strategy_timeframes,
+)
 from algotrader.execution.positions import (
     PositionManager,
     ProtectedPosition,
@@ -62,6 +74,9 @@ from algotrader.execution.protective_stop import ProtectiveStop
 from algotrader.execution.reconciliation import Drift, Reconciler
 from algotrader.execution.service import GROUP, ExecutionService, Outcome, RedisSignalSource
 from algotrader.execution.session_context import RepositoryContextStore
+from algotrader.indicators.engine import IndicatorSet
+from algotrader.indicators.publish import publish_indicator_state
+from algotrader.strategy.dsl import load_strategy_yaml
 
 pytestmark = [pytest.mark.integration]
 
@@ -158,6 +173,10 @@ class KiteAccount:
         self.book: list[dict[str, Any]] = []
         self.net: list[dict[str, Any]] = []
         self.placed: list[dict[str, Any]] = []
+        #: E15-S14: what one share of each symbol costs, and a way to fail.
+        self.margin_per_share: dict[str, float] = {}
+        self.margin_error: Exception | None = None
+        self.margin_calls: list[list[dict[str, Any]]] = []
 
     def place_order(self, **params: Any) -> str:
         self.placed.append(params)
@@ -197,6 +216,15 @@ class KiteAccount:
             "utilised": {"debits": 0.0},
         }
 
+    def order_margins(self, params: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """E15-S14: ``/margins/orders``, as Kite answers it."""
+        self.margin_calls.append(params)
+        if self.margin_error is not None:
+            raise self.margin_error
+        symbol = params[0]["tradingsymbol"]
+        total = self.margin_per_share.get(symbol, 240.0) * params[0]["quantity"]
+        return [{"type": "equity", "tradingsymbol": symbol, "total": total}]
+
     def fill(self, tag: str, quantity: int, price: str) -> None:
         for row in self.book:
             if row["tag"] == tag:
@@ -225,10 +253,10 @@ class Facts:
     async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None:
         return ()
 
-    async def atr(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+    async def atr(self, symbol: str, *, strategy_id: str, now: dt.datetime) -> Decimal | None:
         return Decimal("12.5")
 
-    async def margin_per_share(self, symbol, price, *, now):
+    async def margin_per_share(self, symbol, price, *, direction, now):
         return Decimal("240")
 
     async def correlations(self, symbol, against, *, now):
@@ -239,9 +267,10 @@ class Stack:
     """The real execution stack over one Kite account."""
 
     def __init__(
-        self, session, instruments, redis, audit, calendar, account=None, clock=None
+        self, session, instruments, redis, audit, calendar, account=None, clock=None, facts=None
     ) -> None:
         self.clock = clock or (lambda: NOW)
+        self.redis = redis
         self.account = account or KiteAccount()
         self.adapter = KiteTradingAdapter(
             auth=None, client=self.account, algo_id="", tick_size_for=instruments.tick_size
@@ -287,12 +316,13 @@ class Stack:
             ),
             orders=self.orders,
             redis=redis,
-            facts=Facts(),
+            # E15-S14: a callable, because the live producers read this stack's
+            # own adapter and tables.
+            facts=facts(self) if facts is not None else Facts(),
             clock=self.clock,
             audit=audit.write,
         )
         self.source = RedisSignalSource(redis, block_ms=50)
-        self.redis = redis
 
     async def publish(self, rec: Recommendation) -> None:
         await streams.publish(
@@ -731,3 +761,235 @@ class TestS06TheTimeExitForReal:
         assert state.kill_switch
         assert state.records["kill_switch"].reason is HaltReason.POSITION_NOT_HELD
         assert ("RECONCILIATION_DRIFT", "NOT_HELD") in await _audit_rows(session)
+
+
+# ===========================================================================
+# E15-S14 - the live risk inputs, produced for real
+# ===========================================================================
+
+_CONFIG = Path(__file__).resolve().parents[2] / "config"
+#: The shipped strategy, so the ATR's timeframe comes from a real document.
+_ORB = load_strategy_yaml((_CONFIG / "strategies" / "orb_classic.yaml").read_text())
+
+
+class _Healthy:
+    """E20-S05's roll-up does not exist; these tests answer it so the three
+    inputs this story produces are the only thing under test."""
+
+    async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None:
+        return ()
+
+
+def _live(session, instruments, calendar):
+    def facts(stack: Stack) -> LiveSessionFacts:
+        return LiveSessionFacts(
+            health=_Healthy(),
+            atr=PublishedATR(stack.redis, timeframes=strategy_timeframes([_ORB])),
+            margin=BrokerMarginPerShare(stack.adapter),
+            correlations=DailyCloseCorrelations(
+                BarRepository(session, instruments), calendar=calendar
+            ),
+        )
+
+    return facts
+
+
+async def _publish_atr(
+    redis: aioredis.Redis,
+    symbol: str,
+    *,
+    true_range: str = "60",
+    last_open: dt.datetime = NOW - dt.timedelta(minutes=5),
+) -> Decimal:
+    """Warm a real IndicatorSet on 5m bars and publish it the real way."""
+    width = Decimal(true_range) / 2
+    indicator_set = IndicatorSet(symbol=symbol, timeframe=Timeframe.M5)
+    indicator_set.warm_up(
+        [
+            Bar(
+                symbol=symbol,
+                timeframe=Timeframe.M5,
+                open_ts=last_open - dt.timedelta(minutes=5 * (259 - i)),
+                open=Decimal(1200 + i % 7),
+                high=Decimal(1200 + i % 7) + width,
+                low=Decimal(1200 + i % 7) - width,
+                close=Decimal(1200 + i % 7),
+                volume=10_000,
+            )
+            for i in range(260)
+        ]
+    )
+    snapshot = await publish_indicator_state(redis, indicator_set)
+    assert snapshot is not None and snapshot.ready and snapshot.atr_14 is not None
+    return snapshot.atr_14
+
+
+async def _daily_history(session, instruments, calendar, *symbols: str, sessions: int = 75):
+    """Independent random walks of daily closes, ending yesterday."""
+    days = [calendar.previous_trading_day(TRADE_DATE)]
+    while len(days) < sessions:
+        days.append(calendar.previous_trading_day(days[-1]))
+    rows = []
+    for seed, symbol in enumerate(symbols):
+        rng, price = random.Random(seed), 1000.0
+        sid = await instruments.symbol_id(symbol)
+        for day in reversed(days):
+            price *= math.exp(rng.gauss(0, 0.012))
+            close = Decimal(f"{price:.2f}")
+            rows.append(
+                {
+                    "symbol_id": sid,
+                    "timeframe": "1d",
+                    "ts": _at_ist(day, 9, 15),
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "volume": 100_000,
+                }
+            )
+    await BarRepository(session, instruments).bulk_upsert(rows)
+    await session.flush()
+
+
+def _orb(symbol: str) -> Recommendation:
+    return _rec(symbol).model_copy(update={"strategy_id": "orb_classic"})
+
+
+@pytest.fixture
+def live_stack(session, instruments, redis, audit, calendar) -> Stack:
+    return Stack(
+        session, instruments, redis, audit, calendar, facts=_live(session, instruments, calendar)
+    )
+
+
+class TestS14Ac1AnApprovalSizedFromTheLiveInputs:
+    async def test_the_quantity_is_the_risk_budget_over_the_published_atr(
+        self, live_stack: Stack
+    ) -> None:
+        atr = await _publish_atr(live_stack.redis, "INFY")
+        await live_stack.service.start()
+        await live_stack.publish(_orb("INFY"))
+        result = await live_stack.consume_one()
+
+        assert result is not None and result.outcome is Outcome.SUBMITTED, result
+        (entry,) = live_stack.account.placed
+        stop_distance = (atr * Decimal("1.5")).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        # Rs 5,000 of risk (1% of 5 lakh) over the ATR stop: the binding clamp,
+        # well inside the 83-share position cap and the 1,666-share margin cap.
+        assert entry["quantity"] == int(Decimal(5000) / stop_distance)
+        assert entry["quantity"] < 83
+        (asked,) = live_stack.account.margin_calls
+        assert [(a["tradingsymbol"], a["transaction_type"], a["product"]) for a in asked] == [
+            ("INFY", "BUY", "MIS")
+        ]
+
+    async def test_a_dear_margin_binds_instead(self, live_stack: Stack) -> None:
+        """Rs 8,000 a share against Rs 4 lakh available: 50 shares, below the
+        ATR's answer - so the broker's number is the one that sized it."""
+        atr = await _publish_atr(live_stack.redis, "INFY")
+        live_stack.account.margin_per_share["INFY"] = 8000.0
+        await live_stack.service.start()
+        await live_stack.publish(_orb("INFY"))
+        result = await live_stack.consume_one()
+
+        assert result is not None and result.outcome is Outcome.SUBMITTED, result
+        (entry,) = live_stack.account.placed
+        assert entry["quantity"] == 50
+        assert int(Decimal(5000) / (atr * Decimal("1.5"))) > 50, "the ATR alone allowed more"
+
+
+class TestS14Ac2EachMissingInputRejectsByName:
+    async def _rejected(self, stack: Stack, symbol: str = "INFY"):
+        await stack.service.start()
+        await stack.publish(_orb(symbol))
+        result = await stack.consume_one()
+        assert result is not None and result.outcome is Outcome.REJECTED, result
+        assert stack.account.placed == [], "a rejected signal placed an order"
+        return result
+
+    async def test_no_published_atr(self, live_stack: Stack) -> None:
+        result = await self._rejected(live_stack)
+        assert "ATR for INFY" in result.detail
+
+    async def test_a_stale_atr(self, live_stack: Stack) -> None:
+        """Published half an hour ago: six 5m bars have closed since."""
+        await _publish_atr(live_stack.redis, "INFY", last_open=NOW - dt.timedelta(minutes=35))
+        result = await self._rejected(live_stack)
+        assert "ATR for INFY" in result.detail
+
+    async def test_a_strategy_this_service_was_not_given_has_no_atr(
+        self, live_stack: Stack
+    ) -> None:
+        """The ATR is published on orb_classic's timeframe; a signal from a
+        strategy the service does not know is not sized from it."""
+        await _publish_atr(live_stack.redis, "INFY")
+        await live_stack.service.start()
+        await live_stack.publish(_rec("INFY"))  # strategy_id orb_long_v1
+        result = await live_stack.consume_one()
+        assert result is not None and result.outcome is Outcome.REJECTED
+        assert "ATR for INFY" in result.detail
+        assert live_stack.account.placed == []
+
+    async def test_the_margin_call_fails(self, live_stack: Stack) -> None:
+        await _publish_atr(live_stack.redis, "INFY")
+        live_stack.account.margin_error = ConnectionError("Kite /margins/orders timed out")
+        result = await self._rejected(live_stack)
+        assert "per-share margin requirement for INFY" in result.detail
+
+    async def test_the_broker_answers_zero(self, live_stack: Stack) -> None:
+        await _publish_atr(live_stack.redis, "INFY")
+        live_stack.account.margin_per_share["INFY"] = 0.0
+        result = await self._rejected(live_stack)
+        assert "per-share margin requirement for INFY" in result.detail
+
+
+class TestS14Ac3AnUnknownCorrelationRefusesASecondPosition:
+    async def _hold_tcs(self, stack: Stack) -> None:
+        await _publish_atr(stack.redis, "TCS")
+        await _publish_atr(stack.redis, "INFY")
+        await stack.service.start()
+        await stack.publish(_orb("TCS"))
+        first = await stack.consume_one()
+        assert first is not None and first.outcome is Outcome.SUBMITTED, first
+        (entry,) = stack.account.placed
+        stack.account.fill(entry["tag"], entry["quantity"], "1200.50")
+        stack.account.hold("TCS", quantity=entry["quantity"])
+        await stack.service.tick()
+        assert isinstance(stack.manager.tracked("TCS"), ProtectedPosition)
+
+    async def test_a_held_name_with_no_daily_history(self, live_stack: Stack) -> None:
+        await self._hold_tcs(live_stack)
+        placed = len(live_stack.account.placed)
+        await live_stack.publish(_orb("INFY"))
+        result = await live_stack.consume_one()
+
+        assert result is not None and result.outcome is Outcome.REJECTED, result
+        assert result.reason is not None and result.reason.value == "RISK_ENGINE_FAULT"
+        assert "no correlation available" in result.detail and "TCS" in result.detail
+        assert len(live_stack.account.placed) == placed
+
+    async def test_the_control_with_history_the_second_position_is_taken(
+        self, live_stack: Stack, session, instruments, calendar
+    ) -> None:
+        """Same book, daily closes in Postgres for both: computable, low, and
+        the second entry goes - so the refusal above was the missing history."""
+        await _daily_history(session, instruments, calendar, "INFY", "TCS")
+        await self._hold_tcs(live_stack)
+        await live_stack.publish(_orb("INFY"))
+        result = await live_stack.consume_one()
+        assert result is not None and result.outcome is Outcome.SUBMITTED, result
+
+    async def test_history_that_stopped_before_yesterday_is_unknown(
+        self, live_stack: Stack, session, instruments, calendar
+    ) -> None:
+        await _daily_history(session, instruments, calendar, "INFY", "TCS")
+        await session.execute(
+            text("DELETE FROM ohlcv WHERE timeframe = '1d' AND ts >= :since"),
+            {"since": _at_ist(calendar.previous_trading_day(TRADE_DATE), 0, 0)},
+        )
+        await self._hold_tcs(live_stack)
+        await live_stack.publish(_orb("INFY"))
+        result = await live_stack.consume_one()
+        assert result is not None and result.outcome is Outcome.REJECTED
+        assert "no correlation available" in result.detail

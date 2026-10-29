@@ -149,11 +149,11 @@ class Facts:
     async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None:
         return ()
 
-    async def atr(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+    async def atr(self, symbol: str, *, strategy_id: str, now: dt.datetime) -> Decimal | None:
         return Decimal("12.5")
 
     async def margin_per_share(
-        self, symbol: str, price: Decimal, *, now: dt.datetime
+        self, symbol: str, price: Decimal, *, direction: Direction, now: dt.datetime
     ) -> Decimal | None:
         return Decimal("240")
 
@@ -410,6 +410,32 @@ class TestTheBuilder:
         assert ctx.atr is None
         assert ctx.margin_per_share is None
         assert "SBIN" not in ctx.correlations
+
+    async def test_the_producers_are_asked_about_this_signal(self) -> None:
+        """E15-S14: the ATR is the signal's own strategy's, the margin is for the
+        signal's own side. A builder that dropped either would size a short from
+        a long's margin, or a 15m strategy from whichever timeframe came first."""
+        asked: dict[str, dict[str, Any]] = {}
+
+        class Asked(Facts):
+            async def atr(self, symbol, *, strategy_id, now):
+                asked["atr"] = {"symbol": symbol, "strategy_id": strategy_id, "now": now}
+                return await super().atr(symbol, strategy_id=strategy_id, now=now)
+
+            async def margin_per_share(self, symbol, price, *, direction, now):
+                asked["margin"] = {"symbol": symbol, "price": price, "direction": direction}
+                return await super().margin_per_share(symbol, price, direction=direction, now=now)
+
+        rec = _rec("INFY").model_copy(
+            update={"strategy_id": "orb_short_v2", "direction": Direction.SHORT}
+        )
+        await _builder(facts=Asked()).build(rec, now=NOW, trade_date=TRADE_DATE)
+        assert asked["atr"] == {"symbol": "INFY", "strategy_id": "orb_short_v2", "now": NOW}
+        assert asked["margin"] == {
+            "symbol": "INFY",
+            "price": rec.trigger_price,
+            "direction": Direction.SHORT,
+        }
 
     async def test_an_unknown_instrument_is_refused_before_the_engine(self) -> None:
         with pytest.raises(ContextUnavailableError, match="not in the instrument master"):

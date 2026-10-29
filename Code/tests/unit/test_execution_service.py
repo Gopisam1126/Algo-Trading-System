@@ -220,10 +220,10 @@ class Facts:
     async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None:
         return ()
 
-    async def atr(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+    async def atr(self, symbol: str, *, strategy_id: str, now: dt.datetime) -> Decimal | None:
         return Decimal("12.5")
 
-    async def margin_per_share(self, symbol, price, *, now):
+    async def margin_per_share(self, symbol, price, *, direction, now):
         return Decimal("240")
 
     async def correlations(self, symbol, against, *, now):

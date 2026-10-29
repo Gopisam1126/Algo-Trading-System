@@ -62,7 +62,7 @@ jobs:
           # floor in our own dependencies is unsatisfiable — resolution has to
           # succeed first, then the package is replaced. --no-deps because the
           # graph is already solved and we are only swapping one node.
-          pip install --no-deps --upgrade "autobahn==26.7.1"
+          pip install --no-deps --upgrade "autobahn==26.10.2"
 
       - name: ruff check
         run: ruff check .
@@ -109,7 +109,7 @@ jobs:
           # floor in our own dependencies is unsatisfiable — resolution has to
           # succeed first, then the package is replaced. --no-deps because the
           # graph is already solved and we are only swapping one node.
-          pip install --no-deps --upgrade "autobahn==26.7.1"
+          pip install --no-deps --upgrade "autobahn==26.10.2"
 
       - name: Pre-pull datastore images
         # Pulled explicitly so a slow registry shows up as a pull step rather
@@ -162,7 +162,7 @@ jobs:
           # floor in our own dependencies is unsatisfiable — resolution has to
           # succeed first, then the package is replaced. --no-deps because the
           # graph is already solved and we are only swapping one node.
-          pip install --no-deps --upgrade "autobahn==26.7.1"
+          pip install --no-deps --upgrade "autobahn==26.10.2"
 
       - name: Safety invariants and pen-test suite
         run: pytest tests/security/ -q
@@ -171,7 +171,7 @@ jobs:
         # HARD GATE as of 24 Aug 2026. This was advisory while B7 was open —
         # kiteconnect pins autobahn 19.11.2 (CVE-2020-35678) and a permanently
         # red check trains people to ignore it. B7 is now closed: the pin is
-        # declarative and kiteconnect works under autobahn 26.7.1, which the
+        # declarative and kiteconnect works under autobahn 26.10.2, which the
         # Install step above applies AFTER resolution. A floor in pyproject
         # cannot work — `==19.11.2` makes it unsatisfiable and pip fails.
         #
