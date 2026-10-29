@@ -84,7 +84,7 @@ Two design decisions worth knowing:
 
   ```
   pip install -c constraints.txt -e ".[dev]"
-  pip install --no-deps --upgrade "autobahn==26.7.1"
+  pip install --no-deps --upgrade "autobahn==26.10.2"
   ```
 
   applied in every CI install job, `ops/Dockerfile` and `make install`.

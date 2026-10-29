@@ -404,7 +404,7 @@ docker info --format '{{.ServerVersion}}'   # Docker MUST be up - see "0 skipped
 # the local venv differed from constraints.txt on 17 packages, so local audits
 # checked versions nothing ships. (= `make install`, which now does the same.)
 python -m pip install --upgrade pip setuptools wheel
-pip install -c constraints.txt -e ".[dev]" && pip install --no-deps --upgrade "autobahn==26.7.1"
+pip install -c constraints.txt -e ".[dev]" && pip install --no-deps --upgrade "autobahn==26.10.2"
 # CI's exact commands. `src/ tests/ scripts/` skipped migrations/, and a new
 # migration failed CI's `ruff check .` after a "green" local gate.
 ruff check . && ruff format --check .
@@ -424,6 +424,13 @@ exits with `uniq`'s code: on 28 Oct 2026 a run with 14 failures read "exit code
 after pytest (`pytest ... > log 2>&1; echo "exit $?" >> log`) or read
 `${PIPESTATUS[0]}`, and say "failed" until a run of the WHOLE suite after the
 fix says otherwise — a re-run of one file proves that file.
+
+**Stop the gate if an install step fails.** The venv lives under OneDrive, and
+on 29 Oct 2026 the autobahn replacement failed half-way (a file held mid-swap),
+leaving pip's stash of the OLD version as `site-packages/~utobahn` and no
+autobahn at all - so kiteconnect stopped importing and the suite failed to
+collect. Check both install commands' exit codes, check for `~*` directories in
+`site-packages`, and import `kiteconnect` before running anything else.
 
 **`doctor.py` on a development machine** fails the *Datastores* section and
 warns under *Secrets*, *SEBI compliance* and *Network*, because the deployment
@@ -535,7 +542,7 @@ directory, then run CI's install and the failing command inside
 docker run --rm -v "<scratch>:/w" -w /w python:3.11-slim-bookworm bash -c '
   python -m pip install -q --upgrade pip setuptools wheel
   pip install -q -c constraints.txt -e ".[dev]"
-  pip install -q --no-deps --upgrade "autobahn==26.7.1"
+  pip install -q --no-deps --upgrade "autobahn==26.10.2"
   <the failing CI command>'
 ```
 

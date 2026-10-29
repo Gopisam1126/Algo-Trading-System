@@ -60,7 +60,7 @@ dependencies = [
     # package that is present and importable.
     #
     # Verified empirically: kiteconnect 5.2.1 imports, constructs, builds a
-    # login URL and exposes market_protection/algo_id under autobahn 26.7.1,
+    # login URL and exposes market_protection/algo_id under autobahn 26.10.2,
     # and the full test suite passes.
     #
     # It is NOT declared as a dependency here. `==19.11.2` is a hard pin, so any
@@ -68,7 +68,7 @@ dependencies = [
     # which is exactly what broke CI when it was first attempted. The
     # replacement happens as an explicit post-install step:
     #
-    #     pip install --no-deps --upgrade "autobahn==26.7.1"
+    #     pip install --no-deps --upgrade "autobahn==26.10.2"
     #
     # applied in ci.yml, ops/Dockerfile and the Makefile. Forgetting it in a
     # new install site is caught by

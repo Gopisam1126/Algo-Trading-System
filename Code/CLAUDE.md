@@ -297,7 +297,7 @@ Recorded because each was believed, written down, and wrong.
   that touches the broker layer whether or not a ticker is constructed. *Not
   using a package is not the same as not having it.* B7 was closed by
   upgrading to 26.7.1 — the `==19.11.2` pin is declarative, not a runtime
-  requirement.
+  requirement. Now 26.10.2 (CVE-2026-116579, 29 Oct 2026).
 - **"A clean audit stays clean until the dependencies change."** The E15-S12
   promotion failed QA's audit with no dependency change: four advisories
   (three urllib3, one Twisted) were published between the DEV run and the QA
@@ -308,6 +308,9 @@ Recorded because each was believed, written down, and wrong.
   certifi, filelock, setuptools and five more Twisted server advisories - and
   hours later, between the local audit and the CI run, msgpack and a Twisted
   DNS-client advisory. Seven accepted IDs now, each mapped to its subsystem.
+  Again on 29 Oct 2026, mid-story: autobahn CVE-2026-116579 (permessage-brotli,
+  server side, unreachable here) - FIXED by moving to 26.10.2 rather than
+  accepted, because a fix existed.
   The local venv had also drifted from `constraints.txt` on 17 packages, and
   the local lint skipped `migrations/`: install from constraints and run CI's
   exact commands before trusting a local gate. Never add an `--ignore-vuln`
@@ -717,7 +720,7 @@ else was examined. Verified sound, with probes rather than by reading:
 |---|---|
 | B2 `market_protection` | ✅ Closed — present in kiteconnect 5.2.1 |
 | B4 historical data pricing | ✅ Closed — Connect ₹500/mo bundles WebSocket + historical |
-| B7 `autobahn` CVE-2020-35678 | ✅ Closed 24 Aug 2026 — upgraded to 26.7.1 |
+| B7 `autobahn` CVE-2020-35678 | ✅ Closed 24 Aug 2026 — upgraded to 26.7.1; 26.10.2 since 29 Oct 2026 (CVE-2026-116579) |
 | B3 NSE holiday list | ✅ Closed 24 Aug 2026 — 2026 verified, 245 sessions. **Renew each December** |
 | B1 Algo-ID | ✅ Closed 9 Sep 2026 — **not applicable.** Unregistered below 10 OPS; the broker tags generically and there is no ID to obtain. `config.py` requires one only at or above `SEBI_ALGO_REGISTRATION_OPS` |
 | B5 daily login | ⚠️ Needs real credentials |

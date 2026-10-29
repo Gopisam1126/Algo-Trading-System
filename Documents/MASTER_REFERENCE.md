@@ -1389,7 +1389,7 @@ passing tests. Cheap now, annoying to retrofit.
 
 ### 22.1 What closed, and the lesson in each
 
-**B7 — `autobahn` CVE-2020-35678.** Closed by upgrading to 26.7.1.
+**B7 — `autobahn` CVE-2020-35678.** Closed by upgrading to 26.7.1; moved to 26.10.2 on 29 Oct 2026 for CVE-2026-116579 (permessage-brotli memory exhaustion, server side only - unreachable here, fixed anyway).
 `kiteconnect`'s `autobahn[twisted]==19.11.2` pin is *declarative*, not a
 runtime requirement, and 5.2.1 imports and works fine under the modern
 release.

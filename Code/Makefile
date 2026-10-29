@@ -43,7 +43,7 @@ patch-deps:  ## Replace kiteconnect's vulnerable autobahn pin (B7 / CVE-2020-356
 	@# unsatisfiable and pip fails outright. Resolution has to succeed first,
 	@# then the package is swapped. Enforced by
 	@# tests/security/test_dependency_hygiene.py.
-	$(PY) -m pip install --no-deps --upgrade "autobahn==26.7.1"
+	$(PY) -m pip install --no-deps --upgrade "autobahn==26.10.2"
 
 # --- Quality ---------------------------------------------------------------
 
