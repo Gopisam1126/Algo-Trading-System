@@ -778,7 +778,7 @@ Algo-Trading-System/
 ### 10.3 Redis keyspace
 
 ```
-state:indicator:{symbol}:{tf}   HASH   incremental indicator state
+state:indicator:{symbol}:{tf}   JSON   IndicatorSnapshot (as_of, ready, atr_14 ...) - E15-S14
 state:quote:{symbol}            HASH   ltp, bid, ask, volume
 state:position:{symbol}         HASH   fast-read position mirror
 state:slots                     HASH   slot index → symbol

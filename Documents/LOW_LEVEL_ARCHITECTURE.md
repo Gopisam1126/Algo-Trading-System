@@ -382,7 +382,7 @@ Explicit naming convention prevents collisions and makes `SCAN`-based debugging 
 
 ```
 # ---- Hot state (Hashes) ----
-state:indicator:{symbol}:{timeframe}      → HASH  {ema20, ema50, rsi14, atr14, macd, ...}
+state:indicator:{symbol}:{timeframe}      → STRING (JSON IndicatorSnapshot: as_of, ready, atr_14, ...)
 state:bar:current:{symbol}:{timeframe}    → HASH  {o,h,l,c,v,open_ts}  (in-progress bar)
 state:quote:{symbol}                      → STRING (JSON QuoteState)
 state:position:{symbol}                   → STRING (JSON PositionSnapshot, for fast reads)
@@ -421,9 +421,16 @@ hold **JSON strings**, not hashes — `state.set_state` writes
 `model_dump_json`, because that round-trips `Decimal` exactly and money is
 never a float here; a hash of stringified decimals would re-introduce parsing
 at every read. `HGETALL` against them raises `WRONGTYPE`. The keys above are
-corrected to match the code. `state:indicator` and `state:bar:current` still
-say HASH because **nothing writes them yet** — that is the spec's intent, not
-an observed fact, and `state:slots` genuinely is a hash.
+corrected to match the code. `state:bar:current` still says HASH because
+**nothing writes it yet** — that is the spec's intent, not an observed fact,
+and `state:slots` genuinely is a hash.
+
+**Correction, E15-S14.** `state:indicator:{symbol}:{timeframe}` is a **JSON
+string** too: an `IndicatorSnapshot` written by
+`indicators.publish.publish_indicator_state`, with a 12-hour TTL. It carries
+`as_of` (the CLOSE of the newest bar folded in) and `ready` (every indicator
+warm, no feed gap), because the execution service sizes every position from
+its `atr_14` and must be able to tell this bar's ATR from last Tuesday's.
 
 **Key design decision:** `stream:*` uses Redis **Streams with consumer groups**, not Pub/Sub. Pub/Sub is fire-and-forget — a consumer that restarts loses everything published while it was down. For ticks that is acceptable (the next tick supersedes), but for **signals, orders, and audit events it is not**. Streams give at-least-once delivery, explicit acknowledgement, and pending-entry recovery after a crash.
 
@@ -1334,11 +1341,28 @@ from a caller — and for an approval claims a slot, registers the `EntryPlan`
   300 s) or dated more than 5 s ahead, a duplicate (an order row already exists
   for its key — re-evaluating could re-size an order already sent), and a
   context that cannot be built (unknown instrument, unreadable slots).
-- **Missing live inputs reach the engine as `None`.** `NoProducerYet` answers
-  service health (E20-S05), live ATR and per-share margin as unknown, so the
-  engine rejects every signal until those producers exist. Surveillance flags
-  T2T, ASM, GSM and F&O ban all block (a recorded assumption); a missing daily
-  row is unknown eligibility, and its deadline assumes CAS, the earlier one.
+- **Missing live inputs reach the engine as `None`.** Surveillance flags T2T,
+  ASM, GSM and F&O ban all block (a recorded assumption); a missing daily row
+  is unknown eligibility, and its deadline assumes CAS, the earlier one.
+- **The live inputs (E15-S14, `execution/live_inputs.py`).** Each producer
+  answers only what it can vouch for; anything else is `None` (or an absent
+  correlation) and the engine refuses, naming the input:
+  - **ATR** — the `atr_14` the strategy side publishes to `state:indicator`
+    (§4.3), on the timeframe the signal's own strategy declares. Refused if
+    absent, not ready, describing another key, dated in the future, or more
+    than one bar plus 30 s old. *Not* computed from Postgres: live bars reach
+    it only after the session (§4.1), so that ATR would be a day stale. The
+    strategy loop must **publish before it emits** (E13-S01).
+  - **Per-share margin** — Kite `/margins/orders` for one share, shaped as the
+    entry (NSE, MIS, MARKET, the signal's side), on the **data** token bucket:
+    a margin lookup must never spend the order budget an exit needs. Bounded
+    at 5 s, because it runs under the lock the square-off timer takes. Zero or
+    negative is unknown.
+  - **Correlations** — daily closes from Postgres, aligned on the dates both
+    names traded, today's bar excluded, and unknown for any series that does
+    not end on the previous session.
+  - **Health** has no producer until E20-S05; `NoProducerYet` answers it, so
+    production still rejects every signal on health alone.
 
 ---
 

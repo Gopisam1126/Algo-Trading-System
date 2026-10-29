@@ -142,9 +142,11 @@ order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
 the gateway are unbuilt: no process entrypoint
 (`python -m algotrader.execution`, which docker-compose runs, has no
-`__main__` - no service does yet), and three risk inputs with no producer
-(service health E20-S05, live ATR, per-share margin), so the production engine
-rejects every signal until they exist. The order state machine (E15-S03),
+`__main__` - no service does yet), and service health has no producer
+(E20-S05), so the production engine rejects every signal until it exists. The
+live ATR, per-share margin and correlations ARE produced (E15-S14), but each
+reads a source nothing fills in production yet: indicator state the strategy
+loop must publish (E13-S01), and daily bars (E03). The order state machine (E15-S03),
 protective stop attachment (E15-S04), the position manager (E15-S05), the
 reconciliation loop (E15-S09), fill booking (E15-S12), the execution
 service that drives them from `stream:signals` (E15-S13) and the square-off
@@ -152,7 +154,7 @@ timer that gives every position its time exit (E15-S06) now exist. **A gateway i
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**2,731 tests, 93% coverage** as of E15-S13, 28 Oct 2026 —
+Built and tested (**2,879 tests, 93% coverage** as of E15-S14, 29 Oct 2026 —
 all pass locally with Docker running;
 without it the container-backed integration tests skip and coverage reads lower):
 
@@ -561,6 +563,25 @@ Recorded because each was believed, written down, and wrong.
   it terminal, then sends a protected MARKET exit and marks the position
   `ExitingPosition(reason=TIME)`. No Redis sorted set: that would be a second
   copy of the deadline, and a missed add is a position with no time exit.
+- **E15-S14 live risk inputs** — `execution/live_inputs.py`. ATR is the
+  `atr_14` the strategy side publishes to `state:indicator` (an
+  `IndicatorSnapshot` with `as_of` and `ready`, written by
+  `indicators/publish.py`), on the signal's own strategy's timeframe, refused
+  if more than one bar + 30 s old. Margin is Kite `/margins/orders` for one
+  share (`KiteTradingAdapter.margin_required`), on the DATA bucket, 5 s bound.
+  Correlations come from daily closes aligned on common dates. Compose them
+  with `LiveSessionFacts`; health stays `NoProducerYet` until E20-S05.
+
+- **"The live ATR can be computed from the bars in Postgres."** Live bars
+  reach Postgres only after the session (§4.1: L1 streams, flushed to L2), so
+  that ATR is a day old all session and every signal is refused. The hot
+  indicator state is the only place a live ATR exists.
+- **"A margin lookup belongs on the order-rate limiter"** - the story's own
+  task said so. It is a read; on the order bucket, a burst of lookups could
+  refuse an exit order. Corrected to the data bucket, with a test on tokens.
+- **"`correlations_against` pairs the same days."** It pairs by POSITION. A
+  name suspended for three sessions paired every older return with the wrong
+  day's and read a 0.98 pair as below 0.7. The producer aligns on dates first.
 
 - **"A restored position is one the broker holds."** Not if the broker closed
   it while we were down - its own MIS square-off leaves our row OPEN. The next
@@ -731,18 +752,14 @@ else was examined. Verified sound, with probes rather than by reading:
 
 ### Next
 
-The keystone is gone, so E12 (backtest harness, gauntlet) and E13 (signal
-loop) are unblocked. **E14, the risk engine, is in progress** — S01 (the
-framework) through S07 (ATR sizing) are all delivered, so the engine can
-now approve. **E14-S10 is unblocked** and makes the sector and net-directional
-caps binding, which they are not yet. S08 (slots) and S09 (kill switch) are
-also ready. After E14, order placement is what stands between an approved
-decision and a real order.
-**E14-S10 was raised while building S04**: the sector and net-directional caps
-are configured but binding on nothing, because checks run before sizing and
-the sizer has no clamp for them. All of it is pure computation with no credentials and no
-external data. After that, a vertical slice through paper trading is the first
-thing that would be evidence about the system rather than its parts.
+E14 (the risk engine) and the E15 execution path - gateway, stop, book,
+reconciliation, square-off timer, service and its live inputs - are on QA. A
+paper session needs, in roughly this order: the health roll-up (E20-S05), the
+strategy loop that publishes indicator state before it emits (E13-S01), the
+paper broker (E15-S10, which must answer `margin_required`), daily and intraday
+bars (E03 - E03-S01 is blocked by B8, NSE refusing this host), and the process
+entrypoint (E23-S03). That vertical slice is the first thing that would be
+evidence about the system rather than its parts.
 
 ### How to do the work
 

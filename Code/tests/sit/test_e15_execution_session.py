@@ -9,13 +9,17 @@ it opens protected?**
 Real Postgres, Redis, Kite adapter mapping, gateway, protective stop, position
 manager, reconciler and the factory-built engine. The account is Kite's payload
 shapes with one behaviour added: a MARKET order fills at the next settle. The
-three risk inputs nothing produces yet are answered (``Facts``) so the session
-can approve; ``NoProducerYet`` is what production wires today, and refuses all.
+live risk inputs are answered (``Facts``) so the session can approve - except
+in SIT-23, which produces them for real (E15-S14): ATR from the state the
+strategy side publishes, margin from the broker, correlations from daily
+closes in Postgres.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import math
+import random
 import uuid
 from collections.abc import AsyncIterator
 from decimal import Decimal
@@ -33,18 +37,27 @@ from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_s
 from algotrader.common.config import AppConfig
 from algotrader.common.db import engine as db_engine
 from algotrader.common.db.repositories import (
+    BarRepository,
     DailyStatusRepository,
     InstrumentRepository,
     OrderRepository,
     PositionRepository,
 )
-from algotrader.common.enums import AIVerdict, Direction, RejectReason
+from algotrader.common.enums import AIVerdict, Direction, RejectReason, Timeframe
 from algotrader.common.events import stream as streams
 from algotrader.common.events.envelope import Envelope
+from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import Recommendation
 from algotrader.common.redis import keys
 from algotrader.execution.gateway import GatewayPolicy, OrderGateway
 from algotrader.execution.halt import HaltController, HaltReason
+from algotrader.execution.live_inputs import (
+    BrokerMarginPerShare,
+    DailyCloseCorrelations,
+    LiveSessionFacts,
+    PublishedATR,
+    strategy_timeframes,
+)
 from algotrader.execution.positions import PositionManager, ProtectedPosition, RedisMirror
 from algotrader.execution.protective_stop import ProtectiveStop
 from algotrader.execution.reconciliation import Reconciler
@@ -56,6 +69,9 @@ from algotrader.execution.service import (
     SignalResult,
 )
 from algotrader.execution.session_context import RepositoryContextStore
+from algotrader.indicators.engine import IndicatorSet
+from algotrader.indicators.publish import publish_indicator_state
+from algotrader.strategy.dsl import load_strategy_yaml
 
 pytestmark = [pytest.mark.integration]
 
@@ -234,10 +250,10 @@ class Facts:
     async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None:
         return ()
 
-    async def atr(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+    async def atr(self, symbol: str, *, strategy_id: str, now: dt.datetime) -> Decimal | None:
         return Decimal("12.5")
 
-    async def margin_per_share(self, symbol, price, *, now):
+    async def margin_per_share(self, symbol, price, *, direction, now):
         return Decimal("240")
 
     async def correlations(self, symbol, against, *, now):
@@ -256,7 +272,16 @@ class Day:
     """The real stack over one account, one clock and one set of tables."""
 
     def __init__(
-        self, session, instruments, redis, audit, calendar, *, account=None, clock=None
+        self,
+        session,
+        instruments,
+        redis,
+        audit,
+        calendar,
+        *,
+        account=None,
+        clock=None,
+        facts=None,
     ) -> None:
         self.account = account or SettlingAccount()
         self.clock = clock or Clock(_ist(9, 10))
@@ -310,7 +335,8 @@ class Day:
             ),
             orders=orders,
             redis=redis,
-            facts=Facts(),
+            # SIT-23 passes the live producers, built over this day's adapter.
+            facts=facts(adapter) if facts is not None else Facts(),
             clock=self.clock,
             audit=audit.write,
         )
@@ -682,3 +708,207 @@ class TestSit22NoPositionSurvivesItsDeadline:
         assert state.records["kill_switch"].reason is HaltReason.POSITION_NOT_HELD
         (result,) = day.results[late.correlation_id]
         assert result.reason is RejectReason.KILL_SWITCH_ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# SIT-23 - a session sized from the live inputs (E15-S14)
+# ---------------------------------------------------------------------------
+
+_ORB = load_strategy_yaml(
+    (Path(__file__).resolve().parents[2] / "config" / "strategies" / "orb_classic.yaml").read_text()
+)
+
+
+class _Healthy:
+    """E20-S05's roll-up does not exist yet; answered so the three inputs this
+    story produces are what the session exercises."""
+
+    async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None:
+        return ()
+
+
+class StrategySide:
+    """What E13-S01's loop will do with each sealed 5m bar: fold it into the
+    symbol's indicator set and publish the state BEFORE any signal on it.
+
+    ``quiet`` symbols get no bars (a feed gap); a symbol coming back from one
+    is re-warmed from history, as the engine requires after a gap.
+    """
+
+    def __init__(self, redis: aioredis.Redis, symbols: list[str]) -> None:
+        self.redis = redis
+        self.quiet: set[str] = set()
+        self._sets: dict[str, IndicatorSet] = {}
+        self._gapped: set[str] = set()
+        for symbol in symbols:
+            self._sets[symbol] = self._warmed(symbol, through=_ist(9, 10))
+
+    @staticmethod
+    def _bar(symbol: str, open_ts: dt.datetime) -> Bar:
+        mid = Decimal(1200 + (open_ts.minute // 5) % 7)
+        return Bar(
+            symbol=symbol,
+            timeframe=Timeframe.M5,
+            open_ts=open_ts,
+            open=mid,
+            high=mid + 30,
+            low=mid - 30,
+            close=mid,
+            volume=10_000,
+        )
+
+    def _warmed(self, symbol: str, *, through: dt.datetime) -> IndicatorSet:
+        s = IndicatorSet(symbol=symbol, timeframe=Timeframe.M5)
+        s.warm_up(
+            [self._bar(symbol, through - dt.timedelta(minutes=5 * k)) for k in range(259, -1, -1)]
+        )
+        return s
+
+    async def __call__(self, now: dt.datetime) -> None:
+        open_ = dt.datetime.combine(DAY, dt.time(9, 15), tzinfo=IST).astimezone(dt.UTC)
+        if now <= open_ or int((now - open_).total_seconds()) % 300:
+            return  # not a 5m boundary: no bar has just closed
+        for symbol, indicator_set in self._sets.items():
+            if symbol in self.quiet:
+                self._gapped.add(symbol)
+                continue
+            if symbol in self._gapped:
+                self._gapped.discard(symbol)
+                indicator_set = self._sets[symbol] = self._warmed(
+                    symbol, through=now - dt.timedelta(minutes=10)
+                )
+            indicator_set.update(self._bar(symbol, now - dt.timedelta(minutes=5)))
+            await publish_indicator_state(self.redis, indicator_set)
+
+
+class MarginDesk:
+    """Kite's ``/margins/orders`` for a SettlingAccount, with an outage switch."""
+
+    def __init__(self) -> None:
+        self.down = False
+        self.calls = 0
+
+    def order_margins(self, params: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.calls += 1
+        if self.down:
+            raise ConnectionError("Kite /margins/orders is not answering")
+        return [{"tradingsymbol": params[0]["tradingsymbol"], "total": 240.0}]
+
+
+async def _daily_closes(session, instruments, calendar, *symbols: str) -> None:
+    days = [calendar.previous_trading_day(DAY)]
+    while len(days) < 75:
+        days.append(calendar.previous_trading_day(days[-1]))
+    rows = []
+    for seed, symbol in enumerate(symbols):
+        rng, price = random.Random(100 + seed), 1000.0
+        sid = await instruments.symbol_id(symbol)
+        for day in reversed(days):
+            price *= math.exp(rng.gauss(0, 0.012))
+            close = Decimal(f"{price:.2f}")
+            rows.append(
+                {
+                    "symbol_id": sid,
+                    "timeframe": "1d",
+                    "ts": dt.datetime.combine(day, dt.time(9, 15), tzinfo=IST).astimezone(dt.UTC),
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "volume": 100_000,
+                }
+            )
+    await BarRepository(session, instruments).bulk_upsert(rows)
+    await session.flush()
+
+
+class TestSit23ASessionSizedFromTheLiveInputs:
+    async def test_every_live_input_gap_refuses_by_name_and_the_rest_trade(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        # Daily history for three IT names; HDFCBANK has none.
+        await _daily_closes(session, instruments, calendar, "INFY", "TCS", "WIPRO")
+        strategy = StrategySide(redis, ["INFY", "TCS", "WIPRO", "HDFCBANK"])
+        desk = MarginDesk()
+
+        def live(adapter: KiteTradingAdapter) -> LiveSessionFacts:
+            return LiveSessionFacts(
+                health=_Healthy(),
+                atr=PublishedATR(redis, timeframes=strategy_timeframes([_ORB])),
+                margin=BrokerMarginPerShare(adapter),
+                correlations=DailyCloseCorrelations(
+                    BarRepository(session, instruments), calendar=calendar
+                ),
+            )
+
+        account = SettlingAccount()
+        account.order_margins = desk.order_margins  # type: ignore[attr-defined]
+        day = Day(session, instruments, redis, audit, calendar, account=account, facts=live)
+        await day.service.start()
+
+        def orb(symbol: str, at: dt.datetime) -> Recommendation:
+            return _rec(symbol, at).model_copy(update={"strategy_id": "orb_classic"})
+
+        signals = {
+            _ist(10, 1): [orb("INFY", _ist(10, 1))],  # sized from the live ATR
+            _ist(10, 31): [orb("HDFCBANK", _ist(10, 31))],  # no history: correlation unknown
+            _ist(11, 21): [orb("TCS", _ist(11, 21))],  # TCS feed quiet since 11:00
+            _ist(12, 11): [orb("TCS", _ist(12, 11))],  # re-warmed and publishing again
+            _ist(13, 6): [orb("WIPRO", _ist(13, 6))],  # the margin desk is down
+            _ist(13, 31): [orb("WIPRO", _ist(13, 31))],  # and back
+        }
+        published = [rec for recs in signals.values() for rec in recs]
+
+        async def each_minute(now: dt.datetime) -> None:
+            if now == _ist(11, 0):
+                strategy.quiet.add("TCS")
+            if now == _ist(12, 0):
+                strategy.quiet.discard("TCS")
+            desk.down = _ist(13, 0) <= now < _ist(13, 10)
+            await strategy(now)
+
+        await day.walk(_ist(15, 30), signals, at_each_minute=each_minute)
+
+        def ended(rec: Recommendation) -> tuple[Outcome, RejectReason | None, str]:
+            (result,) = day.results[rec.correlation_id]
+            return result.outcome, result.reason, result.detail
+
+        infy, hdfc, tcs_quiet, tcs_back, wipro_down, wipro_back = published
+        assert ended(infy)[0] is Outcome.SUBMITTED
+        assert ended(tcs_back)[0] is Outcome.SUBMITTED
+        assert ended(wipro_back)[0] is Outcome.SUBMITTED
+
+        outcome, reason, detail = ended(hdfc)
+        assert (outcome, reason) == (Outcome.REJECTED, RejectReason.RISK_ENGINE_FAULT)
+        assert "no correlation available" in detail and "INFY" in detail
+        outcome, reason, detail = ended(tcs_quiet)
+        assert outcome is Outcome.REJECTED and "ATR for TCS" in detail
+        outcome, reason, detail = ended(wipro_down)
+        assert outcome is Outcome.REJECTED and "per-share margin requirement for WIPRO" in detail
+
+        # The first entry was sized from the ATR the strategy side published:
+        # Rs 5,000 of risk over a 1.5 x ATR stop, inside every other clamp.
+        entries = {
+            p["tradingsymbol"]: p for p in day.account.placed if p["transaction_type"] == "BUY"
+        }
+        assert sorted(entries) == ["INFY", "TCS", "WIPRO"]
+        assert 0 < entries["INFY"]["quantity"] < 83
+
+        # Nothing a refusal touched reached the broker; everything that did was
+        # protected, then left at its own deadline, once.
+        assert _stops(day.account) == {s: p["quantity"] for s, p in entries.items()}
+        exits = {
+            p["tradingsymbol"]: p["quantity"]
+            for p in day.account.placed
+            if p["transaction_type"] == "SELL" and p["order_type"] == "MARKET"
+        }
+        assert exits == {s: p["quantity"] for s, p in entries.items()}
+        assert day.manager.open_positions() == []
+        closed = (await session.execute(text("SELECT exit_reason FROM positions"))).all()
+        assert [r.exit_reason for r in closed] == ["TIME"] * 3
+
+        audited = await _audited(session)
+        for rec in published:
+            assert str(rec.correlation_id) in audited, f"{rec.symbol} left no audit row"
+        assert not (await day.halts.state()).any_halted
+        assert desk.calls >= 4, "every sized signal asked the broker"

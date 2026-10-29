@@ -31,7 +31,7 @@ import asyncio
 import datetime as dt
 import logging
 from collections.abc import Callable
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
 from algotrader.broker.adapter import (
@@ -46,7 +46,7 @@ from algotrader.broker.kite import mapping
 from algotrader.broker.kite.errors import classify
 from algotrader.broker.kite.market_data import KiteReads
 from algotrader.broker.ratelimit import BrokerRateLimiter, RateLimitExceededError
-from algotrader.common.enums import OrderType, Side
+from algotrader.common.enums import OrderType, Product, Side
 from algotrader.common.models.trading import Order, OrderRequest
 
 log = logging.getLogger(__name__)
@@ -381,6 +381,58 @@ class KiteTradingAdapter(KiteReads):
         )
         self._margin = snapshot
         return snapshot
+
+    async def margin_required(self, symbol: str, *, side: Side, quantity: int = 1) -> Decimal:
+        """What the broker would block for an intraday MARKET order (E15-S14).
+
+        Kite's ``/margins/orders``. It is a READ - it changes nothing at the
+        exchange, and the static-IP whitelist covers order endpoints only - so
+        it goes through :meth:`_call` and takes a DATA token. Taking an order
+        token for it would let a burst of margin lookups refuse an exit order,
+        which is the starvation the two buckets exist to prevent.
+
+        The order is shaped as the entry will be: NSE, MIS, MARKET. Raises
+        :class:`~algotrader.broker.kite.mapping.MappingError` on any answer it
+        cannot read: a missing or non-numeric ``total`` must never become a
+        margin of zero, which the sizer would divide by.
+        """
+        if quantity < 1:
+            raise ValueError(f"a margin is asked for at least one share, not {quantity}")
+        params = [
+            {
+                "exchange": "NSE",
+                "tradingsymbol": symbol,
+                "transaction_type": mapping.side_out(side),
+                "variety": "regular",
+                "product": mapping.product_out(Product.MIS),
+                "order_type": mapping.order_type_out(OrderType.MARKET),
+                "quantity": quantity,
+                "price": 0,
+                "trigger_price": 0,
+            }
+        ]
+        raw = await self._call(self._client.order_margins, params)
+        rows = raw if isinstance(raw, list) else []
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise mapping.MappingError(
+                f"the order margin answer for {symbol} has {len(rows)} row(s); one was asked for"
+            )
+        row = rows[0]
+        answered_for = row.get("tradingsymbol")
+        if answered_for is not None and str(answered_for) != symbol:
+            raise mapping.MappingError(
+                f"the order margin asked for {symbol} came back for {answered_for}"
+            )
+        total = mapping.require_field(row, "total", what="an order margin")
+        try:
+            value = Decimal(str(total))
+        except InvalidOperation:
+            raise mapping.MappingError(
+                f"the order margin total for {symbol} is not a number"
+            ) from None
+        if not value.is_finite():
+            raise mapping.MappingError(f"the order margin total for {symbol} is not finite")
+        return value
 
     def margin_for_sizing(self, *, now: dt.datetime | None = None) -> MarginSnapshot:
         """The margin snapshot, refused if it has aged out.

@@ -19,13 +19,15 @@ when a new indicator is added and its ``snapshot`` forgets a field.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 from algotrader.common.enums import Timeframe
-from algotrader.common.models.market import Bar
+from algotrader.common.models.market import Bar, IndicatorSnapshot
 from algotrader.indicators.framework import (
     ATR,
     EMA,
@@ -35,6 +37,7 @@ from algotrader.indicators.framework import (
     BollingerBands,
     Indicator,
     VolumeRatio,
+    to_decimal,
 )
 
 log = logging.getLogger(__name__)
@@ -93,6 +96,11 @@ class IndicatorSet:
     #: this is deliberately NOT cleared by the next bar — one bar after a
     #: fifteen-minute hole does not make a 200-EMA correct again.
     stale: bool = False
+    #: The newest bar folded in. What :meth:`published` is "as of": a value is
+    #: only as current as the last bar behind it, and another process reading
+    #: it cannot otherwise tell this morning's ATR from last Tuesday's (E15-S14).
+    last_bar_open: dt.datetime | None = None
+    last_close: Decimal | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -112,6 +120,8 @@ class IndicatorSet:
             indicator.update(bar)
         self._record_history()
         self.bars_seen += 1
+        self.last_bar_open = bar.open_ts
+        self.last_close = bar.close
 
     def _record_history(self) -> None:
         for name in HISTORICAL_INDICATORS:
@@ -181,12 +191,55 @@ class IndicatorSet:
         atr = self.indicators.get("atr_14")
         return atr.percent_of(price) if isinstance(atr, ATR) else None
 
+    def published(self) -> IndicatorSnapshot | None:
+        """This set as other processes read it: ``state:indicator:*`` (E15-S14).
+
+        The execution service sizes every position from ``atr_14`` here, so it
+        carries what the reader needs to judge it, not just the number:
+        ``ready`` (every indicator warm and no feed gap) and ``as_of``, the
+        CLOSE of the newest bar folded in - the moment the values describe.
+
+        ``None`` until a bar has been folded in. A state with no as-of time
+        cannot be judged current, and the reader refuses what it cannot judge.
+        ``atr_14`` goes through :meth:`ATR.as_decimal`, the money-path
+        crossing, because the reader divides a risk budget by it.
+        """
+        if self.last_bar_open is None or self.last_close is None:
+            return None
+        values = self.values()
+        atr = self.indicators.get("atr_14")
+        return IndicatorSnapshot(
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            as_of=self.last_bar_open + dt.timedelta(seconds=self.timeframe.seconds),
+            ready=self.is_ready,
+            close=self.last_close,
+            ema_20=to_decimal(values.get("ema_20")),
+            ema_50=to_decimal(values.get("ema_50")),
+            ema_200=to_decimal(values.get("ema_200")),
+            rsi_14=to_decimal(values.get("rsi_14")),
+            atr_14=atr.as_decimal() if isinstance(atr, ATR) else None,
+            macd=to_decimal(values.get("macd")),
+            macd_signal=to_decimal(values.get("macd_signal")),
+            bb_upper=to_decimal(values.get("bb_upper")),
+            bb_lower=to_decimal(values.get("bb_lower")),
+            vwap=to_decimal(values.get("vwap")),
+            volume_ratio_20=to_decimal(values.get("volume_ratio_20")),
+        )
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
             "timeframe": self.timeframe.value,
             "bars_seen": self.bars_seen,
             "stale": self.stale,
+            # Without these a restored set cannot publish until its next bar,
+            # so the execution service refuses every entry for one interval
+            # after a restart - safe, and avoidable.
+            "last_bar_open": (
+                self.last_bar_open.isoformat() if self.last_bar_open is not None else None
+            ),
+            "last_close": str(self.last_close) if self.last_close is not None else None,
             "indicators": {n: i.snapshot() for n, i in self.indicators.items()},
             # Without this a restored set is blind to ma_crossover and
             # ma_slope_positive for the next 51 bars — safe, because they
@@ -215,6 +268,18 @@ class IndicatorSet:
             indicator.restore(saved[name])
         self.bars_seen = int(state.get("bars_seen", 0))
         self.stale = bool(state.get("stale", False))
+        last_open = state.get("last_bar_open")
+        self.last_bar_open = None
+        if last_open is not None:
+            parsed = dt.datetime.fromisoformat(str(last_open))
+            if parsed.tzinfo is None:
+                raise ValueError(
+                    f"indicator snapshot for {self.symbol} {self.timeframe.value} has a naive "
+                    f"last_bar_open {last_open!r}; re-warm from history"
+                )
+            self.last_bar_open = parsed
+        last_close = state.get("last_close")
+        self.last_close = Decimal(str(last_close)) if last_close is not None else None
         self._history = {
             name: deque((None if v is None else float(v) for v in values), maxlen=HISTORY_DEPTH)
             for name, values in (state.get("history") or {}).items()

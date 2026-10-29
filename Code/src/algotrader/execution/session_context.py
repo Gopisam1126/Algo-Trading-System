@@ -39,11 +39,13 @@ read that fails, or an input nothing produces yet, becomes ``None`` - never a
 zero, never "nothing armed". The engine then rejects, audits the rejection and
 names what was missing.
 
-Three inputs have no producer in this codebase yet, and :class:`NoProducerYet`
-supplies each as unknown: the service-health roll-up (E20-S05), a live ATR, and
-the broker's per-share margin. **Until they exist the engine rejects every
-signal** - which is the correct behaviour for a system missing a safety input,
-and the reason ``SessionFacts`` is a seam rather than a class.
+The live inputs are a seam, :class:`SessionFacts`. The live ATR, the broker's
+per-share margin and the correlations are produced in
+:mod:`algotrader.execution.live_inputs` (E15-S14); the service-health roll-up
+has no producer until E20-S05, and :class:`NoProducerYet` answers it - and,
+wired whole, every input - as unknown. **Until health has a producer the engine
+rejects every signal**, which is the correct behaviour for a system missing a
+safety input.
 
 What cannot be ``None`` - the slot count, the deadline, the instrument itself -
 raises :class:`ContextUnavailableError`, and the service refuses the signal with
@@ -290,18 +292,22 @@ class RepositoryContextStore:
 
 
 class SessionFacts(Protocol):
-    """The live inputs whose producers are other stories.
+    """The live inputs the session supplies (:mod:`~algotrader.execution.live_inputs`).
 
     Each answer is ``None`` (or, for correlations, an absent symbol) when it is
     not known. The risk engine refuses on every one of those.
+
+    ``atr`` takes the signal's strategy because the ATR that sizes it is the
+    one on that strategy's own timeframe; ``margin_per_share`` takes the
+    direction because the margin asked for is the entry's own order.
     """
 
     async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None: ...
 
-    async def atr(self, symbol: str, *, now: dt.datetime) -> Decimal | None: ...
+    async def atr(self, symbol: str, *, strategy_id: str, now: dt.datetime) -> Decimal | None: ...
 
     async def margin_per_share(
-        self, symbol: str, price: Decimal, *, now: dt.datetime
+        self, symbol: str, price: Decimal, *, direction: Direction, now: dt.datetime
     ) -> Decimal | None: ...
 
     async def correlations(
@@ -310,28 +316,29 @@ class SessionFacts(Protocol):
 
 
 class NoProducerYet:
-    """Every live input that nothing in this codebase produces yet: unknown.
+    """Every live input as unknown: the fail-closed answer to each.
 
     Not a placeholder that approves. Each answer is the one the risk engine
     refuses on, so wiring this means every signal is rejected - with the
-    missing input named in the audit row - until the producer exists:
+    missing input named in the audit row:
 
-    * ``unhealthy_services`` - the heartbeat roll-up is E20-S05.
-    * ``atr`` - nothing publishes live indicator state; the strategy runtime
-      computes ATR in-process and does not export it.
-    * ``margin_per_share`` - the adapter has no ``order_margins`` call.
-    * ``correlations`` - empty, so every held symbol is "unknown" and the
-      correlation guard refuses a second position.
+    * ``unhealthy_services`` - the heartbeat roll-up is E20-S05. This is the
+      one input still without a producer: pass this as ``LiveSessionFacts``'s
+      ``health`` until it exists.
+    * ``atr``, ``margin_per_share``, ``correlations`` - produced by
+      :mod:`~algotrader.execution.live_inputs` since E15-S14. Empty
+      correlations make every held symbol "unknown", so the correlation guard
+      refuses a second position.
     """
 
     async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None:
         return None
 
-    async def atr(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+    async def atr(self, symbol: str, *, strategy_id: str, now: dt.datetime) -> Decimal | None:
         return None
 
     async def margin_per_share(
-        self, symbol: str, price: Decimal, *, now: dt.datetime
+        self, symbol: str, price: Decimal, *, direction: Direction, now: dt.datetime
     ) -> Decimal | None:
         return None
 
@@ -469,11 +476,16 @@ class RiskContextBuilder:
                 slots_used=len(occupied),
                 symbol_restrictions=restrictions_from(status),
                 symbol_sector=profile.get("sector"),
-                atr=await self._optional(f"ATR for {symbol}", self._facts.atr(symbol, now=now)),
+                atr=await self._optional(
+                    f"ATR for {symbol}",
+                    self._facts.atr(symbol, strategy_id=rec.strategy_id, now=now),
+                ),
                 lot_size=int(profile.get("lot_size", 0)),
                 margin_per_share=await self._optional(
                     f"per-share margin for {symbol}",
-                    self._facts.margin_per_share(symbol, rec.trigger_price, now=now),
+                    self._facts.margin_per_share(
+                        symbol, rec.trigger_price, direction=rec.direction, now=now
+                    ),
                 ),
                 correlations=correlations or {},
             )
