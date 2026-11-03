@@ -697,11 +697,27 @@ CREATE TABLE strategy (
     state_changed_at     TIMESTAMPTZ  NOT NULL,
     retirement_reason    TEXT,
 
-    -- BR-5: the human approval gate, enforced by the database
-    CONSTRAINT ck_active_needs_approval CHECK (
-        state <> 'ACTIVE' OR (approved_by IS NOT NULL AND approved_at IS NOT NULL)
-    )
+    -- BR-5: the human approval gate, enforced by the database - for every
+    -- state that places live orders. Named ck_active_needs_approval and
+    -- covering ACTIVE alone until E12-S01 (3 Nov 2026); DEGRADED places live
+    -- orders too, and an UPDATE to it passed.
+    CONSTRAINT ck_strategy_live_states_need_approval CHECK (
+        state NOT IN ('ACTIVE', 'DEGRADED')
+        OR (approved_by IS NOT NULL AND approved_at IS NOT NULL)
+    ),
+    -- E12-S01: the registry's structure (STRATEGY_ENGINE.md §10).
+    CONSTRAINT uq_strategy_dsl_hash UNIQUE (dsl_hash),
+    CONSTRAINT ck_strategy_known_state CHECK (state IN ('DRAFT', 'VALIDATING',
+        'REJECTED', 'SHADOW', 'PAPER', 'AWAITING_APPROVAL', 'ACTIVE', 'DEGRADED',
+        'RETIRED', 'QUARANTINED')),
+    CONSTRAINT ck_strategy_dsl_hash_is_sha256 CHECK (dsl_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_strategy_version_positive CHECK (version >= 1),
+    CONSTRAINT ck_strategy_root_is_version_one CHECK (parent_id IS NOT NULL OR version = 1),
+    CONSTRAINT ck_strategy_not_its_own_parent CHECK (parent_id IS NULL OR parent_id <> id)
 );
+-- Grants (E12-S01): SELECT, INSERT, and UPDATE on (state, state_changed_at,
+-- approved_by, approved_at, retirement_reason) only. No DELETE. The document
+-- is immutable; a change is a new version.
 CREATE INDEX ix_strategy_state ON strategy (state)
     WHERE state IN ('ACTIVE','DEGRADED','SHADOW','PAPER');
 

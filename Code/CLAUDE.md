@@ -149,7 +149,9 @@ services that have no process, indicator state the strategy loop must publish
 (E13-S01), and daily bars (E03). So the production engine still rejects every
 signal, now for reasons it names. Paper mode exists (E15-S10): a simulated
 Kite client behind the real adapter, so a paper session runs the code that
-trades. The order state machine (E15-S03),
+trades. Strategies persist (E12-S01): an immutable document per registered
+strategy, loaded and re-verified at start - and nothing reads the registry
+yet (E13-S01). The order state machine (E15-S03),
 protective stop attachment (E15-S04), the position manager (E15-S05), the
 reconciliation loop (E15-S09), fill booking (E15-S12), the execution
 service that drives them from `stream:signals` (E15-S13) and the square-off
@@ -157,7 +159,7 @@ timer that gives every position its time exit (E15-S06) now exist. **A gateway i
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**3,001 tests, 93% coverage** as of E15-S10, 3 Nov 2026 —
+Built and tested (**3,178 tests, 94% coverage** as of E12-S01, 3 Nov 2026 —
 all pass locally with Docker running;
 without it the container-backed integration tests skip and coverage reads lower):
 
@@ -623,6 +625,37 @@ Recorded because each was believed, written down, and wrong.
   same visible depth three times at one instant. Each quote's depth is taken
   once (QA-E15-42) - found by the integration test, not the component tests,
   which read once per quote.
+- **E12-S01 the strategy registry** — `strategy/registry.py` over
+  `StrategyRepository`. `register()` writes a document once, in DRAFT;
+  `load()` re-derives every row and returns `records`, `runnable` (SHADOW,
+  PAPER, ACTIVE, DEGRADED, each with its `StrategyEvaluator`, in registration
+  order) and `rejected` (name -> reason). `register_directory()` seeds
+  `config/strategies` and never changes a state. The document is immutable in
+  the database: the app role may UPDATE only `models.LIFECYCLE_COLUMNS` and
+  cannot DELETE (migration `a986f25d3838`). A change is a new id with
+  `version = parent.version + 1` and `parent_id`.
+
+- **"BR-5 keeps unapproved strategies off live capital."** It kept them out
+  of ACTIVE. DEGRADED places live orders too, and `UPDATE strategy SET state
+  = 'DEGRADED'` on a draft passed the CHECK until E12-S01.
+- **"A default is declared once."** It was declared in the `ParamSpec` and
+  restated in each evaluator and in the capability check, and they
+  disagreed: `timeframe_agreement_at_least` without `of` compiled, passed the
+  capability check, and raised on every bar. `PrimitiveSpec.resolved_params`
+  is now the only place a default is applied, and the runtime, the
+  capability check and the content hash all read through it.
+- **"The content hash deduplicates identical strategies."** It hashed the
+  document as written, so `r: 2` and `r: 2.0`, a stated default and an
+  omitted one, and reordered conditions were all "distinct" - and a rejected
+  strategy could return under a new name with one respelling. It is now a
+  hash of behaviour; changing it needs a data migration, because the load
+  refuses a row whose recomputed hash differs from `dsl_hash`.
+- **"The shipped strategy runs."** `orb_classic` compiles and asks for
+  1h/1d/1w trend agreement; the indicator engine carries 5m/15m/1h. It can
+  never be evaluated here, and `doctor` said OK because it only compiled it.
+  `doctor` now warns, and the registry refuses it by name if it is ever made
+  runnable. A paper session needs either 1d/1w in the engine (with E03's
+  daily bars) or a seed that asks for what the engine carries.
 
 - **"A restored position is one the broker holds."** Not if the broker closed
   it while we were down - its own MIS square-off leaves our row OPEN. The next
@@ -794,13 +827,16 @@ else was examined. Verified sound, with probes rather than by reading:
 ### Next
 
 E14 (the risk engine) and the E15 execution path - gateway, stop, book,
-reconciliation, square-off timer, service and its live inputs - are on QA. A
-paper session needs, in roughly this order: the health roll-up (E20-S05), the
-strategy loop that publishes indicator state before it emits (E13-S01), the
-paper broker (E15-S10, which must answer `margin_required`), daily and intraday
-bars (E03 - E03-S01 is blocked by B8, NSE refusing this host), and the process
-entrypoint (E23-S03). That vertical slice is the first thing that would be
-evidence about the system rather than its parts.
+reconciliation, square-off timer, service and its live inputs - are on QA,
+with the health roll-up (E20-S05), the paper broker (E15-S10) and the
+strategy registry (E12-S01). A paper session still needs: the strategy loop
+that reads the registry's runnable strategies and publishes indicator state
+before it emits (E13-S01 - it also needs the day's plan symbols, which
+nothing produces yet, and a runnable strategy: the shipped `orb_classic`
+cannot be evaluated by this engine), daily and intraday bars (E03 - E03-S01
+is blocked by B8, NSE refusing this host), and the process entrypoint
+(E23-S03). That vertical slice is the first thing that would be evidence
+about the system rather than its parts.
 
 ### How to do the work
 

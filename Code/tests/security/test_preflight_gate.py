@@ -189,3 +189,32 @@ class TestProfileCredentialsAreCoherent:
                 assert get_profile(key).credential_env_vars, (
                     f"{key} declares none, so doctor silently checks nothing for it"
                 )
+
+
+class TestTheStrategyCheckAsksWhetherAStrategyCanRun:
+    """E12-S01, 3 Nov 2026: the Strategies section compiled each shipped file
+    and reported OK. orb_classic compiles - and asks for 1h/1d/1w agreement
+    the indicator engine (5m/15m/1h) cannot answer, so it could never run."""
+
+    def test_the_shipped_seed_is_reported_as_unable_to_run_here(self) -> None:
+        r = doctor.Report()
+        doctor.check_strategies(r)
+        assert any("orb_classic.yaml compiles but cannot run here" in w for w in r.warnings)
+        assert r.failures == []
+
+    def test_a_strategy_that_can_run_here_is_ok(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The control: the new WARN is about evaluability, not every file."""
+        shipped = (CODE_ROOT / "config" / "strategies" / "orb_classic.yaml").read_text(
+            encoding="utf-8"
+        )
+        strategies = tmp_path / "config" / "strategies"
+        strategies.mkdir(parents=True)
+        (strategies / "runnable.yaml").write_text(
+            shipped.replace('of: "1h,1d,1w"', 'of: "5m,15m,1h"'), encoding="utf-8"
+        )
+        monkeypatch.setattr(doctor, "__file__", str(tmp_path / "scripts" / "doctor.py"))
+        r = doctor.Report()
+        doctor.check_strategies(r)
+        assert r.warnings == [] and r.failures == []

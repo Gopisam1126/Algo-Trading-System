@@ -330,6 +330,14 @@ class TestStrategyApprovalGate:
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute("UPDATE strategy SET state = 'ACTIVE' WHERE id = %s", (sid,))
 
+    def test_br5_cannot_be_bypassed_through_degraded(self, conn: psycopg.Connection) -> None:
+        """DEGRADED places live orders too (``StrategyState.places_live_orders``).
+        Until E12-S01 the CHECK named ACTIVE alone, and this UPDATE passed."""
+        sid = f"strat-{uuid.uuid4().hex[:8]}"
+        self._insert_strategy(conn, id=sid, state="DRAFT")
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("UPDATE strategy SET state = 'DEGRADED' WHERE id = %s", (sid,))
+
 
 class TestHazardFlagsAndView:
     """BR-8, and the timezone correction from §2.3 C."""
@@ -490,6 +498,40 @@ class TestEveryTableHasDeliberateGrants:
         for table in MUTABLE_TABLES:
             missing = required - self._granted(conn, table)
             assert not missing, f"{table} is declared MUTABLE but is missing {sorted(missing)}"
+
+    def test_every_model_table_has_a_declared_grant_category(self) -> None:
+        """Mutable, append-only or lifecycle - exactly one. A new table has to
+        be put in one, which is where its grants get decided."""
+        from algotrader.common.db.models import (
+            APPEND_ONLY_TABLES,
+            LIFECYCLE_COLUMNS,
+            MUTABLE_TABLES,
+        )
+
+        categories = [set(MUTABLE_TABLES), set(APPEND_ONLY_TABLES), set(LIFECYCLE_COLUMNS)]
+        assert set.union(*categories) == self._model_tables()
+        assert sum(len(c) for c in categories) == len(self._model_tables()), "a table is in two"
+
+    def test_lifecycle_tables_update_only_their_lifecycle_columns(
+        self, conn: psycopg.Connection
+    ) -> None:
+        """E12-S01: a strategy's document is immutable, its state is not."""
+        from algotrader.common.db.models import LIFECYCLE_COLUMNS
+
+        for table, columns in LIFECYCLE_COLUMNS.items():
+            assert self._granted(conn, table) == {"SELECT", "INSERT"}, table
+            updatable = {
+                r[0]
+                for r in conn.execute(
+                    """
+                    SELECT column_name FROM information_schema.column_privileges
+                    WHERE table_name = %s AND grantee = 'algotrader_app'
+                      AND privilege_type = 'UPDATE'
+                    """,
+                    (table,),
+                ).fetchall()
+            }
+            assert updatable == set(columns), table
 
     def test_append_only_tables_still_refuse_update_and_delete(
         self, conn: psycopg.Connection

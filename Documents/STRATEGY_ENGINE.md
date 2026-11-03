@@ -495,6 +495,9 @@ CREATE TABLE strategy (
     approved_at         TIMESTAMPTZ,
     state_changed_at    TIMESTAMPTZ  NOT NULL,
     retirement_reason   TEXT
+    -- + E12-S01 (migration a986f25d3838): UNIQUE (dsl_hash); state IN the ten;
+    --   ACTIVE *and* DEGRADED need approved_by/approved_at; version >= 1;
+    --   a root is version 1; parent_id <> id. See "Registry integrity" below.
 );
 
 CREATE TABLE strategy_validation (
@@ -540,6 +543,43 @@ CREATE TABLE shadow_signal (                 -- SHADOW-state signals, never exec
 ```
 
 Plus `strategy_trial` from §6.
+
+### Registry integrity (E12-S01, 3 Nov 2026)
+
+**A registered document never changes.** `strategy/registry.py` writes each
+document once, in `DRAFT`, and the application role can UPDATE only the
+lifecycle columns — `state`, `state_changed_at`, `approved_by`, `approved_at`,
+`retirement_reason` — and cannot DELETE. A validation, a shadow record and a
+human approval are evidence about one document; an edit in place would keep
+all three for a strategy nobody validated. A change is a new version: a new
+`id`, `version = parent.version + 1`, `parent_id` naming the revised one, back
+through `DRAFT`. A root is version 1.
+
+**One registered strategy per behaviour.** `dsl_hash` is unique, and the
+registry refuses a document whose content hash is already registered in *any*
+state, naming the twin — so a REJECTED or RETIRED strategy cannot return under
+a new name. That requires the hash to be a hash of behaviour, not of spelling:
+`StrategyDocument.content_hash()` resolves every parameter through its
+primitive's declared default, compares numbers by value (`2` = `2.0`,
+`100` = `100.00`), and treats the conditions in a group, the regimes and the
+sectors as sets. It does not canonicalise a primitive's string semantics or
+one combinator into another; those hash apart and count as separate trials,
+the conservative direction for DSR.
+
+**The load trusts nothing it reads.** At start the registry re-parses and
+recompiles every row against the current primitive vocabulary, recomputes the
+content hash, holds every copied column (id, version, parent, origin,
+hypothesis, regimes, author) to the document, refuses an unknown state and a
+live-order state (ACTIVE or DEGRADED) without a recorded approval, and builds
+an evaluator only for a runnable state (SHADOW, PAPER, ACTIVE, DEGRADED). A
+refused row is named with its reason and the rest still load. A primitive
+default changed under a stored document that omits it changes its hash, and
+the row is refused — correctly: it no longer behaves as validated. Changing
+`content_hash()` itself therefore needs a data migration.
+
+**BR-5 covered ACTIVE alone until this story.** DEGRADED places live orders
+(`StrategyState.places_live_orders`), and `UPDATE strategy SET state =
+'DEGRADED'` on a draft passed the CHECK.
 
 ---
 

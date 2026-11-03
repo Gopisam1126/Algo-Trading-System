@@ -350,12 +350,16 @@ CREATE TABLE positions (
 -- STRATEGY REGISTRY
 -- Full schema (strategy, strategy_validation, strategy_trial,
 -- strategy_performance, shadow_signal) is specified in
--- STRATEGY_ENGINE.md §10. Two invariants enforced at the DB layer:
+-- STRATEGY_ENGINE.md §10. Invariants enforced at the DB layer:
 --   • strategy_trial is INSERT-only — deleting failed trials would
 --     corrupt the Deflated Sharpe denominator and inflate every
 --     future validation.
---   • strategy.approved_by is NULL until a human approves; the
---     state machine will not transition to ACTIVE without it.
+--   • strategy.approved_by is NULL until a human approves; neither
+--     ACTIVE nor DEGRADED (both place live orders) is reachable
+--     without it — DEGRADED was not covered until E12-S01.
+--   • a strategy's document is immutable: the app role may UPDATE
+--     only the lifecycle columns, never DELETE, and dsl_hash is
+--     unique — one registered strategy per behaviour (E12-S01).
 -- ============================================================
 
 -- ============================================================
