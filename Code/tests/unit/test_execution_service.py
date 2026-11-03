@@ -1118,3 +1118,89 @@ class TestS06TheTimerRunsInsideTheService:
         h.service._sleep = no_sleep
         await h.service.run(Quiet(), stop)
         assert h.service._timer_heartbeat is not None
+
+
+# ===========================================================================
+# E20-S05 - the service's own heartbeat
+# ===========================================================================
+
+
+def _stored_beat(h: Harness) -> Any:
+    from algotrader.common.health import Heartbeat
+
+    raw = h.redis.strings.get("control:health:execution-svc")
+    return None if raw is None else Heartbeat.model_validate_json(raw)
+
+
+class TestE20S05TheServiceHeartbeats:
+    async def test_before_it_is_ready_it_says_starting(self) -> None:
+        from algotrader.common.health import ServiceState
+
+        h = Harness()
+        assert await h.service.beat() is ServiceState.STARTING
+        beat = _stored_beat(h)
+        assert beat.state is ServiceState.STARTING and beat.beat_at == NOW
+        assert beat.detail == "not yet restored and reconciled"
+
+    async def test_restored_and_reconciled_it_says_ready(self) -> None:
+        from algotrader.common.health import ServiceState
+
+        h = await Harness().started()
+        assert h.service.ready
+        assert await h.service.beat() is ServiceState.READY
+        assert _stored_beat(h).state is ServiceState.READY
+
+    async def test_a_silent_square_off_timer_makes_it_degraded(self) -> None:
+        """No new entry while time exits run on the backstop alone - and the
+        heartbeat is how every health gate, this service's included, hears it."""
+        from algotrader.common.health import ServiceState
+
+        h = await Harness().started()
+        h.service._timer_heartbeat = NOW - dt.timedelta(seconds=20)
+        await h.service.tick()
+        assert await h.service.beat() is ServiceState.DEGRADED
+        assert _stored_beat(h).detail == "square-off timer silent"
+
+    async def test_a_failed_write_is_swallowed(self) -> None:
+        h = await Harness().started()
+
+        async def down(*_args: Any, **_kwargs: Any) -> None:
+            raise ConnectionError("redis down")
+
+        h.redis.set = down  # type: ignore[method-assign]
+        assert await h.service.beat() is None
+
+    async def test_the_run_loop_heartbeats_and_survives_a_failing_write(self) -> None:
+        """A heartbeat that cannot be written must not take the reconciliation
+        loop or the square-off timer down with it."""
+        from algotrader.common.health import ServiceState
+
+        h = Harness()
+        stop = asyncio.Event()
+        writes: list[str] = []
+        real_set = h.redis.set
+
+        async def flaky(key: str, value: str, **kwargs: Any) -> Any:
+            if key == "control:health:execution-svc":
+                writes.append(value)
+                if len(writes) == 2:
+                    raise ConnectionError("redis blip")
+            return await real_set(key, value, **kwargs)
+
+        h.redis.set = flaky  # type: ignore[method-assign]
+
+        class Quiet(Source):
+            async def next_batch(self) -> list[Delivery]:
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                stop.set()
+                return []
+
+        async def no_sleep(_seconds: float) -> None:
+            await asyncio.sleep(0)
+
+        h.service._sleep = no_sleep
+        await h.service.run(Quiet(), stop)
+        assert len(writes) >= 3, "the loop kept beating after the failed write"
+        assert h.service._timer_heartbeat is not None
+        assert _stored_beat(h).state is ServiceState.READY

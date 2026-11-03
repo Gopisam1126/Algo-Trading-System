@@ -467,9 +467,9 @@ class _Correlations(Protocol):
 class LiveSessionFacts:
     """``SessionFacts`` from the live producers.
 
-    ``health`` is a separate argument because its producer is E20-S05: until
-    it exists, pass :class:`~algotrader.execution.session_context.NoProducerYet`
-    and the engine keeps refusing every signal on health alone - correctly.
+    ``health`` is a separate argument because its producer lives elsewhere:
+    :class:`~algotrader.common.health.HeartbeatHealth` (E20-S05), which every
+    service's heartbeat feeds - not just this one's.
     """
 
     def __init__(

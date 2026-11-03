@@ -184,16 +184,13 @@ jobs:
         # pip-audit still exits non-zero when it actually finds one, which is
         # the behaviour this gate wants.
         #
-        # Each --ignore-vuln names ONE assessed advisory, never a package. All
-        # six are in Twisted SERVER subsystems — IMAP4 (twisted.mail), XMPP and
-        # IRC (twisted.words), telnet (twisted.conch), HTTP (twisted.web) —
-        # which kiteconnect drags in and no stable release fixed when assessed.
-        # Each needs a Twisted server of that protocol to exploit; this system
-        # runs none and never imports any of those subsystems. Every part of
-        # that is asserted, per advisory, in
-        # tests/security/test_dependency_hygiene.py::TestTheAcceptedTwistedAdvisories,
-        # which also fails when Twisted's version moves, forcing re-assessment.
-        # Any OTHER finding in Twisted still fails this gate.
+        # No advisory is accepted (3 Nov 2026). The seven Twisted server
+        # advisories ignored here until then were fixed by Twisted 26.10.0, the
+        # first STABLE release carrying the fixes. Should one ever have to be
+        # accepted again, it is ignored by ID - never by package - here and in
+        # the Makefile, and listed in ACCEPTED_ADVISORIES in
+        # tests/security/test_dependency_hygiene.py, which holds both sites to
+        # that list and proves each accepted advisory unreachable.
         run: |
           set -uo pipefail
           # Human-readable to the LOG first. Writing only JSON to a file made
@@ -202,17 +199,9 @@ jobs:
           # that needs credentials to download. A gate that cannot explain
           # itself gets disabled rather than fixed.
           pip-audit --desc --skip-editable \
-            --ignore-vuln CVE-2026-106454 --ignore-vuln CVE-2026-115774 \
-            --ignore-vuln CVE-2026-115775 --ignore-vuln CVE-2026-115776 \
-            --ignore-vuln CVE-2026-115778 --ignore-vuln CVE-2026-115877 \
-            --ignore-vuln CVE-2026-83813 \
             | tee pip-audit.txt
           status=${PIPESTATUS[0]}
           pip-audit --skip-editable \
-            --ignore-vuln CVE-2026-106454 --ignore-vuln CVE-2026-115774 \
-            --ignore-vuln CVE-2026-115775 --ignore-vuln CVE-2026-115776 \
-            --ignore-vuln CVE-2026-115778 --ignore-vuln CVE-2026-115877 \
-            --ignore-vuln CVE-2026-83813 \
             --format=json --output=pip-audit.json || true
           echo "--- versions of interest ---"
           python -c "import importlib.metadata as m;[print(' ',n,m.version(n)) for n in ('autobahn','kiteconnect','twisted','urllib3','certifi','msgpack','setuptools','bandit','pip')]"

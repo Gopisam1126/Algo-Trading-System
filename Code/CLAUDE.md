@@ -142,11 +142,12 @@ order, because that needs credentials (B5) and a static IP (B6) — B1, the
 Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
 the gateway are unbuilt: no process entrypoint
 (`python -m algotrader.execution`, which docker-compose runs, has no
-`__main__` - no service does yet), and service health has no producer
-(E20-S05), so the production engine rejects every signal until it exists. The
-live ATR, per-share margin and correlations ARE produced (E15-S14), but each
-reads a source nothing fills in production yet: indicator state the strategy
-loop must publish (E13-S01), and daily bars (E03). The order state machine (E15-S03),
+`__main__` - no service does yet). Every live risk input now has a producer -
+health from heartbeats (E20-S05), ATR, margin and correlations (E15-S14) - but
+each reads a source nothing fills in production yet: heartbeats from eight
+services that have no process, indicator state the strategy loop must publish
+(E13-S01), and daily bars (E03). So the production engine still rejects every
+signal, now for reasons it names. The order state machine (E15-S03),
 protective stop attachment (E15-S04), the position manager (E15-S05), the
 reconciliation loop (E15-S09), fill booking (E15-S12), the execution
 service that drives them from `stream:signals` (E15-S13) and the square-off
@@ -154,7 +155,7 @@ timer that gives every position its time exit (E15-S06) now exist. **A gateway i
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**2,879 tests, 93% coverage** as of E15-S14, 29 Oct 2026 —
+Built and tested (**2,937 tests, 93% coverage** as of E20-S05, 3 Nov 2026 —
 all pass locally with Docker running;
 without it the container-backed integration tests skip and coverage reads lower):
 
@@ -312,7 +313,11 @@ Recorded because each was believed, written down, and wrong.
   DNS-client advisory. Seven accepted IDs now, each mapped to its subsystem.
   Again on 29 Oct 2026, mid-story: autobahn CVE-2026-116579 (permessage-brotli,
   server side, unreachable here) - FIXED by moving to 26.10.2 rather than
-  accepted, because a fix existed.
+  accepted, because a fix existed. And on 3 Nov 2026 (E20-S05): four pyasn1
+  decoder DoS advisories and a Twisted HTTP/2 rapid-reset, published 29 Oct.
+  pyasn1 0.6.5 and Twisted 26.10.0 - the first STABLE Twisted with the fixes -
+  closed all five AND the seven accepted Twisted IDs. `ACCEPTED_ADVISORIES` is
+  now empty and the audit ignores nothing.
   The local venv had also drifted from `constraints.txt` on 17 packages, and
   the local lint skipped `migrations/`: install from constraints and run CI's
   exact commands before trusting a local gate. Never add an `--ignore-vuln`
@@ -582,6 +587,23 @@ Recorded because each was believed, written down, and wrong.
 - **"`correlations_against` pairs the same days."** It pairs by POSITION. A
   name suspended for three sessions paired every older return with the wrong
   day's and read a 0.98 pair as below 0.7. The producer aligns on dates first.
+- **E20-S05 health** — `common/health.py`. Each service beats
+  `control:health:{service}` every 10 s (TTL 30 s) via `HeartbeatWriter`;
+  `HeartbeatHealth` is the `health` producer for `LiveSessionFacts`. Its
+  roster is `TRADING_SERVICES` in code - additions only - and
+  `test_health.py` holds it to docker-compose, so a new service cannot be left
+  ungated. `ExecutionService.beat()` reports its own state, DEGRADED while the
+  square-off timer is silent.
+
+- **"A heartbeat's detail is just diagnostics."** It is the health gate's
+  rejection detail, and so a `decision_log` row - the sink the logging filter
+  never sees (REC-003). A service could put a DSN there. `common.logging.redact`
+  now exists for non-log sinks; the detail is redacted on write AND on read,
+  and redacted BEFORE it is cut (a URI cut before its '@' no longer matches).
+- **"The Twisted ignores wait for a fix."** The fix shipped as stable 26.10.0
+  on 30 Oct; nothing re-checked until the next audit went red on new
+  advisories. The version-moved test was the right trigger; it just needs the
+  version to move. `ACCEPTED_ADVISORIES` is empty.
 
 - **"A restored position is one the broker holds."** Not if the broker closed
   it while we were down - its own MIS square-off leaves our row OPEN. The next

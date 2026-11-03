@@ -84,6 +84,7 @@ from algotrader.common.enums import (
     SystemMode,
 )
 from algotrader.common.events import stream as streams
+from algotrader.common.health import HEARTBEAT_INTERVAL_SECONDS, HeartbeatWriter, ServiceState
 from algotrader.common.metrics import get_metrics
 from algotrader.common.models.trading import OrderRequest, Recommendation, RiskDecision
 from algotrader.common.redis import keys
@@ -278,6 +279,7 @@ class ExecutionService:
         reconcile_interval_seconds: float = 30.0,
         squareoff_interval_seconds: float = 1.0,
         squareoff_stall_seconds: float = 10.0,
+        heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._mode = config.system.mode
         self._max_age = dt.timedelta(seconds=config.execution.max_signal_age_seconds)
@@ -345,6 +347,10 @@ class ExecutionService:
         #: loop from a dead one.
         self._timer_heartbeat: dt.datetime | None = None
         self._stall_reported = False
+        #: E20-S05: this service's own entry in the health roll-up. Built here,
+        #: like the timer, so the service cannot run without announcing itself.
+        self._heartbeat = HeartbeatWriter(redis, service=SERVICE)
+        self._beat_interval = heartbeat_interval_seconds
         self._restored = False
         self._reconciled = False
 
@@ -445,10 +451,12 @@ class ExecutionService:
         process exits: a service consuming signals while its reconciliation
         has died would trade on a book nothing is watching.
         """
+        await self.beat()
         await self.start()
         async with asyncio.TaskGroup() as group:
             group.create_task(self._reconcile_until(stop))
             group.create_task(self._squareoff_until(stop))
+            group.create_task(self._heartbeat_until(stop))
             group.create_task(self._consume_until(source, stop))
 
     async def _reconcile_until(self, stop: asyncio.Event) -> None:
@@ -461,6 +469,42 @@ class ExecutionService:
             self._timer_heartbeat = self._clock()
             await self.sweep()
             await self._sleep(self._timer_interval)
+
+    async def _heartbeat_until(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await self.beat()
+            await self._sleep(self._beat_interval)
+
+    async def beat(self) -> ServiceState | None:
+        """Write this service's heartbeat (E20-S05). Never raises.
+
+        READY only once the book is restored AND reconciled - the same bar
+        ``ready`` sets for signals. DEGRADED while the square-off timer is
+        reported silent: an execution service whose time exits are running on
+        the backstop alone should open nothing new, and saying so here puts
+        that in front of every health gate, its own included.
+
+        A failed write is logged and swallowed. The key then expires and the
+        roll-up reads this service as down, which refuses entries; raising
+        would take the reconciliation loop and the square-off timer down with
+        it, and those must outlive a Redis blip.
+        """
+        if self._stall_reported:
+            state, detail = ServiceState.DEGRADED, "square-off timer silent"
+        elif self.ready:
+            state, detail = ServiceState.READY, None
+        else:
+            state, detail = ServiceState.STARTING, "not yet restored and reconciled"
+        try:
+            await self._heartbeat.beat(state, now=self._clock(), detail=detail)
+        except Exception as exc:
+            log.warning(
+                "heartbeat write failed (%s); the roll-up will read %s as down until one succeeds",
+                type(exc).__name__,
+                SERVICE,
+            )
+            return None
+        return state
 
     async def _consume_until(self, source: SignalSource, stop: asyncio.Event) -> None:
         await source.start()

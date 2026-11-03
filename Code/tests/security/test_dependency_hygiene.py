@@ -320,30 +320,26 @@ class TestLoadingAConfigDoesNotDragInTheBrokerStack:
 #: unreachable" — and the class below makes each claim executable instead of
 #: leaving it in a comment that outlives its truth.
 #:
-#: Every one is in a Twisted subsystem this process never loads - six servers
-#: and the DNS client. Assessed 15 Oct 2026 (the first) and 27 Oct 2026 (the
-#: rest; CVE-2026-83813 was published between the local audit and the CI run
-#: that morning). On 27 Oct they were fixed only in 26.10.0rc1/rc2 — a
-#: pre-release, not pinned into a system that moves money when the vulnerable
-#: code cannot run anyway.
-ACCEPTED_ADVISORIES: dict[str, tuple[str, str, str]] = {
-    # IMAP4 server: LIST/LSUB wildcard compiled as a regex (ReDoS).
-    "CVE-2026-106454": ("twisted", "26.4.0", "twisted.mail"),
-    # IMAP4 server: negative literal size loops parseNestedParens forever.
-    "CVE-2026-115774": ("twisted", "26.4.0", "twisted.mail"),
-    # XML element stream (XMPP): an unclosed container grows without bound.
-    "CVE-2026-115775": ("twisted", "26.4.0", "twisted.words"),
-    # IRC server: per-connection line buffer has no maximum.
-    "CVE-2026-115776": ("twisted", "26.4.0", "twisted.words"),
-    # Telnet transport: subnegotiation buffer has no maximum.
-    "CVE-2026-115778": ("twisted", "26.4.0", "twisted.conch"),
-    # HTTP server: bare CR/LF in a header value hides a header (smuggling).
-    "CVE-2026-115877": ("twisted", "26.4.0", "twisted.web"),
-    # DNS client: a response is accepted on the 16-bit transaction id alone
-    # (cache poisoning). Twisted's reactor resolves through the system
-    # resolver by default; twisted.names is used only when installed
-    # explicitly, and nothing here does - or runs the reactor at all.
-    "CVE-2026-83813": ("twisted", "26.4.0", "twisted.names"),
+#: EMPTY since 3 Nov 2026. It held seven Twisted 26.4.0 advisories - IMAP4
+#: (CVE-2026-106454, -115774), XMPP (-115775), IRC (-115776), telnet (-115778),
+#: HTTP header smuggling (-115877) and the DNS client (-83813) - all in
+#: subsystems this process never loads, accepted because the only fix was the
+#: pre-release 26.10.0rc1/rc2. Twisted 26.10.0 (stable, 30 Oct 2026) fixes all
+#: seven and the HTTP/2 rapid-reset GHSA-vpp8-g58w-m8mp published on 29 Oct;
+#: pyasn1 0.6.5 fixes four decoder DoS advisories. With both pinned, pip-audit
+#: finds nothing, so nothing is ignored.
+#:
+#: The machinery below stays: it is how an advisory with no fix is accepted -
+#: by ID, against an exact version and subsystem, with the reachability claim
+#: executed rather than written down.
+ACCEPTED_ADVISORIES: dict[str, tuple[str, str, str]] = {}
+
+#: First releases fixing what the list above used to accept, and the pyasn1
+#: decoder advisories of 29 Oct 2026. A rollback below either fails here, not
+#: only in the audit job.
+FIXED_FLOORS: dict[str, tuple[int, ...]] = {
+    "twisted": (26, 10, 0),
+    "pyasn1": (0, 6, 5),
 }
 
 #: The module each subsystem's advisory is actually in — imported by the
@@ -420,24 +416,46 @@ def _audit_invocations(text: str) -> list[str]:
 
 
 class TestTheAcceptedTwistedAdvisories:
-    """Six advisories against Twisted 26.4.0, all in its SERVER subsystems:
-    the IMAP4 server (two), the XMPP XML stream, the IRC server, the telnet
-    transport and the HTTP server. See ACCEPTED_ADVISORIES for each.
+    """How an unfixable advisory is accepted, and the proof that it holds.
+
+    Until 3 Nov 2026 this covered seven Twisted 26.4.0 advisories, all in
+    server subsystems (see ACCEPTED_ADVISORIES' history). Twisted 26.10.0 fixed
+    them and the list is empty - but the subsystem probe below still runs,
+    because it is the evidence any future acceptance will rest on and it costs
+    one subprocess.
 
     Twisted is here only because kiteconnect pins ``autobahn[twisted]`` and
     imports ``.ticker`` unconditionally (see the B7 classes above). It cannot
-    be removed — ``import kiteconnect`` fails without it — and on the day each
-    was assessed no stable release fixed it.
-
-    What makes them safe is that the vulnerable code cannot run here. Every one
-    needs a Twisted server of that protocol accepting connections; this system
-    runs none, never runs the Twisted reactor, and never even imports
-    ``twisted.mail``, ``twisted.words``, ``twisted.conch`` or ``twisted.web``.
-    The audit therefore ignores exactly these IDs — never the package, so any
-    OTHER Twisted advisory still fails the gate — and each part of that
-    argument is asserted below, because the lesson of QA-SEC-24 is that "we do
-    not use it" was once recorded as fact and was false.
+    be removed — ``import kiteconnect`` fails without it. This system runs no
+    Twisted server, never runs the reactor, and never imports ``twisted.mail``,
+    ``twisted.words``, ``twisted.conch``, ``twisted.web`` or ``twisted.names``;
+    each part of that is asserted below, because the lesson of QA-SEC-24 is
+    that "we do not use it" was once recorded as fact and was false.
     """
+
+    def test_the_fixed_releases_are_installed(self) -> None:
+        for package, floor in FIXED_FLOORS.items():
+            installed = md.version(package)
+            assert _version_tuple(installed) >= floor, (
+                f"{package} {installed} is below {'.'.join(map(str, floor))}, the first "
+                f"release fixing the advisories ACCEPTED_ADVISORIES no longer ignores"
+            )
+
+    def test_the_constraints_pin_the_fixed_releases(self) -> None:
+        constraints = self._read("constraints.txt").lower()
+        for package, floor in FIXED_FLOORS.items():
+            pinned = re.search(rf"^{package}==(\S+)$", constraints, re.M)
+            assert pinned is not None, package
+            assert _version_tuple(pinned.group(1)) >= floor, pinned.group(0)
+
+    def test_no_vulnerable_subsystem_is_loaded_at_all(self) -> None:
+        """Independent of the accepted list: the servers and the resolver whose
+        advisories were once ignored are still never loaded."""
+        loaded = _twisted_modules_loaded_by_the_application()
+        assert loaded, "no Twisted module loaded - the probe is measuring nothing"
+        for subsystem in ("twisted.mail", "twisted.words", "twisted.conch", "twisted.web"):
+            reached = [n for n in loaded if _within(n, subsystem)]
+            assert not reached, f"{reached} is loaded by the application"
 
     @staticmethod
     def _read(*parts: str) -> str:
