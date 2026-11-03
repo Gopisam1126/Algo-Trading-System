@@ -46,6 +46,12 @@ from algotrader.common.db.repositories import (
 from algotrader.common.enums import AIVerdict, Direction, RejectReason, Timeframe
 from algotrader.common.events import stream as streams
 from algotrader.common.events.envelope import Envelope
+from algotrader.common.health import (
+    TRADING_SERVICES,
+    HeartbeatHealth,
+    HeartbeatWriter,
+    ServiceState,
+)
 from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import Recommendation
 from algotrader.common.redis import keys
@@ -912,3 +918,113 @@ class TestSit23ASessionSizedFromTheLiveInputs:
             assert str(rec.correlation_id) in audited, f"{rec.symbol} left no audit row"
         assert not (await day.halts.state()).any_halted
         assert desk.calls >= 4, "every sized signal asked the broker"
+
+
+# ---------------------------------------------------------------------------
+# SIT-24 - no new risk while a component is down; exits never wait (E20-S05)
+# ---------------------------------------------------------------------------
+
+
+class Fleet:
+    """Every other trading service, beating READY once a simulated minute -
+    as each process will every ten seconds. ``down`` ones are silent."""
+
+    def __init__(self, redis: aioredis.Redis) -> None:
+        self.down: set[str] = set()
+        self._writers = [
+            HeartbeatWriter(redis, service=s) for s in sorted(TRADING_SERVICES - {"execution-svc"})
+        ]
+
+    async def __call__(self, now: dt.datetime) -> None:
+        for writer in self._writers:
+            if writer.service not in self.down:
+                await writer.beat(ServiceState.READY, now=now)
+
+
+class TestSit24TheHealthGateThroughASession:
+    async def test_a_silent_component_stops_new_entries_and_never_an_exit(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        await _daily_closes(session, instruments, calendar, "INFY", "TCS", "WIPRO")
+        strategy = StrategySide(redis, ["INFY", "TCS", "WIPRO"])
+        desk = MarginDesk()
+        fleet = Fleet(redis)
+
+        def live(adapter: KiteTradingAdapter) -> LiveSessionFacts:
+            return LiveSessionFacts(
+                health=HeartbeatHealth(redis),
+                atr=PublishedATR(redis, timeframes=strategy_timeframes([_ORB])),
+                margin=BrokerMarginPerShare(adapter),
+                correlations=DailyCloseCorrelations(
+                    BarRepository(session, instruments), calendar=calendar
+                ),
+            )
+
+        account = SettlingAccount()
+        account.order_margins = desk.order_margins  # type: ignore[attr-defined]
+        day = Day(session, instruments, redis, audit, calendar, account=account, facts=live)
+        await day.service.start()
+
+        def orb(symbol: str, at: dt.datetime) -> Recommendation:
+            return _rec(symbol, at).model_copy(update={"strategy_id": "orb_classic"})
+
+        signals = {
+            _ist(10, 1): [orb("INFY", _ist(10, 1))],  # every component up
+            _ist(11, 10): [orb("TCS", _ist(11, 10))],  # market-ingest silent since 11:00
+            _ist(11, 41): [orb("TCS", _ist(11, 41))],  # back since 11:30
+            _ist(13, 5): [orb("WIPRO", _ist(13, 5))],  # this service's timer silent
+        }
+        published = [rec for recs in signals.values() for rec in recs]
+
+        async def each_minute(now: dt.datetime) -> None:
+            if now == _ist(11, 0):
+                fleet.down.add("market-ingest")
+            if now == _ist(11, 30):
+                fleet.down.discard("market-ingest")
+            if now == _ist(13, 0):
+                # The dedicated square-off loop dies; only the backstop sweep
+                # after each reconciliation cycle is left.
+                day.service._timer_heartbeat = _ist(12, 59)
+            await fleet(now)
+            await strategy(now)
+            await day.service.beat()  # what run() does every ten seconds
+
+        await day.walk(_ist(15, 30), signals, at_each_minute=each_minute)
+
+        def ended(rec: Recommendation) -> tuple[Outcome, RejectReason | None, str]:
+            (result,) = day.results[rec.correlation_id]
+            return result.outcome, result.reason, result.detail
+
+        infy, tcs_down, tcs_back, wipro_degraded = published
+        assert ended(infy)[0] is Outcome.SUBMITTED
+        assert ended(tcs_back)[0] is Outcome.SUBMITTED
+
+        outcome, reason, detail = ended(tcs_down)
+        assert (outcome, reason) == (Outcome.REJECTED, RejectReason.HEALTH_GATE_FAILED)
+        assert "market-ingest (" in detail and "execution-svc" not in detail
+        outcome, reason, detail = ended(wipro_degraded)
+        assert (outcome, reason) == (Outcome.REJECTED, RejectReason.HEALTH_GATE_FAILED)
+        assert "execution-svc (DEGRADED: square-off timer silent)" in detail
+
+        # The two positions taken were protected throughout - the outage did
+        # not touch them - and left at their deadlines through the BACKSTOP
+        # sweep while this service was reporting itself degraded.
+        entries = {
+            p["tradingsymbol"]: p for p in day.account.placed if p["transaction_type"] == "BUY"
+        }
+        assert sorted(entries) == ["INFY", "TCS"]
+        assert _stops(day.account) == {s: p["quantity"] for s, p in entries.items()}
+        exits = {
+            p["tradingsymbol"]: p["quantity"]
+            for p in day.account.placed
+            if p["transaction_type"] == "SELL" and p["order_type"] == "MARKET"
+        }
+        assert exits == {s: p["quantity"] for s, p in entries.items()}
+        assert day.manager.open_positions() == []
+        closed = (await session.execute(text("SELECT exit_reason FROM positions"))).all()
+        assert [r.exit_reason for r in closed] == ["TIME", "TIME"]
+
+        audited = await _audited(session)
+        for rec in published:
+            assert str(rec.correlation_id) in audited, f"{rec.symbol} left no audit row"
+        assert not (await day.halts.state()).any_halted, "health refuses entries; it never halts"

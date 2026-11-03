@@ -41,11 +41,10 @@ names what was missing.
 
 The live inputs are a seam, :class:`SessionFacts`. The live ATR, the broker's
 per-share margin and the correlations are produced in
-:mod:`algotrader.execution.live_inputs` (E15-S14); the service-health roll-up
-has no producer until E20-S05, and :class:`NoProducerYet` answers it - and,
-wired whole, every input - as unknown. **Until health has a producer the engine
-rejects every signal**, which is the correct behaviour for a system missing a
-safety input.
+:mod:`algotrader.execution.live_inputs` (E15-S14), and the service-health
+roll-up by :class:`algotrader.common.health.HeartbeatHealth` (E20-S05).
+:class:`NoProducerYet` answers every input as unknown - the fail-closed
+default, under which the engine rejects every signal.
 
 What cannot be ``None`` - the slot count, the deadline, the instrument itself -
 raises :class:`ContextUnavailableError`, and the service refuses the signal with
@@ -322,9 +321,8 @@ class NoProducerYet:
     refuses on, so wiring this means every signal is rejected - with the
     missing input named in the audit row:
 
-    * ``unhealthy_services`` - the heartbeat roll-up is E20-S05. This is the
-      one input still without a producer: pass this as ``LiveSessionFacts``'s
-      ``health`` until it exists.
+    * ``unhealthy_services`` - produced by
+      :class:`~algotrader.common.health.HeartbeatHealth` since E20-S05.
     * ``atr``, ``margin_per_share``, ``correlations`` - produced by
       :mod:`~algotrader.execution.live_inputs` since E15-S14. Empty
       correlations make every held symbol "unknown", so the correlation guard

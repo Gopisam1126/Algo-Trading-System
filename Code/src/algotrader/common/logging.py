@@ -235,6 +235,17 @@ def register_secret_values(values: set[str]) -> None:
     _redactor.add_known_values(values)
 
 
+def redact(text: str) -> str:
+    """Scrub ``text`` the way a log line is scrubbed, for sinks that are not logs.
+
+    ``decision_log`` details, heartbeat details and anything else written
+    outside the logging pipeline never pass the redacting filter (REC-003).
+    Text that may carry a credential - a connection string in a service's
+    own status, an exception message - goes through this before it is stored.
+    """
+    return _redactor._scrub_text(text)
+
+
 def configure_logging(
     *,
     level: str = "INFO",

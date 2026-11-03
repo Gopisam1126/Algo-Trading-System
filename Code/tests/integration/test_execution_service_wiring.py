@@ -16,6 +16,7 @@ restart that restores the real table before the real cycle.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import math
 import random
@@ -53,6 +54,12 @@ from algotrader.common.enums import (
 )
 from algotrader.common.events import stream as streams
 from algotrader.common.events.envelope import Envelope
+from algotrader.common.health import (
+    TRADING_SERVICES,
+    HeartbeatHealth,
+    HeartbeatWriter,
+    ServiceState,
+)
 from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import OrderRequest, Position, Recommendation
 from algotrader.common.redis import keys
@@ -993,3 +1000,96 @@ class TestS14Ac3AnUnknownCorrelationRefusesASecondPosition:
         result = await live_stack.consume_one()
         assert result is not None and result.outcome is Outcome.REJECTED
         assert "no correlation available" in result.detail
+
+
+# ===========================================================================
+# E20-S05 - the health gate, fed by real heartbeats
+# ===========================================================================
+
+
+def _live_with_health(session, instruments, calendar):
+    """The E15-S14 producers, with health from the real heartbeat roll-up."""
+
+    def facts(stack: Stack) -> LiveSessionFacts:
+        return LiveSessionFacts(
+            health=HeartbeatHealth(stack.redis),
+            atr=PublishedATR(stack.redis, timeframes=strategy_timeframes([_ORB])),
+            margin=BrokerMarginPerShare(stack.adapter),
+            correlations=DailyCloseCorrelations(
+                BarRepository(session, instruments), calendar=calendar
+            ),
+        )
+
+    return facts
+
+
+async def _others_ready(redis: aioredis.Redis, *, skip: set[str] = frozenset()) -> None:
+    """Every trading service except this one beats READY - as each process will."""
+    for service in sorted(TRADING_SERVICES - {"execution-svc"} - skip):
+        await HeartbeatWriter(redis, service=service).beat(ServiceState.READY, now=NOW)
+
+
+@pytest.fixture
+def healthy_stack(session, instruments, redis, audit, calendar) -> Stack:
+    return Stack(
+        session,
+        instruments,
+        redis,
+        audit,
+        calendar,
+        facts=_live_with_health(session, instruments, calendar),
+    )
+
+
+class TestE20S05TheHealthGateForReal:
+    async def test_every_service_ready_and_the_signal_is_taken(self, healthy_stack: Stack) -> None:
+        await _publish_atr(healthy_stack.redis, "INFY")
+        await _others_ready(healthy_stack.redis)
+        await healthy_stack.service.start()
+        await healthy_stack.service.beat()  # its own READY, as run() does every 10 s
+        await healthy_stack.publish(_orb("INFY"))
+        result = await healthy_stack.consume_one()
+        assert result is not None and result.outcome is Outcome.SUBMITTED, result
+
+    async def test_a_silent_service_is_named_and_nothing_is_placed(
+        self, healthy_stack: Stack, session: AsyncSession
+    ) -> None:
+        await _publish_atr(healthy_stack.redis, "INFY")
+        await _others_ready(healthy_stack.redis, skip={"market-ingest"})
+        await healthy_stack.service.start()
+        await healthy_stack.service.beat()
+        await healthy_stack.publish(_orb("INFY"))
+        result = await healthy_stack.consume_one()
+
+        assert result is not None and result.outcome is Outcome.REJECTED
+        assert result.reason is not None and result.reason.value == "HEALTH_GATE_FAILED"
+        assert "market-ingest (no heartbeat)" in result.detail
+        assert healthy_stack.account.placed == []
+        assert ("health_gate", "rejected") in await _audit_rows(session)
+
+    async def test_the_execution_service_counts_itself(self, healthy_stack: Stack) -> None:
+        """Restored and reconciled, but its own heartbeat still says STARTING
+        (written before start): the gate waits for it like any other service."""
+        await _publish_atr(healthy_stack.redis, "INFY")
+        await _others_ready(healthy_stack.redis)
+        await healthy_stack.service.beat()  # STARTING
+        await healthy_stack.service.start()
+        await healthy_stack.publish(_orb("INFY"))
+        result = await healthy_stack.consume_one()
+        assert result is not None and result.outcome is Outcome.REJECTED
+        assert "execution-svc (STARTING" in result.detail
+
+    async def test_the_ttl_really_expires_a_dead_services_heartbeat(
+        self, healthy_stack: Stack
+    ) -> None:
+        """The expiry IS the liveness mechanism - shown in Redis, not assumed."""
+        redis = healthy_stack.redis
+        await HeartbeatWriter(redis, service="notifier", ttl_seconds=1).beat(
+            ServiceState.READY, now=NOW
+        )
+        health = HeartbeatHealth(redis)
+        before = await health.unhealthy_services(now=NOW)
+        assert before is not None and not any(s.startswith("notifier") for s in before)
+        await asyncio.sleep(1.5)
+        after = await health.unhealthy_services(now=NOW)
+        assert after is not None and "notifier (no heartbeat)" in after

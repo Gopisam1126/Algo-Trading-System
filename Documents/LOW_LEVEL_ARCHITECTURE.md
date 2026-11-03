@@ -405,7 +405,7 @@ stream:audit                              → XADD, consumer group "db-writer"
 # ---- Control (String) ----
 control:killswitch                        → STRING  "ACTIVE" | "INACTIVE"
 control:mode                              → STRING  "PAPER"|"ALERT"|"APPROVAL"|"LIVE"
-control:health:{service}                  → STRING  heartbeat timestamp, TTL 30s
+control:health:{service}                  → STRING  (JSON Heartbeat: service, state, beat_at, detail), TTL 30s
 
 # ---- Concurrency primitives ----
 lock:slot:{index}                         → STRING  (SET NX PX — slot allocation)
@@ -1361,8 +1361,20 @@ from a caller — and for an approval claims a slot, registers the `EntryPlan`
   - **Correlations** — daily closes from Postgres, aligned on the dates both
     names traded, today's bar excluded, and unknown for any series that does
     not end on the previous session.
-  - **Health** has no producer until E20-S05; `NoProducerYet` answers it, so
-    production still rejects every signal on health alone.
+  - **Health (E20-S05, `common/health.py`)** — every service beats
+    `control:health:{service}` (a `Heartbeat`: STARTING | READY | DEGRADED |
+    FAILED) every 10 s with a 30 s TTL; `HeartbeatHealth` reads them all in one
+    `MGET` and names each service that is absent, unreadable, misfiled, dated
+    in the future, older than 30 s (a key written without a TTL) or not READY.
+    The roster is `TRADING_SERVICES` — every service §2.2 runs while entries
+    are possible, by compose name; a deployment can add to it and cannot
+    remove from it, and a test holds it to docker-compose. A failed read is
+    unknown, never healthy. The execution service beats itself: STARTING
+    until restored and reconciled, READY, and DEGRADED while its square-off
+    timer is silent - so no new entry is opened while time exits run on the
+    backstop alone. A heartbeat's detail reaches `decision_log`, so it is
+    redacted (`common.logging.redact`) when written and again when read.
+    Health refuses entries; it never halts and never touches an exit.
 
 ---
 
@@ -1771,6 +1783,7 @@ Each service exposes `/health` reporting `starting | ready | degraded | failed`.
 | Broker auth fails | Auth job exception | Retry ×3, then halt day | Investigate; possible TOTP/credential issue |
 | WebSocket disconnect | Heartbeat timeout | Reconnect w/ backoff; mark stale; block entries | None if recovers < 2 min |
 | Feed stale > 60s | Staleness monitor | Block new entries; manage existing | Verify broker status page |
+| A service stops heartbeating | `HeartbeatHealth`: key expired (30 s TTL) or `beat_at` older than 30 s | Health gate refuses every entry, naming it; exits, stops and the square-off timer carry on | Restart the service; entries resume with its first READY beat |
 | Redis down | Connection error | All services degrade; no new orders | Restart Redis; state rebuilds |
 | TimescaleDB down | Connection error | Trading continues (Redis-backed); audit buffers to disk | Restart; replay buffered audit |
 | AI timeout/failure | Per-call timeout | Skip trade; if persistent, score-only mode | Check API status; review budget |
