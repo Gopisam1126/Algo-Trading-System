@@ -97,29 +97,22 @@ Two design decisions worth knowing:
     dependency as an error, and the local editable `algotrader` package is
     always skipped because it is not on PyPI — so `--strict` fails every run
     for a reason unrelated to vulnerabilities.
-  - **An ignored advisory is an executable claim, not a comment.** Seven are
-    accepted, all against Twisted 26.4.0, all in subsystems this process never
-    loads: `CVE-2026-106454` and `-115774` (IMAP4 server, `twisted.mail`),
-    `-115775` (XMPP XML stream) and `-115776` (IRC server, both
-    `twisted.words`), `-115778` (telnet, `twisted.conch`), `-115877` (HTTP
-    server header smuggling, `twisted.web`), `-83813` (DNS client,
-    `twisted.names`). The first was assessed 15 Oct 2026 with no patched
-    release; the rest on 27 Oct 2026, when the only fix was the pre-release
-    26.10.0rc1/rc2 - not pinned into a system that moves money when the
-    vulnerable code cannot run. Twisted arrives only through kiteconnect's
-    `autobahn[twisted]` pin and cannot be removed (`import kiteconnect` needs
-    it). This process runs no Twisted server, never installs the `twisted.names`
-    resolver, never runs the reactor, and imports none of those five
-    subsystems. `TestTheAcceptedTwistedAdvisories` in
-    `tests/security/test_dependency_hygiene.py` maps each ID to its subsystem
-    and asserts every part of that - loading every application module in a
-    clean interpreter never pulls in any of them (with a control importing all
-    six vulnerable modules), no source file imports Twisted, every audit site
-    ignores **exactly** the accepted set - and fails the moment Twisted's
-    version moves, so 26.10.0 final gets the ignores removed instead of
-    forgotten. Each ID is ignored individually, never the package: any other
-    Twisted advisory still fails the gate. `make audit` runs the same command
-    as CI.
+  - **An ignored advisory is an executable claim, not a comment - and today
+    there are none.** Until 3 Nov 2026 seven were accepted, all against
+    Twisted 26.4.0 and all in subsystems this process never loads (IMAP4,
+    XMPP, IRC, telnet, the HTTP server, the DNS client), because the only fix
+    was the pre-release 26.10.0rc1/rc2. Twisted 26.10.0, the stable release of
+    30 Oct 2026, fixes all seven and the HTTP/2 rapid-reset advisory of 29 Oct
+    (GHSA-vpp8-g58w-m8mp); pyasn1 0.6.5 fixes four decoder DoS advisories of
+    the same day. Both are pinned, the audit finds nothing, and CI and
+    `make audit` ignore nothing. If an advisory ever has to be accepted again:
+    ignore it by ID - never the package - in `ci.yml` and the Makefile, and
+    list it in `ACCEPTED_ADVISORIES` (`tests/security/test_dependency_hygiene.py`)
+    against its exact version and subsystem. `TestTheAcceptedTwistedAdvisories`
+    then holds both sites to exactly that list, proves the subsystem is never
+    loaded (with a control that imports the vulnerable modules), and fails the
+    moment the package's version moves, so a fixed release gets the ignore
+    removed instead of forgotten - which is what happened here.
   - **An audit that passed on DEV can fail on QA with no code change.**
     Advisories are published against the world, not against a commit. The
     E15-S12 promotion went red two weeks after its DEV run passed because

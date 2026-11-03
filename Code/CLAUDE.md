@@ -312,7 +312,11 @@ Recorded because each was believed, written down, and wrong.
   DNS-client advisory. Seven accepted IDs now, each mapped to its subsystem.
   Again on 29 Oct 2026, mid-story: autobahn CVE-2026-116579 (permessage-brotli,
   server side, unreachable here) - FIXED by moving to 26.10.2 rather than
-  accepted, because a fix existed.
+  accepted, because a fix existed. And on 3 Nov 2026 (E20-S05): four pyasn1
+  decoder DoS advisories and a Twisted HTTP/2 rapid-reset, published 29 Oct.
+  pyasn1 0.6.5 and Twisted 26.10.0 - the first STABLE Twisted with the fixes -
+  closed all five AND the seven accepted Twisted IDs. `ACCEPTED_ADVISORIES` is
+  now empty and the audit ignores nothing.
   The local venv had also drifted from `constraints.txt` on 17 packages, and
   the local lint skipped `migrations/`: install from constraints and run CI's
   exact commands before trusting a local gate. Never add an `--ignore-vuln`
