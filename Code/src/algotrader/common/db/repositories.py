@@ -41,6 +41,7 @@ from algotrader.common.db.models import (
     Ohlcv,
     Order,
     Position,
+    Strategy,
 )
 from algotrader.common.enums import PositionStatus, Timeframe
 
@@ -1147,4 +1148,87 @@ def _decision_to_dict(row: DecisionLog) -> dict[str, Any]:
         "service": row.service,
         "prev_hash": row.prev_hash,
         "row_hash": row.row_hash,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy registry
+# ---------------------------------------------------------------------------
+
+
+class StrategyRepository:
+    """The ``strategy`` table, for :class:`algotrader.strategy.registry.StrategyRegistry`.
+
+    **Insert and read, nothing else.** A registered document never changes -
+    the application role can UPDATE only the lifecycle columns, and cannot
+    DELETE at all (migration ``a986f25d3838``) - so a method here that
+    rewrote ``dsl`` would fail on the first call in production while passing
+    every test that connects as the table owner. State transitions are
+    E12-S02's, through those columns.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def insert_strategy(self, row: dict[str, Any]) -> bool:
+        """Write one row; False if its id or its content hash is already taken.
+
+        ``ON CONFLICT DO NOTHING`` with no target covers both the primary key
+        and ``uq_strategy_dsl_hash``, so a lost race comes back as an answer
+        the registry can explain rather than an IntegrityError mid-transaction.
+        Any OTHER refusal - a CHECK, the parent foreign key - still raises:
+        those mean the registry's own checks were bypassed.
+        """
+        result = await self._session.execute(
+            pg_insert(Strategy).values(**row).on_conflict_do_nothing().returning(Strategy.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def strategy_by_id(self, strategy_id: str) -> dict[str, Any] | None:
+        row = (
+            await self._session.execute(select(Strategy).where(Strategy.id == strategy_id))
+        ).scalar_one_or_none()
+        return None if row is None else _strategy_to_dict(row)
+
+    async def strategy_by_hash(self, dsl_hash: str) -> dict[str, Any] | None:
+        row = (
+            await self._session.execute(select(Strategy).where(Strategy.dsl_hash == dsl_hash))
+        ).scalar_one_or_none()
+        return None if row is None else _strategy_to_dict(row)
+
+    async def all_strategies(self) -> list[dict[str, Any]]:
+        """Every row, in registration order. Dozens, never thousands: the
+        registry caps what runs (STRATEGY_ENGINE.md §11 ``registry``), and a
+        rejected strategy is one row however many trials it took."""
+        rows = (
+            (
+                await self._session.execute(
+                    select(Strategy).order_by(Strategy.hypothesis_frozen_at, Strategy.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [_strategy_to_dict(r) for r in rows]
+
+
+def _strategy_to_dict(row: Strategy) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "version": row.version,
+        "parent_id": row.parent_id,
+        "origin": row.origin,
+        "state": row.state,
+        "dsl": row.dsl,
+        "dsl_hash": row.dsl_hash,
+        "hypothesis": row.hypothesis,
+        "hypothesis_frozen_at": row.hypothesis_frozen_at,
+        "applicable_regimes": list(row.applicable_regimes),
+        "created_at": row.created_at,
+        "created_by": row.created_by,
+        "approved_by": row.approved_by,
+        "approved_at": row.approved_at,
+        "state_changed_at": row.state_changed_at,
+        "retirement_reason": row.retirement_reason,
     }

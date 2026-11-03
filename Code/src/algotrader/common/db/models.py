@@ -73,6 +73,7 @@ from algotrader.common.enums import (
     PositionStatus,
     Product,
     Side,
+    StrategyState,
     SurveillanceCategory,
     Timeframe,
 )
@@ -702,11 +703,28 @@ class Strategy(Base):
     retirement_reason: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
-        # BR-5: the human approval gate, enforced by the database.
+        # BR-5: the human approval gate, enforced by the database - for every
+        # state that places live orders. It covered ACTIVE alone until E12-S01
+        # (3 Nov 2026), and DEGRADED places live orders too
+        # (StrategyState.places_live_orders), so one UPDATE to DEGRADED put an
+        # unapproved strategy on live capital past this CHECK.
         CheckConstraint(
-            "state <> 'ACTIVE' OR (approved_by IS NOT NULL AND approved_at IS NOT NULL)",
-            name="active_needs_approval",
+            "state NOT IN ('ACTIVE', 'DEGRADED') "
+            "OR (approved_by IS NOT NULL AND approved_at IS NOT NULL)",
+            name="live_states_need_approval",
         ),
+        CheckConstraint(
+            "state IN (" + ", ".join(f"'{s.value}'" for s in StrategyState) + ")",
+            name="known_state",
+        ),
+        # E12-S01: the registry's structure, stated where a bad write meets it.
+        # One registered strategy per behaviour - a REJECTED strategy cannot
+        # come back under a new id - and lineage that is a chain from a v1.
+        UniqueConstraint("dsl_hash", name="uq_strategy_dsl_hash"),
+        CheckConstraint("dsl_hash ~ '^[0-9a-f]{64}$'", name="dsl_hash_is_sha256"),
+        CheckConstraint("version >= 1", name="version_positive"),
+        CheckConstraint("parent_id IS NOT NULL OR version = 1", name="root_is_version_one"),
+        CheckConstraint("parent_id IS NULL OR parent_id <> id", name="not_its_own_parent"),
     )
 
 
@@ -843,7 +861,7 @@ Index("ix_journal_date", TradeJournal.trade_date.desc())
 
 #: Tables the application role must be able to modify. The two that are
 #: deliberately absent — ``decision_log`` and ``strategy_trial`` — are what
-#: BR-3 and BR-4 come down to.
+#: BR-3 and BR-4 come down to; ``strategy`` is in LIFECYCLE_COLUMNS instead.
 MUTABLE_TABLES: tuple[str, ...] = (
     "instruments",
     "instrument_daily_status",
@@ -855,7 +873,6 @@ MUTABLE_TABLES: tuple[str, ...] = (
     "order_fills",
     "positions",
     "trade_journal",
-    "strategy",
     "strategy_validation",
     "strategy_performance",
     "shadow_signal",
@@ -863,6 +880,22 @@ MUTABLE_TABLES: tuple[str, ...] = (
 
 #: Append-only tables: SELECT and INSERT only, no UPDATE, no DELETE.
 APPEND_ONLY_TABLES: tuple[str, ...] = ("decision_log", "strategy_trial")
+
+#: Tables whose rows are permanent records with a lifecycle: SELECT and INSERT,
+#: UPDATE on exactly these columns, and no DELETE (E12-S01). A strategy's
+#: document - its DSL, hash, hypothesis and lineage - is what its validation,
+#: shadow history and approval were granted to; an UPDATE that changed it
+#: would keep all three for a strategy nobody validated. A rejected or retired
+#: strategy is archived, never deleted (STRATEGY_ENGINE.md §5).
+LIFECYCLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "strategy": (
+        "state",
+        "state_changed_at",
+        "approved_by",
+        "approved_at",
+        "retirement_reason",
+    ),
+}
 
 #: Tables that become TimescaleDB hypertables, with their chunk intervals.
 HYPERTABLES: dict[str, str] = {

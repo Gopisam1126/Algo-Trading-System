@@ -150,9 +150,19 @@ def _require_timeframe(timeframe: Timeframe, caps: Capabilities, primitive: str)
         )
 
 
+def resolved_params(condition: Condition) -> dict[str, Any]:
+    """The parameters ``condition`` runs with - its own plus declared defaults.
+
+    Everything here that hands parameters to an evaluator, or checks them,
+    goes through this, so a default has one definition (the ``ParamSpec``)
+    rather than one per reader. See :meth:`PrimitiveSpec.resolved_params`.
+    """
+    return REGISTRY.get(condition.primitive).resolved_params(condition.params)
+
+
 def verify_condition(condition: Condition, caps: Capabilities = DEFAULT_CAPABILITIES) -> None:
     """Check one condition can be answered here. Raises, or returns silently."""
-    name, params = condition.primitive, condition.params
+    name = condition.primitive
 
     if name not in CONDITION_EVALUATORS and name not in STOP_EVALUATORS:
         if name in DEFERRED_TO_POSITION_MANAGER:
@@ -169,12 +179,16 @@ def verify_condition(condition: Condition, caps: Capabilities = DEFAULT_CAPABILI
     # unconditionally. Checking here means holding an evaluator is proof the
     # parameters are in range, not just that the primitive names exist.
     try:
-        REGISTRY.get(name).validate_params(dict(params))
+        REGISTRY.get(name).validate_params(dict(condition.params))
     except ValueError as exc:
         raise UnevaluableStrategyError(f"{name}: {exc}") from exc
+    # Checked with the parameters the evaluator will be given, defaults
+    # included - not with defaults restated here, which is how this check and
+    # the evaluator came to disagree about ``of``.
+    params = resolved_params(condition)
 
-    def period(param: str, default: int | None = None) -> int | None:
-        value = params.get(param, default)
+    def period(param: str) -> int | None:
+        value = params.get(param)
         return None if value is None else int(value)
 
     if name in ("price_above_ma", "ma_slope_positive"):
@@ -194,7 +208,7 @@ def verify_condition(condition: Condition, caps: Capabilities = DEFAULT_CAPABILI
                 f"reading that makes sense."
             )
     elif name == "rsi_between":
-        _require_indicator(f"rsi_{period('period', 14)}", caps, name, "period")
+        _require_indicator(f"rsi_{period('period')}", caps, name, "period")
         lo, hi = params.get("min"), params.get("max")
         if lo is not None and hi is not None and Decimal(str(lo)) > Decimal(str(hi)):
             raise UnevaluableStrategyError(
@@ -202,13 +216,13 @@ def verify_condition(condition: Condition, caps: Capabilities = DEFAULT_CAPABILI
                 f"and the condition can never be true."
             )
     elif name == "atr_pct_between":
-        _require_indicator(f"atr_{period('period', 14)}", caps, name, "period")
+        _require_indicator(f"atr_{period('period')}", caps, name, "period")
     elif name == "volume_ratio_above":
-        _require_indicator(f"volume_ratio_{period('window', 20)}", caps, name, "window")
+        _require_indicator(f"volume_ratio_{period('window')}", caps, name, "window")
     elif name == "higher_tf_trend_is":
         _require_timeframe(parse_timeframe(str(params["timeframe"])), caps, name)
     elif name == "timeframe_agreement_at_least":
-        raw = str(params.get("of", "5m,15m,1h"))
+        raw = str(params["of"])
         timeframes = [parse_timeframe(t) for t in raw.split(",") if t.strip()]
         for timeframe in timeframes:
             _require_timeframe(timeframe, caps, name)
@@ -300,10 +314,9 @@ def evaluate_condition(condition: Condition, ctx: EvalContext) -> ConditionResul
     evaluator = CONDITION_EVALUATORS.get(condition.primitive)
     if evaluator is None:
         raise UnevaluableStrategyError(f"no evaluator for primitive {condition.primitive!r}")
-    outcome = evaluator(ctx, condition.params)
-    return ConditionResult(
-        primitive=condition.primitive, outcome=outcome, params=dict(condition.params)
-    )
+    params = resolved_params(condition)
+    outcome = evaluator(ctx, params)
+    return ConditionResult(primitive=condition.primitive, outcome=outcome, params=params)
 
 
 def _all_of(outcomes: list[bool | None]) -> bool | None:
@@ -367,7 +380,7 @@ def evaluate_stop(doc: StrategyDocument, ctx: EvalContext) -> Decimal | None:
     evaluator = STOP_EVALUATORS.get(doc.exit.stop.primitive)
     if evaluator is None:
         raise UnevaluableStrategyError(f"exit stop {doc.exit.stop.primitive!r} has no evaluator")
-    return evaluator(ctx, doc.exit.stop.params)
+    return evaluator(ctx, resolved_params(doc.exit.stop))
 
 
 def evaluate_target(
@@ -379,7 +392,7 @@ def evaluate_target(
     target = doc.exit.target
     if target is None or target.primitive != "r_multiple_target":
         return None
-    return r_multiple_target(entry, stop, doc.direction, target.params, tick)
+    return r_multiple_target(entry, stop, doc.direction, resolved_params(target), tick)
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +664,7 @@ __all__ = [
     "evaluate_stop",
     "evaluate_target",
     "load_evaluators",
+    "resolved_params",
     "verify_condition",
     "verify_strategy",
 ]

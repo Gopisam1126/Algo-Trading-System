@@ -446,14 +446,26 @@ def check_strategies(r: Report) -> None:
         return
 
     from algotrader.strategy.dsl import compile_strategy
+    from algotrader.strategy.runtime import StrategyEvaluator
 
     for path in files:
         try:
             doc = load_strategy_yaml(path.read_text(encoding="utf-8"))
             compile_strategy(doc)
-            r.ok(f"{path.name}", f"{doc.id} v{doc.version}")
         except Exception as exc:
             r.fail(f"{path.name} failed to compile", str(exc)[:80])
+            continue
+        # Compiling is not running. orb_classic compiled and reported OK here
+        # while asking for 1d/1w agreement the indicator engine does not carry,
+        # so it could never be evaluated (found 3 Nov 2026, E12-S01). A WARN,
+        # not a FAIL: a shipped file registers as DRAFT and arms nothing; the
+        # registry refuses it by name if it is ever made runnable.
+        try:
+            StrategyEvaluator(doc)
+        except ValueError as exc:
+            r.warn(f"{path.name} compiles but cannot run here", str(exc)[:80])
+            continue
+        r.ok(f"{path.name}", f"{doc.id} v{doc.version}")
 
 
 def check_secrets(r: Report) -> None:

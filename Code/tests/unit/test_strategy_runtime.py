@@ -53,6 +53,7 @@ from algotrader.strategy.runtime import (
     evaluate_stop,
     evaluate_target,
     load_evaluators,
+    verify_condition,
 )
 
 primitive_registry.install()
@@ -1192,3 +1193,73 @@ class TestAnIntegerParameterIsNeverTruncatedAtRuntime:
             Condition(primitive="price_above_ma", params={"period": 20}), ctx()
         )
         assert result.primitive == "price_above_ma"
+
+
+class TestADefaultHasOneDefinition:
+    """E12-S01, 3 Nov 2026: a parameter default is the ``ParamSpec``'s, and
+    every reader sees it.
+
+    Defaults were declared in the registry and restated by hand in each
+    evaluator and in the capability check. ``timeframe_agreement_at_least``
+    declared ``of`` optional with a default; the capability check applied the
+    default and the evaluator applied none. A strategy omitting ``of``
+    compiled, passed the load-time capability check, and then raised
+    PrimitiveError on every bar it was asked about.
+    """
+
+    def _bullish(self) -> MultiTimeframeSnapshot:
+        return MultiTimeframeSnapshot(
+            symbol="INFY",
+            all_ready=True,
+            per_timeframe={
+                tf: {"ema_20": 110.0, "ema_50": 100.0, "atr_14": 2.0}
+                for tf in (Timeframe.M5, Timeframe.M15, Timeframe.H1)
+            },
+        )
+
+    def test_timeframe_agreement_without_of_evaluates_over_the_declared_default(self, ctx) -> None:
+        omitted = _cond("timeframe_agreement_at_least", count=3)
+        stated = _cond("timeframe_agreement_at_least", count=3, of="5m,15m,1h")
+        here = ctx(snapshot=self._bullish())
+
+        verify_condition(omitted)
+        assert evaluate_condition(omitted, here).outcome is True
+        assert evaluate_condition(omitted, here).outcome == evaluate_condition(stated, here).outcome
+
+    def test_the_old_evaluator_call_still_raises_without_the_resolution(self, ctx) -> None:
+        """Pins the defect: the evaluator itself has no default for ``of``, so
+        anything calling it with the document's raw parameters fails."""
+        with pytest.raises(PrimitiveError, match="'of'"):
+            CONDITION_EVALUATORS["timeframe_agreement_at_least"](
+                ctx(snapshot=self._bullish()), {"count": 3}
+            )
+
+    @pytest.mark.parametrize("name", sorted(CONDITION_EVALUATORS))
+    def test_every_condition_evaluator_receives_every_declared_default(
+        self, name: str, ctx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        received: dict[str, object] = {}
+
+        def spy(_ctx: object, params: dict[str, object]) -> bool:
+            received.update(params)
+            return True
+
+        monkeypatch.setitem(CONDITION_EVALUATORS, name, spy)
+        evaluate_condition(Condition(primitive=name, params={}), ctx())
+        declared = {p.name: p.default for p in REGISTRY.get(name).params if p.default is not None}
+        assert received == declared
+
+    def test_the_stop_and_target_receive_their_declared_defaults(
+        self, ctx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        received: dict[str, object] = {}
+
+        def spy(_ctx: object, params: dict[str, object]) -> Decimal:
+            received.update(params)
+            return Decimal("1190")
+
+        monkeypatch.setitem(STOP_EVALUATORS, "atr_stop", spy)
+        doc = compile_strategy(load_strategy_yaml(STRATEGY_YAML.replace(", period: 14", "")))
+        evaluate_stop(doc, ctx())
+        assert received == {"multiplier": 1.5, "period": 14}
+        assert evaluate_target(doc, Decimal("1200"), Decimal("1190")) == Decimal("1220.00")

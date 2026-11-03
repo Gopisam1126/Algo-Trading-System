@@ -180,6 +180,26 @@ class PrimitiveSpec(BaseModel):
                 if not isinstance(value, str) or value not in spec.choices:
                     raise ValueError(f"{where}={value!r} not in {spec.choices}")
 
+    def resolved_params(self, given: dict[str, Any]) -> dict[str, Any]:
+        """The parameters a condition actually runs with: ``given`` plus every
+        declared default it omits.
+
+        The ONE place a default is applied (E12-S01, 3 Nov 2026). Defaults were
+        declared here and then restated by hand in each evaluator and in the
+        capability check, and the copies disagreed:
+        ``timeframe_agreement_at_least`` declared ``of`` optional with a default,
+        the capability check applied that default, and the evaluator applied
+        none - so a strategy omitting ``of`` compiled, loaded, and raised on
+        every bar. The runtime, the capability check and the content hash all
+        read parameters through this method, so a strategy that omits a default
+        and one that states it are the same strategy everywhere.
+        """
+        resolved = dict(given)
+        for spec in self.params:
+            if spec.name not in resolved and spec.default is not None:
+                resolved[spec.name] = spec.default
+        return resolved
+
 
 class PrimitiveRegistry:
     """The closed set of primitives a strategy may reference."""
@@ -419,21 +439,75 @@ class StrategyDocument(BaseModel):
             raise ValueError("created_at must be timezone-aware")
         return v
 
-    def content_hash(self) -> str:
+    def content_hash(self, registry: PrimitiveRegistry = REGISTRY) -> str:
         """Stable hash of the *behavioural* content.
 
-        Excludes metadata (name, timestamps, authorship) so that genuinely
-        identical strategies deduplicate in the trial registry while distinct
-        variants each count as their own trial.
+        Excludes metadata (name, timestamps, authorship, hypothesis, lineage)
+        so that genuinely identical strategies deduplicate in the trial
+        registry while distinct variants each count as their own trial.
+
+        **Two documents that behave identically must hash identically**
+        (E12-S01, 3 Nov 2026). The hash was taken over the document as written,
+        so ``r: 2`` and ``r: 2.0``, ``min_price: 100`` and ``100.00``, a stated
+        default and an omitted one, and the same conditions or regimes in
+        another order all hashed differently. The registry refuses a document
+        whose hash is already registered - that is what stops a REJECTED
+        strategy re-entering validation under a new name - and every one of
+        those spellings walked straight past it. The canonical form below
+        changes nothing the runtime can observe:
+
+        * parameters are resolved through the primitive's declared defaults,
+          the same resolution the runtime evaluates with;
+        * numbers are compared by value - the evaluators read every number as
+          ``Decimal(str(value))``, so 2 and 2.0 are indistinguishable to them;
+        * conditions within a group, and regimes and sectors, are sets: the
+          group combinators are commutative and idempotent, and applicability
+          tests membership.
+
+        It is NOT canonical over meaning a primitive gives a string
+        (``of: "1h,1d"`` against ``"1d,1h"``), or across combinators (one
+        condition under ``all_of`` against the same under ``any_of``). Those
+        hash apart and count as two trials: the conservative direction for the
+        deflated Sharpe, and a rename-and-resubmit that still runs the same
+        gauntlet on the same data.
+
+        **Changing this function changes the hash of stored strategies**, and
+        the registry refuses at load any row whose recomputed hash differs
+        from its ``dsl_hash`` - so a change here needs a data migration. The
+        same refusal fires, correctly, when a primitive's declared DEFAULT
+        changes under a stored strategy that omits it: that strategy no longer
+        behaves as the strategy that was validated.
         """
         payload = {
             "direction": self.direction.value,
-            "applicability": self.applicability.model_dump(mode="json"),
-            "entry": self.entry.model_dump(mode="json"),
-            "exit": self.exit.model_dump(mode="json"),
+            "applicability": {
+                "regimes": sorted({r.value for r in self.applicability.regimes}),
+                "timeframe": self.applicability.timeframe.value,
+                "min_price": _canonical_value(self.applicability.min_price),
+                "sectors": (
+                    None
+                    if self.applicability.sectors is None
+                    else sorted(set(self.applicability.sectors))
+                ),
+            },
+            "entry": {
+                "all_of": _canonical_group(self.entry.all_of, registry),
+                "any_of": _canonical_group(self.entry.any_of, registry),
+                "none_of": _canonical_group(self.entry.none_of, registry),
+            },
+            "exit": {
+                slot: None if cond is None else _canonical_condition(cond, registry)
+                for slot, cond in (
+                    ("stop", self.exit.stop),
+                    ("time", self.exit.time),
+                    ("target", self.exit.target),
+                    ("trail", self.exit.trail),
+                )
+            },
             "constraints": self.constraints.model_dump(mode="json"),
         }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode()).hexdigest()
 
     def validate_against(self, registry: PrimitiveRegistry = REGISTRY) -> None:
         """Structural validation against the primitive registry.
@@ -456,6 +530,40 @@ class StrategyDocument(BaseModel):
                 "strategy has more than 12 entry conditions; that many degrees "
                 "of freedom is a strong overfitting signal"
             )
+
+
+def _canonical_value(value: Any) -> Any:
+    """A number by its value, tagged so it cannot collide with a string.
+
+    ``bool`` is excluded first because it is an ``int`` subclass. Zero loses
+    its sign: ``-0.0`` and ``0`` compare equal everywhere the runtime looks.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return value
+    number = Decimal(str(value))
+    if not number.is_finite():
+        return f"num:{number}"
+    if number == 0:
+        return "num:0"
+    return f"num:{number.normalize()}"
+
+
+def _canonical_condition(condition: Condition, registry: PrimitiveRegistry) -> dict[str, Any]:
+    resolved = registry.get(condition.primitive).resolved_params(condition.params)
+    return {
+        "primitive": condition.primitive,
+        "params": {name: _canonical_value(resolved[name]) for name in sorted(resolved)},
+    }
+
+
+def _canonical_group(conditions: list[Condition], registry: PrimitiveRegistry) -> list[str]:
+    """A group's conditions as a set: order and repetition change nothing."""
+    return sorted(
+        {
+            json.dumps(_canonical_condition(c, registry), sort_keys=True, separators=(",", ":"))
+            for c in conditions
+        }
+    )
 
 
 class CompilationError(ValueError):

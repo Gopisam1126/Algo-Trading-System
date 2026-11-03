@@ -103,7 +103,7 @@ class TestOrmDoesNotLeak:
         """
         targets = [
             CODE_ROOT / "src" / "algotrader" / name
-            for name in ("ingest", "signals", "execution", "premarket")
+            for name in ("ingest", "signals", "execution", "premarket", "strategy")
         ]
         existing = [str(p) for p in targets if p.exists()]
         if not existing:
