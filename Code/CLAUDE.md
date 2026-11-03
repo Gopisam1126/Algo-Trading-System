@@ -147,7 +147,9 @@ health from heartbeats (E20-S05), ATR, margin and correlations (E15-S14) - but
 each reads a source nothing fills in production yet: heartbeats from eight
 services that have no process, indicator state the strategy loop must publish
 (E13-S01), and daily bars (E03). So the production engine still rejects every
-signal, now for reasons it names. The order state machine (E15-S03),
+signal, now for reasons it names. Paper mode exists (E15-S10): a simulated
+Kite client behind the real adapter, so a paper session runs the code that
+trades. The order state machine (E15-S03),
 protective stop attachment (E15-S04), the position manager (E15-S05), the
 reconciliation loop (E15-S09), fill booking (E15-S12), the execution
 service that drives them from `stream:signals` (E15-S13) and the square-off
@@ -155,7 +157,7 @@ timer that gives every position its time exit (E15-S06) now exist. **A gateway i
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**2,937 tests, 93% coverage** as of E20-S05, 3 Nov 2026 —
+Built and tested (**3,001 tests, 93% coverage** as of E15-S10, 3 Nov 2026 —
 all pass locally with Docker running;
 without it the container-backed integration tests skip and coverage reads lower):
 
@@ -604,6 +606,23 @@ Recorded because each was believed, written down, and wrong.
   on 30 Oct; nothing re-checked until the next audit went red on new
   advisories. The version-moved test was the right trigger; it just needs the
   version to move. `ACCEPTED_ADVISORIES` is empty.
+- **E15-S10 paper mode** — `broker/paper.py`. `PaperKite` is a simulated
+  Kite SDK CLIENT, wrapped by the real `KiteTradingAdapter`; build it with
+  `trading_client(config.system.mode, live=..., paper=...)`, the one place
+  the modes differ (only LIVE ever gets the Kite client).
+  `tests/security/test_paper_isolation.py` fails on any other `SystemMode`
+  branch. Quotes come through `ingest.quotes.quote_reader` (a SYNC Redis
+  read - the client runs in the adapter's worker threads).
+
+- **"Paper needs a broker sandbox."** Kite now has one, and it cannot run
+  this system: its docs say LIMIT only, no MARKET, no `order_margins`. A
+  simulated client behind the real adapter is the only paper path that runs
+  the code that trades.
+- **"Matching on every read is how a broker fills."** One reconciliation
+  cycle reads the broker several times; matching on each read filled the
+  same visible depth three times at one instant. Each quote's depth is taken
+  once (QA-E15-42) - found by the integration test, not the component tests,
+  which read once per quote.
 
 - **"A restored position is one the broker holds."** Not if the broker closed
   it while we were down - its own MIS square-off leaves our row OPEN. The next

@@ -32,6 +32,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from algotrader.broker.kite.trading import KiteTradingAdapter
+from algotrader.broker.paper import PaperConfig, PaperKite
 from algotrader.common.audit import AuditWriter
 from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_status
 from algotrader.common.config import AppConfig
@@ -77,6 +78,7 @@ from algotrader.execution.service import (
 from algotrader.execution.session_context import RepositoryContextStore
 from algotrader.indicators.engine import IndicatorSet
 from algotrader.indicators.publish import publish_indicator_state
+from algotrader.ingest.quotes import QuoteState
 from algotrader.strategy.dsl import load_strategy_yaml
 
 pytestmark = [pytest.mark.integration]
@@ -1028,3 +1030,148 @@ class TestSit24TheHealthGateThroughASession:
         for rec in published:
             assert str(rec.correlation_id) in audited, f"{rec.symbol} left no audit row"
         assert not (await day.halts.state()).any_halted, "health refuses entries; it never halts"
+
+
+# ---------------------------------------------------------------------------
+# SIT-25 - a whole session on the paper broker (E15-S10)
+# ---------------------------------------------------------------------------
+
+
+class PaperDesk(PaperKite):
+    """The paper broker as the walk's account. It fills on reads, so the walk's
+    per-minute ``settle()`` has nothing to do."""
+
+    def settle(self) -> None:
+        return None
+
+
+class _Prices:
+    """A day's quotes, stamped at the walk's clock each minute."""
+
+    def __init__(self, clock: Clock) -> None:
+        self._clock = clock
+        self.quotes: dict[str, QuoteState] = {}
+
+    def __call__(self, symbol: str) -> QuoteState | None:
+        return self.quotes.get(symbol)
+
+    def at(self, symbol: str, ltp: str, **depth: Any) -> None:
+        price = Decimal(ltp)
+        self.quotes[symbol] = QuoteState(
+            symbol=symbol,
+            ltp=price,
+            bid=price - Decimal("0.05"),
+            ask=price + Decimal("0.05"),
+            as_of=self._clock.now,
+            **depth,
+        )
+
+
+def _session_prices(prices: _Prices, now: dt.datetime) -> None:
+    """INFY breaks down through its stop at 10:31; TCS and HDFCBANK drift; only
+    ten HDFCBANK shares are offered at a time between 11:00 and 11:10."""
+    prices.at("INFY", "1200.00" if now < _ist(10, 31) else "1170.00")
+    prices.at("TCS", "1205.00" if now >= _ist(13, 0) else "1200.00")
+    thin = _ist(11, 0) <= now < _ist(11, 10)
+    prices.at("HDFCBANK", "1200.00", **({"ask_qty": 10, "bid_qty": 10} if thin else {}))
+
+
+class TestSit25ADayOnThePaperBroker:
+    async def test_the_session_runs_the_live_code_on_paper_and_the_books_agree(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        clock = Clock(_ist(9, 10))
+        prices = _Prices(clock)
+        desk = PaperDesk(quotes=prices, clock=clock, config=PaperConfig())
+        day = Day(session, instruments, redis, audit, calendar, account=desk, clock=clock)
+        await day.service.start()
+
+        signals = {
+            _ist(10, 1): [_rec("INFY", _ist(10, 1))],  # stopped out at 10:31
+            _ist(10, 5): [_rec("TCS", _ist(10, 5))],  # CAS: squared off at 15:05
+            _ist(11, 0): [_rec("HDFCBANK", _ist(11, 0))],  # fills 10 of it, frozen
+        }
+        published = [rec for recs in signals.values() for rec in recs]
+
+        async def each_minute(now: dt.datetime) -> None:
+            _session_prices(prices, now)
+
+        await day.walk(_ist(15, 30), signals, at_each_minute=each_minute)
+
+        for rec in published:
+            (result,) = day.results[rec.correlation_id]
+            assert result.outcome is Outcome.SUBMITTED, (rec.symbol, result)
+
+        closed = {
+            r.symbol: r
+            for r in (
+                await session.execute(
+                    text(
+                        "SELECT i.tradingsymbol AS symbol, p.quantity, p.exit_reason, "
+                        "p.realized_pnl, p.status FROM positions p "
+                        "JOIN instruments i ON i.id = p.symbol_id"
+                    )
+                )
+            ).all()
+        }
+        assert {s: (r.status, r.exit_reason) for s, r in closed.items()} == {
+            "INFY": ("CLOSED", "STOP"),
+            "TCS": ("CLOSED", "TIME"),
+            "HDFCBANK": ("CLOSED", "TIME"),
+        }
+        assert closed["HDFCBANK"].quantity == 10, "only what filled was booked"
+        assert closed["INFY"].realized_pnl < 0 and closed["TCS"].realized_pnl > 0
+
+        # Every entry was protected by exactly one stop for what it FILLED.
+        rows = desk.orders()
+        for symbol in ("INFY", "TCS", "HDFCBANK"):
+            entry = next(
+                o for o in rows if o["tradingsymbol"] == symbol and o["transaction_type"] == "BUY"
+            )
+            stops = [o for o in rows if o["tradingsymbol"] == symbol and o["order_type"] == "SL-M"]
+            assert [s["quantity"] for s in stops] == [entry["filled_quantity"]], symbol
+        assert all(p["quantity"] == 0 for p in desk.positions()["net"]), "flat at the close"
+
+        # The broker's books and ours agree, to the paisa: paper cash is the
+        # opening balance plus the P&L reconciliation recorded, less charges.
+        recorded = sum((r.realized_pnl for r in closed.values()), Decimal(0))
+        cash = Decimal(str(desk.margins()["available"]["cash"]))
+        assert desk.charges_total > 0
+        assert cash == (PaperConfig().opening_cash + recorded - desk.charges_total).quantize(
+            Decimal("0.01")
+        )
+
+        audited = await _audited(session)
+        for rec in published:
+            assert str(rec.correlation_id) in audited
+        assert not (await day.halts.state()).any_halted
+
+    async def test_a_restart_from_the_paper_snapshot_keeps_the_book(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        """The composition persists the paper account through on_change; a
+        restarted process restores it and the restarted service finds every
+        position held - nothing is exited, nothing halts."""
+        clock = Clock(_ist(9, 10))
+        prices = _Prices(clock)
+        saved: dict[str, Any] = {}
+        desk = PaperDesk(quotes=prices, clock=clock, on_change=saved.update)
+        day = Day(session, instruments, redis, audit, calendar, account=desk, clock=clock)
+        await day.service.start()
+        signals = {_ist(10, 1): [_rec("INFY", _ist(10, 1))]}
+
+        async def each_minute(now: dt.datetime) -> None:
+            prices.at("INFY", "1200.00")
+
+        await day.walk(_ist(10, 10), signals, at_each_minute=each_minute)
+        assert isinstance(day.manager.tracked("INFY"), ProtectedPosition)
+
+        revived = PaperDesk(quotes=prices, clock=clock)
+        revived.restore(saved)
+        after = Day(session, instruments, redis, audit, calendar, account=revived, clock=clock)
+        report = await after.service.start()
+
+        assert report is not None and report.exited == [] and not report.halted
+        assert isinstance(after.manager.tracked("INFY"), ProtectedPosition)
+        assert revived.orders() == desk.orders()
+        assert not (await after.halts.state()).any_halted
