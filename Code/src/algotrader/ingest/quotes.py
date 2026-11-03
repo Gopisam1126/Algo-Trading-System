@@ -19,11 +19,13 @@ import datetime as dt
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import Any
 
 import redis.asyncio as aioredis
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from algotrader.common.events import Envelope, stream
 from algotrader.common.models.market import Tick
@@ -163,3 +165,28 @@ class QuotePublisher:
             )
             return None
         return quote
+
+
+def quote_reader(client: Any) -> Callable[[str], QuoteState | None]:
+    """A SYNCHRONOUS lookup of the current quote, for the paper broker (E15-S10).
+
+    ``broker.paper.PaperKite`` stands in for the Kite SDK, which the trading
+    adapter calls through ``asyncio.to_thread`` - so the paper client runs in a
+    worker thread and cannot await the async Redis client. ``client`` is a
+    synchronous ``redis.Redis`` with ``decode_responses=True``. An unparseable
+    value is absent, as ``state.get_state`` treats it: no quote, no fill.
+    """
+
+    def read(symbol: str) -> QuoteState | None:
+        raw = client.get(keys.quote(symbol))
+        if raw is None:
+            return None
+        try:
+            return QuoteState.model_validate_json(raw)
+        except ValidationError:
+            log.error(
+                "discarding unparseable quote for %s; the paper broker will not fill it", symbol
+            )
+            return None
+
+    return read

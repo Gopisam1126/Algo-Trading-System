@@ -32,6 +32,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from algotrader.broker.kite.trading import KiteTradingAdapter
+from algotrader.broker.paper import PaperConfig, PaperKite
 from algotrader.common.audit import AuditWriter
 from algotrader.common.calendar import MarketCalendar, load_holidays_with_status
 from algotrader.common.config import AppConfig
@@ -83,6 +84,7 @@ from algotrader.execution.service import GROUP, ExecutionService, Outcome, Redis
 from algotrader.execution.session_context import RepositoryContextStore
 from algotrader.indicators.engine import IndicatorSet
 from algotrader.indicators.publish import publish_indicator_state
+from algotrader.ingest.quotes import QuoteState
 from algotrader.strategy.dsl import load_strategy_yaml
 
 pytestmark = [pytest.mark.integration]
@@ -1093,3 +1095,161 @@ class TestE20S05TheHealthGateForReal:
         await asyncio.sleep(1.5)
         after = await health.unhealthy_services(now=NOW)
         assert after is not None and "notifier (no heartbeat)" in after
+
+
+# ===========================================================================
+# E15-S10 - the real execution stack over the paper broker
+# ===========================================================================
+
+
+class _PaperTape:
+    """Quotes for the paper broker, stamped at the stack's clock."""
+
+    def __init__(self, clock: dict[str, dt.datetime]) -> None:
+        self._clock = clock
+        self.quotes: dict[str, QuoteState] = {}
+
+    def __call__(self, symbol: str) -> QuoteState | None:
+        return self.quotes.get(symbol)
+
+    def quote(self, symbol: str, ltp: str, **depth: Any) -> None:
+        self.quotes[symbol] = QuoteState(
+            symbol=symbol, ltp=Decimal(ltp), as_of=self._clock["now"], **depth
+        )
+
+
+def _paper_stack(session, instruments, redis, audit, calendar, **config: Any):
+    clock = {"now": NOW}
+    tape = _PaperTape(clock)
+    paper = PaperKite(
+        quotes=tape,
+        clock=lambda: clock["now"],
+        config=PaperConfig(**({"slippage_bps": Decimal("0")} | config)),
+    )
+    stack = Stack(
+        session, instruments, redis, audit, calendar, account=paper, clock=lambda: clock["now"]
+    )
+    return stack, paper, tape, clock
+
+
+def _paper_orders(paper: PaperKite) -> list[tuple[str, str, int, int, str]]:
+    return [
+        (o["transaction_type"], o["order_type"], o["quantity"], o["filled_quantity"], o["status"])
+        for o in paper.orders()
+    ]
+
+
+class TestE15S10TheRealStackOverPaper:
+    async def test_entered_protected_and_stopped_out_on_paper_prices(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        stack, paper, tape, clock = _paper_stack(session, instruments, redis, audit, calendar)
+        tape.quote("INFY", "1200.00")
+        await stack.service.start()
+        await stack.publish(_rec("INFY"))
+        result = await stack.consume_one()
+        assert result is not None and result.outcome is Outcome.SUBMITTED, result
+
+        report = await stack.service.tick()  # the paper broker fills on this read
+        assert report is not None and report.booked == ["INFY"], report
+        tracked = stack.manager.tracked("INFY")
+        assert isinstance(tracked, ProtectedPosition)
+        quantity = tracked.position.quantity
+        assert _paper_orders(paper) == [
+            ("BUY", "MARKET", quantity, quantity, "COMPLETE"),
+            ("SELL", "SL-M", quantity, 0, "TRIGGER PENDING"),
+        ]
+        assert tracked.position.entry_price == Decimal("1200.0000")
+
+        clock["now"] += dt.timedelta(minutes=1)
+        tape.quote("INFY", "1170.00")  # through the stop
+        await stack.service.tick()  # the stop fills on this read
+        await stack.service.tick()  # and this cycle closes the position
+        assert stack.manager.open_positions() == []
+        row = (
+            await session.execute(text("SELECT status, exit_reason, realized_pnl FROM positions"))
+        ).one()
+        assert (row.status, row.exit_reason) == ("CLOSED", "STOP")
+        assert row.realized_pnl == (Decimal("1170") - Decimal("1200")) * quantity
+        (held,) = paper.positions()["net"]
+        assert held["quantity"] == 0
+
+    async def test_squared_off_at_the_deadline_on_paper(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        stack, paper, tape, clock = _paper_stack(session, instruments, redis, audit, calendar)
+        tape.quote("INFY", "1200.00")
+        await stack.service.start()
+        await stack.publish(_rec("INFY"))
+        await stack.consume_one()
+        await stack.service.tick()
+        assert isinstance(stack.manager.tracked("INFY"), ProtectedPosition)
+
+        clock["now"] = _at_ist(TRADE_DATE, 15, 15)
+        tape.quote("INFY", "1210.00")
+        await stack.service.sweep()  # cancels the stop, sends the protected MARKET exit
+        clock["now"] += dt.timedelta(seconds=30)
+        tape.quote("INFY", "1210.00")
+        await stack.service.on_reconnect()  # reads the fill and closes
+
+        statuses = [(o["order_type"], o["status"]) for o in paper.orders()]
+        assert statuses == [("MARKET", "COMPLETE"), ("SL-M", "CANCELLED"), ("MARKET", "COMPLETE")]
+        row = (await session.execute(text("SELECT status, exit_reason FROM positions"))).one()
+        assert (row.status, row.exit_reason) == ("CLOSED", "TIME")
+        assert paper.positions()["net"][0]["quantity"] == 0
+
+    async def test_an_entry_the_paper_account_cannot_carry_is_rejected_and_released(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        """The risk engine sized it from the facts it was given (83 shares, the
+        20% position cap); the broker's own RMS - margin at 100% against a
+        Rs 50,000 account - refused it: the path a live rejection takes."""
+        stack, paper, tape, _clock = _paper_stack(
+            session,
+            instruments,
+            redis,
+            audit,
+            calendar,
+            opening_cash=Decimal("50000"),
+            margin_rate=Decimal("1"),
+        )
+        tape.quote("INFY", "1200.00")
+        await stack.service.start()
+        await stack.publish(_rec("INFY"))
+        result = await stack.consume_one()
+        assert result is not None and result.outcome is Outcome.SUBMITTED
+        report = await stack.service.tick()
+        assert report is not None and report.booked == []
+        (entry,) = paper.orders()
+        assert entry["status"] == "REJECTED" and entry["status_message"].startswith("RMS:")
+        assert stack.manager.open_positions() == []
+        assert len(stack.service.pending) == 0, "a rejected entry must release its slot"
+        assert not (await stack.halts.state()).any_halted
+
+    async def test_a_partly_filled_entry_is_frozen_and_only_what_filled_is_protected(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        """E15-S12's freeze, against a broker that really produces partial
+        fills: the first cycle sees 10 of the order filled, cancels the rest so
+        no later share can arrive without a stop, and books exactly what filled
+        - with a stop for exactly that many."""
+        stack, paper, tape, clock = _paper_stack(session, instruments, redis, audit, calendar)
+        tape.quote("INFY", "1200.00", ask=Decimal("1200.00"), ask_qty=10)
+        await stack.service.start()
+        await stack.publish(_rec("INFY"))
+        await stack.consume_one()
+        for _ in range(4):
+            await stack.service.tick()
+            clock["now"] += dt.timedelta(seconds=30)
+            tape.quote("INFY", "1200.00", ask=Decimal("1200.00"), ask_qty=10)
+
+        entry, *rest = paper.orders()
+        assert (entry["status"], entry["filled_quantity"]) == ("CANCELLED", 10)
+        assert entry["quantity"] > 10, "the order was larger than the depth"
+        tracked = stack.manager.tracked("INFY")
+        assert isinstance(tracked, ProtectedPosition), tracked
+        assert tracked.position.quantity == 10
+        working_stops = [(o["quantity"], o["status"]) for o in rest if o["order_type"] == "SL-M"]
+        assert working_stops == [(10, "TRIGGER PENDING")]
+        assert paper.positions()["net"][0]["quantity"] == 10
+        assert not (await stack.halts.state()).any_halted

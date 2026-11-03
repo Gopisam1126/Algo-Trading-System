@@ -1375,6 +1375,22 @@ from a caller — and for an approval claims a slot, registers the `EntryPlan`
     backstop alone. A heartbeat's detail reaches `decision_log`, so it is
     redacted (`common.logging.redact`) when written and again when read.
     Health refuses entries; it never halts and never touches an exit.
+- **Paper mode (E15-S10, `broker/paper.py`).** Paper is a simulated Kite
+  CLIENT (`PaperKite`) behind the real `KiteTradingAdapter`, so the adapter's
+  snapping, market-protection gate, tag truncation, status mapping and error
+  classification run in paper exactly as live; the gateway, engine, book,
+  reconciler and timer are the same objects. `trading_client(mode, live=,
+  paper=)` is the one injection - LIVE gets the Kite client, every other mode
+  the paper one, and the live factory is never called otherwise - and a
+  structural test confines every `SystemMode` branch to config, the service's
+  mode refusal and that function. Fills come on the next read from the
+  published quote: far side of the spread, slippage against the order, tick
+  rounding against it; partial to the visible depth, each quote's depth taken
+  once; SL-M triggers on the LTP crossing; an entry the paper margin cannot
+  carry is REJECTED by "RMS" asynchronously, as Kite does; no fresh quote is a
+  rejection, never a guessed price; Zerodha's intraday charges come out of
+  paper cash. The account lives in memory; `on_change` hands each snapshot to
+  the composition to persist (E23-S03), and `restore` revives it.
 
 ---
 
@@ -1660,7 +1676,7 @@ All logs are JSON (`structlog`), always carrying `correlation_id`, `service`, `s
 | **Contract** | Broker/AI API shapes | pytest + recorded fixtures | Detects upstream API drift |
 | **Replay** | Full pipeline over recorded historical ticks | Custom harness | Regression on every change |
 | **Chaos** | Injected failures | Custom | Pre-live gate |
-| **Paper** | Live market, no capital | Real broker sandbox | Multi-week before live |
+| **Paper** | Live market, no capital | `broker/paper.py` `PaperKite` behind the real Kite adapter (E15-S10) — not Kite's sandbox, which is LIMIT-only and has no `order_margins` | Multi-week before live |
 
 ### 12.1a Why execution beats review (learned the hard way)
 
