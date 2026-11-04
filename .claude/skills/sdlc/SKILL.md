@@ -432,6 +432,16 @@ autobahn at all - so kiteconnect stopped importing and the suite failed to
 collect. Check both install commands' exit codes, check for `~*` directories in
 `site-packages`, and import `kiteconnect` before running anything else.
 
+**A clean exit is not a clean venv.** On 3 Nov 2026 three gate runs in a row
+were interrupted by OneDrive holding a file mid-swap, and the debris outlived
+the "successful" ones: `twisted-26.4.0.dist-info` beside `twisted-26.10.0`, the
+same for certifi and setuptools - metadata for a version that is not the code
+on disk, which an audit then reads. After installing, verify every
+distribution appears once and every package matches its `constraints.txt` pin
+(autobahn 26.10.2 and Windows' missing uvloop excepted). Repair by removing the
+orphaned `.dist-info` (or renaming a complete `~name` stash back), never by
+another blind reinstall - each swap is another chance for the lock.
+
 **`doctor.py` on a development machine** fails the *Datastores* section and
 warns under *Secrets*, *SEBI compliance* and *Network*, because the deployment
 secrets are not there — that is expected, and it exits 1 for it. Any FAIL in

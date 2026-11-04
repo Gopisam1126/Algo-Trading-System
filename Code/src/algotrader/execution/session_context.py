@@ -396,8 +396,8 @@ class RiskContextBuilder:
         pending: PendingEntries,
         facts: SessionFacts,
     ) -> None:
-        if not callable(getattr(calendar, "squareoff_deadline", None)):
-            raise TypeError("RiskContextBuilder needs a calendar with squareoff_deadline()")
+        if not callable(getattr(calendar, "deadline_for", None)):
+            raise TypeError("RiskContextBuilder needs a calendar with deadline_for()")
         self._capital = capital
         self._slots_total = slots_total
         self._buffer = exit_buffer_minutes
@@ -431,10 +431,8 @@ class RiskContextBuilder:
         is_cas = status.get("is_cas_stock") if status is not None else None
         if is_cas is not None and not isinstance(is_cas, bool):
             is_cas = None
-        deadline = self._calendar.squareoff_deadline(
-            trade_date,
-            is_cas_stock=True if is_cas is None else is_cas,
-            buffer_minutes=self._buffer,
+        deadline = self._calendar.deadline_for(
+            trade_date, is_cas_stock=is_cas, buffer_minutes=self._buffer
         )
 
         occupied = await self._required("the occupied slots", self._store.occupied_slots())

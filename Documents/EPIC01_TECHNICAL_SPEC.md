@@ -981,8 +981,8 @@ returned partially parsed, because half-valid trading state is worse than none.
 | Stream | Producer | Consumer group(s) | MAXLEN |
 |---|---|---|---|
 | `stream:ticks` | market-ingest | `archiver` | 100,000 |
-| `stream:bars:{tf}` | market-ingest | `ti-engine` | 10,000 |
-| `stream:snapshots` | ti-engine | `signal-engine` | 10,000 |
+| `stream:bars:{tf}` | market-ingest | `signal-engine` (all timeframes in one `XREADGROUP`; E13-S01) | 10,000 |
+| `stream:snapshots` | — (unused: the indicator engine runs inside `signal-engine`, which publishes `state:indicator:*`) | — | 10,000 |
 | `stream:signals` | signal-engine | `execution` | 10,000 |
 | `stream:orders` | execution | `notifier`, `api` | 10,000 |
 | `stream:audit` | all | `db-writer` | 50,000 |

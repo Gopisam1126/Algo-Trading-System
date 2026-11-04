@@ -462,7 +462,7 @@ class SignalEngine:
             await self.route(strategy, trigger, snapshot)
 ```
 
-`route()` dispatches by strategy state: ACTIVE proceeds to AI review and the risk engine; PAPER goes to the paper execution path; SHADOW is recorded to `shadow_signal` and goes no further. **The risk engine is unchanged and unaware of strategy state** — it evaluates any recommendation reaching it identically, which preserves the single-path property that makes it testable.
+*Built in E13-S01 as `signals/loop.py` - see LOW_LEVEL_ARCHITECTURE.md §5.6, "As built".* `route()` dispatches by strategy state: ACTIVE proceeds to AI review and the risk engine; PAPER goes to the paper execution path; SHADOW is recorded to `shadow_signal` and goes no further. **The risk engine is unchanged and unaware of strategy state** — it evaluates any recommendation reaching it identically, which preserves the single-path property that makes it testable.
 
 ### 9.2 Regime-aware selection
 

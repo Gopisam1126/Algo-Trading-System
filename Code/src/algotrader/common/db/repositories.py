@@ -34,13 +34,17 @@ from sqlalchemy import CursorResult, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from algotrader.common.calendar import IST as _IST
 from algotrader.common.db.models import (
+    DailyPlan,
     DecisionLog,
     Instrument,
     InstrumentDailyStatus,
     Ohlcv,
     Order,
+    PlanCandidate,
     Position,
+    ShadowSignal,
     Strategy,
 )
 from algotrader.common.enums import PositionStatus, Timeframe
@@ -1048,6 +1052,38 @@ class PositionRepository:
         )
         return [await self._position_to_dict(r) for r in rows]
 
+    async def entries_on(self, trade_date: dt.date, strategy_id: str, symbol: str) -> int:
+        """Positions ``strategy_id`` opened in ``symbol`` on ``trade_date`` (IST).
+
+        What the signal loop hands the evaluator as ``entries_today``, so
+        ``max_entries_per_day`` is enforced against entries that happened
+        rather than signals that were sent (E13-S01). Every status counts: a
+        position stopped out at 10:00 is still the day's entry. The day is the
+        IST trading day; a UTC date would cut the session at 05:30.
+
+        Raises UnknownSymbolError for a symbol not in the master - an answer
+        of 0 would be "no entries yet" about an instrument nobody can trade.
+        """
+        start = dt.datetime.combine(trade_date, dt.time(0, 0), tzinfo=_IST).astimezone(dt.UTC)
+        end = start + dt.timedelta(days=1)
+        known = (
+            await self._session.execute(
+                select(Instrument.id).where(Instrument.tradingsymbol == symbol)
+            )
+        ).scalar_one_or_none()
+        if known is None:
+            raise UnknownSymbolError(symbol)
+        count = (
+            await self._session.execute(
+                select(func.count(Position.id))
+                .where(Position.symbol_id == known)
+                .where(Position.strategy_id == strategy_id)
+                .where(Position.opened_at >= start)
+                .where(Position.opened_at < end)
+            )
+        ).scalar_one()
+        return int(count)
+
     async def _position_to_dict(self, row: Position) -> dict[str, Any]:
         return {
             "position_id": row.id,
@@ -1232,3 +1268,74 @@ def _strategy_to_dict(row: Strategy) -> dict[str, Any]:
         "state_changed_at": row.state_changed_at,
         "retirement_reason": row.retirement_reason,
     }
+
+
+# ---------------------------------------------------------------------------
+# The day's plan and shadow signals (E13-S01)
+# ---------------------------------------------------------------------------
+
+
+class PlanRepository:
+    """Reads the day's LOCKED plan. The signal loop's only source of symbols.
+
+    Read-only: the plan is written by the pre-market job (E11-S08) and frozen
+    at 09:12. An unlocked plan is still being built, so it is not returned -
+    trading the draft of a plan is trading something nobody has frozen.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def locked_plan(self, trade_date: dt.date) -> dict[str, Any] | None:
+        plan = (
+            await self._session.execute(
+                select(DailyPlan)
+                .where(DailyPlan.trade_date == trade_date)
+                .where(DailyPlan.locked_at.is_not(None))
+            )
+        ).scalar_one_or_none()
+        if plan is None:
+            return None
+        rows = (
+            await self._session.execute(
+                select(Instrument.tradingsymbol, PlanCandidate.status, PlanCandidate.rank)
+                .join(Instrument, Instrument.id == PlanCandidate.symbol_id)
+                .where(PlanCandidate.plan_id == plan.id)
+                .order_by(PlanCandidate.rank)
+            )
+        ).all()
+        return {
+            "trade_date": plan.trade_date,
+            "locked_at": plan.locked_at,
+            "config_hash": plan.config_hash,
+            "candidates": [
+                {"symbol": symbol, "status": status, "rank": rank} for symbol, status, rank in rows
+            ],
+        }
+
+
+class ShadowSignalRepository:
+    """``shadow_signal``: what a SHADOW strategy would have done (E13-S01).
+
+    The SHADOW route's only destination. Insert-only here; E12-S09's end-of-
+    day evaluation fills ``hypothetical_outcome``.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def record_shadow_signal(self, row: dict[str, Any]) -> int:
+        values = dict(row)
+        symbol = values.pop("symbol")
+        known = (
+            await self._session.execute(
+                select(Instrument.id).where(Instrument.tradingsymbol == symbol)
+            )
+        ).scalar_one_or_none()
+        if known is None:
+            raise UnknownSymbolError(symbol)
+        values["symbol_id"] = known
+        result = await self._session.execute(
+            pg_insert(ShadowSignal).values(**values).returning(ShadowSignal.id)
+        )
+        return int(result.scalar_one())

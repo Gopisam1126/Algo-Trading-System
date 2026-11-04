@@ -23,13 +23,23 @@ it are marked, so a consumer can decide rather than being silently fed them.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
-from algotrader.common.calendar import CAS_CONTINUOUS_END, IST, MarketCalendar
+from algotrader.common.calendar import CAS_CONTINUOUS_END, IST, MARKET_CLOSE, MarketCalendar
 from algotrader.common.enums import Timeframe
+from algotrader.common.events import stream
+from algotrader.common.events.envelope import Envelope
 from algotrader.common.models.market import Bar, Tick
+from algotrader.common.redis import keys
+
+if TYPE_CHECKING:
+    import redis.asyncio as aioredis
 
 log = logging.getLogger(__name__)
 
@@ -304,3 +314,83 @@ class MultiTimeframeBuilder:
         out of order, and every bar boundary becomes approximate.
         """
         return sum(b.late_ticks for b in self._builders.values())
+
+
+# ---------------------------------------------------------------------------
+# Publishing sealed bars (E13-S01)
+# ---------------------------------------------------------------------------
+
+#: Bars are addressed by what they are, not by when they were sent: the same
+#: bar republished (a producer retry, a replay) carries the same id, which is
+#: how a reader recognises it.
+BAR_NAMESPACE = uuid.UUID("5b1e0c0e-13a1-4c6e-9b0b-0e13a1b4a201")
+
+
+def bar_id(bar: Bar) -> uuid.UUID:
+    """The identity of one sealed bar: symbol, timeframe, open time."""
+    return uuid.uuid5(
+        BAR_NAMESPACE,
+        f"{bar.symbol}|{bar.timeframe.value}|{bar.open_ts.astimezone(dt.UTC).isoformat()}",
+    )
+
+
+def bar_close(bar: Bar) -> dt.datetime:
+    """When the bar's interval ends: open + timeframe, or the session close.
+
+    The day's last hourly bar opens at 15:15 and closes at 15:30, with the
+    market - not at 16:15.
+    """
+    nominal = bar.open_ts + dt.timedelta(seconds=bar.timeframe.seconds)
+    session_close = dt.datetime.combine(
+        bar.open_ts.astimezone(IST).date(), MARKET_CLOSE, tzinfo=IST
+    ).astimezone(dt.UTC)
+    return min(nominal, session_close)
+
+
+def publication_order(bars: Sequence[Bar]) -> list[Bar]:
+    """By close time, and at one close time the LONGEST timeframe first.
+
+    One tick at 10:15 seals the 5m, 15m and 1h bars together. The signal loop
+    reads every bar stream in a single XREADGROUP, so writing the longer bars
+    first means any read that returns the 5m bar also returns the 15m and 1h
+    bars that close with it - and a 5m strategy is never evaluated against an
+    hourly trend one bar behind the one that just closed. Written the other way
+    round, which bar a decision saw would depend on read timing, and no
+    backtest could reproduce it.
+    """
+    return sorted(bars, key=lambda b: (bar_close(b), -b.timeframe.seconds))
+
+
+async def publish_sealed_bars(
+    client: aioredis.Redis,
+    bars: Sequence[Bar],
+    *,
+    now: dt.datetime,
+    emitted_by: str = "market-ingest",
+) -> list[str]:
+    """XADD sealed bars to ``stream:bars:{tf}``, in :func:`publication_order`.
+
+    Refuses a bar that is not final: a forming bar is look-ahead, and the
+    stream's readers fold everything they are given into indicators.
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    ordered = publication_order(bars)
+    for bar in ordered:
+        if not bar.is_final:
+            raise ValueError(
+                f"refusing to publish a forming bar for {bar.symbol} {bar.timeframe.value}"
+            )
+    entry_ids = []
+    for bar in ordered:
+        name = keys.stream_bars(bar.timeframe)
+        envelope = Envelope(
+            correlation_id=bar_id(bar),
+            emitted_at=now,
+            emitted_by=emitted_by,
+            payload=json.loads(bar.model_dump_json()),
+        )
+        entry_ids.append(
+            await stream.publish(client, name, envelope, maxlen=stream.default_maxlen(name))
+        )
+    return entry_ids

@@ -124,14 +124,16 @@ Nine long-lived processes plus scheduled jobs. Each is a separate container.
 |---|---|---|---|---|
 | `orchestrator` | Always | Lifecycle, scheduling, global kill switch, health aggregation | No | No |
 | `market-ingest` | Market hours + pre-open | WebSocket consumption, tick normalization, bar construction | No | No |
-| `ti-engine` | Market hours | Incremental indicator computation per symbol per timeframe | No | No |
-| `signal-engine` | Trading window | Strategy evaluation, AI confirmation, recommendation emission | No | Yes (Sonnet) |
+| ~~`ti-engine`~~ | — | **Folded into `signal-engine` (E15-S14, E13-S01).** See the note below | — | — |
+| `signal-engine` | Trading window | Incremental indicator computation, strategy evaluation, AI confirmation, recommendation emission | No | Yes (Sonnet) |
 | `execution-svc` | Market hours | Risk checks, sizing, order placement, position lifecycle, reconciliation | **Yes (only)** | No |
 | `macro-svc` | 06:00–16:00 | News, sentiment, macro signals → Market Condition Context | No | Yes (Haiku) |
 | `premarket-job` | 05:30–09:15 | Historical analysis, universe scoring, daily plan generation | No | Yes (Opus) |
 | `api-server` | Always | REST + WebSocket for dashboard, manual controls, approvals | Proxies to execution-svc | No |
 | `notifier` | Always | Outbound alerts (Telegram/email), rate-limited and templated | No | No |
 | `strategy-svc` | Scheduled (weekends) + on demand | Strategy registry, compilation, validation gauntlet, backtesting, AI strategy generation | No | Yes (Opus) |
+
+> **`ti-engine` folded into `signal-engine` (E13-S01, 3 Nov 2026).** The indicator engine runs in the strategy loop and nowhere else - E15-S14 recorded the decision in `indicators/publish.py`, E13-S01 built on it. A separate service would put IPC between a bar and the indicators evaluated on it: the strategy side would read a snapshot that might be one bar behind, and execution would size from a published ATR that a signal could overtake. In-process, every sealed bar is folded once, its `state:indicator:*` published, and only then evaluated. `ti-engine` is gone from `ops/docker-compose.yml` and from `TRADING_SERVICES` - otherwise the health gate would wait forever for a heartbeat no process sends.
 
 > **`strategy-svc` added in v1.1.** It owns the strategy lifecycle described in [STRATEGY_ENGINE.md](STRATEGY_ENGINE.md): compiling declarative strategy documents, running the validation gauntlet (walk-forward with purging/embargo, Deflated Sharpe, Probability of Backtest Overfitting), maintaining the append-only trial registry, and — from Phase 2 — generating strategy proposals from market observations and the trade journal. It runs **off the critical path**: heavy, batched, and never inline with trading. `signal-engine` reads the resulting registry; it does not invoke this service.
 
@@ -400,7 +402,7 @@ plan:candidate:{YYYY-MM-DD}:{symbol}      → STRING  (serialized PlanCandidate)
 context:market                            → STRING  (serialized MarketContext, TTL 90m)
 
 # ---- Event streams (Streams) ----
-stream:ticks                              → XADD, consumer group "ti-engine"
+stream:ticks                              → XADD, consumer group "archiver"
 stream:bars:{timeframe}                   → XADD, consumer group "signal-engine"
 stream:signals                            → XADD, consumer group "execution-svc"
 stream:orders                             → XADD, consumer group "notifier","api-server"
@@ -655,6 +657,18 @@ class Strategy(Protocol):
 ```
 
 Purity here is deliberate: strategies are the component most likely to be modified, and a pure function over a snapshot can be backtested by replaying historical snapshots with zero infrastructure.
+
+**As built (E13-S01, `signals/loop.py`, `signals/source.py`).** The deterministic half of the loop above, without the AI review (E13-S03) and emission (E13-S04) that sit behind its LIVE and PAPER routes:
+
+- **Only the locked plan.** `daily_plan` with `locked_at` set, for today's IST date; in-plan means candidate status `ACTIVE` or `TRADED`. No locked plan, or a plan for another date, evaluates nothing. A bar for an unplanned symbol is neither folded nor evaluated.
+- **Every bar once, and a hole stops the symbol.** A bar not newer than the last one folded for its (symbol, timeframe) is a redelivery and is skipped - folding it would move every EMA and the ATR. A bar that does not follow the previous one in the session's slots (or a day's first bar that is not 09:15) marks the symbol stale, and nothing is evaluated for it until a re-warm. This relies on the producer emitting a bar for every interval: carry-forward bars for no-trade intervals are its job.
+- **Published before evaluated.** The bar's indicator state is written to `state:indicator:*` before anything is evaluated on it; a failed publish evaluates nothing.
+- **One read of every bar stream.** `stream:bars:{tf}` for every carried timeframe is read in one `XREADGROUP`, and each batch is handled by close time, longest timeframe first. The producer publishes in the same order (`ingest.bars.publication_order`), so a 5m strategy at 10:15 is never evaluated against an hourly trend one bar behind.
+- **Late is not evaluated.** A bar handled more than 60s after it closed is folded and not evaluated.
+- **Routes by state**, a table total over the runnable states and checked at import: ACTIVE and DEGRADED to LIVE, PAPER to PAPER, SHADOW to the shadow recorder (`shadow_signal`) and nowhere else. The signals package imports nothing that can place an order.
+- **One signal per strategy per bar.** The correlation id is `uuid5(strategy, symbol, timeframe, bar open)`, so a redelivered bar cannot become a second signal downstream.
+- **After a restart**, today's bars the consumer group has *finished with* are folded back without evaluation; the ones the dead process held, and the undelivered ones, come through the normal path and are evaluated (SIT-009).
+- **Every input nothing produces yet is absent**: no market context means no regime, and every strategy declares its regimes, so nothing fires until E09.
 
 **Concurrency guard:** before emitting, acquire `lock:symbol:{symbol}` (Redis `SET NX PX 60000`). Two strategies firing on the same symbol in the same cycle must not produce two entries.
 
@@ -1405,7 +1419,7 @@ from a caller — and for an approval claims a slot, registers the `EntryPlan`
 | Service | Model |
 |---|---|
 | `market-ingest` | Single event loop. One WebSocket task, one processing task, bounded `asyncio.Queue` between them (backpressure: if the queue fills, drop the *oldest* ticks and log — freshness beats completeness for quotes). |
-| `ti-engine` | Event loop + `ProcessPoolExecutor` for warm-up only. Per-symbol updates are cheap enough to stay on the loop. |
+| ~~`ti-engine`~~ | Folded into `signal-engine` (E13-S01): the indicator updates run on its event loop; warm-up may still use a `ProcessPoolExecutor`. |
 | `signal-engine` | Event loop. AI calls dispatched with `asyncio.gather` across symbols, bounded by a `Semaphore(config.ai.max_concurrent)` to respect API rate limits. |
 | `execution-svc` | **Single-threaded, strictly serialized.** All order operations pass through one queue processed sequentially. Concurrency here buys nothing and risks double-entry races. This is a deliberate performance sacrifice for correctness. Made structural in E15-S13: one `asyncio.Lock` held by every signal and every reconciliation cycle. |
 | `premarket-job` | `ProcessPoolExecutor` for the MTF stage; event loop elsewhere. |
