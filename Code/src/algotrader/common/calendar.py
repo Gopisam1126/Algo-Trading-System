@@ -245,6 +245,27 @@ class MarketCalendar:
         deadline_ist = datetime.combine(trade_date, broker_time, tzinfo=IST)
         return (deadline_ist - timedelta(minutes=buffer_minutes)).astimezone(UTC)
 
+    def deadline_for(
+        self,
+        trade_date: date,
+        *,
+        is_cas_stock: bool | None,
+        buffer_minutes: int = 5,
+    ) -> datetime:
+        """Our deadline when the CAS classification may be unknown.
+
+        Unknown is treated as CAS - the EARLIEST broker deadline - so a missing
+        classification moves the exit earlier, never later. The execution
+        service (the deadline it puts on a position) and the signal loop (the
+        bars it counts until square-off) both read the deadline through this,
+        so the two cannot name different instants for one symbol (E13-S01).
+        """
+        return self.squareoff_deadline(
+            trade_date,
+            is_cas_stock=True if is_cas_stock is None else is_cas_stock,
+            buffer_minutes=buffer_minutes,
+        )
+
     def minutes_to_squareoff(
         self,
         moment: datetime,

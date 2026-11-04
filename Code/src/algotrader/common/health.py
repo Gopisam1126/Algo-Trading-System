@@ -89,11 +89,13 @@ _DETAIL_SHOWN: Final = 80
 #: Every service that runs while entries are possible - ``LOW_LEVEL_ARCHITECTURE.md``
 #: §2.2's "Runs" column, by docker-compose service name. ``premarket-job`` and
 #: ``strategy-svc`` are batch work and absent on purpose. See the module docstring.
+#: ``ti-engine`` was here until E13-S01 (3 Nov 2026): the indicator engine runs
+#: inside ``signal-engine`` (E15-S14's decision), so no ti-engine process will
+#: ever beat, and the roster would have refused every entry for its silence.
 TRADING_SERVICES: Final = frozenset(
     {
         "orchestrator",
         "market-ingest",
-        "ti-engine",
         "signal-engine",
         "macro-svc",
         "execution-svc",

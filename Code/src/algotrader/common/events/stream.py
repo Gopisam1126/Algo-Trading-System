@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final, cast
 
@@ -168,6 +169,72 @@ async def consume(
     )
     deliveries.extend(_decode(client, stream, fresh))
     return deliveries
+
+
+@dataclass(frozen=True, slots=True)
+class StreamEntry:
+    """One entry from :func:`consume_many`: which stream it came from, and
+    what it held. ``delivery`` is ``None`` when the entry is not an Envelope -
+    returned rather than skipped, so the caller can acknowledge it instead of
+    re-reading it from the backlog on every call."""
+
+    stream: str
+    entry_id: str
+    delivery: Delivery | None
+
+
+async def consume_many(
+    client: aioredis.Redis,
+    streams: Sequence[str],
+    group: str,
+    consumer: str,
+    *,
+    count: int = 10,
+    block_ms: int = 1_000,
+) -> list[StreamEntry]:
+    """Read several streams in ONE ``XREADGROUP``, backlog first.
+
+    One command is one moment: an entry written to any of the streams before
+    the read is in its reply. Three separate reads are three moments, and a
+    producer writing between them is seen by some and not others - which is
+    the difference between "every bar that closed at 10:15" and "some of
+    them" (E13-S01). ``count`` applies per stream.
+    """
+    names = list(dict.fromkeys(streams))
+    if not names:
+        raise StreamError("consume_many needs at least one stream")
+    pending = await client.xreadgroup(
+        groupname=group, consumername=consumer, streams=dict.fromkeys(names, "0"), count=count
+    )
+    entries = _decode_tagged(pending)
+    if entries:
+        return entries
+    fresh = await client.xreadgroup(
+        groupname=group,
+        consumername=consumer,
+        streams=dict.fromkeys(names, ">"),
+        count=count,
+        block=block_ms,
+    )
+    return _decode_tagged(fresh)
+
+
+def _decode_tagged(raw: Any) -> list[StreamEntry]:
+    out: list[StreamEntry] = []
+    for stream_name, entries in raw or []:
+        name = stream_name.decode() if isinstance(stream_name, bytes) else str(stream_name)
+        for entry_id, fields in entries:
+            try:
+                delivery: Delivery | None = Delivery(
+                    entry_id=str(entry_id), envelope=Envelope.from_fields(fields)
+                )
+            except (ValueError, TypeError):
+                # TypeError: a pending entry trimmed from the stream comes back
+                # with no fields at all.
+                log.error("unreadable entry %s on %s", entry_id, name, exc_info=True)
+                delivery = None
+            out.append(StreamEntry(stream=name, entry_id=str(entry_id), delivery=delivery))
+    return out
 
 
 def _decode(client: aioredis.Redis, stream: str, raw: Any) -> list[Delivery]:

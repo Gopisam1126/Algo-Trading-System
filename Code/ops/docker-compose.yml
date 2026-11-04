@@ -108,11 +108,10 @@ services:
       ALGOTRADER_ROLE: market-ingest
       BROKER_READ_ONLY: "true"           # read-only adapter; cannot trade
 
-  ti-engine:
-    <<: *app
-    command: python -m algotrader.indicators
-    networks: [core]                      # no internet access whatsoever
-
+  # There is no separate ti-engine. The indicator engine runs inside
+  # signal-engine (E15-S14, E13-S01): it folds each sealed bar once, publishes
+  # state:indicator:*, and only then evaluates - so a signal can never overtake
+  # the state execution sizes it from.
   signal-engine:
     <<: *app
     command: python -m algotrader.signals

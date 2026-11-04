@@ -144,14 +144,17 @@ the gateway are unbuilt: no process entrypoint
 (`python -m algotrader.execution`, which docker-compose runs, has no
 `__main__` - no service does yet). Every live risk input now has a producer -
 health from heartbeats (E20-S05), ATR, margin and correlations (E15-S14) - but
-each reads a source nothing fills in production yet: heartbeats from eight
-services that have no process, indicator state the strategy loop must publish
-(E13-S01), and daily bars (E03). So the production engine still rejects every
-signal, now for reasons it names. Paper mode exists (E15-S10): a simulated
-Kite client behind the real adapter, so a paper session runs the code that
-trades. Strategies persist (E12-S01): an immutable document per registered
-strategy, loaded and re-verified at start - and nothing reads the registry
-yet (E13-S01). The order state machine (E15-S03),
+each reads a source nothing fills in production yet: heartbeats from seven
+services that have no process, and daily bars (E03). So the production engine
+still rejects every signal, now for reasons it names. Paper mode exists
+(E15-S10): a simulated Kite client behind the real adapter, so a paper session
+runs the code that trades. Strategies persist (E12-S01): an immutable document
+per registered strategy, loaded and re-verified at start. **The strategy loop
+exists (E13-S01)**: planned symbols' sealed bars folded once, state published,
+runnable strategies evaluated and routed by state - and its LIVE and PAPER
+routes end at a port, because the AI review that comes next (E13-S03) does
+not exist, so nothing it produces reaches `stream:signals` yet. With no market
+context (E09) there is no regime, and nothing fires. The order state machine (E15-S03),
 protective stop attachment (E15-S04), the position manager (E15-S05), the
 reconciliation loop (E15-S09), fill booking (E15-S12), the execution
 service that drives them from `stream:signals` (E15-S13) and the square-off
@@ -159,7 +162,7 @@ timer that gives every position its time exit (E15-S06) now exist. **A gateway i
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**3,178 tests, 94% coverage** as of E12-S01, 3 Nov 2026 —
+Built and tested (**3,258 tests, 94% coverage** as of E13-S01, 4 Nov 2026 —
 all pass locally with Docker running;
 without it the container-backed integration tests skip and coverage reads lower):
 
@@ -270,8 +273,9 @@ without it the container-backed integration tests skip and coverage reads lower)
   reconciliation can find a stop it never saw placed. Mutation: 17 injected,
   17 killed.
 
-**Empty (`__init__.py` only):** `signals/`, `orchestrator/`, `premarket/`,
-`api/`, `notifier/`, `ai/`, `macro/` — seven of thirteen packages.
+**Empty (`__init__.py` only):** `orchestrator/`, `premarket/`, `api/`,
+`notifier/`, `ai/`, `macro/` — six of thirteen packages (`signals/` has the
+loop since E13-S01).
 `execution/` holds `risk/`, `sizer.py`, `slots.py`, `halt.py`, `gateway.py` and
 `order_state.py`. **Order PLACEMENT exists; order MANAGEMENT does not** — an
 approved decision reaches a broker and its lifecycle is now a validated state
@@ -656,6 +660,38 @@ Recorded because each was believed, written down, and wrong.
   `doctor` now warns, and the registry refuses it by name if it is ever made
   runnable. A paper session needs either 1d/1w in the engine (with E03's
   daily bars) or a seed that asks for what the engine carries.
+- **E13-S01 the strategy loop** — `signals/loop.py` (`SignalLoop.on_bar`,
+  `replay`) and `signals/source.py` (`RedisBarSource`, `deliver`, `run`,
+  `replay_today`). Only today's LOCKED plan (`PlanRepository`); each sealed
+  bar folded once - a redelivery is skipped, a skipped interval marks the
+  symbol stale; state published BEFORE evaluation; strategies on the bar's
+  timeframe only; routes by `ROUTE_BY_STATE` (SHADOW to `ShadowRecorder` ->
+  `shadow_signal`, nowhere else). The producer half is
+  `ingest.bars.publish_sealed_bars` (longest timeframe first); the consumer
+  reads every bar stream in ONE `XREADGROUP` (`stream.consume_many`). There
+  is no `ti-engine`: the indicator engine runs here, and the service is gone
+  from compose and `TRADING_SERVICES`.
+
+- **"Folding a bar is idempotent."** `IndicatorSet.update` folds whatever it
+  is given; a redelivered bar moves every EMA and the ATR by one bar. The
+  loop refuses a bar not newer than the last one folded.
+- **"The bar builder fills quiet intervals."** It has `carry_forward`, and
+  nothing calls it: a tick after a silent interval seals the old bar and
+  starts a new one with nothing between. The loop reads the missing bar as a
+  gap (correctly - the series is irregular either way); the producer
+  composition must call `carry_forward` for liquid-but-quiet names.
+- **"Replay everything on the stream after a restart."** That also folded the
+  bars the dead process was holding, and the backlog then handed them back as
+  duplicates: a bar in flight at a crash was never evaluated (SIT-009, found
+  by SIT-27's restart scenario). Replay folds only what the group
+  acknowledged.
+- **"Three bar streams can be read as three reads."** At 10:15 the 5m, 15m
+  and 1h bars close together; three reads are three moments, and which
+  hourly bar a 5m decision saw depended on timing. One `XREADGROUP`, and a
+  producer writing the longest first.
+- **"The health roster is the service list."** It listed `ti-engine`, a
+  service no code will run - the gate would have waited forever for its
+  heartbeat.
 
 - **"A restored position is one the broker holds."** Not if the broker closed
   it while we were down - its own MIS square-off leaves our row OPEN. The next
@@ -828,15 +864,16 @@ else was examined. Verified sound, with probes rather than by reading:
 
 E14 (the risk engine) and the E15 execution path - gateway, stop, book,
 reconciliation, square-off timer, service and its live inputs - are on QA,
-with the health roll-up (E20-S05), the paper broker (E15-S10) and the
-strategy registry (E12-S01). A paper session still needs: the strategy loop
-that reads the registry's runnable strategies and publishes indicator state
-before it emits (E13-S01 - it also needs the day's plan symbols, which
-nothing produces yet, and a runnable strategy: the shipped `orb_classic`
-cannot be evaluated by this engine), daily and intraday bars (E03 - E03-S01
-is blocked by B8, NSE refusing this host), and the process entrypoint
-(E23-S03). That vertical slice is the first thing that would be evidence
-about the system rather than its parts.
+with the health roll-up (E20-S05), the paper broker (E15-S10), the strategy
+registry (E12-S01) and the strategy loop (E13-S01). A paper session still
+needs: what sits behind the loop's LIVE/PAPER routes and turns a Trigger into
+a Recommendation on `stream:signals` (E13-S03 AI review - which needs the
+Anthropic client, E10-S01 - and E13-S04 emission), a market context with a
+regime (E09), the day's locked plan (E11-S08), a strategy this engine can
+evaluate (the shipped `orb_classic` cannot), daily and intraday bars (E03 -
+E03-S01 is blocked by B8, NSE refusing this host), and the process
+entrypoints (E23-S03). That vertical slice is the first thing that would be
+evidence about the system rather than its parts.
 
 ### How to do the work
 
