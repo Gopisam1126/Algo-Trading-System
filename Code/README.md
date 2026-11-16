@@ -1,19 +1,14 @@
 # AI Algo Trading Platform — India (NSE/BSE)
 
-Personal-use algorithmic trading system for Indian equities. Pulls real-time
-market data, computes technical indicators across multiple timeframes, monitors
-news and macro conditions, uses AI for pattern synthesis and reasoning, and
-executes risk-gated trades across multiple stocks concurrently.
+Personal-use algorithmic trading system for Indian equities, intraday, through
+Zerodha Kite Connect. As built it is a **rule-based** engine - strategy rules over
+technical indicators, a deterministic risk engine and an order gateway; the AI
+review layer is designed and not built.
 
-> **Status: the deterministic path is built from tick to Trigger.** The
-> safety-critical primitives, the full data layer, the Kite broker adapter,
-> WebSocket ingestion, the technical-analysis engine and the strategy runtime
-> are built and tested — **1,059 tests passing at 90% coverage**, CI green.
->
-> What is *not* built is the assembly: `signals/`, `execution/`,
-> `orchestrator/`, `premarket/`, `api/`, `notifier/`, `ai/` and `macro/` are
-> one line each. There is no risk engine and no order placement.
-> **Nothing trades yet, and nothing can.**
+> **Status:** see [`MASTER_REFERENCE.md` §2](../Documents/MASTER_REFERENCE.md#2-current-status--what-exists-what-doesnt),
+> the one authoritative statement. Components are built and tested; no process
+> entrypoint exists yet, so nothing runs and **nothing has ever traded**. Test
+> counts are deliberately not written here: the latest CI run is the count.
 
 ---
 
@@ -104,15 +99,15 @@ src/algotrader/
   broker/                BrokerAdapter protocol (read-only vs trading split)
   ingest/                WebSocket ingestion, cleaning, bar construction
   indicators/            Incremental TI engine
-  macro/                 News + macro context (slow loop)
-  premarket/             The daily preparation pipeline
-  signals/               Strategy evaluation + AI review
-  strategy/              DSL, primitive registry, validation gauntlet
-  ai/                    Anthropic client, prompts, budget
-  execution/             Risk engine, sizing, orders, positions  ← 100% coverage
-  orchestrator/          Lifecycle, scheduling, kill switch
-  api/                   FastAPI dashboard (localhost only)
-  notifier/              Telegram alerts (single recipient)
+  macro/                 News + macro context (slow loop)      [empty - planned]
+  premarket/             The daily preparation pipeline        [empty - planned]
+  signals/               Strategy evaluation loop (AI review: planned)
+  strategy/              DSL, primitives, registry (gauntlet: planned)
+  ai/                    Anthropic client, prompts, budget     [empty - planned]
+  execution/             Risk engine, sizing, orders, positions  ← 100% coverage is the TARGET (LLA §15)
+  orchestrator/          Lifecycle and scheduling              [empty - planned]
+  api/                   FastAPI dashboard (localhost only)    [empty - planned]
+  notifier/              Telegram alerts (single recipient)    [empty - planned]
 tests/
   unit/ property/ integration/ replay/ chaos/ security/
 ops/

@@ -52,9 +52,82 @@ doctor = _load_doctor()
 class _Cfg:
     """Minimal stand-in for AppConfig — only what the checks read."""
 
-    def __init__(self, mode: SystemMode, primary: str = "zerodha", fallback: str = "fyers"):
-        self.system = type("s", (), {"mode": mode})()
+    def __init__(
+        self,
+        mode: SystemMode,
+        primary: str = "zerodha",
+        fallback: str = "fyers",
+        static_ip: str = "",
+    ):
+        self.system = type("s", (), {"mode": mode, "static_ip": static_ip})()
         self.broker = type("b", (), {"primary": primary, "fallback": fallback})()
+
+
+class TestEgressIpFailsClosedInLiveMode:
+    """Audit SEC-006: the broker whitelist check only ever WARNED.
+
+    An unset expectation, or an egress lookup that failed, left `make doctor`
+    green in LIVE mode - so the go-live gate could pass with the address the
+    broker accepts orders from never compared with the one this host uses.
+    """
+
+    WHITELISTED = "1.2.3.4"
+
+    def _run(self, cfg: _Cfg, *, actual: str | Exception) -> Any:
+        r = doctor.Report()
+
+        def egress() -> str:
+            if isinstance(actual, Exception):
+                raise actual
+            return actual
+
+        with (
+            patch("algotrader.common.config.load_config", return_value=cfg),
+            patch.object(doctor, "_egress_ip", egress),
+        ):
+            doctor.check_egress_ip(r)
+        return r
+
+    def test_live_with_no_expected_address_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("EXPECTED_EGRESS_IP", raising=False)
+        r = self._run(_Cfg(SystemMode.LIVE), actual=self.WHITELISTED)
+        assert any("no expected egress IP" in f for f in r.failures), r.warnings
+
+    def test_live_with_a_failed_lookup_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("EXPECTED_EGRESS_IP", raising=False)
+        r = self._run(
+            _Cfg(SystemMode.LIVE, static_ip=self.WHITELISTED), actual=OSError("network down")
+        )
+        assert any("could not determine egress IP" in f for f in r.failures), r.warnings
+
+    def test_the_same_two_only_warn_in_paper_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The control: development must stay usable without a static IP."""
+        monkeypatch.delenv("EXPECTED_EGRESS_IP", raising=False)
+        unset = self._run(_Cfg(SystemMode.PAPER), actual=self.WHITELISTED)
+        failed = self._run(
+            _Cfg(SystemMode.PAPER, static_ip=self.WHITELISTED), actual=OSError("down")
+        )
+        assert not unset.failures and not failed.failures
+        assert unset.warnings and failed.warnings
+
+    def test_a_matching_address_passes_from_the_config_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("EXPECTED_EGRESS_IP", raising=False)
+        r = self._run(_Cfg(SystemMode.LIVE, static_ip=self.WHITELISTED), actual=self.WHITELISTED)
+        assert not r.failures and not r.warnings
+
+    def test_a_different_address_fails_in_any_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("EXPECTED_EGRESS_IP", raising=False)
+        r = self._run(_Cfg(SystemMode.PAPER, static_ip=self.WHITELISTED), actual="5.6.7.8")
+        assert any("MISMATCH" in f for f in r.failures)
+
+    def test_an_override_that_disagrees_with_the_config_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("EXPECTED_EGRESS_IP", "5.6.7.8")
+        r = self._run(_Cfg(SystemMode.LIVE, static_ip=self.WHITELISTED), actual="5.6.7.8")
+        assert any("disagrees" in f for f in r.failures)
 
 
 class TestCredentialCheckFollowsTheConfiguredBroker:

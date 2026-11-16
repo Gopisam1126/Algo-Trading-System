@@ -1,6 +1,6 @@
 # AI-Driven Algorithmic Trading Platform — Research & Architecture Context Document
 
-**Status:** Pre-implementation research. No code written yet.
+**Status:** Research and design rationale. Parts are built and parts are planned; what exists today is in [MASTER_REFERENCE.md §2](MASTER_REFERENCE.md#2-current-status--what-exists-what-doesnt) (corrected 16 Nov 2026, audit ENG-049 - this header said no code had been written).
 **Purpose:** Single source of truth for the *why* behind every future architecture/implementation decision. Read this before writing code; update it when decisions change.
 
 > **⚠️ Revision note (2026-08-04, v1.1):** This document was originally written before the project scoped to **Indian markets (NSE/BSE)**. It recommended US brokers (Alpaca, Interactive Brokers), US data providers, and framed regulation around the US PDT rule — all of which were wrong for this project and contradicted the companion documents. Those sections have been corrected. The reasoning content (AI layering, latency analysis, multi-timeframe methodology, confluence) was market-agnostic and stands unchanged. See [VERIFICATION_REPORT.md](VERIFICATION_REPORT.md) for the full audit.

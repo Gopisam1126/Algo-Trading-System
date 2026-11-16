@@ -31,15 +31,20 @@ assumption the check rests on, not a property it verifies.
 
 ## Staleness is deliberately NOT re-checked here
 
-``margin_for_sizing()`` (E02-S07) **raises** ``StaleMarginError`` when the
-snapshot is older than its TTL, which closes the time-of-check/time-of-use gap:
-available margin falls after every fill, so a snapshot taken before the
-previous entry can authorise a position the account cannot carry.
+The production context builder (``execution/session_context.py``) asks the
+broker for margin afresh on EVERY signal - ``fetch_margins()``, one live read,
+under the service's lock - so a number that reaches
+:attr:`RiskContext.available_margin` is **fresh or absent**. This check rejects
+absent. (Corrected by the 10 Nov 2026 audit, RSK-021: this paragraph said the
+number arrived through ``margin_for_sizing()``, whose TTL raises
+``StaleMarginError``; production never called it. The freshness comes from
+reading per signal, not from a TTL.)
 
-By the time a number reaches :attr:`RiskContext.available_margin` it is
-therefore **fresh or absent**. This check rejects absent. Re-implementing the
-TTL here would give two places to disagree about how old is too old, and the
-one that is wrong would be the one nobody was looking at.
+**What would make this wrong.** Caching margin between signals to save broker
+calls. Available margin falls after every fill, so a cached snapshot taken
+before the previous entry can authorise a position the account cannot carry.
+A cache must go through ``margin_for_sizing()`` and its TTL - never a plain
+attribute - and this paragraph must then change to say so.
 
 ## What check 13 can and cannot do
 

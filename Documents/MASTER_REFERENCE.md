@@ -5,7 +5,7 @@
 this should understand what the system is, how it is built, why each significant
 decision was made, what exists today, what does not, and what to do next.
 
-**Version:** 1.3 · **Date:** 2026-08-24 · **Status:** Phases 0–1 built through the strategy runtime — nothing trades yet
+**Version:** 1.4 · **Date:** 2026-11-16 · **Status:** see §2 — a rule-based engine, built as components; no entrypoint, no AI layer, nothing trades
 **Repository:** github.com/Gopisam1126/Algo-Trading-System · Active branch: `DEV`
 
 ---
@@ -103,122 +103,79 @@ resolve to "no trade" rather than a forced decision.
 
 ## 2. Current Status — What Exists, What Doesn't
 
-### 2.1 Status: data layer, broker layer, ingestion, indicators and the strategy runtime are built
+**This section is the one authoritative statement of what is built.** Every other
+document — both READMEs, `Code/CLAUDE.md`, `SETUP.md` — links here rather than
+restating it, because seven contradictory copies of "what exists" and seven test
+counts (112 to 3,258) are what the 10 Nov 2026 audit found (ENG-009, ENG-037).
+It carries **no test counts**: the number of tests that pass is what CI's latest
+run on a branch says, at that commit, and nothing written in prose stays true.
 
-| Metric | Value |
-|---|---|
-| Python code | 15,427 lines (`src/`, 72 modules) + 15,046 lines of tests (52 files) |
-| Design documentation | ~11,600 lines across 13 documents |
-| Tests | **1,662** — 388 of them security tests. Locally 1,415 pass and 247 are Docker-gated; CI runs the container tests too |
-| Test coverage | **83%** statement/branch across `src/`, measured with the container tests skipped |
-| Mutation testing | 129 injected defects across the safety-critical paths, **126 killed, 3 verified benign** |
-| Database migrations | 5, forward and reverse verified |
-| Strategy primitives | 27 registered **and 27 implemented** (see §2.4) |
-| Git commits | 43, on branch `DEV` |
-| **Trades placed** | **Zero. Nothing trades.** |
+### 2.1 What the system is, as built (16 Nov 2026)
 
-Package sizes, which say more than a total:
+**A rule-based intraday trading engine with an AI review step planned and not
+built.** Decisions are fixed-threshold strategy rules (the 27-primitive DSL over
+EMA/RSI/MACD/ATR/VWAP/volume/levels) evaluated on sealed bars; there is no
+pattern-recognition model and **no LLM is called anywhere** (audit AI-003,
+AI-004). The AI layer this document describes - pre-market synthesis, in-session
+review, news triage - is the design for E10/E11/E13-S03, and the anti-
+hallucination controls in §11 are its specification, not running code.
 
-| Package | Lines | |
+**Nothing can start.** No package has a `__main__`, so every docker-compose
+service and the image `CMD` exit at once (audit ARC-001); the process
+entrypoints are E23-S03. The data -> decision -> order pipeline is connected
+only inside tests: nothing in `src` produces `stream:signals`, nothing consumes
+`stream:ticks`, and the feed, cleaning pipeline, signal loop and execution
+service are constructed only by tests (audit ARC-002).
+
+**Nothing has ever placed an order** — but the code that would is built: the
+order gateway calls the broker's `place_order`, and the execution service drives
+it from `stream:signals`. Only the shipped configuration (autonomy L1, approval
+required) keeps an assembled system from trading: `execution/autonomy.py`
+refuses every entry at L0-L3 until the approval flow (E16-S03) and the envelope
+(E16-S02) exist, and a live configuration at L4 does not load.
+
+### 2.2 Package by package
+
+| Package | State | What is there |
 |---|---|---|
-| `common/` | 7,359 | config, secrets, logging, calendar, audit, 16 tables, 6 repositories, Redis, events |
-| `strategy/` | 2,136 | DSL, 27 primitive specs **and their evaluators**, tri-state runtime |
-| `broker/` | 1,988 | Kite auth, market data, trading, error taxonomy, instruments, rate limit |
-| `ingest/` | 1,526 | WebSocket protocol and client, cleaning, bars, quotes |
-| `indicators/` | 1,395 | incremental framework, engine, levels |
-| `signals/` `execution/` `orchestrator/` `premarket/` `api/` `notifier/` `ai/` `macro/` | 1 each | **empty — `__init__.py` only** |
+| `common/` | Components | config with hard bounds, `SecretString`, redacting logs, NSE calendar, models, TimescaleDB schema + repositories, hash-chained audit, Redis primitives and streams, retention, health heartbeats |
+| `broker/` | Components | Kite auth and daily re-auth, read-only/trading split, error taxonomy, instrument sync, margins, rate limiter (required, capped at 5 OPS), paper broker |
+| `ingest/` | Components | Kite WebSocket client on the binary protocol, cleaning (validation, dedup, outliers), session-aligned bars, quote state |
+| `indicators/` | Components | incremental EMA/SMA/RSI/ATR/MACD/Bollinger/VWAP/VolumeRatio, warm-up, multi-timeframe snapshot, levels, state publishing |
+| `strategy/` | Components | the DSL, 27 primitives and their evaluators, the tri-state runtime, the approval-gated registry |
+| `signals/` | Components | the strategy loop and bar source (E13-S01); its LIVE/PAPER routes end at a port |
+| `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, square-off timer, autonomy gate, day ledger, execution service |
+| `ai/` `macro/` `premarket/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
 
-### 2.2 What is BUILT and tested
+"Components" means built and tested on their own and against each other in
+integration tests; none of them runs as a process yet.
 
-| Component | State | Notes |
-|---|---|---|
-| Domain models | ✅ Complete | Decimal money, tz-aware UTC, immutable |
-| Config + validation | ✅ Complete | 3 gates including hard bounds in code |
-| Secrets handling | ✅ Complete | `SecretString` self-redacts, 10 leak paths tested |
-| Logging + redaction | ✅ Complete | 12 redaction paths tested, false-positive guarded |
-| NSE calendar | ✅ Complete | Per-stock square-off, session-aligned bars |
-| Broker protocol | ✅ Complete | Read-only vs trading split; 5 broker profiles |
-| Strategy DSL | ✅ Complete | 27 primitives, compiler, no code execution possible |
-| Docker topology | ✅ Written | 13 services, network-segmented, not yet run |
-| Pre-flight (`doctor.py`) | ✅ Complete | Environment, config, SEBI, SDK, calendar checks |
-| **Database schema** | ✅ Complete | TimescaleDB hypertables, BR-1..BR-20 as constraints, 4 reversible migrations |
-| **Repository layer** | ✅ Complete | Async SQLAlchemy, ORM confined here, COPY-based backfill |
-| **Audit log** | ✅ Complete | Hash-chained, append-only, survives a database outage via disk buffer |
-| **Redis layer** | ✅ Complete | Typed state, slot locks, token bucket, timer ZSET, event streams |
-| **Retention** | ✅ Complete | Parquet archive, verified before any purge, self-healing restore |
-| **Corporate actions** | ✅ Complete | Raw prices immutable; adjustment stored as factors (BR-15/16/19) |
-| **CI/CD** | ✅ Complete | GitHub Actions, gated promotion to QA; pip-audit and bandit are **hard gates** |
-| **Kite broker adapter** | ✅ Complete | Auth + daily re-auth scheduling, read-only/trading split, error taxonomy, instrument sync, live margin, rate limiter capped at 5 OPS |
-| **Market data ingestion** | ✅ Complete | WebSocket client on the documented binary protocol, reconnection with a `FeedGap` signal, tick validation, dedup, outlier filter, session-aligned bars, quote state |
-| **Technical analysis** | ✅ Complete | Incremental EMA/SMA/RSI/ATR/MACD/Bollinger/VWAP/VolumeRatio verified against TA-Lib, warm-up orchestration, multi-timeframe snapshot, pivots and opening range |
-| **Strategy runtime** | ✅ Complete | The 27 primitives now **execute**; tri-state (True/False/UNKNOWN) composition, capability verification at load, tick-snapped stops |
-| **NSE holiday calendar** | ✅ Complete | Full 2026 list, cross-checked across three publications; 245 trading days; refuses to answer for an uncovered year |
+### 2.3 What stands between this and a paper session
 
-### 2.3 What is NOT built
-
-| Service | Status |
-|---|---|
-| `signals/` | ❌ Empty — the evaluation **loop** (the evaluator it would drive exists) |
-| `execution/` | 🟡 **Risk engine started** (E14-S01 framework, E14-S02 pre-conditions 1–4, E14-S03 eligibility 5–7, E14-S04 exposure 8–10, E14-S05 loss limits 11–12, E14-S06 margin and timing 13–14, E14-S07 ATR sizing). **All fourteen checks and the sizer now exist**, and a real pipeline trigger becomes an APPROVED decision carrying a quantity and an executable stop. There is still **no order placement** — nothing turns that decision into an order |
-| `orchestrator/` | ❌ Empty — no scheduler |
-| `premarket/` | ❌ Empty — no daily pipeline |
-| `macro/` | ❌ Empty — no news or macro pipeline |
-| `api/` | ❌ Empty — no dashboard |
-| `notifier/` | ❌ Empty — no Telegram |
-| `ai/` | ❌ Empty — no Anthropic client |
-| Strategy validation gauntlet | ❌ Designed, not implemented |
-
-### 2.3.1 The honest architectural summary
-
-**Eight service packages are one line each, and nothing composes the five that
-are built.** No module in `src/` imports both `ingest` and `indicators`. That
-is on plan — assembly is E11's pre-market pipeline and E13's signal loop — but
-it changes what the test count means: 1,662 tests are claims about
-*components*. There is exactly one test of the *system*
-(`tests/integration/test_tick_to_trigger.py`), and it was written deliberately
-to find what component tests cannot. It found a HIGH-severity defect
-immediately: the evaluator traded straight through a simulated feed gap
-because nothing consulted `all_ready`.
-
-Read that as the standing risk. Every remaining integration defect lives in
-the seams, and the seams are what has not been built.
+The AI review and the Recommendation emitter (E13-S03/S04, which need the
+Anthropic client, E10-S01); a market context with a regime (E09); the day's
+locked plan (E11-S08); a strategy this engine can evaluate (the shipped
+`orb_classic` asks for daily and weekly bars the engine does not carry); daily
+and intraday bars (E03 - E03-S01 is blocked by B8); and the entrypoints
+(E23-S03). The backlog tracker is the authority on each item's state.
 
 ### 2.4 The gap that had been invisible
 
 `registry.py` declared 27 strategy primitives — name, category, parameter
-bounds — and **none of them had an implementation**. `compile_strategy`'s own
-docstring promised that "the runtime evaluator walks the validated tree"; no
-such evaluator existed. A strategy could be authored, validated, hashed,
-persisted and activated, and would then never fire. Nothing raised. The
-symptom was an absence of trades, which is indistinguishable from a quiet
-market.
+bounds — and **none of them had an implementation**. A strategy could be
+authored, validated, hashed, persisted and activated, and would then never
+fire. Nothing raised. It is now implemented, and the test that would have
+caught it exists: declared primitives and implemented primitives must be the
+same set. The 10 Nov 2026 audit found the same shape in configuration - an
+autonomy ladder, an order-rate cap, AI confidence gates and an entry order type
+that were validated and read by nothing - and `tests/unit/test_config_honesty.py`
+now holds every configuration key to a reader or a named owning story.
 
-It is now implemented, and the test that would have caught it exists: declared
-primitives and implemented primitives must be the same set.
+### 2.5 What QA keeps catching
 
-### 2.4 Honest assessment
-
-**What Phase 0 achieved:** the safety-critical foundation is real and tested. The
-four invariants (§3.1) are enforced by code with tests that fail if they are
-removed. The parts that are easy to get subtly wrong — money arithmetic, timezone
-handling, per-stock square-off deadlines, secret handling — are done and verified.
-
-**What remains:** all the actual functionality. Phase 0 plus E01 is roughly 25%
-of the MVP by effort. The remainder is service implementation, which is more code
-but less dangerous, because the invariants that constrain it are already in place.
-
-**What QA has actually caught here.** Twenty-seven security findings and a long
-tail of QA defects, none of which a code read would have found — a hash chain
-forgeable through delimiter ambiguity, a redactor with no pattern for connection
-URIs, adjustment factors only approximately order-independent, a `doctor` that
-validated the wrong broker's credentials, an evaluator that traded straight
-through a feed gap, and a vocabulary of 27 strategy primitives with no
-implementation behind any of them.
-
-The lesson that keeps paying is the first law of
-`ENGINEERING_STANDARD.md`: **run the probe, do not read the code and conclude.**
-Its §11 catalogue records every one of these with the mechanism that let it
-survive review.
+The lesson that keeps paying is the first law of `ENGINEERING_STANDARD.md`:
+**run the probe, do not read the code and conclude.** Its §11 catalogue records
+the defects found that way, with the mechanism that let each survive review.
 
 ---
 
@@ -726,7 +683,7 @@ Algo-Trading-System/
 | `dsl.py` | 376 | Strategy document schema, `PrimitiveRegistry`, compiler. `ExitRules` **requires** stop and time exits. `Hypothesis` requires substantive text (boilerplate rejected). |
 | `primitives/registry.py` | 280 | The 27 vetted primitives — price, trend, momentum, volatility, volume, multiframe, context, news, time, exit. Each with declared parameter bounds. |
 
-#### `tests/` — 379 tests
+#### `tests/` (counts: see the latest CI run, §2)
 
 | File | Lines | Covers |
 |---|---|---|
@@ -846,9 +803,15 @@ the prompt.
 | `stop_reason == "refusal"` | Log category, skip, alert. **Check `stop_reason` before reading `content`** — a refusal has empty content and indexing `content[0]` crashes. |
 | Schema validation failure | Skip, log raw response for prompt debugging |
 | Rate limit | SDK backoff; if still failing, skip |
-| Token budget exceeded | Degrade to score-only mode, alert, keep trading |
+| Token budget exceeded | **No new entries.** Alert. Open positions keep their stops, time exits and reconciliation. |
 
-Cost overrun degrades capability; it never halts risk management.
+Cost overrun stops NEW risk; it never stops the management of risk already
+taken. (Corrected 16 Nov 2026, audit AI-002: this row used to say *degrade to
+score-only mode, keep trading*, which is an unreviewed order by another name and
+contradicts the table's own heading - and a budget can be exhausted on purpose,
+by a flood of long news items.) Trading on deterministic scores alone, if it is
+ever wanted, is an explicit autonomy setting the operator turns on and the audit
+log records - never a fallback the system chooses for itself. It is not built.
 
 ---
 

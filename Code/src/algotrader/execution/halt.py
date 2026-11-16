@@ -60,8 +60,32 @@ close positions, which is E14-S13 and not this.
   is no availability to observe. Folded into E14-S12's story rather than
   stubbed, because a trigger that watches nothing reads as a live control.
 
-Every other auto-trigger in task 2 has a real input today and is expressible as
-a :class:`HaltReason`, which is what makes this half of the story buildable.
+## Who arms what (corrected 16 Nov 2026, audit RSK-003 / RSK-016)
+
+This docstring used to say "every other auto-trigger in task 2 has a real input
+today". It was not true. The table is now the truth, and
+``tests/unit/test_halt.py`` holds the source tree to it:
+
+====================== =====================================================
+Reason                 Armed by
+====================== =====================================================
+MANUAL                 ``scripts/halt.py arm`` - the operator (RSK-016)
+DAILY_LOSS_LIMIT       ``execution/loss_latch.py``, on a breach (RSK-003)
+CONSECUTIVE_LOSS_LIMIT ``execution/loss_latch.py``, on a breach (RSK-003)
+BROKER_DISCONNECTED    the reconciliation loop, after repeated failed cycles
+UNKNOWN_POSITION       reconciliation
+DUPLICATE_ORDER        reconciliation
+NAKED_POSITION         the protective stop
+POSITION_NOT_HELD      reconciliation and the square-off timer
+STALE_FEED             **nothing yet** - the feed composition (E23-S03)
+MARGIN_SHORTFALL       **nothing yet** - the margin monitor (E14-S12)
+====================== =====================================================
+
+The two "nothing yet" reasons are declared so their producers have something
+to call; until then a stale feed or a margin shortfall is refused per signal
+(the risk engine rejects on a missing ATR, quote or margin) rather than halting
+the session. ``clear()`` is called by ``scripts/halt.py clear`` and nothing
+else: only a named human clears a halt.
 """
 
 from __future__ import annotations
@@ -342,25 +366,33 @@ class HaltController:
             )
         latch = _LATCH_FOR.get(reason, _DEFAULT_LATCH)
         key = self._key(latch)
-
-        existing = await self._client.get(key)
-        if existing is not None:
-            text = existing.decode() if isinstance(existing, bytes) else str(existing)
-            prior = HaltRecord.from_json(text)
-            if prior is not None:
-                log.info("%s is already armed (%s); leaving the first reason", latch, prior.reason)
-                return prior
-            log.warning("%s is armed but unreadable; overwriting with the current reason", latch)
-
         record = HaltRecord(
             reason=reason,
             detail=one_safe_line(detail),
             since=now.astimezone(dt.UTC),
             armed_by=one_safe_line(armed_by),
         )
-        # No TTL, ever. A halt that expires is an automatic un-halt on a timer,
-        # which is exactly what §8.1 forbids.
-        await self._client.set(key, record.to_json())
+
+        # ONE atomic set-if-absent (audit ENG-019). This was GET, then SET,
+        # with an await between: reconciliation and the square-off timer run
+        # as sibling tasks, so two arms could both read "absent" and the
+        # second would overwrite the first reason - breaking "the first reason
+        # wins", which is the audit property this method exists for. No TTL,
+        # ever: a halt that expires is an automatic un-halt on a timer, which
+        # §8.1 forbids.
+        if not await self._client.set(key, record.to_json(), nx=True):
+            existing = await self._client.get(key)
+            prior = None
+            if existing is not None:
+                text = existing.decode() if isinstance(existing, bytes) else str(existing)
+                prior = HaltRecord.from_json(text)
+            if prior is not None:
+                log.info("%s is already armed (%s); leaving the first reason", latch, prior.reason)
+                return prior
+            # Armed but unreadable (or cleared in between): the latch stays
+            # armed either way; give it a record an operator can read.
+            log.warning("%s is armed but unreadable; recording the current reason", latch)
+            await self._client.set(key, record.to_json())
         log.critical(
             "TRADING HALTED — %s (%s) armed by %s: %s",
             latch,

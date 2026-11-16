@@ -64,6 +64,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Final, Protocol
 
+from pydantic import BaseModel, ConfigDict
+
 from algotrader.common.calendar import IST
 from algotrader.common.enums import Direction, Side, Timeframe
 from algotrader.common.models.market import IndicatorSnapshot
@@ -82,6 +84,7 @@ __all__ = [
     "AtrReading",
     "BrokerMarginPerShare",
     "DailyCloseCorrelations",
+    "LiveQuotePrice",
     "LiveSessionFacts",
     "PublishedATR",
     "daily_correlations",
@@ -109,6 +112,10 @@ DAILY_SLACK_SESSIONS: Final = 10
 #: The timeframes a live state exists for. Daily and weekly are not built from
 #: ticks during the session, so a strategy declaring one has no live ATR.
 _INTRADAY: Final = frozenset({Timeframe.M1, Timeframe.M5, Timeframe.M15, Timeframe.H1})
+#: How old a quote may be and still price a decision (audit RSK-002). A liquid
+#: Nifty-200 name ticks several times a second; ten seconds of silence is a
+#: feed problem, and a price from before it is not the market's.
+QUOTE_MAX_AGE: Final = dt.timedelta(seconds=10)
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +447,56 @@ class DailyCloseCorrelations:
 
 
 # ---------------------------------------------------------------------------
+# The live price (audit RSK-002)
+# ---------------------------------------------------------------------------
+
+
+class _QuoteFields(BaseModel):
+    """The two fields of ``ingest.quotes.QuoteState`` a price check needs.
+
+    Parsed here rather than imported: execution reads the quote STATE, not the
+    ingest package (the same separation ``broker/paper.py`` keeps). Unknown
+    fields are ignored so the producer can add to the record freely.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    ltp: Decimal
+    as_of: dt.datetime
+
+
+class LiveQuotePrice:
+    """The last traded price from ``state:quote:{symbol}``, if it is fresh.
+
+    ``None`` - which the sizer refuses on - when there is no quote, when it is
+    older than :data:`QUOTE_MAX_AGE`, when it is dated in the future, or when
+    its price is not positive. A stale price is worse than a missing one: a
+    missing one is obviously missing (``ingest/quotes.py``).
+    """
+
+    def __init__(self, client: Any, *, max_age: dt.timedelta = QUOTE_MAX_AGE) -> None:
+        self._client = client
+        self._max_age = max_age
+
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        quote = await state.get_state(self._client, keys.quote(symbol), _QuoteFields)
+        if quote is None or quote.as_of.tzinfo is None:
+            return None
+        age = now - quote.as_of
+        if age > self._max_age or -age > MAX_STATE_SKEW:
+            log.warning(
+                "quote for %s is %.1fs old (limit %ss); treated as absent",
+                one_safe_line(symbol),
+                age.total_seconds(),
+                int(self._max_age.total_seconds()),
+            )
+            return None
+        if not quote.ltp.is_finite() or quote.ltp <= 0:
+            return None
+        return quote.ltp
+
+
+# ---------------------------------------------------------------------------
 # The composite the service is handed
 # ---------------------------------------------------------------------------
 
@@ -464,6 +521,10 @@ class _Correlations(Protocol):
     ) -> Mapping[str, Decimal]: ...
 
 
+class _Prices(Protocol):
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None: ...
+
+
 class LiveSessionFacts:
     """``SessionFacts`` from the live producers.
 
@@ -473,12 +534,19 @@ class LiveSessionFacts:
     """
 
     def __init__(
-        self, *, health: _Health, atr: _Atr, margin: _Margin, correlations: _Correlations
+        self,
+        *,
+        health: _Health,
+        atr: _Atr,
+        margin: _Margin,
+        correlations: _Correlations,
+        prices: _Prices,
     ) -> None:
         self._health = health
         self._atr = atr
         self._margin = margin
         self._correlations = correlations
+        self._prices = prices
 
     async def unhealthy_services(self, *, now: dt.datetime) -> tuple[str, ...] | None:
         return await self._health.unhealthy_services(now=now)
@@ -495,3 +563,6 @@ class LiveSessionFacts:
         self, symbol: str, against: Sequence[str], *, now: dt.datetime
     ) -> Mapping[str, Decimal]:
         return await self._correlations.correlations(symbol, against, now=now)
+
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        return await self._prices.last_price(symbol, now=now)

@@ -64,6 +64,7 @@ from algotrader.common.calendar import IST
 from algotrader.common.enums import Direction
 from algotrader.common.models.trading import Recommendation, SizingResult
 from algotrader.common.text import one_safe_line
+from algotrader.execution.day_ledger import UNKNOWN, DayLedger, day_ledger
 from algotrader.execution.risk.context import OpenPosition, RiskContext, RiskContextError
 
 log = logging.getLogger(__name__)
@@ -82,7 +83,6 @@ __all__ = [
     "RiskContextBuilder",
     "SessionFacts",
     "restrictions_from",
-    "session_losses",
 ]
 
 
@@ -218,33 +218,6 @@ def restrictions_from(status: Mapping[str, Any] | None) -> tuple[str, ...] | Non
     return tuple(blocked)
 
 
-def session_losses(closed: Sequence[Mapping[str, Any]]) -> tuple[Decimal | None, int | None]:
-    """Today's realised P&L and the current losing streak, from closed trades.
-
-    ``closed`` is oldest first. Returns ``(None, None)`` when any closed trade
-    has no realised P&L: a total that silently skips one trade is a total that
-    is wrong in the direction of trading on, and a streak counted past a gap
-    cannot be trusted either.
-
-    **A break-even trade neither extends nor ends a streak.** Ending it would
-    let one scratch trade clear two real losses; extending it would halt on
-    trades that lost nothing. Only a strictly positive result ends a streak.
-    """
-    pnls: list[Decimal] = []
-    for row in closed:
-        pnl = row.get("realized_pnl")
-        if pnl is None:
-            return None, None
-        pnls.append(Decimal(pnl))
-    streak = 0
-    for pnl in reversed(pnls):
-        if pnl > 0:
-            break
-        if pnl < 0:
-            streak += 1
-    return sum(pnls, Decimal(0)), streak
-
-
 def session_start(trade_date: dt.date) -> dt.datetime:
     """Midnight IST on the trade date, as UTC: where "today" begins."""
     return dt.datetime.combine(trade_date, dt.time(0, 0), tzinfo=IST).astimezone(dt.UTC)
@@ -258,7 +231,9 @@ def session_start(trade_date: dt.date) -> dt.datetime:
 class ContextStore(Protocol):
     """The persisted facts the context reads. One method per question."""
 
-    async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]: ...
+    async def orders_since(self, since: dt.datetime) -> list[dict[str, Any]]:
+        """Every order placed at or after ``since``, any status (the day ledger)."""
+        ...
 
     async def occupied_slots(self) -> set[int]: ...
 
@@ -266,17 +241,35 @@ class ContextStore(Protocol):
 
     async def daily_status(self, symbol: str, trade_date: dt.date) -> dict[str, Any] | None: ...
 
+    async def strategy_state(self, strategy_id: str) -> str | None:
+        """The registered strategy's lifecycle state, or None if it has none."""
+        ...
+
 
 class RepositoryContextStore:
-    """:class:`ContextStore` over the three repositories that hold the answers."""
+    """:class:`ContextStore` over the repositories that hold the answers."""
 
-    def __init__(self, *, positions: Any, instruments: Any, daily_status: Any) -> None:
+    def __init__(
+        self,
+        *,
+        positions: Any,
+        instruments: Any,
+        daily_status: Any,
+        strategies: Any,
+        orders: Any,
+    ) -> None:
         self._positions = positions
         self._instruments = instruments
         self._daily_status = daily_status
+        self._strategies = strategies
+        self._orders = orders
 
-    async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]:
-        return list(await self._positions.closed_since(since))
+    async def orders_since(self, since: dt.datetime) -> list[dict[str, Any]]:
+        return list(await self._orders.orders_placed_since(since))
+
+    async def strategy_state(self, strategy_id: str) -> str | None:
+        row = await self._strategies.strategy_by_id(strategy_id)
+        return None if row is None else str(row["state"])
 
     async def occupied_slots(self) -> set[int]:
         return set(await self._positions.occupied_slots())
@@ -313,6 +306,10 @@ class SessionFacts(Protocol):
         self, symbol: str, against: Sequence[str], *, now: dt.datetime
     ) -> Mapping[str, Decimal]: ...
 
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        """The live last traded price if a FRESH one exists (audit RSK-002)."""
+        ...
+
 
 class NoProducerYet:
     """Every live input as unknown: the fail-closed answer to each.
@@ -344,6 +341,9 @@ class NoProducerYet:
         self, symbol: str, against: Sequence[str], *, now: dt.datetime
     ) -> Mapping[str, Decimal]:
         return {}
+
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        return None
 
 
 class HaltReader(Protocol):
@@ -377,6 +377,8 @@ class BuiltContext:
 
     context: RiskContext
     is_cas_stock: bool | None
+    #: The day's ledger the loss figures came from, for the loss latch.
+    ledger: DayLedger = UNKNOWN
 
 
 class RiskContextBuilder:
@@ -410,9 +412,19 @@ class RiskContextBuilder:
         self._facts = facts
 
     async def build(
-        self, rec: Recommendation, *, now: dt.datetime, trade_date: dt.date
+        self,
+        rec: Recommendation,
+        *,
+        now: dt.datetime,
+        trade_date: dt.date,
+        size_factor: Decimal,
     ) -> BuiltContext:
-        """The context for ``rec`` at ``now``. Raises ContextUnavailableError."""
+        """The context for ``rec`` at ``now``. Raises ContextUnavailableError.
+
+        ``size_factor`` is the caller's: it comes from the strategy's state and
+        the AI review, which the service reads, and it has no default because
+        "nobody said" must not mean full size.
+        """
         self._pending.prune()
         symbol = rec.symbol
 
@@ -440,12 +452,7 @@ class RiskContextBuilder:
 
         halts = await self._halts.state()  # HaltController fails closed on its own
         open_positions = await self._open_positions()
-        realised, streak = (None, None)
-        closed = await self._optional(
-            "today's closed trades", self._store.closed_since(session_start(trade_date))
-        )
-        if closed is not None:
-            realised, streak = session_losses(closed)
+        ledger = await self.ledger(now=now, trade_date=trade_date)
 
         margin = await self._optional("live broker margin", self._margins.fetch_margins())
         held = sorted({p.symbol for p in open_positions} - {symbol})
@@ -463,8 +470,10 @@ class RiskContextBuilder:
                 unhealthy_services=await self._optional(
                     "service health", self._facts.unhealthy_services(now=now)
                 ),
-                realised_pnl_today=realised,
-                consecutive_losses=streak,
+                realised_pnl_today=ledger.realised,
+                unrealised_pnl_today=ledger.unrealised,
+                charges_today=ledger.charges,
+                consecutive_losses=ledger.streak,
                 daily_loss_halted=halts.daily_loss,
                 consecutive_loss_halted=halts.consecutive_loss,
                 open_positions=tuple(open_positions),
@@ -484,10 +493,34 @@ class RiskContextBuilder:
                     ),
                 ),
                 correlations=correlations or {},
+                last_price=await self._optional(
+                    f"the live price of {symbol}", self._facts.last_price(symbol, now=now)
+                ),
+                size_factor=size_factor,
             )
         except RiskContextError as exc:
             raise ContextUnavailableError(f"the risk context is inconsistent: {exc}") from exc
-        return BuiltContext(context=context, is_cas_stock=is_cas)
+        return BuiltContext(context=context, is_cas_stock=is_cas, ledger=ledger)
+
+    async def ledger(self, *, now: dt.datetime, trade_date: dt.date) -> DayLedger:
+        """The day's P&L from today's orders (audit RSK-004/RSK-005), or UNKNOWN.
+
+        Separate from :meth:`build` because the loss latch needs it with no
+        signal in hand - after every reconciliation cycle, which is when a
+        close is booked.
+        """
+        orders = await self._optional(
+            "today's orders", self._store.orders_since(session_start(trade_date))
+        )
+        if orders is None:
+            return UNKNOWN
+        open_symbols = sorted({str(o["symbol"]) for o in orders if o.get("filled_quantity")})
+        prices: dict[str, Decimal | None] = {}
+        for symbol in open_symbols:
+            prices[symbol] = await self._optional(
+                f"the live price of {symbol}", self._facts.last_price(symbol, now=now)
+            )
+        return day_ledger(orders, prices.get)
 
     async def _open_positions(self) -> list[OpenPosition]:
         """The book and the entries in flight, each with its sector.

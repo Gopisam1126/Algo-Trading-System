@@ -53,6 +53,7 @@ from algotrader.execution.positions import (
 )
 from algotrader.execution.protective_stop import ProtectiveStop, stop_client_order_id
 from algotrader.execution.reconciliation import Drift, Reconciler, ReconciliationReadError
+from tests.doubles import CountingLimiter
 
 pytestmark = [pytest.mark.integration]
 
@@ -214,7 +215,11 @@ class Wiring:
     def __init__(self, session, instruments, redis, audit, account: KiteAccount, calendar) -> None:
         self.account = account
         self.adapter = KiteTradingAdapter(
-            auth=None, client=account, algo_id="", tick_size_for=instruments.tick_size
+            limiter=CountingLimiter(),
+            auth=None,
+            client=account,
+            algo_id="",
+            tick_size_for=instruments.tick_size,
         )
         self.orders = OrderRepository(session, instruments)
         self.gateway = OrderGateway(

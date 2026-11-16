@@ -86,6 +86,8 @@ def _ctx(**overrides) -> RiskContext:
         "kill_switch_active": False,
         "unhealthy_services": (),
         "realised_pnl_today": Decimal(0),
+        "unrealised_pnl_today": Decimal(0),
+        "charges_today": Decimal(0),
         "consecutive_losses": 0,
         "daily_loss_halted": False,
         "consecutive_loss_halted": False,
@@ -95,6 +97,13 @@ def _ctx(**overrides) -> RiskContext:
         "slots_total": 5,
         "slots_used": 0,
         "symbol_restrictions": (),
+        # Audit RSK-014/RSK-002/RSK-006: the book fields are required, and
+        # the sizer refuses without a live price and a size factor.
+        "open_positions": (),
+        "correlations": {},
+        "lot_size": 1,
+        "last_price": Decimal("1200.00"),
+        "size_factor": Decimal(1),
     }
     base.update(overrides)
     return RiskContext(**base)

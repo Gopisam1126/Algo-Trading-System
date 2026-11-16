@@ -3,7 +3,7 @@
 
 **Document type:** Low-Level Design (LLD) / Technical Architecture Specification
 **Audience:** The engineer(s) implementing this system. Assumes the two companion documents have been read.
-**Status:** Design complete, pre-implementation. No code written.
+**Status:** Design specification. Parts are built and parts are planned; what exists today is in [MASTER_REFERENCE.md §2](MASTER_REFERENCE.md#2-current-status--what-exists-what-doesnt) (corrected 16 Nov 2026, audit ENG-049 - this header said no code had been written).
 **Version:** 1.0 — 2026-08-04
 
 **Companion documents (read in this order):**
@@ -607,7 +607,7 @@ class PremarketPipeline:
 
 **Checkpointing:** each stage writes its output to `premarket_checkpoint` keyed by `(trade_date, stage_name)`. If the job crashes at 08:50, restarting resumes at `AISynthesisStage` using the already-computed scores rather than recomputing three hours of analysis with 25 minutes to go before the open.
 
-**Hard time budget:** every stage has a deadline. `AISynthesisStage` must complete by 09:00 or the pipeline proceeds to `GapAdjustmentStage` with a **score-only plan** (no AI playbooks, all candidates flagged `ai_unavailable=True`, signal-engine then requires higher score thresholds to act). The system degrades to a purely quantitative day rather than missing the open.
+**Hard time budget:** every stage has a deadline. `AISynthesisStage` must complete by 09:00 or the pipeline proceeds to `GapAdjustmentStage` with a **score-only plan** (no AI playbooks, all candidates flagged `ai_unavailable=True`, signal-engine then requires higher score thresholds to act). The system degrades to a purely quantitative PLAN rather than missing the open. A score-only plan is planning data, not a licence to trade unreviewed: every entry still needs its in-session AI review, and when that is unavailable no entry is sent (audit AI-002, 16 Nov 2026).
 
 **`MultiTimeframeStage` parallelism:** ~200 symbols × 3 timeframes × ~250 bars is the heaviest compute of the day. It fans out across a `ProcessPoolExecutor` sized to `cpu_count() - 1`, with each worker handling a symbol slice and returning serialized snapshots.
 
@@ -1126,7 +1126,7 @@ Note there is no `temperature` parameter — current-generation models reject sa
 | `stop_reason == "refusal"` | Log with the refusal category, skip the trade, alert. Check `stop_reason` **before** reading `content` — a refusal has empty or partial content and code that indexes `content[0]` will crash. |
 | Schema validation failure | Skip the trade, log the raw response for prompt debugging. |
 | Rate limit (429) | SDK retries with backoff; if still failing, skip. |
-| Daily token budget exceeded | Degrade to score-only mode (Tier-1 threshold raised), alert user, continue trading. |
+| Daily token budget exceeded | No new entries; alert the user; open positions keep their stops, time exits and reconciliation. (Corrected 16 Nov 2026, audit AI-002: "degrade to score-only mode, continue trading" was an unreviewed order by another name.) |
 
 **Cost control:** a Redis counter tracks daily token spend. At `alert_at_pct` the user is notified; at `hard_stop_at_pct` the AI layer is disabled for the day and the system falls back to quantitative-only operation. Cost overrun degrades capability; it never halts risk management.
 
@@ -1506,8 +1506,8 @@ Concretely:
 
 1. **No secret in source control, ever.** Enforced by a pre-commit hook running `gitleaks`, plus `git-secrets` patterns for broker key formats.
 2. **No secret in a config file.** Config contains a *reference*: `credentials_source: vault://trading/angelone`.
-3. **No secret in logs.** A `RedactingFilter` on the root logger scrubs any value matching known secret patterns and any value present in the loaded secret set — implemented as a filter, so it applies even to third-party library logging.
-4. **No secret in an LLM prompt.** The prompt builder asserts that no rendered field appears in the secret registry, and fails loudly if one does.
+3. **No secret in logs.** A `RedactingFilter` on the handler `common.logging.configure_logging()` installs on the root logger scrubs any value matching known secret patterns and any value present in the loaded secret set; because every record reaching that handler passes it, third-party library logging is covered too. *(As built. A process that replaces the root handler - running Alembic in-process does - removes it; see audit SEC-012.)*
+4. **No secret in an LLM prompt.** *(Planned, E10 - no prompt builder or LLM call exists yet.)* The prompt builder must assert that no rendered field appears in the secret registry, and fail loudly if one does.
 5. **No secret in an error message or stack trace** sent to Telegram or email.
 
 **Storage:** HashiCorp Vault with AppRole auth is the target. For a leaner start, **SOPS + age** with the private key held only on the production host is a legitimate stepping stone — it keeps encrypted secrets in git safely while avoiding running a Vault server on day one. Either way, the `SecretsProvider` interface is identical, so migration is a config change.
@@ -1749,7 +1749,7 @@ def test_approved_order_always_has_stop(any_recommendation):
 | Kill `execution-svc` with open positions | On restart, reconcile from broker; positions adopted; deadlines restored |
 | Redis restart | Services reconnect; indicator state rebuilt from DB warm-up; streams resume from last ack |
 | Broker WebSocket drop for 5 min | Reconnect, mark stale, rebuild bars from REST, resume |
-| Anthropic API 100% failure | Trades continue at score-only thresholds; alert raised |
+| Anthropic API 100% failure | No new entries; alert raised; open positions are still managed (AI-002) |
 | Broker returns 500 on order placement | No duplicate order; reconciler resolves; audit records ambiguity |
 | Clock jump (NTP correction) | Deadlines recomputed; no spurious square-offs |
 | Disk full | Graceful degradation; alert; no silent data loss |
@@ -1820,8 +1820,8 @@ Each service exposes `/health` reporting `starting | ready | degraded | failed`.
 | A service stops heartbeating | `HeartbeatHealth`: key expired (30 s TTL) or `beat_at` older than 30 s | Health gate refuses every entry, naming it; exits, stops and the square-off timer carry on | Restart the service; entries resume with its first READY beat |
 | Redis down | Connection error | All services degrade; no new orders | Restart Redis; state rebuilds |
 | TimescaleDB down | Connection error | Trading continues (Redis-backed); audit buffers to disk | Restart; replay buffered audit |
-| AI timeout/failure | Per-call timeout | Skip trade; if persistent, score-only mode | Check API status; review budget |
-| AI budget exhausted | Token counter | Score-only mode; alert | Decide whether to raise budget |
+| AI timeout/failure | Per-call timeout | Skip trade; if persistent, no new entries until it recovers (AI-002) | Check API status; review budget |
+| AI budget exhausted | Token counter | No new entries; alert (AI-002) | Decide whether to raise budget |
 | Order rejected | Broker response | Log reason; do not retry blindly | Review reason code |
 | Order ambiguous (timeout) | No response | **Query orderbook, never retry** | Verify reconciliation resolved it |
 | Unknown position found | Reconciler diff | **Kill switch + P0 alert** | Immediate investigation |

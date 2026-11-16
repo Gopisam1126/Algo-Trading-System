@@ -21,10 +21,12 @@ on strategy promotion.
 
 from __future__ import annotations
 
+import ipaddress
+import os
 from datetime import time
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -36,23 +38,61 @@ from algotrader.common.enums import AutonomyLevel, SystemMode, Timeframe
 # that goes through review, which is exactly the point.
 # ---------------------------------------------------------------------------
 
-#: SEBI's algo-registration threshold, in orders per second per segment per
-#: exchange.  At or above this rate a self-developed algo must be registered
-#: with the exchange through the broker and carries a registered Algo-ID;
-#: below it, no registration exists and the broker/exchange tags the order
-#: with a generic identifier.  Verified 9 Sep 2026 against SEBI circular
-#: SEBI/HO/MIRSD/MIRSD-PoD/P/CIR/2025/0000013 clause I(c).
+#: The algo-registration threshold, in orders per second (per exchange and
+#: segment). At or above it a self-developed algo must be registered with the
+#: exchange through the broker and carries a registered Algo-ID; below it the
+#: order is tagged with a GENERIC algo identifier.
+#:
+#: **Where the number comes from (corrected 16 Nov 2026, audit HAL-002).** The
+#: SEBI circular (SEBI/HO/MIRSD/MIRSD-PoD/P/CIR/2025/0000013, 4 Feb 2025) sets
+#: no number: its clause I(c) speaks of "the specified order per second
+#: threshold" and a footnote leaves the figure to the Brokers' Industry
+#: Standards Forum. The 10 is the exchanges' implementation standard - NSE
+#: circular NSE/INVG/67858 (5 May 2025) and its follow-ons (NSE/INVG/69255, 22
+#: Jul 2025) - read from broker and secondary summaries; the NSE text itself was
+#: not reachable from this host (blocker B8). The exchanges may revise it after
+#: notice, and a broker may set a lower client limit, so it is re-checked once
+#: a year with the holiday file (PRE_LIVE_CHECKLIST.md).
 SEBI_ALGO_REGISTRATION_OPS = 10
 
 MAX_ORDERS_PER_SECOND = 5  # SEBI threshold is 10; we cap at half
 MAX_RISK_PCT_PER_TRADE = Decimal("10.0")
 MAX_POSITION_SLOTS = 20
 MAX_DAILY_LOSS_PCT = Decimal("25.0")
+#: The largest share of capital ONE position may take. Applied to
+#: ``risk.per_trade.max_position_pct`` (it was defined and applied to nothing
+#: until the 10 Nov 2026 audit, RSK-009).
 MAX_POSITION_PCT = Decimal("100.0")
 MIN_STRATEGY_TRIALS = 50  # below this, statistics are meaningless
 MAX_PBO_ALLOWED = Decimal("0.6")  # Probability of Backtest Overfitting
 MAX_ACTIVE_STRATEGIES = 12
 MIN_EXIT_BUFFER_MINUTES = 1
+#: Audit RSK-009: each of the next four was bounded on one side only, so a
+#: config could switch the control it feeds off by making it unreachable.
+#: ``consecutive_loss_halt: 1000`` is a streak halt that never trips;
+#: ``exit_buffer_minutes: 300`` puts the time exit before the session opens;
+#: ``min_minutes_to_squareoff: 1`` makes the runway check pass at 15:14.
+MAX_CONSECUTIVE_LOSS_HALT = 5
+MAX_EXIT_BUFFER_MINUTES = 30
+MIN_ENTRY_RUNWAY_MINUTES = 15
+MAX_ENTRY_RUNWAY_MINUTES = 180
+#: The widest trigger-to-live-price gap the sizer will size on (RSK-002).
+MAX_PRICE_DIVERGENCE_PCT = Decimal("5.0")
+#: The windows no configuration may remove (RSK-009). Config may ADD windows;
+#: each of these must be covered by one of the configured windows, so an
+#: empty or partial ``no_trade_windows`` list is refused rather than read as
+#: "no blackout".
+MANDATORY_NO_TRADE_WINDOWS: tuple[tuple[time, time], ...] = (
+    (time(9, 15), time(9, 20)),  # the opening auction's aftermath
+    (time(15, 0), time(15, 30)),  # no new entries into the close
+)
+#: What ``ALGOTRADER_ENV`` must be for ``system.mode: live`` to load (RSK-008).
+LIVE_ENVIRONMENT = "production"
+#: The environment variable that must carry the loaded file's
+#: :meth:`AppConfig.config_hash` before live mode loads (RSK-008). A second,
+#: out-of-band confirmation that THIS file - not one an edit or an
+#: ``ALGOTRADER_CONFIG`` redirect produced - is the one meant to trade.
+CONFIRM_LIVE_VARIABLE = "ALGOTRADER_CONFIRM_LIVE"
 #: The oldest a Recommendation may be when the execution service acts on it
 #: (E15-S13). The entry is a MARKET order sized from the trigger price, so a
 #: signal acted on late is sized for a price that has moved - and the stop
@@ -95,7 +135,10 @@ class _Model(BaseModel):
 
 class SystemConfig(_Model):
     mode: SystemMode = SystemMode.PAPER
-    timezone: str = "Asia/Kolkata"
+    #: The market's timezone. Fixed (audit ENG-003): every market-hours
+    #: computation uses ``common.calendar.IST``, so another value here would
+    #: change nothing while reading as a setting.
+    timezone: Literal["Asia/Kolkata"] = "Asia/Kolkata"
     deployment_region: str = "ap-south-1"
     static_ip: str = ""
     log_level: str = "INFO"
@@ -103,7 +146,18 @@ class SystemConfig(_Model):
     @field_validator("deployment_region")
     @classmethod
     def _must_be_india(cls, v: str) -> str:
-        """SEBI requires algos to be hosted on Indian servers."""
+        """Host in India - a SELF-IMPOSED control, not a cited SEBI rule.
+
+        Corrected 16 Nov 2026 (audit HAL-001). This said "SEBI requires algos to
+        be hosted on Indian servers", and neither the SEBI circular nor the
+        exchange standards, as far as they have been read, say that. The audit
+        reports a different and potentially material standard - that retail
+        algos "should be hosted on brokers' cloud servers" - whose application
+        to a client's own sub-threshold algo is an open question for Zerodha
+        and counsel (PRE_LIVE_CHECKLIST.md, owner action). The India-region
+        check stays because it costs nothing and keeps data and latency local;
+        it is not evidence of compliance with any hosting rule.
+        """
         india_regions = {
             "ap-south-1",
             "ap-south-2",
@@ -116,8 +170,9 @@ class SystemConfig(_Model):
         }
         if v.lower() not in india_regions:
             raise ValueError(
-                f"deployment_region {v!r} is not an India region. SEBI requires "
-                f"algos to run on Indian servers. Allowed: {sorted(india_regions)}"
+                f"deployment_region {v!r} is not an India region. This system "
+                f"runs in India by its own rule (see the docstring for what is and "
+                f"is not a regulatory requirement). Allowed: {sorted(india_regions)}"
             )
         return v
 
@@ -286,6 +341,14 @@ class BrokerConfig(_Model):
     #: ``_live_mode_requires_compliance``, which requires it above the
     #: threshold and nowhere else.
     algo_id: str = ""
+    #: The broker's WRITTEN answer to "what must a client-developed,
+    #: sub-threshold algo send on an API order?" - a support ticket number, an
+    #: email date, or a documentation URL with its retrieval date (audit
+    #: LEG-001). The exchanges tag such orders with a generic algo ID; whether
+    #: Kite applies it server-side or expects the client to send something is
+    #: not confirmed. Live mode refuses to load while this is empty: the
+    #: question has a cheap answer and an expensive wrong guess.
+    algo_tagging_confirmation: str = ""
     auth: BrokerAuthConfig = Field(default_factory=BrokerAuthConfig)
 
 
@@ -356,11 +419,56 @@ class UniverseConfig(_Model):
 
 class PerTradeRisk(_Model):
     risk_pct: Decimal = Field(default=Decimal("1.0"), gt=0)
-    sizing_method: str = "atr_based"
+    #: The only sizing method that exists (``execution/sizer.py``). A string
+    #: field accepted any word and changed nothing (audit ENG-003); a Literal
+    #: makes "configured" and "implemented" the same set.
+    sizing_method: Literal["atr_based"] = "atr_based"
     atr_multiplier_stop: Decimal = Field(default=Decimal("1.5"), gt=0)
     max_position_pct: Pct = Decimal("20")
+    #: The smallest position worth a slot, as a share of capital (audit
+    #: RSK-012). Below it the sizer refuses rather than open a token position
+    #: that takes one of the day's slots and pays a full round trip of costs
+    #: for almost no exposure. 2% of 5,00,000 is Rs 10,000.
+    min_position_pct: Pct = Decimal("2")
+    #: How far the trigger price may sit from the live price, as a percentage
+    #: of the live price, before the signal is refused (audit RSK-002). Capped
+    #: in code: a band wide enough to admit a 10x scale error is no band.
+    max_price_divergence_pct: Decimal = Field(
+        default=Decimal("1.0"), gt=0, le=MAX_PRICE_DIVERGENCE_PCT
+    )
     target_r_multiple: Decimal = Field(default=Decimal("2.0"), gt=0)
-    trailing_stop_after_r: Decimal | None = Decimal("1.0")
+    #: Must be unset. Nothing moves a stop after entry - no trailing stop is
+    #: implemented, and ``Position`` requires a long's stop below its entry,
+    #: so one past breakeven is not representable (audit NR-009). The field
+    #: defaulted to 1.0 and promised a trailing stop after 1R that never
+    #: happened; it now refuses any value until the feature exists.
+    trailing_stop_after_r: Decimal | None = None
+
+    @field_validator("trailing_stop_after_r")
+    @classmethod
+    def _trailing_not_implemented(cls, v: Decimal | None) -> Decimal | None:
+        if v is not None:
+            raise ValueError(
+                "risk.per_trade.trailing_stop_after_r must be unset: no trailing stop is "
+                "implemented, so a value here would describe a control that does not run"
+            )
+        return v
+
+    @field_validator("max_position_pct")
+    @classmethod
+    def _position_within_hard_bound(cls, v: Decimal) -> Decimal:
+        if v > MAX_POSITION_PCT:
+            raise ValueError(f"max_position_pct {v} exceeds the hard bound of {MAX_POSITION_PCT}%")
+        return v
+
+    @model_validator(mode="after")
+    def _minimum_below_maximum(self) -> Self:
+        if not 0 < self.min_position_pct < self.max_position_pct:
+            raise ValueError(
+                f"min_position_pct {self.min_position_pct} must be above 0 and below "
+                f"max_position_pct {self.max_position_pct}, or no position could ever fit"
+            )
+        return self
 
     @field_validator("risk_pct")
     @classmethod
@@ -391,7 +499,7 @@ class PortfolioRisk(_Model):
     #: either would silently move the other.
     correlation_threshold: Decimal = Field(default=Decimal("0.7"), gt=0, le=1)
     max_net_directional_exposure_pct: Pct = Decimal("60")
-    consecutive_loss_halt: int = Field(default=3, ge=1)
+    consecutive_loss_halt: int = Field(default=3, ge=1, le=MAX_CONSECUTIVE_LOSS_HALT)
 
     @field_validator("max_daily_loss_pct")
     @classmethod
@@ -404,9 +512,37 @@ class PortfolioRisk(_Model):
 
 
 class SquareOffTimes(_Model):
+    """The broker's auto square-off times - facts, not tunables (audit ENG-003).
+
+    ``MarketCalendar`` computes every deadline from its own constants
+    (``common/calendar.py``) and nothing read these, so an edit here changed
+    the documentation of the time exit and not the time exit. They must now
+    equal the calendar's; a change of exchange schedule is a code change to
+    the calendar, with its tests.
+    """
+
     cas_stocks: time = time(15, 10)
     non_cas_stocks: time = time(15, 20)
     fno: time = time(15, 25)
+
+    @model_validator(mode="after")
+    def _are_the_calendars(self) -> Self:
+        from algotrader.common import calendar
+
+        expected = {
+            "cas_stocks": calendar.SQUAREOFF_CAS_STOCKS,
+            "non_cas_stocks": calendar.SQUAREOFF_NON_CAS,
+            "fno": calendar.SQUAREOFF_FNO,
+        }
+        wrong = {k: v for k, v in expected.items() if getattr(self, k) != v}
+        if wrong:
+            raise ValueError(
+                f"risk.square_off_times {sorted(wrong)} differ from the calendar's "
+                f"{ {k: v.strftime('%H:%M') for k, v in wrong.items()} }; the deadlines "
+                f"are computed from common/calendar.py, so a different value here would "
+                f"describe a time exit that does not happen"
+            )
+        return self
 
 
 class RiskConfig(_Model):
@@ -415,7 +551,9 @@ class RiskConfig(_Model):
     capital_per_slot_pct: Pct = Decimal("20")
     per_trade: PerTradeRisk = Field(default_factory=PerTradeRisk)
     portfolio: PortfolioRisk = Field(default_factory=PortfolioRisk)
-    exit_buffer_minutes: int = Field(default=5, ge=MIN_EXIT_BUFFER_MINUTES)
+    exit_buffer_minutes: int = Field(
+        default=5, ge=MIN_EXIT_BUFFER_MINUTES, le=MAX_EXIT_BUFFER_MINUTES
+    )
     #: How much runway a NEW entry must have before this stock's square-off
     #: deadline (E14-S06, check 14).
     #:
@@ -435,7 +573,9 @@ class RiskConfig(_Model):
     #: interval is adaptive and not known at check time, so a single configured
     #: floor is the honest mechanism — revisit if the system settles on one
     #: timeframe.
-    min_minutes_to_squareoff: int = Field(default=30, ge=1)
+    min_minutes_to_squareoff: int = Field(
+        default=30, ge=MIN_ENTRY_RUNWAY_MINUTES, le=MAX_ENTRY_RUNWAY_MINUTES
+    )
     square_off_times: SquareOffTimes = Field(default_factory=SquareOffTimes)
 
     @field_validator("position_slots")
@@ -444,6 +584,17 @@ class RiskConfig(_Model):
         if v > MAX_POSITION_SLOTS:
             raise ValueError(f"position_slots {v} exceeds the hard bound of {MAX_POSITION_SLOTS}")
         return v
+
+    @model_validator(mode="after")
+    def _correlated_positions_fit_the_slots(self) -> Self:
+        """A correlation cap above the slot count can never bind (RSK-009)."""
+        if self.portfolio.max_correlated_positions > self.position_slots:
+            raise ValueError(
+                f"max_correlated_positions {self.portfolio.max_correlated_positions} "
+                f"exceeds position_slots {self.position_slots}; a cap that can never be "
+                f"reached is not a cap"
+            )
+        return self
 
     @model_validator(mode="after")
     def _slot_allocation_coherent(self) -> Self:
@@ -474,11 +625,23 @@ class ExecutionConfig(_Model):
     interval_ceiling: Timeframe = Timeframe.M15
     latency_headroom_multiplier: Decimal = Field(default=Decimal("2.0"), ge=1)
     recalibrate_interval_daily: bool = True
+    #: Read by :meth:`algotrader.broker.ratelimit.RateLimitConfig.from_execution`,
+    #: which builds the one order limiter (audit RSK-010).
     max_orders_per_second: int = Field(default=5, ge=1)
-    order_type: str = "limit"
-    limit_offset_pct: Decimal = Decimal("0.05")
-    order_timeout_sec: int = Field(default=30, ge=1)
-    no_trade_windows: list[tuple[time, time]] = Field(default_factory=list)
+    # There is no ``order_type`` here, deliberately (audit ENG-003). The file
+    # said ``order_type: limit`` with a 0.05% offset and a 30 s timeout while
+    # the gateway builds MARKET entries with market protection, and nothing
+    # read any of the three. MARKET is the decision (``execution/gateway.py``,
+    # ``build_entry``): the trigger has already been reached, and a limit that
+    # does not fill leaves the risk budget committed to a position that does
+    # not exist. Market protection is what bounds the slippage.
+    #: Entries are refused inside each window. Every window in
+    #: :data:`MANDATORY_NO_TRADE_WINDOWS` must be covered by one of these, so
+    #: the default is those windows and an empty list is refused (RSK-009,
+    #: RSK-014).
+    no_trade_windows: list[tuple[time, time]] = Field(
+        default_factory=lambda: list(MANDATORY_NO_TRADE_WINDOWS)
+    )
 
     #: Market protection for MARKET/SL-M orders. -1 = broker auto-protection.
     #: Zerodha rejects unprotected market orders from 1 Apr 2026, and 0 is
@@ -518,6 +681,28 @@ class ExecutionConfig(_Model):
     def _floor_below_ceiling(self) -> Self:
         if self.interval_floor.seconds > self.interval_ceiling.seconds:
             raise ValueError("interval_floor must not exceed interval_ceiling")
+        return self
+
+    @model_validator(mode="after")
+    def _windows_are_real_and_cover_the_mandatory_ones(self) -> Self:
+        """Each window must have start < end, and the mandatory ones must stay.
+
+        A ``(15:30, 15:00)`` window matched nothing and read as a blackout in
+        review; an empty list removed the opening and closing blocks without a
+        word (audit RSK-009).
+        """
+        for start, end in self.no_trade_windows:
+            if not start < end:
+                raise ValueError(
+                    f"no_trade_window {start:%H:%M}-{end:%H:%M} does not start before it "
+                    f"ends, so it would block nothing"
+                )
+        for start, end in MANDATORY_NO_TRADE_WINDOWS:
+            if not any(s <= start and end <= e for s, e in self.no_trade_windows):
+                raise ValueError(
+                    f"no_trade_windows must cover {start:%H:%M}-{end:%H:%M}; configuration may "
+                    f"add windows but cannot remove a mandatory one"
+                )
         return self
 
 
@@ -656,6 +841,19 @@ class StrategyEngineConfig(_Model):
 
 
 class AutonomyConfig(_Model):
+    """The autonomy ladder (``MVP_UI_AND_LEGAL.md §3.1``).
+
+    ``level`` is ENFORCED on every entry by :mod:`algotrader.execution.autonomy`
+    (audit RSK-001: it was validated and shipped as "L1 / alert only" while the
+    execution service traded on ``system.mode`` alone). L0 and L1 place
+    nothing; L2 needs a per-trade approval and L3 needs the envelope below, and
+    because neither the approval flow (E16-S03) nor the envelope evaluation
+    (E16-S02) exists yet, both refuse every entry. L4 places paper orders
+    only. The envelope numbers are therefore read by nothing yet - they are
+    E16-S02's inputs, and the level that would use them refuses until it
+    exists.
+    """
+
     level: AutonomyLevel = AutonomyLevel.L1_ALERT
     max_position_value_pct: Pct = Decimal("20")
     min_ai_confidence: Decimal = Field(default=Decimal("0.70"), ge=0, le=1)
@@ -671,6 +869,10 @@ class NotificationConfig(_Model):
     trade_alerts: bool = True
     risk_breach_alerts: bool = True
     eod_report: bool = True
+    #: Every entry waits for a human's approval, at every autonomy level.
+    #: Enforced by :mod:`algotrader.execution.autonomy` (audit RSK-001): there
+    #: is no approval channel yet (E16-S03), so while this is true no entry is
+    #: sent - which is what an approval that never arrives means.
     require_approval_before_entry: bool = True
     recipients: list[str] = Field(default_factory=list, max_length=1)
 
@@ -789,6 +991,24 @@ class AppConfig(_Model):
                     "with the broker (SEBI requirement, and it applies at every "
                     "order rate)"
                 )
+            self._live_static_ip_is_public()
+            if not self.broker.algo_tagging_confirmation.strip():
+                raise ValueError(
+                    "live mode requires broker.algo_tagging_confirmation: the broker's "
+                    "written answer on how a sub-threshold client algo's orders are "
+                    "tagged (audit LEG-001). Record the ticket, email or URL and date"
+                )
+            if self.autonomy.level is AutonomyLevel.L4_FULL_AUTO:
+                # Audit RSK-001. MVP_UI_AND_LEGAL.md 3.1: L4 'only after months of
+                # L3 evidence'. L3 cannot run until its envelope exists (E16-S02),
+                # so full autonomy on live capital is refused outright - here,
+                # where configurations are validated, because paper and live may
+                # differ in nothing else (tests/security/test_paper_isolation.py).
+                raise ValueError(
+                    "autonomy L4 is not permitted with system.mode live: full autonomy "
+                    "on live capital needs months of L3 evidence, and L3 cannot run yet"
+                )
+            self._live_is_deliberate()
             if (
                 self.execution.max_orders_per_second >= SEBI_ALGO_REGISTRATION_OPS
                 and not self.broker.algo_id
@@ -801,6 +1021,55 @@ class AppConfig(_Model):
                     f"and broker.algo_id must carry the registered Algo-ID"
                 )
         return self
+
+    def _live_static_ip_is_public(self) -> None:
+        """The whitelisted address must be a real public IP (audit RSK-008).
+
+        The gate used to be ``if not static_ip``, so ``"x"`` - or a private
+        address no broker could ever have whitelisted - satisfied it.
+        """
+        try:
+            address = ipaddress.ip_address(self.system.static_ip.strip())
+        except ValueError:
+            raise ValueError(
+                "system.static_ip is not an IP address; live mode needs the public "
+                "address the broker has whitelisted"
+            ) from None
+        if not address.is_global:
+            raise ValueError(
+                f"system.static_ip {address} is not a public address (private, "
+                f"loopback, reserved or documentation range); the broker whitelists "
+                f"the address orders arrive FROM, which is public"
+            )
+
+    def _live_is_deliberate(self) -> None:
+        """Live needs the production environment AND this file's confirmation.
+
+        Audit RSK-008: one YAML line - or an ``ALGOTRADER_CONFIG`` pointing at
+        another file - enabled real orders. Two independent conditions now
+        have to agree with the file being loaded:
+
+        * ``ALGOTRADER_ENV`` is ``production`` - a development machine cannot
+          load a live configuration by accident;
+        * ``ALGOTRADER_CONFIRM_LIVE`` equals this configuration's
+          :meth:`config_hash` - the operator confirmed THIS file, and any
+          later edit to it (or a different file) changes the hash and refuses.
+        """
+        environment = os.environ.get("ALGOTRADER_ENV", "")
+        if environment != LIVE_ENVIRONMENT:
+            raise ValueError(
+                f"live mode requires ALGOTRADER_ENV={LIVE_ENVIRONMENT}; it is "
+                f"{environment or 'unset'}"
+            )
+        expected = self.config_hash()
+        confirmed = os.environ.get(CONFIRM_LIVE_VARIABLE, "").strip()
+        if confirmed != expected:
+            raise ValueError(
+                f"live mode requires {CONFIRM_LIVE_VARIABLE} to equal this "
+                f"configuration's hash ({expected}); it is "
+                f"{'unset' if not confirmed else 'a different value'}. Confirm the file "
+                f"you mean to trade with, after its last edit"
+            )
 
     def config_hash(self) -> str:
         """Stable hash, recorded in each day's plan.

@@ -562,17 +562,21 @@ class Position(Base):
 # The partial unique indexes are defined outside __table_args__ because they
 # need column expressions. These two ARE the slot-discipline guarantee: the
 # Redis lock is the fast path, but a lock can be lost and an index cannot.
+#
+# ``status <> 'CLOSED'``, not ``= 'OPEN'`` (audit RSK-019, migration
+# 3d12560eeba9): a CLOSING position still carries live exposure, so it holds
+# its slot and its symbol until its exit fills.
 Index(
     "uq_open_slot",
     Position.slot_index,
     unique=True,
-    postgresql_where=text("status = 'OPEN'"),
+    postgresql_where=text("status <> 'CLOSED'"),
 )
 Index(
     "uq_open_symbol",
     Position.symbol_id,
     unique=True,
-    postgresql_where=text("status = 'OPEN'"),
+    postgresql_where=text("status <> 'CLOSED'"),
 )
 Index(
     "ix_positions_open",

@@ -37,6 +37,7 @@ from algotrader.execution.protective_stop import (
     StopNotEstablishedError,
     stop_client_order_id,
 )
+from tests.doubles import CountingLimiter
 
 pytestmark = [pytest.mark.integration]
 
@@ -137,6 +138,7 @@ def _position(symbol: str = "INFY", stop: str = "1179.75") -> Position:
 def _gateway(instruments, session, client, *, with_resolver: bool = True) -> OrderGateway:
     return OrderGateway(
         KiteTradingAdapter(
+            limiter=CountingLimiter(),
             auth=None,
             client=client,
             algo_id="",

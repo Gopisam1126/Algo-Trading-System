@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import redis.asyncio as aioredis
 
@@ -54,7 +55,16 @@ class RateLimitExceededError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class RateLimitConfig:
-    """Effective limits. Both must stay under what the broker permits."""
+    """Effective limits. Both must stay under what the broker permits.
+
+    **Capped by the code's hard bound, not only by SEBI's threshold** (audit
+    RSK-010). ``common.config.MAX_ORDERS_PER_SECOND`` is the project's cap -
+    half the registration threshold - and until 10 Nov 2026 this class checked
+    only the threshold, with ``order_burst`` unbounded, so a 9/sec or
+    burst-50 limiter was accepted while every document said 5. Both the rate
+    and the burst are now refused above the hard cap: a burst is orders in one
+    second too.
+    """
 
     orders_per_second: int = 3
     order_burst: int = 3
@@ -62,14 +72,37 @@ class RateLimitConfig:
     data_burst: int = 10
 
     def __post_init__(self) -> None:
+        from algotrader.common.config import MAX_ORDERS_PER_SECOND
+
         if self.orders_per_second >= SEBI_ORDER_RATE_THRESHOLD:
             raise ValueError(
                 f"orders_per_second={self.orders_per_second} is at or above SEBI's "
                 f"{SEBI_ORDER_RATE_THRESHOLD}/sec registration threshold. Staying "
                 f"below it is what keeps this a self-developed personal algo."
             )
+        for name in ("orders_per_second", "order_burst"):
+            value = getattr(self, name)
+            if value > MAX_ORDERS_PER_SECOND:
+                raise ValueError(
+                    f"{name}={value} exceeds the hard cap MAX_ORDERS_PER_SECOND="
+                    f"{MAX_ORDERS_PER_SECOND}. Configuration may lower the order rate; "
+                    f"nothing may raise it past the cap."
+                )
+        if self.orders_per_second < 1 or self.data_per_second < 1:
+            raise ValueError("a rate below 1/sec never refills")
         if self.order_burst < 1 or self.data_burst < 1:
             raise ValueError("burst capacity must be at least 1")
+
+    @classmethod
+    def from_execution(cls, execution: Any) -> RateLimitConfig:
+        """The production limits, from ``config.execution`` (audit RSK-010).
+
+        ``execution.max_orders_per_second`` was validated against the hard cap
+        and then read by nothing. It is now the order rate AND the burst: no
+        second's worth of orders may exceed the configured rate.
+        """
+        rate = int(execution.max_orders_per_second)
+        return cls(orders_per_second=rate, order_burst=rate)
 
 
 class BrokerRateLimiter:

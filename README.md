@@ -1,14 +1,17 @@
 # Algo-Trading-System
 
-AI-driven algorithmic trading platform for Indian markets (NSE/BSE). Personal use.
+Algorithmic trading system for Indian equities (NSE/BSE), intraday, through
+Zerodha Kite Connect. Personal use, own capital.
 
-Pulls real-time market data, computes technical indicators across multiple
-timeframes, monitors news and macro conditions, uses AI for pattern synthesis
-and reasoning, and executes risk-gated trades across multiple stocks
-concurrently.
+As built it is a **rule-based** engine: market data, technical indicators and a
+declarative strategy DSL feed a deterministic risk engine and order gateway. An
+AI review step (and news, macro and pre-market synthesis) is designed and **not
+built** - no LLM is called anywhere.
 
-> **Status: Phase 0 — foundation.** Safety-critical primitives are built and
-> tested (112 tests passing). Services are not yet implemented. **Nothing trades.**
+> **Status:** see [MASTER_REFERENCE.md §2](Documents/MASTER_REFERENCE.md#2-current-status--what-exists-what-doesnt),
+> the one place it is kept. In short: built and tested as components, not yet
+> runnable as a system - no process entrypoint exists - and **nothing has ever
+> traded**.
 
 ---
 

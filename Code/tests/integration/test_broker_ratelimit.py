@@ -98,7 +98,9 @@ class TestTheOrderBudgetIsEnforced:
         assert loop.time() - started < 0.5, "the limiter blocked instead of refusing"
 
     async def test_the_bucket_refills(self, r: aioredis.Redis) -> None:
-        limiter = BrokerRateLimiter(r, RateLimitConfig(orders_per_second=9, order_burst=1))
+        # 5/sec, not 9: the hard cap refuses anything above MAX_ORDERS_PER_SECOND
+        # (audit RSK-010). One token refills in 0.2 s, inside the 0.3 s sleep.
+        limiter = BrokerRateLimiter(r, RateLimitConfig(orders_per_second=5, order_burst=1))
         await limiter.acquire_order()
         with pytest.raises(RateLimitExceededError):
             await limiter.acquire_order()

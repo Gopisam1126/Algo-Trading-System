@@ -12,6 +12,13 @@ leverage*, and a default would turn "we could not reach the broker" into a
 number. Where a value may genuinely be unavailable the field is ``| None``, and
 the check that reads it is required to reject rather than assume — see
 :meth:`require`.
+
+That sentence was false until the 10 Nov 2026 audit (RSK-014):
+``open_positions=()``, ``slots_used=0``, ``correlations={}`` and ``lot_size=1``
+were permissive defaults, so a second context builder that forgot them would
+have read an empty book and passed checks 4 and 7-10. The class is keyword-only
+now and those fields have no default; what is ``| None`` defaults to ``None``,
+which every reader refuses.
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 from types import MappingProxyType
 from typing import TypeVar
@@ -91,7 +98,7 @@ class OpenPosition:
         return self.entry_price * self.quantity
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class RiskContext:
     """Everything the fourteen checks read, and nothing else.
 
@@ -142,6 +149,14 @@ class RiskContext:
     #: Closed-trade P&L for the session. **Negative is a loss.** Open positions
     #: are not in it — the name is the contract.
     realised_pnl_today: Decimal | None = None
+    #: Open quantity marked at the live price, and the charges on every order
+    #: executed today plus those that would close what is open (audit RSK-005).
+    #: The daily loss check reads realised + unrealised - charges: the
+    #: account's change for the day, not its closed trades' gross. Both are
+    #: ``None`` when unknown, which the check refuses on.
+    unrealised_pnl_today: Decimal | None = None
+    charges_today: Decimal | None = None
+    #: Completed round trips that lost money NET of charges, most recent first.
     consecutive_losses: int | None = None
 
     #: Latches for the two loss limits (E14-S05).
@@ -165,9 +180,10 @@ class RiskContext:
     consecutive_loss_halted: bool | None = None
 
     # -- portfolio ----------------------------------------------------------
-    open_positions: tuple[OpenPosition, ...] = ()
-    slots_total: int = 0
-    slots_used: int = 0
+    #: Required (RSK-014). An empty book is a claim that the book was read.
+    open_positions: tuple[OpenPosition, ...]
+    slots_total: int
+    slots_used: int
 
     # -- the symbol under consideration -------------------------------------
     #: Restrictions that BLOCK trading this symbol — T2T, ASM, GSM, F&O ban —
@@ -200,12 +216,23 @@ class RiskContext:
     #: distance is the divisor, so zero is an infinite quantity and negative is
     #: a stop on the wrong side of entry.
     atr: Decimal | None = None
-    #: Tradable unit. 1 for NSE equity; F&O contracts are not.
+    #: Tradable unit. 1 for NSE equity; F&O contracts are not. Required
+    #: (RSK-014): it comes from the instrument master, never from a default.
     #:
     #: Sizing floors to a whole multiple of this, which is what keeps realised
     #: risk inside the budget — rounding to nearest would exceed it by up to
     #: one lot's worth of stop distance on every round-up.
-    lot_size: int = 1
+    lot_size: int
+    #: The live last traded price (audit RSK-002), ``None`` when no fresh quote
+    #: exists - which the sizer refuses on. Every notional cap divides rupees
+    #: by a price, and the trigger price is the strategy's claim about the
+    #: market; this is the market's own answer, and the two must agree.
+    last_price: Decimal | None = None
+    #: The share of the sized position this signal may take, in (0, 1]
+    #: (audit RSK-006, AI-001): 0.5 for a DEGRADED strategy, 0.5 for an AI
+    #: confidence below ``min_for_full_size``. ``None`` - nobody said - is a
+    #: refusal in the sizer, not full size.
+    size_factor: Decimal | None = None
     #: Per-share margin the broker will demand. Separate from `available_margin`
     #: because the sizing cap needs both.
     margin_per_share: Decimal | None = None
@@ -218,8 +245,9 @@ class RiskContext:
     #: which omits what it cannot compute rather than fabricating a zero.
     #:
     #: Typed ``Mapping`` because it is frozen at construction — see
-    #: :meth:`_freeze_mutable_fields`.
-    correlations: Mapping[str, Decimal] = field(default_factory=dict)
+    #: :meth:`_freeze_mutable_fields`. Required (RSK-014): "no correlations
+    #: were computed" must be said, not defaulted.
+    correlations: Mapping[str, Decimal]
 
     def _freeze_mutable_fields(self) -> None:
         """Make every container field immutable, whatever the caller passed.
@@ -339,6 +367,17 @@ class RiskContext:
                 f"risk budget is divided by it, so zero is an infinite quantity "
                 f"and negative is a stop on the wrong side of entry. A name "
                 f"with no measured range belongs behind check 5, not here."
+            )
+        if self.last_price is not None and self.last_price <= 0:
+            raise RiskContextError(
+                f"last_price is {self.last_price}; a traded price is positive, and the "
+                f"price-divergence guard divides by it"
+            )
+        if self.size_factor is not None and not Decimal(0) < self.size_factor <= 1:
+            raise RiskContextError(
+                f"size_factor is {self.size_factor}. It may only REDUCE a position: "
+                f"above 1 would enlarge one past every clamp, and 0 or below is not a "
+                f"size at all"
             )
         if self.margin_per_share is not None and self.margin_per_share <= 0:
             raise RiskContextError(

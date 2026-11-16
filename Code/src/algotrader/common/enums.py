@@ -305,6 +305,15 @@ class RejectReason(StrEnum):
     #: otherwise pass. The binding constraint says which clamp it was.
     POSITION_TOO_SMALL = "POSITION_TOO_SMALL"
     TOO_CLOSE_TO_SQUAREOFF = "TOO_CLOSE_TO_SQUAREOFF"
+    #: The Recommendation's trigger price is too far from the live price to
+    #: size on (audit RSK-002). Every notional cap divides rupees by a price;
+    #: a trigger of 100 for a stock at 1,000 sized 833 shares against a 20%
+    #: cap. A signal that disagrees with the market about what the stock costs
+    #: is refused, never re-priced.
+    PRICE_DIVERGENCE = "PRICE_DIVERGENCE"
+    #: The signal's strategy is not in a state that places orders in this mode
+    #: - read from the database, never from the message (audit RSK-006).
+    STRATEGY_NOT_PERMITTED = "STRATEGY_NOT_PERMITTED"
     AI_LOW_CONFIDENCE = "AI_LOW_CONFIDENCE"
     AI_VETO = "AI_VETO"
     AI_UNAVAILABLE = "AI_UNAVAILABLE"

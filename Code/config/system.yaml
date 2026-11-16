@@ -18,8 +18,11 @@
 
 system:
   mode: paper                     # paper | alert_only | approval | live
+                                  # live also needs ALGOTRADER_ENV=production,
+                                  # ALGOTRADER_CONFIRM_LIVE=<this file's
+                                  # config_hash> and a public static_ip
   timezone: Asia/Kolkata
-  deployment_region: ap-south-1   # MUST be an India region (SEBI)
+  deployment_region: ap-south-1   # an India region - this system's own rule
   static_ip: ""                   # MUST be broker-whitelisted before live
   log_level: INFO
 
@@ -65,9 +68,11 @@ redis:
 broker:
   primary: zerodha                # angelone | zerodha | fyers | dhan | upstox
   fallback: fyers                 # free minute-level history; data redundancy
-  algo_id: ""                     # CORRECT as empty: below 10 OPS the algo is
-                                  # unregistered, so no Algo-ID exists to set.
-                                  # The broker tags the order generically.
+  algo_id: ""                     # empty: below 10 OPS the algo is unregistered
+                                  # and its orders carry a GENERIC algo ID
+  algo_tagging_confirmation: ""   # REQUIRED before live: the broker's written
+                                  # answer on who applies that generic ID
+                                  # (ticket/email/URL + date) - audit LEG-001
   auth:
     # Zerodha uses a REDIRECT flow (login URL -> request_token -> access_token),
     # not a programmatic login. The token expires daily and must be renewed
@@ -115,8 +120,11 @@ risk:
     sizing_method: atr_based
     atr_multiplier_stop: 1.5
     max_position_pct: 20
+    min_position_pct: 2           # smaller than Rs 10,000 is not worth a slot
+    max_price_divergence_pct: 1.0 # trigger vs live price; beyond -> refused
     target_r_multiple: 2.0
-    trailing_stop_after_r: 1.0
+    # trailing_stop_after_r: unset. No trailing stop is implemented, so the
+    # loader refuses any value rather than describe a control that never runs.
 
   portfolio:
     max_daily_loss_pct: 3.0       # -> halts at -Rs 15,000
@@ -148,14 +156,13 @@ execution:
                                   # 3/sec is ample and leaves large headroom.
   market_protection: -1           # REQUIRED on MARKET/SL-M from 1 Apr 2026.
                                   # -1 = broker auto-protection. 0 is rejected.
-  order_type: limit
-  limit_offset_pct: 0.05
-  order_timeout_sec: 30
+  # Entries are MARKET with market protection - see execution/gateway.py
+  # build_entry. There is no order_type / limit_offset here: nothing read them.
   max_signal_age_seconds: 60      # older Recommendations are refused, not
                                   # traded late: the entry is MARKET and sized
                                   # from the trigger price. Hard cap 300.
 
-  no_trade_windows:
+  no_trade_windows:               # config may ADD windows; these two must stay
     - ["09:15", "09:20"]          # opening noise
     - ["15:00", "15:30"]          # no new entries near close
 
@@ -215,6 +222,19 @@ strategy_engine:
     min_journal_trades: 50
 
 # ---------------------------------------------------------------------------
+# ENFORCED on every entry by execution/autonomy.py:
+#   L0 observe, L1 alert  -> no order is placed, in any mode
+#   L2 approve            -> needs a per-trade approval; no approval channel
+#                            exists yet (E16-S03), so nothing is placed
+#   L3 supervised         -> trades inside the envelope below; the envelope
+#                            evaluation does not exist yet (E16-S02), so
+#                            nothing is placed
+#   L4 full auto          -> PAPER only: a live config at L4 is refused when
+#                            it loads. Live capital at L4 needs months of L3
+#                            evidence (MVP_UI_AND_LEGAL.md 3.1), and L3 does
+#                            not exist yet.
+# A paper session that places orders therefore needs L4 AND
+# notifications.require_approval_before_entry: false.
 autonomy:
   level: L1                       # L0 observe | L1 alert | L2 approve | L3 supervised | L4 auto
   max_position_value_pct: 20
@@ -232,4 +252,5 @@ notifications:
   trade_alerts: true
   risk_breach_alerts: true
   eod_report: true
-  require_approval_before_entry: true
+  require_approval_before_entry: true   # true -> no entry is sent until an
+                                        # approval channel exists (E16-S03)

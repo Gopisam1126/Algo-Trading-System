@@ -79,11 +79,20 @@ class KiteTradingAdapter(KiteReads):
         *,
         auth: Any,
         client: Any,
-        limiter: BrokerRateLimiter | None = None,
+        limiter: BrokerRateLimiter,
         algo_id: str = "",
         margin_ttl_seconds: float = DEFAULT_MARGIN_TTL_SECONDS,
         tick_size_for: Callable[[str], Decimal] | None = None,
     ) -> None:
+        # REQUIRED (audit RSK-010). It defaulted to None, nothing in src built
+        # one, and with none every order skipped the rate limit - the broker's
+        # own 429 was the only brake. Refused at runtime too, because a caller
+        # passing None explicitly is the same hole.
+        if limiter is None:
+            raise TypeError(
+                "KiteTradingAdapter needs a BrokerRateLimiter: an adapter that can "
+                "place orders without a rate limit is not one this system builds"
+            )
         super().__init__(auth=auth, client=client, limiter=limiter)
         self._algo_id = algo_id
         self._margin_ttl = margin_ttl_seconds

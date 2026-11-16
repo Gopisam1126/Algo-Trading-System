@@ -39,8 +39,9 @@ Plus five things found while verifying the above:
   indicators. It resolved to a prebuilt Windows wheel (`ta-lib 0.7.1`). No
   action needed.
 
-Current state: **118 tests passing** (112 existing + 6 new), `mypy` clean on
-the new modules, `ruff` clean on the new files.
+(This section is a record of the Sprint 1 setup session and its counts were
+true then. What is built NOW is in `Documents/MASTER_REFERENCE.md` §2, and how
+many tests pass is what the latest CI run says - audit ENG-037.)
 
 ---
 

@@ -8,7 +8,10 @@ should stop opening new risk at all.
 
 **Decision.** Two checks — ``daily_loss`` and ``consecutive_loss`` — each
 rejecting if **either** the live figure breaches its limit **or** a latch is
-set. The latch is read here and written by E14-S09.
+set. The latch is read here and written by ``execution/loss_latch.py``, which
+arms it after every reconciliation cycle and every signal (audit RSK-003: until
+16 Nov 2026 nothing wrote it, so this "terminal for the day" halt un-halted
+itself exactly as described below).
 
 **Alternative rejected**, and it is the obvious one: a pure predicate over
 ``ctx.realised_pnl_today`` and ``ctx.consecutive_losses``. It reads correctly,
@@ -37,10 +40,17 @@ specific shape is not "one big loss" — it is the system quietly resuming after
 a limit has already fired, which is how a 3% day becomes a 9% day while every
 individual trade passes every per-trade limit.
 
-**What would make this wrong.** If the limits ever needed to consider
-*unrealised* P&L. ``realised_pnl_today`` is realised by name and by intent, so
-a day showing -1% realised and -6% mark-to-market passes both checks here.
-Whether that is right is a real question and deliberately not decided here.
+**What the daily figure is (decided 16 Nov 2026, audit RSK-005).** The
+account's change for the day: realised P&L + open positions marked at the live
+price - every transaction charge (``execution/day_ledger.py``). It used to be
+gross realised alone, so a day at -1% realised and -6% mark-to-market passed,
+and charges never counted at all. ``max_daily_loss_pct`` is a limit on THAT
+number. The losing streak counts round trips net of charges.
+
+**What would make this wrong.** A strategy that deliberately rides an open
+drawdown (a mean-reversion entry that expects to be under water first): the
+limit now fires on the drawdown itself. That is the conservative reading of
+"3% daily loss", and the one that cannot be argued past on a bad day.
 
 ## What these checks do NOT stop
 
@@ -84,22 +94,29 @@ def build_daily_loss_check(max_loss_pct: Decimal) -> RiskCheck:
     def check(rec: Recommendation, ctx: RiskContext) -> CheckOutcome:
         limit = ctx.capital * max_loss_pct / 100
         realised = ctx.require(ctx.realised_pnl_today, "today's realised P&L")
-        loss = -realised  # positive when the day is down
+        unrealised = ctx.require(ctx.unrealised_pnl_today, "the open positions' live P&L")
+        charges = ctx.require(ctx.charges_today, "today's transaction charges")
+        # Audit RSK-005: the account's change for the day. Gross realised P&L
+        # alone left open losers and every rupee of charges outside the limit.
+        day = realised + unrealised - charges
+        loss = -day  # positive when the day is down
 
         if ctx.require(ctx.daily_loss_halted, "the daily-loss halt latch"):
             return CheckOutcome.fail(
                 RejectReason.DAILY_LOSS_LIMIT,
                 f"the daily loss limit has already halted trading today "
-                f"(limit {max_loss_pct}% = {limit:.2f}; realised "
-                f"{realised:.2f}). A halt is terminal for the "
+                f"(limit {max_loss_pct}% = {limit:.2f}; the day stands at "
+                f"{day:.2f}). A halt is terminal for the "
                 f"day and only an operator clears it.",
             )
         if loss >= limit:
             return CheckOutcome.fail(
                 RejectReason.DAILY_LOSS_LIMIT,
-                f"realised loss {loss:.2f} has reached the {max_loss_pct}% "
-                f"daily limit of {limit:.2f} on capital {ctx.capital:.2f}. No "
-                f"new entries; existing positions are the operator's call.",
+                f"the day's loss {loss:.2f} (realised {realised:.2f}, open "
+                f"{unrealised:.2f}, charges {charges:.2f}) has reached the "
+                f"{max_loss_pct}% daily limit of {limit:.2f} on capital "
+                f"{ctx.capital:.2f}. No new entries; existing positions are "
+                f"the operator's call.",
             )
         return CheckOutcome.ok()
 

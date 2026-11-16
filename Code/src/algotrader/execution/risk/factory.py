@@ -55,6 +55,8 @@ def sizing_policy(config: AppConfig) -> SizingPolicy:
         target_r_multiple=risk.per_trade.target_r_multiple,
         max_sector_exposure_pct=risk.portfolio.max_sector_exposure_pct,
         max_net_directional_exposure_pct=risk.portfolio.max_net_directional_exposure_pct,
+        max_price_divergence_pct=risk.per_trade.max_price_divergence_pct,
+        min_position_pct=risk.per_trade.min_position_pct,
     )
 
 

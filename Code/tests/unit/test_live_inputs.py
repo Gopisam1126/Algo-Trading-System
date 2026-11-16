@@ -35,8 +35,10 @@ from algotrader.execution.live_inputs import (
     ATR_FRESHNESS_GRACE,
     DAILY_SLACK_SESSIONS,
     MAX_STATE_SKEW,
+    QUOTE_MAX_AGE,
     BrokerMarginPerShare,
     DailyCloseCorrelations,
+    LiveQuotePrice,
     LiveSessionFacts,
     PublishedATR,
     daily_correlations,
@@ -364,7 +366,9 @@ class Limiter:
 
 
 def _adapter(client: Any, limiter: Limiter | None = None) -> KiteTradingAdapter:
-    return KiteTradingAdapter(auth=None, client=client, limiter=limiter)  # type: ignore[arg-type]
+    # The adapter requires a limiter (audit RSK-010); these tests are about the
+    # margin read, so the default one admits every call and counts it.
+    return KiteTradingAdapter(auth=None, client=client, limiter=limiter or Limiter())  # type: ignore[arg-type]
 
 
 class TestMarginRequired:
@@ -686,25 +690,78 @@ class Recorder:
         self.calls.append(("corr", (symbol, tuple(against)), kw))
         return {"TCS": Decimal("0.1")}
 
+    async def last_price(self, symbol, **kw):
+        self.calls.append(("price", (symbol,), kw))
+        return Decimal("1200")
+
 
 class TestLiveSessionFacts:
     async def test_each_question_goes_to_its_producer_unchanged(self) -> None:
         r = Recorder()
-        facts = LiveSessionFacts(health=r, atr=r, margin=r, correlations=r)
+        facts = LiveSessionFacts(health=r, atr=r, margin=r, correlations=r, prices=r)
         assert await facts.unhealthy_services(now=NOW) == ()
         assert await facts.atr("INFY", strategy_id="orb_classic", now=NOW) == Decimal("1")
         assert await facts.margin_per_share(
             "INFY", Decimal("1200"), direction=Direction.SHORT, now=NOW
         ) == Decimal("2")
         assert await facts.correlations("INFY", ["TCS"], now=NOW) == {"TCS": Decimal("0.1")}
+        assert await facts.last_price("INFY", now=NOW) == Decimal("1200")
         assert r.calls == [
             ("health", (), {"now": NOW}),
             ("atr", ("INFY",), {"strategy_id": "orb_classic", "now": NOW}),
             ("margin", ("INFY", Decimal("1200")), {"direction": Direction.SHORT, "now": NOW}),
             ("corr", ("INFY", ("TCS",)), {"now": NOW}),
+            ("price", ("INFY",), {"now": NOW}),
         ]
 
     async def test_health_without_a_producer_is_still_unknown(self) -> None:
         r = Recorder()
-        facts = LiveSessionFacts(health=NoProducerYet(), atr=r, margin=r, correlations=r)
+        facts = LiveSessionFacts(health=NoProducerYet(), atr=r, margin=r, correlations=r, prices=r)
         assert await facts.unhealthy_services(now=NOW) is None
+
+
+# ---------------------------------------------------------------------------
+# Audit RSK-002 - the live price the trigger is checked against
+# ---------------------------------------------------------------------------
+
+
+class TestLiveQuotePrice:
+    """A quote prices a decision only while it is fresh; otherwise it is absent,
+    and the sizer refuses on absent."""
+
+    async def _price(self, quote: dict[str, Any] | str | None, *, now: dt.datetime = NOW) -> Any:
+        redis = FakeRedis()
+        if quote is not None:
+            raw = quote if isinstance(quote, str) else json.dumps(quote, default=str)
+            await redis.set(keys.quote("INFY"), raw)
+        return await LiveQuotePrice(redis).last_price("INFY", now=now)
+
+    async def test_a_fresh_quote_is_its_price(self) -> None:
+        quote = {"symbol": "INFY", "ltp": "1201.5", "as_of": NOW.isoformat(), "volume": 10}
+        assert await self._price(quote) == Decimal("1201.5")
+
+    async def test_no_quote_is_no_price(self) -> None:
+        assert await self._price(None) is None
+
+    async def test_a_quote_older_than_the_limit_is_no_price(self) -> None:
+        stale = (NOW - QUOTE_MAX_AGE - dt.timedelta(seconds=1)).isoformat()
+        assert await self._price({"ltp": "1201.5", "as_of": stale}) is None
+
+    async def test_the_limit_itself_is_still_fresh(self) -> None:
+        edge = (NOW - QUOTE_MAX_AGE).isoformat()
+        assert await self._price({"ltp": "1201.5", "as_of": edge}) == Decimal("1201.5")
+
+    async def test_a_quote_from_the_future_is_no_price(self) -> None:
+        ahead = (NOW + MAX_STATE_SKEW + dt.timedelta(seconds=1)).isoformat()
+        assert await self._price({"ltp": "1201.5", "as_of": ahead}) is None
+
+    @pytest.mark.parametrize("ltp", ["0", "-5"])
+    async def test_a_non_positive_price_is_no_price(self, ltp: str) -> None:
+        assert await self._price({"ltp": ltp, "as_of": NOW.isoformat()}) is None
+
+    async def test_an_unparseable_quote_is_no_price(self) -> None:
+        assert await self._price("{not json") is None
+
+    async def test_a_naive_timestamp_is_no_price(self) -> None:
+        naive = NOW.replace(tzinfo=None).isoformat()
+        assert await self._price({"ltp": "1201.5", "as_of": naive}) is None

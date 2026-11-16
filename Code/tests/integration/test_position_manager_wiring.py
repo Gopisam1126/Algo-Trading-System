@@ -57,6 +57,7 @@ from algotrader.execution.positions import (
     UnverifiedPosition,
 )
 from algotrader.execution.protective_stop import ProtectiveStop
+from tests.doubles import CountingLimiter
 
 pytestmark = [pytest.mark.integration]
 
@@ -219,6 +220,7 @@ class _Quote:
 def _manager(instruments, session, redis, calendar, client) -> tuple[PositionManager, Any]:
     gateway = OrderGateway(
         KiteTradingAdapter(
+            limiter=CountingLimiter(),
             auth=None,
             client=client,
             algo_id="",

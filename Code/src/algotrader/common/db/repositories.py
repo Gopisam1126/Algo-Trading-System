@@ -785,15 +785,20 @@ class OrderRepository:
         """TX2: record what the broker said, after the call has returned."""
         from sqlalchemy import update
 
-        await self._session.execute(
+        # Guarded on SUBMITTING (audit ENG-005): reconciliation may already
+        # have adopted the row and moved it on (OPEN, FILLED); writing
+        # SUBMITTED over that would move an order's state BACKWARDS.
+        result = await self._session.execute(
             update(Order)
             .where(Order.client_order_id == client_order_id)
+            .where(Order.status == "SUBMITTING")
             .values(
                 broker_order_id=broker_order_id,
                 status="SUBMITTED",
                 last_update_at=dt.datetime.now(dt.UTC),
             )
         )
+        await self._expect_one(result, client_order_id, "attach the broker id to")
 
     async def mark_rejected(self, client_order_id: str, *, reason: str | None) -> None:
         """TX2's other outcome: the broker refused the order (SIT-003).
@@ -811,15 +816,36 @@ class OrderRepository:
         """
         from sqlalchemy import update
 
-        await self._session.execute(
+        # Guarded on SUBMITTING (ENG-005): a refusal is recorded against the
+        # submission it refused, never over a state reconciliation has set.
+        result = await self._session.execute(
             update(Order)
             .where(Order.client_order_id == client_order_id)
+            .where(Order.status == "SUBMITTING")
             .values(
                 status="REJECTED",
                 rejection_reason=reason,
                 last_update_at=dt.datetime.now(dt.UTC),
             )
         )
+        await self._expect_one(result, client_order_id, "mark rejected")
+
+    async def _expect_one(self, result: Any, client_order_id: str, what: str) -> bool:
+        """An UPDATE that matched nothing is not a success (audit ENG-005).
+
+        No row at all: the key is wrong, and the caller believes it recorded
+        something it did not - raise. A row in another state: the write was
+        guarded off on purpose, so say so and report False.
+        """
+        if result.rowcount == 1:
+            return True
+        current = await self.find_by_client_order_id(client_order_id)
+        if current is None:
+            raise LookupError(f"no order {client_order_id} to {what}")
+        log.warning(
+            "did not %s %s: it is %s, not SUBMITTING", what, client_order_id, current["status"]
+        )
+        return False
 
     async def find_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
         """The recovery lookup. Hot path after an ambiguous broker failure.
@@ -906,9 +932,12 @@ class OrderRepository:
         }
         if broker_order_id is not None:
             values["broker_order_id"] = broker_order_id
-        await self._session.execute(
+        result = await self._session.execute(
             update(Order).where(Order.client_order_id == client_order_id).values(**values)
         )
+        if cast("CursorResult[Any]", result).rowcount != 1:
+            # ENG-005: a mismatched key was a silent success.
+            raise LookupError(f"no order {client_order_id} to apply the broker's state to")
 
     async def _order_to_dict(self, row: Order) -> dict[str, Any]:
         return {
@@ -968,7 +997,7 @@ class PositionRepository:
         rows = (
             (
                 await self._session.execute(
-                    select(Position).where(Position.status == PositionStatus.OPEN.value)
+                    select(Position).where(Position.status != PositionStatus.CLOSED.value)
                 )
             )
             .scalars()
@@ -981,7 +1010,9 @@ class PositionRepository:
         rows = (
             (
                 await self._session.execute(
-                    select(Position.slot_index).where(Position.status == PositionStatus.OPEN.value)
+                    select(Position.slot_index).where(
+                        Position.status != PositionStatus.CLOSED.value
+                    )
                 )
             )
             .scalars()
@@ -1014,9 +1045,14 @@ class PositionRepository:
         """
         from sqlalchemy import update
 
-        await self._session.execute(
+        # Guarded on NOT CLOSED, with the row count checked (audit ENG-005):
+        # a second close overwrote the first close's price and P&L, and a
+        # mismatched id was a silent success. The first close of a position
+        # is the record; a repeat is refused, a missing row raises.
+        result = await self._session.execute(
             update(Position)
             .where(Position.id == position_id)
+            .where(Position.status != PositionStatus.CLOSED.value)
             .values(
                 status=PositionStatus.CLOSED.value,
                 closed_at=closed_at or dt.datetime.now(dt.UTC),
@@ -1026,6 +1062,17 @@ class PositionRepository:
                 max_favourable_excursion=max_favourable_excursion,
                 max_adverse_excursion=max_adverse_excursion,
             )
+        )
+        if cast("CursorResult[Any]", result).rowcount == 1:
+            return
+        exists = (
+            await self._session.execute(select(Position.status).where(Position.id == position_id))
+        ).scalar_one_or_none()
+        if exists is None:
+            raise LookupError(f"no position {position_id} to close")
+        log.warning(
+            "position %s is already closed; the first close stands and this one is ignored",
+            position_id,
         )
 
     async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]:

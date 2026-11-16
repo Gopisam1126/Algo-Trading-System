@@ -100,3 +100,12 @@ desktop.ini
 # one that drifts.
 scripts/tracker/tracker_data.json
 scripts/tracker/tracker.html
+
+# --- Audit working folders: never published ----------------------------------
+# A security audit's findings are a map of every exploitable defect, and this
+# repository is public. The 10 Nov 2026 audit wrote _audit/ at the repository
+# root, untracked and unignored, so one `git add -A` would have published it
+# (audit GIT-001). Keep audit material out of git entirely.
+_audit/
+.ipynb_checkpoints/
+*.ipynb

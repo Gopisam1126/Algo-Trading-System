@@ -134,6 +134,12 @@ Never commit a `.env`, a credential, or anything under `data/`.
 
 ## Current state
 
+**The one authoritative status is `Documents/MASTER_REFERENCE.md` §2** - per
+package: empty, components, or composed. This section is history and lessons;
+where it and §2 disagree, §2 is right (audit ENG-038: this section said in one
+paragraph that the stop, book and reconciliation exist and in another that they
+do not). It carries no test counts (ENG-037): the latest CI run is the count.
+
 **The deterministic path runs from tick to an approved `RiskDecision` and now
 through `execution/gateway.py` to a submitted broker order.** The keystone
 sentence that led this file for months — *"nothing turns that decision into an
@@ -162,9 +168,8 @@ timer that gives every position its time exit (E15-S06) now exist. **A gateway i
 system**, and E15-S04's rule is the one to hold onto: a position without a live
 stop must not survive a cycle.
 
-Built and tested (**3,258 tests, 94% coverage** as of E13-S01, 4 Nov 2026 —
-all pass locally with Docker running;
-without it the container-backed integration tests skip and coverage reads lower):
+Built and tested as components (counts: the latest CI run; it must say
+0 skipped - without Docker the container-backed tests skip):
 
 - **Foundations** — domain models, config with hard bounds, `SecretString`,
   redacting logging, NSE calendar, broker protocol, strategy DSL.
@@ -274,20 +279,16 @@ without it the container-backed integration tests skip and coverage reads lower)
   17 killed.
 
 **Empty (`__init__.py` only):** `orchestrator/`, `premarket/`, `api/`,
-`notifier/`, `ai/`, `macro/` — six of thirteen packages (`signals/` has the
-loop since E13-S01).
-`execution/` holds `risk/`, `sizer.py`, `slots.py`, `halt.py`, `gateway.py` and
-`order_state.py`. **Order PLACEMENT exists; order MANAGEMENT does not** — an
-approved decision reaches a broker and its lifecycle is now a validated state
-machine, but nothing attaches a protective stop (E15-S04), nothing manages a
-position (E15-S05), and nothing reconciles against the broker (E15-S09). The
-system still cannot trade safely, and the reason is now specific rather than
-total.
+`notifier/`, `ai/`, `macro/` - six of thirteen packages. `execution/` holds the
+whole order path: risk engine, sizer, slots, halt and loss latches, gateway and
+state machine, protective stop, position book, reconciliation, square-off,
+autonomy gate, day ledger and the service that drives them. **Nothing composes
+it into a process yet** (no entrypoint, E23-S03).
 
 ### The architectural fact to keep in mind
 
 **Nothing composes the packages that are built.** No module in `src/` imports
-both `ingest` and `indicators`. The 1,933 tests are claims about *components*;
+both `ingest` and `indicators`. The tests are claims about *components*;
 there is exactly one test of the *system*, `tests/integration/test_tick_to_trigger.py`,
 written deliberately to find what component tests cannot — and it found a
 HIGH-severity defect on its first run. Assembly is E11 and E13. Until it
@@ -813,6 +814,28 @@ Recorded because each was believed, written down, and wrong.
   a suite that called itself green. Use `item.get_closest_marker(...)`. A test
   that quietly stops running is worse than one that fails, because nothing
   asks why.
+
+### The 10 Nov 2026 audit, and what it found that QA had not
+
+An independent read-only audit of d4b43f4 reported 126 findings (1 Critical,
+7 High). Remediated from 16 Nov 2026; `Documents/BACKLOG_Tracker.xlsx` (epic
+E24) records each. The shapes worth remembering, because each passed QA:
+
+- **"A validated config key is a control."** The autonomy ladder, the approval
+  flag, the order-rate cap, the AI confidence gates and the entry order type
+  were validated and read by NOTHING - L1 "alert only" would have traded live.
+  `tests/unit/test_config_honesty.py` now holds every key to a reader or a named
+  owning story. Grep for a field's readers before believing it binds.
+- **"The latch is read, so it is armed."** Nothing ever armed the two loss
+  latches; every SIT proving a halt "stays halted" armed it by hand.
+  `execution/loss_latch.py` is the writer. A test that sets up the state it
+  claims the system produces proves the reader, not the system.
+- **"Realised P&L is the day's P&L."** Gross, closed trades only: open losers,
+  every charge and every unbooked round trip were outside the loss limit.
+  `execution/day_ledger.py` reads today's orders, net of charges.
+- **"The trigger is the price."** Nothing compared it with the market, and
+  every cap divides by it. The sizer now requires a fresh live price and
+  refuses a trigger more than 1% away.
 
 ### What the whole-system audit checked and did not break
 

@@ -47,8 +47,21 @@ Each of these is audited under stage ``EXECUTION`` with its reason:
 * **A mode that places no orders** - ``alert_only`` never trades and
   ``approval`` needs a human confirmation flow that does not exist yet, so
   both refuse rather than send.
+* **An autonomy level that places no orders** - :mod:`.autonomy` (audit
+  RSK-001). The level and ``require_approval_before_entry`` were validated and
+  read by nothing.
 * **AI veto** - none of the fourteen checks reads the verdict; a VETO that
   reached this stream must still not trade.
+* **AI confidence below ``ai.confidence.min_to_act``, or a timeframe
+  conflict** - audit AI-001: both gates were configured and read by nothing,
+  so a WEAK review at confidence 0 was sized like a CONFIRM at 0.99. Between
+  ``min_to_act`` and ``min_for_full_size`` the entry is sized at
+  :data:`REDUCED_SIZE_FACTOR`.
+* **A strategy whose state does not place orders in this mode** - audit
+  RSK-006. A DEGRADED strategy trades at :data:`DEGRADED_SIZE_FACTOR`
+  (``STRATEGY_ENGINE.md §4``: "ACTIVE -> DEGRADED, 50% size"); a state read
+  from the database, never from the message, because a signal cannot be
+  trusted to say how much it may trade.
 * **Stale or future-dated** - the entry is MARKET and sized from the trigger
   price, so a signal acted on late is sized for a price that has moved.
 * **A duplicate** - redelivery is normal on an at-least-once stream. If this
@@ -66,6 +79,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
@@ -81,6 +95,7 @@ from algotrader.common.enums import (
     OrderIntent,
     RejectReason,
     Side,
+    StrategyState,
     SystemMode,
 )
 from algotrader.common.events import stream as streams
@@ -89,7 +104,9 @@ from algotrader.common.metrics import get_metrics
 from algotrader.common.models.trading import OrderRequest, Recommendation, RiskDecision
 from algotrader.common.redis import keys
 from algotrader.common.text import one_safe_line
+from algotrader.execution.autonomy import entry_refusal
 from algotrader.execution.gateway import RateLimitedError, client_order_id
+from algotrader.execution.loss_latch import LossLatch
 from algotrader.execution.positions import EntryPlan
 from algotrader.execution.reconciliation import CycleReport, Reconciler, ReconciliationLoop
 from algotrader.execution.risk.factory import build_risk_engine
@@ -141,6 +158,27 @@ MAX_CLOCK_SKEW: Final = dt.timedelta(seconds=5)
 #: The modes in which this service sends orders. PAPER relies on the process
 #: entrypoint handing the gateway a paper placer - see the story's notes.
 TRADING_MODES: Final = frozenset({SystemMode.PAPER, SystemMode.LIVE})
+#: The strategy states whose signals this service sends, by mode (RSK-006).
+#: LIVE takes only the states that place live orders; PAPER also takes the
+#: PAPER state, which is what a paper-trading strategy is for. Anything else -
+#: SHADOW, DRAFT, RETIRED, QUARANTINED, unknown - has no business on
+#: ``stream:signals``, and is refused rather than trusted.
+PERMITTED_STATES: Final = {
+    SystemMode.LIVE: frozenset({StrategyState.ACTIVE, StrategyState.DEGRADED}),
+    SystemMode.PAPER: frozenset(
+        {StrategyState.PAPER, StrategyState.ACTIVE, StrategyState.DEGRADED}
+    ),
+}
+#: ``STRATEGY_ENGINE.md §4``: "ACTIVE -> DEGRADED, 50% size".
+DEGRADED_SIZE_FACTOR: Final = Decimal("0.5")
+#: ``ai.confidence.min_for_full_size``: "below this -> reduced size". The
+#: documents give no figure; half size is the decision (audit AI-001), the same
+#: reduction a degraded strategy gets, so the two compose to a quarter.
+REDUCED_SIZE_FACTOR: Final = Decimal("0.5")
+#: A timeframe conflict (``ai.confidence.treat_conflict_as_no_trade``) is fewer
+#: than this many of the three timeframes agreeing - a majority disagreeing.
+#: The same majority ``autonomy.min_timeframe_agreement`` ships with.
+MIN_TIMEFRAMES_AGREEING: Final = 2
 
 
 class Outcome(StrEnum):
@@ -282,6 +320,10 @@ class ExecutionService:
         heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._mode = config.system.mode
+        self._autonomy = config.autonomy.level
+        self._approval_required = config.notifications.require_approval_before_entry
+        self._confidence = config.ai.confidence
+        self._store = store
         self._max_age = dt.timedelta(seconds=config.execution.max_signal_age_seconds)
         self._calendar = calendar
         self._gateway = gateway
@@ -317,6 +359,17 @@ class ExecutionService:
             pending=self._pending,
             facts=facts,
         )
+        #: Audit RSK-003: the one writer of the two loss latches. Built here,
+        #: like the loop and the timer, so the service cannot run without it.
+        self._latch = LossLatch(
+            capital=config.risk.capital,
+            max_daily_loss_pct=config.risk.portfolio.max_daily_loss_pct,
+            consecutive_loss_halt=config.risk.portfolio.consecutive_loss_halt,
+            halts=halts,
+        )
+        #: How long a transient failure in one of ``run``'s loops waits before
+        #: the loop tries again (audit ENG-001).
+        self._retry_after = 1.0
         #: Built here so that it can only ever hold THIS service's lock.
         self._loop = ReconciliationLoop(
             reconciler,
@@ -366,8 +419,14 @@ class ExecutionService:
 
     @property
     def ready(self) -> bool:
-        """Restored, and reconciled against the broker at least once."""
-        return self._restored and self._reconciled
+        """Restored, reconciled once, and the MOST RECENT cycle succeeded.
+
+        Audit RSK-011: this was a one-way latch - after the first good cycle,
+        signals kept being sized and sent while later cycles failed, for the
+        60-90 s until the third failure armed BROKER_DISCONNECTED. A book
+        whose last check against the broker failed is an unverified book.
+        """
+        return self._restored and self._reconciled and self._loop.consecutive_failures == 0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -395,6 +454,7 @@ class ExecutionService:
         report = await self._loop.on_reconnect()
         if report is not None:
             self._reconciled = True
+            await self.enforce_loss_limits()
         await self.sweep()
         return report
 
@@ -403,9 +463,25 @@ class ExecutionService:
         report = await self._loop.tick()
         if report is not None:
             self._reconciled = True
+            await self.enforce_loss_limits()
         self._check_timer_liveness()
         await self.sweep()
         return report
+
+    async def enforce_loss_limits(self) -> None:
+        """Arm a loss latch the day has breached (audit RSK-003). Never raises.
+
+        After every successful cycle, because that is when closes are booked
+        and fills written back. A failure here is logged, not raised: it must
+        not take the reconciliation loop down with it, and the per-signal
+        check refuses on the same breach - or on the unknown figure - anyway.
+        """
+        now = self._clock()
+        try:
+            ledger = await self._contexts.ledger(now=now, trade_date=now.astimezone(IST).date())
+            await self._latch.observe(ledger, now=now)
+        except Exception:
+            log.exception("could not evaluate the loss limits after a cycle")
 
     async def sweep(self) -> TimerReport | None:
         """One square-off sweep, under the lock, once the book is restored.
@@ -459,15 +535,28 @@ class ExecutionService:
             group.create_task(self._heartbeat_until(stop))
             group.create_task(self._consume_until(source, stop))
 
+    # Each loop below survives a transient failure (audit ENG-001). Inside the
+    # TaskGroup, one exception cancelled its siblings: a Redis blip reading
+    # stream:signals stopped reconciliation AND the square-off timer with
+    # positions open. The exit path must outlive the entry path, so a failed
+    # iteration is logged and retried; while reconciliation fails, `ready` is
+    # False and entries are refused (RSK-011), which is the safe direction.
+
     async def _reconcile_until(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
-            await self.tick()
+            try:
+                await self.tick()
+            except Exception:
+                log.exception("a reconciliation iteration raised; retrying")
             await self._sleep(self._interval)
 
     async def _squareoff_until(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             self._timer_heartbeat = self._clock()
-            await self.sweep()
+            try:
+                await self.sweep()
+            except Exception:
+                log.exception("a square-off sweep raised; retrying")
             await self._sleep(self._timer_interval)
 
     async def _heartbeat_until(self, stop: asyncio.Event) -> None:
@@ -507,10 +596,19 @@ class ExecutionService:
         return state
 
     async def _consume_until(self, source: SignalSource, stop: asyncio.Event) -> None:
-        await source.start()
+        started = False
         while not stop.is_set():
-            for delivery in await source.next_batch():
-                await self.deliver(source, delivery)
+            try:
+                if not started:
+                    await source.start()
+                    started = True
+                for delivery in await source.next_batch():
+                    await self.deliver(source, delivery)
+            except Exception:
+                # Nothing consumed is nothing sent; an unacknowledged entry is
+                # redelivered and the duplicate check makes that harmless.
+                log.exception("reading stream:signals raised; retrying")
+                await self._sleep(self._retry_after)
 
     async def deliver(self, source: SignalSource, delivery: Delivery) -> SignalResult | None:
         """Handle one stream entry, then acknowledge it - or dead-letter it.
@@ -589,10 +687,30 @@ class ExecutionService:
                 client_order_id=cid,
             )
 
+        state = await self._strategy_state(rec.strategy_id)
+        permitted = PERMITTED_STATES.get(self._mode, frozenset())
+        if state not in permitted:
+            return SignalResult(
+                Outcome.REFUSED,
+                f"strategy {one_safe_line(rec.strategy_id)} is "
+                f"{state.value if state is not None else 'not readable'}, which does not "
+                f"place {self._mode.value} orders",
+                reason=RejectReason.STRATEGY_NOT_PERMITTED,
+                client_order_id=cid,
+            )
+
         try:
-            built = await self._contexts.build(rec, now=now, trade_date=trade_date)
+            built = await self._contexts.build(
+                rec, now=now, trade_date=trade_date, size_factor=self._size_factor(rec, state)
+            )
         except ContextUnavailableError as exc:
             return SignalResult(Outcome.REFUSED, str(exc), reason=RejectReason.RISK_ENGINE_FAULT)
+        # RSK-003: a breach visible in this signal's context arms its latch now,
+        # not at the next cycle. The check below refuses on the live figure too.
+        try:
+            await self._latch.observe(built.ledger, now=now)
+        except Exception:
+            log.exception("could not arm a loss latch for a breach seen at signal time")
 
         decision = self._engine.evaluate(rec, built.context)
         await self._write_engine_audit()
@@ -631,9 +749,31 @@ class ExecutionService:
             return SignalResult(
                 Outcome.REFUSED, f"system mode is {self._mode.value}, which places no orders"
             )
+        autonomy = entry_refusal(level=self._autonomy, approval_required=self._approval_required)
+        if autonomy is not None:
+            # No reason code, for the same reason as the mode: a configured
+            # level is a choice, not a fault.
+            return SignalResult(Outcome.REFUSED, autonomy)
         if rec.ai_verdict is AIVerdict.VETO:
             return SignalResult(
                 Outcome.REFUSED, "the AI review vetoed this signal", reason=RejectReason.AI_VETO
+            )
+        if rec.ai_confidence < self._confidence.min_to_act:
+            return SignalResult(
+                Outcome.REFUSED,
+                f"AI confidence {rec.ai_confidence} is below ai.confidence.min_to_act "
+                f"{self._confidence.min_to_act}",
+                reason=RejectReason.AI_LOW_CONFIDENCE,
+            )
+        if (
+            self._confidence.treat_conflict_as_no_trade
+            and rec.timeframe_agreement < MIN_TIMEFRAMES_AGREEING
+        ):
+            return SignalResult(
+                Outcome.REFUSED,
+                f"only {rec.timeframe_agreement} of 3 timeframes agree; a conflict is no "
+                f"trade (ai.confidence.treat_conflict_as_no_trade)",
+                reason=RejectReason.TIMEFRAME_CONFLICT,
             )
         age = now - rec.emitted_at
         if age > self._max_age:
@@ -651,6 +791,35 @@ class ExecutionService:
                 reason=RejectReason.STALE_DATA,
             )
         return None
+
+    def _size_factor(self, rec: Recommendation, state: StrategyState) -> Decimal:
+        """How much of the sized position this signal may take. Never above 1.
+
+        DEGRADED halves it (RSK-006); a confidence below ``min_for_full_size``
+        halves it (AI-001); both quarter it. Applied by the sizer to the final
+        quantity, AFTER every clamp, so a reduction cannot be absorbed by a cap
+        that was binding anyway - the position cap binds on most trades under
+        the shipped config (RSK-020), and a factor on the risk budget alone
+        would then reduce nothing.
+        """
+        factor = Decimal(1)
+        if state is StrategyState.DEGRADED:
+            factor *= DEGRADED_SIZE_FACTOR
+        if rec.ai_confidence < self._confidence.min_for_full_size:
+            factor *= REDUCED_SIZE_FACTOR
+        return factor
+
+    async def _strategy_state(self, strategy_id: str) -> StrategyState | None:
+        """The strategy's state as the database holds it; unreadable is None."""
+        try:
+            raw = await self._store.strategy_state(strategy_id)
+        except Exception:
+            log.warning("could not read the state of strategy %s", strategy_id, exc_info=True)
+            return None
+        try:
+            return StrategyState(raw) if raw is not None else None
+        except ValueError:
+            return None
 
     async def _send(
         self,

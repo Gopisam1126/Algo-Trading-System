@@ -335,6 +335,19 @@ class GatewayPolicy:
                 "configured while protecting nothing."
             )
 
+    @classmethod
+    def from_config(cls, config: Any) -> GatewayPolicy:
+        """The production policy, from ``AppConfig`` (audit ENG-003).
+
+        ``execution.market_protection`` and ``broker.algo_id`` were validated
+        and read by nothing - no code in src built a ``GatewayPolicy``, so the
+        composition root would have restated both numbers by hand.
+        """
+        return cls(
+            algo_id=config.broker.algo_id or None,
+            market_protection=config.execution.market_protection,
+        )
+
 
 class OrderGateway:
     """Turns an approved decision into a submitted order. The only path."""

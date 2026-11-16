@@ -107,9 +107,11 @@ async def take_token(
     an order delayed past its trigger price is worse than an order not placed.
 
     ``capacity`` is the burst allowance and ``refill_per_second`` the sustained
-    rate. For the broker limiter both come from config, which is itself capped
-    by ``MAX_ORDERS_PER_SECOND`` in code — configuration can tune this limiter
-    but cannot raise it past the SEBI-safe bound.
+    rate. For the broker limiter both come from
+    ``broker.ratelimit.RateLimitConfig``, built from ``execution.
+    max_orders_per_second`` and refusing a rate OR a burst above
+    ``MAX_ORDERS_PER_SECOND`` (audit RSK-010: this sentence said so before
+    anything made it true).
     """
     if capacity <= 0:
         raise RateLimiterConfigError("capacity must be positive")

@@ -9,9 +9,11 @@ at a time.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
+from typing import ClassVar
 
 import pytest
 
@@ -54,9 +56,13 @@ class FakeRedis:
         self._check()
         return self.data.get(key)
 
-    async def set(self, key: str, value: str, **kwargs) -> bool:
+    async def set(self, key: str, value: str, **kwargs) -> bool | None:
+        # Honours NX like real Redis (audit ENG-019 made arm() depend on it):
+        # a double that set unconditionally would hide the race arm() closes.
         self._check()
         self.set_calls.append((key, kwargs))
+        if kwargs.get("nx") and key in self.data:
+            return None
         self.data[key] = value
         return True
 
@@ -470,3 +476,151 @@ class TestTheRecordRoundTrips:
         explain it. The description must still say something useful."""
         state = HaltState(True, False, False, {})
         assert "could not be read" in state.describe()
+
+
+# ---------------------------------------------------------------------------
+# Audit 10 Nov 2026 - ENG-019 (arm was GET-then-SET), RSK-016 (no human
+# trigger, nothing cleared), RSK-003 (the "who arms what" claim was false)
+# ---------------------------------------------------------------------------
+
+
+class _InterleavingRedis(FakeRedis):
+    """Lets another task run between any two Redis calls, as the event loop does."""
+
+    async def get(self, key: str) -> str | None:
+        await asyncio.sleep(0)
+        return await super().get(key)
+
+    async def set(self, key: str, value: str, **kwargs) -> bool | None:
+        await asyncio.sleep(0)
+        return await super().set(key, value, **kwargs)
+
+
+class TestArmingIsAtomic:
+    async def test_two_interleaved_arms_keep_the_first_reason(self) -> None:
+        """Reconciliation and the square-off timer run as sibling tasks. With
+        GET-then-SET both read 'absent' and the second overwrote the first."""
+        client = _InterleavingRedis()
+        controller = HaltController(client)  # type: ignore[arg-type]
+        first, second = await asyncio.gather(
+            controller.arm(HaltReason.NAKED_POSITION, detail="a", armed_by="stop", now=NOW),
+            controller.arm(HaltReason.POSITION_NOT_HELD, detail="b", armed_by="timer", now=NOW),
+        )
+        stored = (await controller.state()).records["kill_switch"]
+        assert stored.reason is HaltReason.NAKED_POSITION
+        assert first.reason is second.reason is HaltReason.NAKED_POSITION
+
+    async def test_the_write_is_a_set_if_absent_with_no_expiry(self) -> None:
+        controller, client = _controller()
+        await controller.arm(HaltReason.MANUAL, detail="x", armed_by="op", now=NOW)
+        _, kwargs = client.set_calls[0]
+        assert kwargs.get("nx") is True
+        assert not {"ex", "px", "exat", "pxat", "keepttl"} & set(kwargs)
+
+
+def _halt_script():
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "halt.py"
+    spec = importlib.util.spec_from_file_location("halt_script", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["halt_script"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestTheOperatorCommand:
+    """RSK-016: the kill switch had no human trigger in code, and nothing
+    called clear()."""
+
+    async def test_arm_halts_with_a_manual_reason_and_the_operators_name(self) -> None:
+        script = _halt_script()
+        controller, _ = _controller()
+        code = await script.run(
+            ["arm", "--operator", "Gopi", "--detail", "news I do not like"], controller, now=NOW
+        )
+        assert code == 0
+        state = await controller.state()
+        assert state.kill_switch
+        record = state.records["kill_switch"]
+        assert record.reason is HaltReason.MANUAL and record.armed_by == "Gopi"
+
+    async def test_status_exits_one_while_halted(self) -> None:
+        script = _halt_script()
+        controller, _ = _controller()
+        assert await script.run(["status"], controller, now=NOW) == 0
+        await controller.arm(HaltReason.MANUAL, detail="x", armed_by="op", now=NOW)
+        assert await script.run(["status"], controller, now=NOW) == 1
+
+    async def test_clear_needs_a_person_and_what_they_checked(self) -> None:
+        script = _halt_script()
+        controller, _ = _controller()
+        await controller.arm(HaltReason.DAILY_LOSS_LIMIT, detail="x", armed_by="latch", now=NOW)
+        refused = await script.run(
+            ["clear", "--operator", "system", "--acknowledge", "fine"], controller, now=NOW
+        )
+        assert refused == 2
+        assert (await controller.state()).daily_loss, "a non-person cleared nothing"
+        cleared = await script.run(
+            [
+                "clear",
+                "--operator",
+                "Gopi",
+                "--acknowledge",
+                "reviewed the day",
+                "--latch",
+                "daily_loss",
+            ],
+            controller,
+            now=NOW,
+        )
+        assert cleared == 0
+        assert not (await controller.state()).any_halted
+
+
+class TestWhoArmsWhatIsTrue:
+    """halt.py's table of producers, held to the source tree. Its predecessor
+    sentence ('every other auto-trigger has a real input today') was false for
+    four reasons, and nothing checked it."""
+
+    #: reason -> the src files that may arm it. Empty = declared, no producer.
+    TABLE: ClassVar[dict[HaltReason, set[str]]] = {
+        HaltReason.MANUAL: set(),  # scripts/halt.py, outside src
+        HaltReason.DAILY_LOSS_LIMIT: {"execution/loss_latch.py"},
+        HaltReason.CONSECUTIVE_LOSS_LIMIT: {"execution/loss_latch.py"},
+        HaltReason.BROKER_DISCONNECTED: {"execution/reconciliation.py"},
+        HaltReason.UNKNOWN_POSITION: {"execution/reconciliation.py"},
+        HaltReason.DUPLICATE_ORDER: {"execution/reconciliation.py"},
+        HaltReason.NAKED_POSITION: {"execution/protective_stop.py", "execution/reconciliation.py"},
+        HaltReason.POSITION_NOT_HELD: {"execution/reconciliation.py", "execution/squareoff.py"},
+        HaltReason.STALE_FEED: set(),
+        HaltReason.MARGIN_SHORTFALL: set(),
+    }
+
+    def test_the_table_covers_every_reason(self) -> None:
+        assert set(self.TABLE) == set(HaltReason)
+
+    def test_every_producer_in_src_is_in_the_table(self) -> None:
+        import re
+        from pathlib import Path
+
+        src = Path(__file__).resolve().parents[2] / "src" / "algotrader"
+        found: dict[HaltReason, set[str]] = {r: set() for r in HaltReason}
+        for path in src.rglob("*.py"):
+            rel = path.relative_to(src).as_posix()
+            if rel == "execution/halt.py":
+                continue
+            text = path.read_text(encoding="utf-8")
+            for name in re.findall(r"\.arm\(\s*HaltReason\.([A-Z_]+)", text):
+                found[HaltReason[name]].add(rel)
+        assert found == self.TABLE
+
+    def test_the_operator_command_arms_manual(self) -> None:
+        from pathlib import Path
+
+        script = Path(__file__).resolve().parents[2] / "scripts" / "halt.py"
+        text = script.read_text(encoding="utf-8")
+        assert "HaltReason.MANUAL" in text and ".clear(" in text

@@ -31,7 +31,6 @@ from algotrader.execution.session_context import (
     RepositoryContextStore,
     RiskContextBuilder,
     restrictions_from,
-    session_losses,
     session_start,
 )
 
@@ -96,7 +95,8 @@ class Store:
             "INFY": {**CLEAN, "is_cas_stock": False},
             "TCS": {**CLEAN, "is_cas_stock": True},
         }
-        self.closed: list[dict[str, Any]] = []
+        #: Today's orders, the day ledger's input (audit RSK-004/RSK-005).
+        self.orders: list[dict[str, Any]] = []
         self.occupied: set[int] = set()
         self.fail: set[str] = set()
 
@@ -104,9 +104,9 @@ class Store:
         if op in self.fail:
             raise ConnectionError(f"{op} is unreachable")
 
-    async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]:
-        self._maybe("closed_since")
-        return list(self.closed)
+    async def orders_since(self, since: dt.datetime) -> list[dict[str, Any]]:
+        self._maybe("orders_since")
+        return list(self.orders)
 
     async def occupied_slots(self) -> set[int]:
         self._maybe("occupied_slots")
@@ -160,6 +160,9 @@ class Facts:
     async def correlations(self, symbol, against, *, now):
         return {s: Decimal("0.1") for s in against}
 
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        return Decimal("1200.00")
+
 
 class Book:
     def __init__(self, positions: list[Any] | None = None) -> None:
@@ -194,7 +197,7 @@ def _builder(
 
 
 async def _build(builder: RiskContextBuilder, symbol: str = "INFY"):
-    return await builder.build(_rec(symbol), now=NOW, trade_date=TRADE_DATE)
+    return await builder.build(_rec(symbol), now=NOW, trade_date=TRADE_DATE, size_factor=Decimal(1))
 
 
 def _held(symbol: str = "SBIN") -> UnverifiedPosition:
@@ -244,25 +247,11 @@ class TestRestrictions:
         assert restrictions_from({**CLEAN, flag: None}) != ()
 
 
-class TestSessionLosses:
-    def test_no_closed_trades_is_zero_and_no_streak(self) -> None:
-        assert session_losses([]) == (Decimal(0), 0)
-
-    def test_the_total_is_the_sum_and_the_streak_counts_back_from_the_end(self) -> None:
-        rows = [{"realized_pnl": Decimal(p)} for p in ("500", "-200", "-300")]
-        assert session_losses(rows) == (Decimal("0"), 2)
-
-    def test_a_win_ends_a_streak(self) -> None:
-        rows = [{"realized_pnl": Decimal(p)} for p in ("-200", "-300", "100")]
-        assert session_losses(rows) == (Decimal("-400"), 0)
-
-    def test_break_even_neither_extends_nor_ends_a_streak(self) -> None:
-        rows = [{"realized_pnl": Decimal(p)} for p in ("-200", "0", "-300", "0")]
-        assert session_losses(rows) == (Decimal("-500"), 2)
-
-    def test_one_trade_without_a_pnl_makes_both_unknown(self) -> None:
-        rows = [{"realized_pnl": Decimal("-200")}, {"realized_pnl": None}]
-        assert session_losses(rows) == (None, None)
+class TestSessionStart:
+    """`session_losses` was replaced by the day ledger (audit RSK-004/RSK-005,
+    16 Nov 2026), which reads today's ORDERS rather than closed positions; its
+    total, streak, break-even and unknown-input properties are tested in
+    tests/unit/test_day_ledger.py, net of charges."""
 
     def test_the_day_starts_at_midnight_ist(self) -> None:
         assert session_start(TRADE_DATE) == dt.datetime(2026, 8, 24, 18, 30, tzinfo=dt.UTC)
@@ -387,18 +376,44 @@ class TestTheBuilder:
         built = await _build(_builder(margins=margins))
         assert built.context.available_margin is None
 
-    async def test_unreadable_closed_trades_leave_both_loss_figures_unknown(self) -> None:
+    async def test_unreadable_orders_leave_every_loss_figure_unknown(self) -> None:
         store = Store()
-        store.fail = {"closed_since"}
+        store.fail = {"orders_since"}
         built = await _build(_builder(store=store))
         assert built.context.realised_pnl_today is None
+        assert built.context.unrealised_pnl_today is None
+        assert built.context.charges_today is None
         assert built.context.consecutive_losses is None
 
     async def test_the_days_losses_reach_the_context(self) -> None:
+        """Two losing round trips of 10 shares: -12 and -8 gross; each pays
+        brokerage on both legs, so both are net losers and the streak is 2."""
         store = Store()
-        store.closed = [{"realized_pnl": Decimal("-1200")}, {"realized_pnl": Decimal("-800")}]
+        at = NOW - dt.timedelta(hours=1)
+        for loss, minute in (("12", 0), ("8", 10)):
+            corr = uuid4()
+            store.orders += [
+                {
+                    "correlation_id": corr,
+                    "symbol": "SBIN",
+                    "side": "BUY",
+                    "filled_quantity": 10,
+                    "average_price": Decimal("800"),
+                    "last_update_at": at + dt.timedelta(minutes=minute),
+                },
+                {
+                    "correlation_id": corr,
+                    "symbol": "SBIN",
+                    "side": "SELL",
+                    "filled_quantity": 10,
+                    "average_price": Decimal("800") - Decimal(loss) / 10,
+                    "last_update_at": at + dt.timedelta(minutes=minute + 1),
+                },
+            ]
         built = await _build(_builder(store=store))
-        assert built.context.realised_pnl_today == Decimal("-2000")
+        assert built.context.realised_pnl_today == Decimal("-20")
+        assert built.context.unrealised_pnl_today == 0
+        assert built.context.charges_today is not None and built.context.charges_today > 0
         assert built.context.consecutive_losses == 2
 
     async def test_with_no_producers_every_live_input_is_unknown(self) -> None:
@@ -429,7 +444,9 @@ class TestTheBuilder:
         rec = _rec("INFY").model_copy(
             update={"strategy_id": "orb_short_v2", "direction": Direction.SHORT}
         )
-        await _builder(facts=Asked()).build(rec, now=NOW, trade_date=TRADE_DATE)
+        await _builder(facts=Asked()).build(
+            rec, now=NOW, trade_date=TRADE_DATE, size_factor=Decimal(1)
+        )
         assert asked["atr"] == {"symbol": "INFY", "strategy_id": "orb_short_v2", "now": NOW}
         assert asked["margin"] == {
             "symbol": "INFY",
@@ -512,7 +529,7 @@ class TestPendingEntriesCountAsHeld:
 
 
 class TestTheRepositoryStore:
-    async def test_it_answers_from_the_three_repositories(self) -> None:
+    async def test_it_answers_from_its_repositories(self) -> None:
         class Positions:
             async def closed_since(self, since):
                 return [{"realized_pnl": Decimal("1")}]
@@ -528,10 +545,48 @@ class TestTheRepositoryStore:
             async def for_symbol(self, symbol, trade_date):
                 return {"symbol": symbol, "trade_date": trade_date}
 
+        class Strategies:
+            async def strategy_by_id(self, strategy_id):
+                return (
+                    {"strategy_id": strategy_id, "state": "DEGRADED"}
+                    if strategy_id == "s"
+                    else None
+                )
+
+        class Orders:
+            async def orders_placed_since(self, since):
+                return [{"client_order_id": "x", "placed_at": since}]
+
         store = RepositoryContextStore(
-            positions=Positions(), instruments=Instruments(), daily_status=Daily()
+            orders=Orders(),
+            positions=Positions(),
+            instruments=Instruments(),
+            daily_status=Daily(),
+            strategies=Strategies(),
         )
+        # RSK-006: the strategy's state, from the strategy table.
+        assert await store.strategy_state("s") == "DEGRADED"
+        assert await store.strategy_state("unregistered") is None
         assert await store.occupied_slots() == {1}
-        assert await store.closed_since(NOW) == [{"realized_pnl": Decimal("1")}]
+        assert await store.orders_since(NOW) == [{"client_order_id": "x", "placed_at": NOW}]
         assert (await store.profile("INFY"))["sector"] == "IT"
         assert (await store.daily_status("INFY", TRADE_DATE))["trade_date"] == TRADE_DATE
+
+
+class TestTheLivePriceAndSizeFactorReachTheContext:
+    """Audit RSK-002 and RSK-006: both are inputs the sizer refuses without."""
+
+    async def test_both_arrive(self) -> None:
+        built = await _builder().build(
+            _rec("INFY"), now=NOW, trade_date=TRADE_DATE, size_factor=Decimal("0.5")
+        )
+        assert built.context.last_price == Decimal("1200.00")
+        assert built.context.size_factor == Decimal("0.5")
+
+    async def test_a_failed_price_read_is_none_not_a_guess(self) -> None:
+        class NoQuote(Facts):
+            async def last_price(self, symbol, *, now):
+                raise ConnectionError("redis is down")
+
+        built = await _build(_builder(facts=NoQuote()))
+        assert built.context.last_price is None

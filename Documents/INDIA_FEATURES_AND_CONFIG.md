@@ -7,7 +7,7 @@
 **Then:** [MVP_UI_AND_LEGAL.md](MVP_UI_AND_LEGAL.md) — MVP feature scope, autonomy model, UI/admin design, Indian legal & tax framework
 **Also:** [STRATEGY_ENGINE.md](STRATEGY_ENGINE.md) — strategy DSL, AI generation, validation gauntlet · [VERIFICATION_REPORT.md](VERIFICATION_REPORT.md) — cross-document audit
 **Scope:** NSE/BSE Indian equities and (optionally) F&O. Multi-stock, intraday-focused.
-**Status:** Pre-implementation specification. No code written.
+**Status:** Specification. Parts are built and parts are planned; what exists today is in [MASTER_REFERENCE.md §2](MASTER_REFERENCE.md#2-current-status--what-exists-what-doesnt) (corrected 16 Nov 2026, audit ENG-049). The config schema in §8 is the *design*; `Code/config/system.yaml` and `tests/unit/test_config_honesty.py` say which keys are read today.
 **Last updated:** 2026-08-04
 
 ---

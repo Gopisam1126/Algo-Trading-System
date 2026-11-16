@@ -74,7 +74,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from algotrader.common.enums import RejectReason
+from algotrader.common.enums import Direction, RejectReason
 from algotrader.common.models.trading import Recommendation
 from algotrader.execution.risk.context import RiskContext
 from algotrader.execution.risk.framework import CheckOutcome, RiskCheck
@@ -242,7 +242,15 @@ def build_net_exposure_check(max_pct: Decimal) -> RiskCheck:
     def check(rec: Recommendation, ctx: RiskContext) -> CheckOutcome:
         net = ctx.net_exposure()
         pct = _pct_of(abs(net), ctx.capital)
-        if pct >= max_pct:
+        # Audit RSK-017: refuse only a candidate that would ADD to the lean. A
+        # short into a book at +60% reduces directional risk, and the sizer's
+        # signed headroom (``cap + net`` for a short) exists to permit exactly
+        # that trade; this check refused it while permitting nothing better.
+        # A flat book (net 0) has no lean to add to.
+        adds_to_lean = (net > 0 and rec.direction is Direction.LONG) or (
+            net < 0 and rec.direction is Direction.SHORT
+        )
+        if pct >= max_pct and adds_to_lean:
             side = "long" if net > 0 else "short"
             return CheckOutcome.fail(
                 RejectReason.NET_EXPOSURE_LIMIT,

@@ -14,7 +14,7 @@
 | **Medium** (contradictions between documents) | 6 | ✅ All fixed |
 | **Low** (typos, minor drift) | 3 | ✅ All fixed |
 | **Gaps** (missing capability) | 1 major | ✅ New document written |
-| **Verified correct** | 14 checks | ✅ No action needed |
+| **Verified correct** | 14 checks | ✅ 11 verified; 3 doc-consistent only (rows 1, 11, 13 - corrected 16 Nov 2026) |
 
 **Headline finding:** [ARCHITECTURE_RESEARCH.md](ARCHITECTURE_RESEARCH.md) was written before the project scoped to Indian markets and still recommended **Alpaca and Interactive Brokers as brokers, US data vendors, and the US Pattern Day Trader rule as the regulatory frame.** Anyone reading the documents in the prescribed order would have started by building the wrong broker integration against the wrong regulator. This has been corrected throughout.
 
@@ -90,7 +90,7 @@ These were explicitly checked and found consistent across all documents:
 
 | # | Check | Result |
 |---|---|---|
-| 1 | Model IDs (`claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5`) | ✅ Consistent in docs 2, 3, 4; all valid current IDs |
+| 1 | Model IDs (`claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5`) | 📄 Consistent in docs 2, 3, 4. "All valid current IDs" was asserted, not checked against Anthropic's model list, and no code calls a model (audit HAL-003); re-verify against the Models API when the client is built (E10-S01) |
 | 2 | Model tiering rationale (Opus pre-market, Sonnet in-session, Haiku triage) | ✅ Consistent |
 | 3 | Square-off times (15:10 CAS / 15:20 non-CAS / 15:25 F&O) | ✅ Consistent in docs 2, 3, 4 |
 | 4 | Order rate cap (5/sec system vs 10/sec SEBI threshold) | ✅ Consistent |
@@ -100,10 +100,10 @@ These were explicitly checked and found consistent across all documents:
 | 8 | Daily loss limit arithmetic | ✅ 3.0% of ₹500,000 = ₹15,000 |
 | 9 | SEBI constraints (10 OPS, static IP, India hosting, daily re-auth, Algo-ID) | ✅ Consistent in docs 2, 3, 4 |
 | 10 | "AI never sizes positions" principle | ✅ Enforced identically — `Recommendation` type has no quantity field |
-| 11 | Fail-closed behaviour on every AI failure path | ✅ Consistent |
+| 11 | Fail-closed behaviour on every AI failure path | 📄 **Doc-consistent only** - no AI layer exists to verify (audit ENG-050). The token-budget row was not even that, and is corrected (AI-002) |
 | 12 | Tax treatment (intraday = speculative, ITR-3, turnover = absolute sum of P&L) | ✅ Correct per research |
-| 13 | Prompt-injection defence (sanitize → structured output → bounded score) | ✅ Consistent between docs 3 and 4 |
-| 14 | Kill switch semantics (halts new entries, does not auto-liquidate) | ✅ Consistent |
+| 13 | Prompt-injection defence (sanitize → structured output → bounded score) | 📄 **Doc-consistent only** between docs 3 and 4 - no news or AI code exists (audit ENG-050) |
+| 14 | Kill switch semantics (halts new entries, does not auto-liquidate) | ✅ Consistent, and built (`execution/halt.py`, `scripts/halt.py`) |
 
 ---
 
@@ -229,8 +229,9 @@ added to LOW_LEVEL_ARCHITECTURE.md §1.1.
 - **`pykiteconnect` 5.1.0 lacks `market_protection`.** A plain
   `pip install kiteconnect` yields a version that cannot place compliant market
   orders. Verify the installed version before live trading.
-- **NSE holiday list is an empty placeholder.** Until populated, every weekday
-  is treated as a trading day.
+- ~~**NSE holiday list is an empty placeholder.**~~ **Resolved 24 Aug 2026**
+  (blocker B3, PRE_LIVE_CHECKLIST): the 2026 list is populated and verified.
+  Struck rather than deleted, 16 Nov 2026 (audit ENG-050), so the history stays.
 
 ---
 

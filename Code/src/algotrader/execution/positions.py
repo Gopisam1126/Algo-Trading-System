@@ -291,6 +291,26 @@ def confirm_fill(order: Order) -> FilledEntry:
     )
 
 
+def anchored_stop(direction: Direction, *, fill: Decimal, sizing: SizingResult) -> Decimal:
+    """The stop for a position that FILLED at ``fill`` (audit RSK-013).
+
+    The sizer computed quantity and stop from the trigger price, and the entry
+    is a MARKET order, so the fill is rarely the trigger. Keeping the sizer's
+    stop with the real fill made realised risk ``quantity x |fill - stop|`` -
+    116% of the budget at a 10-rupee slip, with nothing re-checking it.
+
+    The stop distance is what the risk budget was divided by, so anchoring it
+    at the FILL keeps ``quantity x distance <= budget`` true. The tighter of the
+    two stops is taken: an adverse fill moves the stop with it, a favourable
+    one keeps the approved stop (already less than one distance away, so risk
+    is under budget). A stop is never loosened.
+    """
+    distance = abs(sizing.entry_price - sizing.stop_price)
+    if direction is Direction.LONG:
+        return max(sizing.stop_price, fill - distance)
+    return min(sizing.stop_price, fill + distance)
+
+
 # ---------------------------------------------------------------------------
 # Marks
 # ---------------------------------------------------------------------------
@@ -727,6 +747,20 @@ class PositionManager:
                 f"entry. The holding was exited at market and is not a position. "
                 f"({one_safe_line(str(exc))})"
             ) from exc
+
+        anchored = anchored_stop(direction, fill=entry.price, sizing=sizing)
+        if anchored != position.stop_price:
+            log.info(
+                "%s filled at %s against a %s trigger; stop tightened %s -> %s so the "
+                "risk stays inside the approved budget",
+                order.symbol,
+                entry.price,
+                sizing.entry_price,
+                position.stop_price,
+                anchored,
+            )
+            # Rebuilt, not model_copy: construction re-validates the stop side.
+            position = Position(**{**position.model_dump(), "stop_price": anchored})
 
         position_id = await self._store.open_position(
             {

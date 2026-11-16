@@ -40,6 +40,7 @@ from algotrader.execution.positions import (
     ProtectedPosition,
     UnprotectableFillError,
     UnverifiedPosition,
+    anchored_stop,
     confirm_fill,
 )
 from algotrader.execution.protective_stop import (
@@ -772,6 +773,52 @@ class TestAFillThroughItsOwnStop:
         tracked = await _open(manager, _order(price="1186.4600"), _sizing(stop="1186.4500"))
         assert isinstance(tracked, ProtectedPosition)
         assert protector.exited == []
+
+
+class TestTheStopFollowsTheFill:
+    """Audit RSK-013: the entry is MARKET and the sizer sized from the trigger,
+    so keeping the sizer's stop with the real fill made realised risk
+    qty x |fill - stop| - 116% of the budget at a 10-rupee slip.
+
+    Trigger 1200, stop 1186.45: the distance is 13.55, and qty x 13.55 is the
+    approved risk. Every expectation below is that distance applied by hand.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_adverse_fill_moves_the_stop_with_it(self) -> None:
+        """Long filled at 1210: stop 1210 - 13.55 = 1196.45, not 1186.45."""
+        manager, protector, store, _m, _c = _manager()
+        await _open(manager, _order(price="1210.0000"), _sizing())
+        assert protector.attached[0].stop_price == Decimal("1196.4500")
+        assert store.inserts[0]["stop_price"] == Decimal("1196.4500")
+        risk = (Decimal("1210") - protector.attached[0].stop_price) * 100
+        assert risk == Decimal("1355.00"), "realised risk is the approved risk"
+
+    @pytest.mark.asyncio
+    async def test_a_favourable_fill_keeps_the_approved_stop(self) -> None:
+        """Long filled at 1190: 1190 - 13.55 = 1176.45 would LOOSEN it; kept at 1186.45."""
+        manager, protector, _s, _m, _c = _manager()
+        await _open(manager, _order(price="1190.0000"), _sizing())
+        assert protector.attached[0].stop_price == Decimal("1186.4500")
+
+    @pytest.mark.asyncio
+    async def test_a_short_filled_low_moves_its_stop_down(self) -> None:
+        """Short, trigger 1200, stop 1214 (distance 14), filled at 1190:
+        stop 1190 + 14 = 1204."""
+        manager, protector, _s, _m, _c = _manager()
+        await _open(
+            manager,
+            _order(side=Side.SELL, price="1190.0000"),
+            _sizing(stop="1214.0000", target="1170.0000"),
+        )
+        assert protector.attached[0].stop_price == Decimal("1204.0000")
+
+    def test_the_rule_never_loosens(self) -> None:
+        sizing = _sizing()
+        for fill in ("1150", "1187", "1200", "1250"):
+            assert anchored_stop(Direction.LONG, fill=Decimal(fill), sizing=sizing) >= Decimal(
+                "1186.4500"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ from algotrader.broker.kite.trading import KiteTradingAdapter
 from algotrader.common.enums import OrderIntent, OrderType, Product, Side
 from algotrader.common.models.trading import OrderRequest
 from algotrader.common.secrets import SecretString
+from tests.doubles import CountingLimiter
 
 TOKEN = "kite_access_token_SUPERSECRET_9f2b"
 API_SECRET = "api_secret_DO_NOT_LEAK_7c1d"
@@ -271,7 +272,7 @@ class TestMarketProtectionCannotBeSkipped:
 
     @pytest.fixture
     def adapter(self) -> KiteTradingAdapter:
-        return KiteTradingAdapter(auth=_auth(), client=object())
+        return KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=object())
 
     def test_a_protected_market_order_builds(self, adapter: KiteTradingAdapter) -> None:
         params = adapter._build_params(_market_request())
@@ -309,7 +310,10 @@ class TestMarketProtectionCannotBeSkipped:
         market protection and must not be confused with it here.
         """
         priced = KiteTradingAdapter(
-            auth=_auth(), client=object(), tick_size_for=lambda _s: Decimal("0.05")
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=object(),
+            tick_size_for=lambda _s: Decimal("0.05"),
         )
         request = _market_request(
             order_type=OrderType.LIMIT,
@@ -344,7 +348,7 @@ class TestTheIdempotencyKeySurvivesTheBrokerField:
 
     def test_the_submitted_tag_matches_what_recovery_searches_for(self) -> None:
         """The two paths must agree, or idempotency is decorative."""
-        adapter = KiteTradingAdapter(auth=_auth(), client=object())
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=object())
         client_order_id = "c" * 32
         submitted = adapter._build_params(_market_request(client_order_id=client_order_id))["tag"]
         assert submitted == mapping.broker_tag(client_order_id)
@@ -355,11 +359,15 @@ class TestAlgoIdIsOptionalByDesign:
         """SEBI's framework has the BROKER tag sub-10-OPS strategies, and
         Zerodha's compliance guidance never asks the developer to supply one.
         Sending an empty string would be worse than sending nothing."""
-        adapter = KiteTradingAdapter(auth=_auth(), client=object(), algo_id="")
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=object(), algo_id=""
+        )
         assert "algo_id" not in adapter._build_params(_market_request())
 
     def test_a_configured_algo_id_is_attached(self) -> None:
-        adapter = KiteTradingAdapter(auth=_auth(), client=object(), algo_id="GENERIC123")
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=object(), algo_id="GENERIC123"
+        )
         assert adapter._build_params(_market_request())["algo_id"] == "GENERIC123"
 
 

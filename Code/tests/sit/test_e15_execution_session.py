@@ -80,6 +80,7 @@ from algotrader.indicators.engine import IndicatorSet
 from algotrader.indicators.publish import publish_indicator_state
 from algotrader.ingest.quotes import QuoteState
 from algotrader.strategy.dsl import load_strategy_yaml
+from tests.doubles import CountingLimiter, MarketAt, RegisteredStrategies
 
 pytestmark = [pytest.mark.integration]
 
@@ -267,6 +268,10 @@ class Facts:
     async def correlations(self, symbol, against, *, now):
         return {s: Decimal("0.1") for s in against}
 
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        # Audit RSK-002: the market agrees with every recommendation's trigger.
+        return Decimal("1200.00")
+
 
 class Clock:
     def __init__(self, now: dt.datetime) -> None:
@@ -295,7 +300,11 @@ class Day:
         self.clock = clock or Clock(_ist(9, 10))
         self.redis = redis
         adapter = KiteTradingAdapter(
-            auth=None, client=self.account, algo_id="", tick_size_for=instruments.tick_size
+            limiter=CountingLimiter(),
+            auth=None,
+            client=self.account,
+            algo_id="",
+            tick_size_for=instruments.tick_size,
         )
         orders = OrderRepository(session, instruments)
         gateway = OrderGateway(
@@ -319,12 +328,15 @@ class Day:
             audit=audit.write,
         )
         config = AppConfig(
+            # Audit RSK-001: L4 without approval places (paper) orders.
+            autonomy={"level": "L4"},
+            notifications={"require_approval_before_entry": False},
             execution={
                 "no_trade_windows": [
                     (dt.time(9, 15), dt.time(9, 20)),
                     (dt.time(15, 0), dt.time(15, 30)),
                 ]
-            }
+            },
         )
         self.service = ExecutionService(
             config=config,
@@ -340,6 +352,10 @@ class Day:
                 positions=positions,
                 instruments=instruments,
                 daily_status=DailyStatusRepository(session, instruments),
+                # Audit RSK-006: execution reads the strategy's state; RSK-004/5:
+                # the day ledger reads today's orders.
+                strategies=RegisteredStrategies({"orb_long_v1": "ACTIVE", "orb_classic": "ACTIVE"}),
+                orders=orders,
             ),
             orders=orders,
             redis=redis,
@@ -633,7 +649,16 @@ class TestSit22NoPositionSurvivesItsDeadline:
         ).all()
         assert [r.exit_reason for r in rows] == ["TIME", "TIME", "TIME"]
         assert all(held["quantity"] == 0 for held in day.account.net.values()), "flat at close"
-        assert not (await day.halts.state()).any_halted
+        # CHANGED 16 Nov 2026 (audit RSK-003/RSK-005). This asserted that no
+        # latch at all was set. The day ends with three round trips time-exited
+        # at their entry price, and net of charges each LOST money - so the
+        # loss latch, which nothing armed before, now arms the losing-streak
+        # halt at the third. That is the control working. What this session
+        # must never produce is a FAULT halt (kill switch) or a daily-loss one.
+        state = await day.halts.state()
+        assert not state.kill_switch and not state.daily_loss
+        assert state.consecutive_loss
+        assert state.records["consecutive_loss"].armed_by == "loss-latch"
 
     async def test_a_restart_after_the_deadline_still_squares_off_before_the_broker(
         self, session, instruments, redis, audit, calendar
@@ -847,6 +872,7 @@ class TestSit23ASessionSizedFromTheLiveInputs:
                 correlations=DailyCloseCorrelations(
                     BarRepository(session, instruments), calendar=calendar
                 ),
+                prices=MarketAt(Decimal("1200.00")),
             )
 
         account = SettlingAccount()
@@ -918,7 +944,16 @@ class TestSit23ASessionSizedFromTheLiveInputs:
         audited = await _audited(session)
         for rec in published:
             assert str(rec.correlation_id) in audited, f"{rec.symbol} left no audit row"
-        assert not (await day.halts.state()).any_halted
+        # CHANGED 16 Nov 2026 (audit RSK-003/RSK-005). This asserted that no
+        # latch at all was set. The day ends with three round trips time-exited
+        # at their entry price, and net of charges each LOST money - so the
+        # loss latch, which nothing armed before, now arms the losing-streak
+        # halt at the third. That is the control working. What this session
+        # must never produce is a FAULT halt (kill switch) or a daily-loss one.
+        state = await day.halts.state()
+        assert not state.kill_switch and not state.daily_loss
+        assert state.consecutive_loss
+        assert state.records["consecutive_loss"].armed_by == "loss-latch"
         assert desk.calls >= 4, "every sized signal asked the broker"
 
 
@@ -960,6 +995,7 @@ class TestSit24TheHealthGateThroughASession:
                 correlations=DailyCloseCorrelations(
                     BarRepository(session, instruments), calendar=calendar
                 ),
+                prices=MarketAt(Decimal("1200.00")),
             )
 
         account = SettlingAccount()

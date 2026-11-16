@@ -81,6 +81,8 @@ def _context(**overrides: object) -> RiskContext:
         "kill_switch_active": False,
         "unhealthy_services": (),
         "realised_pnl_today": Decimal(0),
+        "unrealised_pnl_today": Decimal(0),
+        "charges_today": Decimal(0),
         "consecutive_losses": 0,
         "daily_loss_halted": False,
         "consecutive_loss_halted": False,
@@ -89,6 +91,10 @@ def _context(**overrides: object) -> RiskContext:
         "capital": Decimal("500000"),
         "slots_total": 5,
         "slots_used": 0,
+        # Audit RSK-014: the book fields are required.
+        "open_positions": (),
+        "correlations": {},
+        "lot_size": 1,
     }
     kwargs.update(overrides)
     return RiskContext(**kwargs)  # type: ignore[arg-type]

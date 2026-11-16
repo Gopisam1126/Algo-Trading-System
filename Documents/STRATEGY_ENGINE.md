@@ -2,7 +2,7 @@
 ## User-Authored & AI-Generated Strategies with Overfitting Defence
 
 **Document type:** Subsystem design specification
-**Status:** Design complete, pre-implementation
+**Status:** Design specification. Parts are built and parts are planned; what exists today is in [MASTER_REFERENCE.md §2](MASTER_REFERENCE.md#2-current-status--what-exists-what-doesnt) (corrected 16 Nov 2026, audit ENG-049 - this header said no code had been written).
 **Version:** 1.0 — 2026-08-04
 
 > 📘 **New here? Start with [MASTER_REFERENCE.md](MASTER_REFERENCE.md)** — the single onboarding document covering the whole system.

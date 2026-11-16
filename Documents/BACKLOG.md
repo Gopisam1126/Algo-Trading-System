@@ -1244,7 +1244,7 @@ USD/INR and crude effects on sector expectations.
 **Tasks**
 - [ ] Redis counter for daily token spend
 - [ ] Alert at `alert_at_pct`
-- [ ] **Hard stop at 100% → degrade to score-only mode, keep trading**
+- [ ] **Hard stop at 100% → no new entries; open positions still managed; alert** (corrected 16 Nov 2026, audit AI-002 - "keep trading" was an unreviewed order)
 - [ ] Per-tier cost attribution
 - [ ] Daily cost report
 

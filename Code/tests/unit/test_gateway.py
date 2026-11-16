@@ -582,7 +582,7 @@ class TestThePolicyRefusesUnsafeConfiguration:
             _policy(market_protection=Decimal("0"))
 
     async def test_a_missing_algo_id_is_the_expected_state_not_a_gap(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """CORRECTED 9 Sep 2026, and the correction is the point.
 
@@ -610,11 +610,14 @@ class TestThePolicyRefusesUnsafeConfiguration:
 
         assert MAX_ORDERS_PER_SECOND < SEBI_ALGO_REGISTRATION_OPS
 
-        live = AppConfig().model_dump()
+        from tests.doubles import live_config
+
+        live = AppConfig().model_dump(mode="json")
         live["system"]["mode"] = "live"
         live["system"]["static_ip"] = "1.2.3.4"
         live["broker"]["algo_id"] = ""
-        assert AppConfig(**live).broker.algo_id == ""
+        live["broker"]["algo_tagging_confirmation"] = "Zerodha ticket TEST-1"  # LEG-001
+        assert live_config(monkeypatch, live).broker.algo_id == ""
 
     async def test_live_mode_still_refuses_to_load_without_a_static_ip(self) -> None:
         """The obligation that did NOT dissolve, kept adjacent to the one that
