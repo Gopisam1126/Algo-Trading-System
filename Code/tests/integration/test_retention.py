@@ -320,7 +320,20 @@ class TestCompressionPolicyHealth:
     async def test_zero_compressed_chunks_is_not_an_error_on_a_young_database(
         self, session: AsyncSession
     ) -> None:
-        """Nothing is 90 days old yet. That is expected, not a failure."""
+        """Nothing is 90 days old yet. That is expected, not a failure.
+
+        CHANGED 16 Nov 2026. This read the shared database as it found it and
+        assumed it was young. It stopped being young on the calendar: other
+        tests write bars with fixed August 2026 dates, which crossed the 90-day
+        compression threshold in mid-November, and a compressed chunk stays
+        compressed after the fixture's DELETE empties it. The test now MAKES the
+        young database it is about - every ohlcv chunk dropped inside this
+        test's transaction, which the fixture rolls back.
+        """
+        await session.execute(
+            text("SELECT drop_chunks('ohlcv', older_than => now() + interval '100 years')")
+        )
         status = await retention.compression_status(session, "ohlcv")
+        assert status.total_chunks == 0
         assert status.compressed_chunks == 0
         assert status.healthy

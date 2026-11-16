@@ -110,6 +110,35 @@ def _both():
     )
 
 
+class TestTheDayIsRealisedPlusOpenLessCharges:
+    """Audit RSK-005: the limit read gross realised P&L, so open losers and every
+    rupee of charges were outside it. Mutation testing (16 Nov 2026) found no
+    test that failed when charges were dropped from the figure - these are it."""
+
+    def test_charges_take_a_gross_loss_over_the_limit(self) -> None:
+        """The audit's own case: -14,990 gross with 50 in charges is -15,040."""
+        ctx = _ctx(realised_pnl_today=Decimal("-14990"), charges_today=Decimal("50"))
+        outcome = _daily()(_rec(), ctx)
+        assert not outcome.passed
+        assert outcome.reason is RejectReason.DAILY_LOSS_LIMIT
+
+    def test_open_losses_take_the_day_over_the_limit(self) -> None:
+        """-12,000 realised and -6,000 open is -18,000: past a 15,000 limit."""
+        ctx = _ctx(realised_pnl_today=Decimal("-12000"), unrealised_pnl_today=Decimal("-6000"))
+        assert not _daily()(_rec(), ctx).passed
+
+    def test_the_same_gross_loss_without_charges_passes(self) -> None:
+        """The control: 14,990 alone is under the limit."""
+        assert _daily()(_rec(), _ctx(realised_pnl_today=Decimal("-14990"))).passed
+
+    def test_an_unknown_charge_figure_raises_rather_than_reading_as_zero(self) -> None:
+        """The engine turns the raise into a RISK_ENGINE_FAULT rejection."""
+        from algotrader.execution.risk.context import RiskContextError
+
+        with pytest.raises(RiskContextError, match="transaction charges"):
+            _daily()(_rec(), _ctx(charges_today=None))
+
+
 class TestAC1DailyLossLimit:
     def test_a_loss_at_the_limit_rejects(self) -> None:
         outcome = _daily()(_rec(), _ctx(realised_pnl_today=-LIMIT_RUPEES))
