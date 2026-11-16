@@ -307,3 +307,12 @@ class TestTheShapeOfTheGraph:
                         seen.add(target)
                         frontier.append(target)
             assert seen & terminal, f"{start.value} can never reach a terminal state"
+
+
+def test_a_recovered_submission_may_be_found_part_filled() -> None:
+    """Audit ENG-018: the recovery query after a lost response can find the
+    order already PART-filled; SUBMITTING had no edge to PARTIAL."""
+    from algotrader.common.enums import OrderStatus
+    from algotrader.execution.order_state import assert_legal
+
+    assert_legal(OrderStatus.SUBMITTING, OrderStatus.PARTIAL)

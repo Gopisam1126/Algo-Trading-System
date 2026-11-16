@@ -89,10 +89,10 @@ import logging
 from dataclasses import dataclass
 from typing import Protocol
 
-from algotrader.common.enums import OrderStatus
+from algotrader.common.enums import OrderIntent, OrderStatus
 from algotrader.common.models.trading import Order, Position
 from algotrader.common.text import one_safe_line
-from algotrader.execution.gateway import Closable, client_order_id
+from algotrader.execution.gateway import Closable, client_order_id, protective_keys
 from algotrader.execution.halt import HaltReason
 
 log = logging.getLogger(__name__)
@@ -130,6 +130,16 @@ class StopNotEstablishedError(StopFailureError):
     """
 
 
+class StopUnverifiedError(StopFailureError):
+    """The stop was submitted and its state could not be READ (audit TRD-006).
+
+    Neither established nor failed: the position is booked as unverified and
+    reconciliation settles it. Raising a bare exception here used to leave a
+    persisted OPEN row and a possibly-live stop with no book entry - so the
+    square-off timer, which walks only the book, never time-exited it.
+    """
+
+
 class NakedPositionError(StopFailureError):
     """The stop failed AND the emergency close failed. The session is halted.
 
@@ -156,6 +166,12 @@ class StopGateway(Protocol):
     async def submit_exit(self, position: Closable, *, trade_date: dt.date) -> str: ...
 
     async def find_order(self, client_order_id_: str) -> Order | None: ...
+
+    async def current_key(
+        self, position: Closable, *, intent: OrderIntent, trade_date: dt.date
+    ) -> str: ...
+
+    async def cancel(self, client_order_id_: str) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -262,10 +278,13 @@ class ProtectiveStop:
                 f"position belongs to must be unambiguous."
             )
 
-        cid = stop_client_order_id(position, trade_date=trade_date)
         try:
             broker_order_id = await self._gateway.submit_stop(position, trade_date=trade_date)
         except Exception as exc:
+            # TRD-005: an AMBIGUOUS submit may have landed. Cancel whatever is
+            # working under this stop's keys before the exit, so a stop that
+            # did land cannot later sell shares the exit already sold.
+            await self._cancel_stops(position, trade_date=trade_date)
             # Deliberately total. Every failure to submit a stop has the same
             # response, and enumerating broker exception types here would mean
             # a new one silently became "protected".
@@ -280,9 +299,28 @@ class ProtectiveStop:
                 f"was exited at market. Cause: {one_safe_line(str(exc))}"
             ) from exc
 
-        # Submitted is not protected. Ask the broker.
-        order = await self._gateway.find_order(cid)
+        # Submitted is not protected. Ask the broker - for the attempt just
+        # submitted, which after a re-placed stop is not attempt 0 (TRD-001).
+        cid = await self._gateway.current_key(
+            position, intent=OrderIntent.STOP, trade_date=trade_date
+        )
+        try:
+            order = await self._gateway.find_order(cid)
+        except Exception as exc:
+            # TRD-006: the verifying read itself failed. Whether a stop is
+            # working is UNKNOWN - so neither "protected" (it may not be) nor
+            # an emergency exit (it may be, and the exit would double it).
+            # The caller books the position as unverified; reconciliation asks
+            # the broker again within a cycle and adopts or exits it.
+            raise StopUnverifiedError(
+                f"the stop for {position.symbol} was submitted as {broker_order_id} but "
+                f"its state could not be read ({type(exc).__name__}); the position is "
+                f"booked unverified for reconciliation to prove or exit"
+            ) from exc
         if not is_live(order):
+            # TRD-005: it may still be WORKING in a status nobody modelled
+            # (RECONCILE_REQUIRED is not live, and is not dead either).
+            await self._cancel_stops(position, trade_date=trade_date)
             observed = "absent from the orderbook" if order is None else order.status.value
             await self._emergency_close(
                 position,
@@ -318,7 +356,9 @@ class ProtectiveStop:
         and rejected afterwards — the case the story's build concern names, and
         the one no synchronous check can reach.
         """
-        cid = stop_client_order_id(position, trade_date=trade_date)
+        cid = await self._gateway.current_key(
+            position, intent=OrderIntent.STOP, trade_date=trade_date
+        )
         return is_live(await self._gateway.find_order(cid))
 
     async def exit_is_live(self, target: Closable, *, trade_date: dt.date) -> bool:
@@ -330,7 +370,10 @@ class ProtectiveStop:
         CRITICAL "NAKED POSITION" line and counts a stop failure on every call,
         and an alarm that repeats every cycle stops being read.
         """
-        return is_live(await self._gateway.find_order(_exit_cid(target, trade_date)))
+        cid = await self._gateway.current_key(
+            target, intent=OrderIntent.SQUAREOFF, trade_date=trade_date
+        )
+        return is_live(await self._gateway.find_order(cid))
 
     async def adopt(
         self, position: Position, *, trade_date: dt.date, now: dt.datetime
@@ -351,7 +394,9 @@ class ProtectiveStop:
         """
         if now.tzinfo is None:
             raise ValueError(f"adopt timestamp {now!r} is naive")
-        cid = stop_client_order_id(position, trade_date=trade_date)
+        cid = await self._gateway.current_key(
+            position, intent=OrderIntent.STOP, trade_date=trade_date
+        )
         order = await self._gateway.find_order(cid)
         if not is_live(order) or order is None or not order.broker_order_id:
             return None
@@ -408,7 +453,10 @@ class ProtectiveStop:
             # Found by the STRIDE pass against this story's own diff
             # (QA-E15-11); the first version logged "closed at market" having
             # verified nothing.
-            if not is_live(await self._gateway.find_order(_exit_cid(position, trade_date))):
+            exit_key = await self._gateway.current_key(
+                position, intent=OrderIntent.SQUAREOFF, trade_date=trade_date
+            )
+            if not is_live(await self._gateway.find_order(exit_key)):
                 raise StopFailureError(
                     f"the exit for {position.symbol} was submitted as {exit_id} but "
                     f"the broker does not list it as live"
@@ -446,6 +494,29 @@ class ProtectiveStop:
             position.symbol,
             exit_id,
         )
+
+    async def cancel_stops(self, position: Closable, *, trade_date: dt.date) -> None:
+        """Cancel whatever is working under any of this position's stop keys."""
+        await self._cancel_stops(position, trade_date=trade_date)
+
+    async def _cancel_stops(self, position: Closable, *, trade_date: dt.date) -> None:
+        """Best effort, never raises: cancel every attempt of this stop.
+
+        Each cancel is a no-op for an attempt the broker does not list or that
+        is already terminal. A cancel that fails is logged - the exit that
+        follows still goes, because an unprotected position is the worse state,
+        and reconciliation finds an orphaned stop (TRD-008).
+        """
+        for key in protective_keys(position, intent=OrderIntent.STOP, trade_date=trade_date):
+            try:
+                await self._gateway.cancel(key)
+            except Exception as exc:
+                log.error(
+                    "could not cancel stop %s for %s: %s",
+                    key,
+                    position.symbol,
+                    one_safe_line(str(exc)),
+                )
 
     def _count(self, name: str) -> None:
         """Increment a counter if metrics are wired, and never fail on them.

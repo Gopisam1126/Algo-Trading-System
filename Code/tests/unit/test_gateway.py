@@ -46,12 +46,14 @@ from algotrader.common.enums import (
 from algotrader.common.models.trading import (
     Order,
     OrderRequest,
+    Position,
     Recommendation,
     RiskDecision,
     SizingResult,
 )
 from algotrader.execution.gateway import (
     CLIENT_ORDER_ID_LENGTH,
+    MAX_PROTECTIVE_ATTEMPTS,
     DecisionMismatchError,
     GatewayError,
     GatewayPolicy,
@@ -59,8 +61,10 @@ from algotrader.execution.gateway import (
     OrderGateway,
     OrderNeverLandedError,
     OrderStateUnknownError,
+    ProtectiveAttemptsExhaustedError,
     RateLimitedError,
     client_order_id,
+    protective_keys,
 )
 from algotrader.execution.order_state import IllegalTransitionError
 
@@ -195,19 +199,6 @@ class RecordingStore:
         }
 
 
-class Limiter:
-    def __init__(self, *, allowed: int) -> None:
-        self.allowed = allowed
-        self.calls = 0
-
-    async def allow(self) -> bool:
-        self.calls += 1
-        if self.allowed <= 0:
-            return False
-        self.allowed -= 1
-        return True
-
-
 def _policy(**overrides) -> GatewayPolicy:
     kwargs = {
         "algo_id": "ALGO12345",
@@ -275,12 +266,11 @@ def _rejected(
     )
 
 
-def _gateway(placer=None, limiter=None, store=None, **policy_overrides):
+def _gateway(placer=None, store=None, **policy_overrides):
     return OrderGateway(
         placer or RecordingPlacer(),
         policy=_policy(**policy_overrides),
         store=store if store is not None else RecordingStore(),
-        limiter=limiter,
     )
 
 
@@ -436,67 +426,26 @@ class TestAc2TheIdempotencyKey:
 
 
 @_ASYNC
-class TestAc3TheRateLimiter:
-    async def test_a_refusal_never_reaches_the_broker(self) -> None:
-        """Refused before the exchange, so nothing is in flight and there is
-        nothing to reconcile — which is why this is a different error from the
-        broker's own RateLimitError."""
-        placer = RecordingPlacer()
-        gateway = _gateway(placer, limiter=Limiter(allowed=0))
-        with pytest.raises(RateLimitedError):
-            await gateway.submit_entry(_approved(), _rec(), trade_date=TRADE_DATE)
-        assert placer.submitted == []
+class TestAc3TheRateLimiterIsTheAdapters:
+    """CHANGED 16 Nov 2026 (audit RSK-010). The gateway had its OWN optional
+    limiter, which nothing in src implemented, beside the adapter's required,
+    account-wide bucket - two limiters with opposite retry rules. It is gone;
+    the adapter's bucket (tests/unit/test_broker_kite.py) is the one. What these
+    tests protected holds structurally now: a token is taken only inside
+    ``place_order``, so nothing that does not reach the placer spends one."""
 
-    async def test_the_limiter_is_consulted_once_per_submission(self) -> None:
-        """CORRECTED 10 Sep 2026 while delivering E15-S02.
-
-        This used to submit the SAME decision three times and assert that
-        three orders reached the broker — the duplicate-position bug E15-S02
-        exists to prevent, written down as a passing assertion. Three
-        *submissions* means three distinct signals, so each now carries its
-        own correlation_id and its own idempotency key.
-        """
+    async def test_a_suppressed_duplicate_never_reaches_the_placer(self) -> None:
         placer = RecordingPlacer()
-        limiter = Limiter(allowed=3)
-        gateway = _gateway(placer, limiter=limiter)
-        for _ in range(3):
-            fresh = _rec(correlation_id=uuid4())
-            await gateway.submit_entry(_approved(rec=fresh), fresh, trade_date=TRADE_DATE)
-        assert limiter.calls == 3
-        assert len(placer.submitted) == 3
-
-    async def test_a_suppressed_duplicate_does_not_spend_a_token(self) -> None:
-        """The other half, and it is not merely bookkeeping. Tokens are the
-        scarce resource protecting a regulatory threshold: one spent on an
-        order that is never sent narrows the budget for one that is."""
-        placer = RecordingPlacer()
-        limiter = Limiter(allowed=3)
-        gateway = _gateway(placer, limiter=limiter)
+        gateway = _gateway(placer)
         for _ in range(3):
             await gateway.submit_entry(_approved(), _rec(), trade_date=TRADE_DATE)
-        assert limiter.calls == 1
         assert len(placer.submitted) == 1
 
-    async def test_submissions_stop_when_the_bucket_empties(self) -> None:
+    async def test_a_rejected_decision_never_reaches_the_placer(self) -> None:
         placer = RecordingPlacer()
-        gateway = _gateway(placer, limiter=Limiter(allowed=2))
-        for _ in range(2):
-            fresh = _rec(correlation_id=uuid4())
-            await gateway.submit_entry(_approved(rec=fresh), fresh, trade_date=TRADE_DATE)
-        with pytest.raises(RateLimitedError):
-            fresh = _rec(correlation_id=uuid4())
-            await gateway.submit_entry(_approved(rec=fresh), fresh, trade_date=TRADE_DATE)
-        assert len(placer.submitted) == 2
-
-    async def test_the_limiter_is_consulted_after_the_order_is_valid(self) -> None:
-        """A rejected decision must not spend a token. Tokens are the scarce
-        resource protecting a regulatory threshold; burning one on an order
-        that was never going to be sent narrows the budget for real ones."""
-        limiter = Limiter(allowed=1)
-        gateway = _gateway(limiter=limiter)
         with pytest.raises(NotApprovedError):
-            await gateway.submit_entry(_rejected(), _rec(), trade_date=TRADE_DATE)
-        assert limiter.calls == 0
+            await _gateway(placer).submit_entry(_rejected(), _rec(), trade_date=TRADE_DATE)
+        assert placer.submitted == []
 
 
 @_ASYNC
@@ -516,16 +465,6 @@ class TestAc4TheControl:
         request = _gateway(placer).build_entry(_approved(), _rec(), trade_date=TRADE_DATE)
         assert isinstance(request, OrderRequest)
         assert placer.submitted == []
-
-    async def test_no_limiter_means_no_gate(self) -> None:
-        """The limiter is optional so the gateway is usable in paper mode and
-        in tests. Stated explicitly because an optional safety control is
-        exactly the kind of thing that should be deliberate."""
-        placer = RecordingPlacer()
-        await _gateway(placer, limiter=None).submit_entry(
-            _approved(), _rec(), trade_date=TRADE_DATE
-        )
-        assert len(placer.submitted) == 1
 
 
 @_ASYNC
@@ -697,17 +636,18 @@ class TestAc1TheIntentIsRecordedBeforeTheBrokerIsCalled:
             await _gateway(store=store).submit_entry(_rejected(), _rec(), trade_date=TRADE_DATE)
         assert store.rows == {}
 
-    async def test_a_rate_limited_order_records_nothing(self) -> None:
-        """The ordering that matters most here. A SUBMITTING row for an order
-        that was never sent would send the reconciliation loop hunting an order
-        the broker has never heard of, every 30 seconds, all day."""
+    async def test_a_rate_limited_order_is_recorded_refused_not_in_flight(self) -> None:
+        """CHANGED 16 Nov 2026 (RSK-010): the refusal now comes from the adapter,
+        after TX1. A SUBMITTING row for an order that was never sent would send
+        reconciliation hunting it every 30 seconds; it is written REJECTED."""
         placer, store = RecordingPlacer(), RecordingStore()
+        placer.fail_with = RateLimitError("order rate limit reached")
         with pytest.raises(RateLimitedError):
-            await _gateway(placer, limiter=Limiter(allowed=0), store=store).submit_entry(
+            await _gateway(placer, store=store).submit_entry(
                 _approved(), _rec(), trade_date=TRADE_DATE
             )
-        assert store.rows == {}
-        assert placer.submitted == []
+        (row,) = store.rows.values()
+        assert row["status"] == "REJECTED"
 
     async def test_a_store_failure_stops_the_order(self) -> None:
         """Fail closed: a fact we cannot record is a fact we must not create."""
@@ -1216,7 +1156,7 @@ class TestTheAdapterSpeaksTheTaxonomy:
     adapter handle BrokerError subclasses. Both adapter paths translate it."""
 
     class _Refusing:
-        async def acquire_order(self) -> float:
+        async def acquire_order(self, *, wait_seconds: float = 0.0) -> float:
             from algotrader.broker.ratelimit import RateLimitExceededError
 
             raise RateLimitExceededError("order", tokens_left=0.0)
@@ -1292,21 +1232,165 @@ class TestCancel:
         cid = _listed(placer, broker_order_id=None)
         assert await _gateway(placer).cancel(cid) is False
 
-    async def test_the_rate_limiter_governs_cancels_too(self) -> None:
-        placer = RecordingPlacer()
-        cid = _listed(placer)
-
-        class Refuse:
-            async def allow(self) -> bool:
-                return False
-
-        with pytest.raises(RateLimitedError):
-            await _gateway(placer, limiter=Refuse()).cancel(cid)
-        assert placer.cancelled == []
-
     async def test_a_refused_cancel_is_raised_for_the_caller_to_count(self) -> None:
         placer = RecordingPlacer()
         cid = _listed(placer)
         placer.cancel_fails_with = ConnectionError("timed out")
         with pytest.raises(ConnectionError):
             await _gateway(placer).cancel(cid)
+
+
+# ---------------------------------------------------------------------------
+# Audit TRD-001 / TRD-002 - a protective order may take a further attempt, but
+# only past one the broker confirms dead
+# ---------------------------------------------------------------------------
+
+
+def _held_position(direction: Direction = Direction.LONG) -> Position:
+    return Position(
+        correlation_id=CID,
+        symbol="INFY",
+        slot_index=0,
+        direction=direction,
+        quantity=83,
+        entry_price=Decimal("1200.00"),
+        stop_price=Decimal("1186.45") if direction is Direction.LONG else Decimal("1213.55"),
+        opened_at=NOW,
+        squareoff_deadline=dt.datetime(2026, 8, 25, 9, 45, tzinfo=dt.UTC),  # 15:15 IST
+    )
+
+
+def _book(
+    placer: RecordingPlacer, request: OrderRequest, status: OrderStatus, filled: int = 0
+) -> None:
+    placer.orderbook[request.client_order_id] = _broker_order(request, "B-1").model_copy(
+        update={"status": status, "filled_quantity": filled}
+    )
+
+
+@_ASYNC
+class TestAProtectiveOrderTakesANewAttempt:
+    async def test_a_rejected_exit_can_be_sent_again_under_a_new_key(self) -> None:
+        """TRD-001: the square-off timer cancelled the stop, the time exit was
+        REJECTED, and the single-use key meant no exit could ever be re-sent."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        gateway = _gateway(placer, store=store)
+        position = _held_position()
+        await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        first = placer.submitted[0]
+        _book(placer, first, OrderStatus.REJECTED)  # the exchange refused it
+        await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        assert len(placer.submitted) == 2
+        second = placer.submitted[1]
+        assert second.client_order_id != first.client_order_id
+        assert (
+            second.client_order_id
+            == protective_keys(position, intent=OrderIntent.SQUAREOFF, trade_date=TRADE_DATE)[1]
+        )
+        assert (
+            await gateway.current_key(position, intent=OrderIntent.SQUAREOFF, trade_date=TRADE_DATE)
+            == second.client_order_id
+        )
+
+    async def test_a_rate_limited_stop_can_be_placed_again(self) -> None:
+        """TRD-002: a refusal after TX1 spent the stop's key for the day."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        gateway = _gateway(placer, store=store)
+        position = _held_position()
+        placer.fail_with = RateLimitError("429")
+        with pytest.raises(RateLimitedError):
+            await gateway.submit_stop(position, trade_date=TRADE_DATE)
+        placer.fail_with = None
+        await gateway.submit_stop(position, trade_date=TRADE_DATE)
+        assert len(placer.submitted) == 2
+        assert placer.submitted[0].client_order_id != placer.submitted[1].client_order_id
+
+    @pytest.mark.parametrize(
+        ("status", "filled"),
+        [
+            (OrderStatus.OPEN, 0),
+            (OrderStatus.SUBMITTED, 0),
+            (OrderStatus.FILLED, 83),
+            (OrderStatus.CANCELLED, 40),  # part-filled, then cancelled
+        ],
+    )
+    async def test_an_exit_that_is_live_or_filled_is_never_sent_twice(
+        self, status: OrderStatus, filled: int
+    ) -> None:
+        """The control, and the rule that keeps 'query, never retry' true."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        gateway = _gateway(placer, store=store)
+        position = _held_position()
+        await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        _book(placer, placer.submitted[0], status, filled)
+        await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        assert len(placer.submitted) == 1
+
+    async def test_an_exit_whose_outcome_is_unknown_is_not_replaced(self) -> None:
+        """Recorded SUBMITTING and not in the orderbook: unknown, so the next
+        submit RESUMES it (query by tag) and never adds a second order."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        gateway = _gateway(placer, store=store)
+        position = _held_position()
+        placer.fail_with = AmbiguousOrderError("timed out")
+        with pytest.raises(OrderNeverLandedError):
+            await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        placer.fail_with = None
+        with pytest.raises((OrderNeverLandedError, IllegalTransitionError)):
+            await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        assert len(placer.submitted) == 1
+
+    async def test_a_refusal_the_broker_shows_was_placed_is_not_replaced(self) -> None:
+        """Our row says REJECTED (a 429), but the broker lists a working order
+        under the key: Kite's 429 is not documented to guarantee nothing was
+        placed, so the broker's word wins and nothing new is sent."""
+        placer, store = RecordingPlacer(), RecordingStore()
+        gateway = _gateway(placer, store=store)
+        position = _held_position()
+        placer.fail_with = RateLimitError("429")
+        with pytest.raises(RateLimitedError):
+            await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        placer.fail_with = None
+        _book(placer, placer.submitted[0], OrderStatus.OPEN)
+        with pytest.raises(IllegalTransitionError):
+            await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        assert len(placer.submitted) == 1
+
+    async def test_the_attempts_run_out(self) -> None:
+        placer, store = RecordingPlacer(), RecordingStore()
+        gateway = _gateway(placer, store=store)
+        position = _held_position()
+        for _ in range(MAX_PROTECTIVE_ATTEMPTS):
+            await gateway.submit_exit(position, trade_date=TRADE_DATE)
+            _book(placer, placer.submitted[-1], OrderStatus.REJECTED)
+        with pytest.raises(ProtectiveAttemptsExhaustedError):
+            await gateway.submit_exit(position, trade_date=TRADE_DATE)
+        assert len(placer.submitted) == MAX_PROTECTIVE_ATTEMPTS
+
+    def test_an_entry_never_takes_a_second_attempt(self) -> None:
+        with pytest.raises(GatewayError, match="only a stop or an exit"):
+            client_order_id(
+                correlation_id=CID,
+                symbol="INFY",
+                side=Side.BUY,
+                intent=OrderIntent.ENTRY,
+                trade_date=TRADE_DATE,
+                attempt=1,
+            )
+
+    def test_attempt_zero_is_the_key_every_earlier_version_derived(self) -> None:
+        """Existing rows keep their meaning: no attempt suffix on attempt 0."""
+        import hashlib
+
+        material = "|".join((str(CID), "INFY", "SELL", "SQUAREOFF", TRADE_DATE.isoformat()))
+        expected = hashlib.sha256(material.encode()).hexdigest()[:32]
+        assert (
+            client_order_id(
+                correlation_id=CID,
+                symbol="INFY",
+                side=Side.SELL,
+                intent=OrderIntent.SQUAREOFF,
+                trade_date=TRADE_DATE,
+            )
+            == expected
+        )

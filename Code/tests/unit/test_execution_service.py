@@ -17,7 +17,12 @@ from uuid import uuid4
 
 import pytest
 
-from algotrader.broker.adapter import AmbiguousOrderError, MarginSnapshot, OrderRejectedError
+from algotrader.broker.adapter import (
+    AmbiguousOrderError,
+    MarginSnapshot,
+    OrderRejectedError,
+    RateLimitError,
+)
 from algotrader.common.audit import AuditEntry
 from algotrader.common.calendar import MarketCalendar, load_holidays_with_status
 from algotrader.common.config import AppConfig
@@ -344,7 +349,6 @@ class Harness:
             self.placer,
             policy=GatewayPolicy(algo_id=None, market_protection=Decimal("-1")),
             store=self.orders,
-            limiter=limiter,
         )
         self.manager = PositionManager(
             protector=None,  # type: ignore[arg-type]
@@ -714,16 +718,16 @@ class TestASendThatFails:
         assert len(h.service.pending) == 0
 
     async def test_a_rate_limited_send_releases_them_too(self) -> None:
-        class Refusing:
-            async def allow(self) -> bool:
-                return False
-
-        h = await Harness(limiter=Refusing()).started()
+        """CHANGED 16 Nov 2026 (audit RSK-010): the refusal is the ADAPTER's
+        bucket now - the gateway's own optional limiter is gone - so it comes
+        after TX1 and the row is written REJECTED (known never sent)."""
+        h = await Harness().started()
+        h.placer.raises = RateLimitError("order rate limit reached")
         rec = _rec()
         result = await h.service.handle(rec)
         assert result.outcome is Outcome.SEND_FAILED
         assert h.manager.plan_for(_cid(rec)) is None
-        assert h.orders.rows == {}
+        assert h.orders.rows[_cid(rec)]["status"] == "REJECTED"
 
     async def test_an_ambiguous_send_keeps_the_plan(self) -> None:
         """Recorded SUBMITTING, absent at the broker on the follow-up query:

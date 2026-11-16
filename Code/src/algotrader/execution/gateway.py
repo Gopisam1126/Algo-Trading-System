@@ -178,12 +178,6 @@ class OrderStore(Protocol):
     async def find_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None: ...
 
 
-class RateLimiter(Protocol):
-    """Permission to send one order now, or not."""
-
-    async def allow(self) -> bool: ...
-
-
 class GatewayError(RuntimeError):
     """The gateway refused to build or submit an order."""
 
@@ -224,6 +218,15 @@ class OrderNeverLandedError(GatewayError):
     """
 
 
+class ProtectiveAttemptsExhaustedError(GatewayError):
+    """Every attempt key for this stop or exit has been used today.
+
+    Raised rather than inventing a fourth key: three refused protective orders
+    for one position is not a transient condition, and the response - the
+    naked-position halt - is a human's.
+    """
+
+
 class OrderStateUnknownError(GatewayError):
     """The recovery query answered, but not with enough to adopt.
 
@@ -234,6 +237,15 @@ class OrderStateUnknownError(GatewayError):
     """
 
 
+#: How many keys one position-day may use for one protective intent - its
+#: stop, or its exit (audit TRD-001/TRD-002). Bounded so a run of rejections
+#: becomes a halt for a human, not a firehose of orders.
+MAX_PROTECTIVE_ATTEMPTS: Final = 3
+#: The intents that may take a further attempt after a confirmed-dead one.
+#: Entries never do: a refused entry's signal is stale by definition.
+PROTECTIVE_INTENTS: Final = frozenset({OrderIntent.STOP, OrderIntent.SQUAREOFF})
+
+
 def client_order_id(
     *,
     correlation_id: object,
@@ -241,13 +253,28 @@ def client_order_id(
     side: Side,
     intent: OrderIntent,
     trade_date: dt.date,
+    attempt: int = 0,
 ) -> str:
     """The deterministic idempotency key of §8.2.
 
     Keyword-only on purpose. Five string-ish components in a fixed order, where
     swapping two would still hash successfully and produce an id that is wrong
     in a way nothing downstream could detect.
+
+    ``attempt`` (audit TRD-001, 16 Nov 2026). One key per position-day meant a
+    stop or exit that was REFUSED - by the exchange, by RMS, by a rate limit -
+    could never be sent again: the square-off timer cancelled the stop, the
+    time exit was rejected, and the position was left with no stop and no
+    automatic exit for the rest of the day. A protective order may now take a
+    further attempt, but only past one the broker confirms is DEAD (terminal,
+    nothing filled) - never past one whose outcome is unknown, which is what
+    keeps "query, never retry" true (``OrderGateway.next_key``). Attempt 0 is
+    the key every earlier version derived, so existing rows keep their meaning.
     """
+    if not 0 <= attempt < MAX_PROTECTIVE_ATTEMPTS:
+        raise GatewayError(f"attempt {attempt} is outside 0..{MAX_PROTECTIVE_ATTEMPTS - 1}")
+    if attempt and intent not in PROTECTIVE_INTENTS:
+        raise GatewayError(f"only a stop or an exit takes a further attempt, not {intent.value}")
     # Checked BEFORE the join it protects. The join is what creates the
     # ambiguity — ("AB", "C") and ("A", "BC") produce the same string — so
     # validating afterwards would read as a guard while guarding nothing that
@@ -259,16 +286,32 @@ def client_order_id(
                 f"orders could hash to one id and the second would be suppressed as "
                 f"a duplicate of the first."
             )
-    material = _SEPARATOR.join(
-        (
-            str(correlation_id),
-            symbol,
-            side.value,
-            intent.value,
-            trade_date.isoformat(),
-        )
-    )
+    parts = [str(correlation_id), symbol, side.value, intent.value, trade_date.isoformat()]
+    if attempt:
+        parts.append(f"attempt={attempt}")
+    material = _SEPARATOR.join(parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:CLIENT_ORDER_ID_LENGTH]
+
+
+def protective_keys(position: Any, *, intent: OrderIntent, trade_date: dt.date) -> tuple[str, ...]:
+    """Every key this position's stop or exit can have today, attempt 0 first.
+
+    For readers that must recognise the order whichever attempt it is -
+    reconciliation matching the broker's orderbook, the square-off timer
+    looking for the working stop.
+    """
+    side = Side.SELL if position.direction is Direction.LONG else Side.BUY
+    return tuple(
+        client_order_id(
+            correlation_id=position.correlation_id,
+            symbol=position.symbol,
+            side=side,
+            intent=intent,
+            trade_date=trade_date,
+            attempt=attempt,
+        )
+        for attempt in range(MAX_PROTECTIVE_ATTEMPTS)
+    )
 
 
 class Closable(Protocol):
@@ -358,7 +401,6 @@ class OrderGateway:
         *,
         policy: GatewayPolicy,
         store: OrderStore,
-        limiter: RateLimiter | None = None,
     ) -> None:
         self._placer = placer
         self._policy = policy
@@ -369,7 +411,6 @@ class OrderGateway:
         #: cannot be constructed, so there is no configuration in which orders
         #: are placed untracked.
         self._store = store
-        self._limiter = limiter
 
     async def submit_entry(
         self,
@@ -395,7 +436,8 @@ class OrderGateway:
         one position, and a stop whose outcome is unknown is a position that
         may be naked. Both are already solved on this path.
         """
-        return await self.submit(self.build_stop(position, trade_date=trade_date))
+        attempt = await self.next_attempt(position, intent=OrderIntent.STOP, trade_date=trade_date)
+        return await self.submit(self.build_stop(position, trade_date=trade_date, attempt=attempt))
 
     async def submit_exit(
         self,
@@ -405,7 +447,65 @@ class OrderGateway:
         intent: OrderIntent = OrderIntent.SQUAREOFF,
     ) -> str:
         """Submit a MARKET exit closing the whole position."""
-        return await self.submit(self.build_exit(position, trade_date=trade_date, intent=intent))
+        attempt = await self.next_attempt(position, intent=intent, trade_date=trade_date)
+        return await self.submit(
+            self.build_exit(position, trade_date=trade_date, intent=intent, attempt=attempt)
+        )
+
+    async def next_attempt(
+        self, position: Closable, *, intent: OrderIntent, trade_date: dt.date
+    ) -> int:
+        """The attempt to submit this stop or exit under (audit TRD-001/TRD-002).
+
+        The first attempt with no row; or, while every earlier attempt is
+        confirmed DEAD, the next one. An attempt that is live, filled, part
+        filled, in flight or simply unknown is returned as it is - submitting
+        under it RESUMES it (``_resume``), so nothing is sent twice. Only the
+        broker's own word that an order is terminal with nothing filled, or our
+        own record that the order was refused before it reached the exchange,
+        frees the next key.
+        """
+        keys = protective_keys(position, intent=intent, trade_date=trade_date)
+        for attempt, key in enumerate(keys):
+            row = await self._store.find_by_client_order_id(key)
+            if row is None or not await self._is_dead(key, row):
+                return attempt
+        raise ProtectiveAttemptsExhaustedError(
+            f"all {len(keys)} {intent.value} attempts for {position.symbol} today are dead; "
+            f"a further one is a human's decision"
+        )
+
+    async def current_key(
+        self, position: Closable, *, intent: OrderIntent, trade_date: dt.date
+    ) -> str:
+        """The key of this position's newest recorded stop or exit.
+
+        What a caller looking for "the stop" must ask: after a re-placed stop,
+        attempt 0's order is the dead one and the working stop is attempt 1.
+        Attempt 0's key when nothing is recorded yet.
+        """
+        keys = protective_keys(position, intent=intent, trade_date=trade_date)
+        newest = keys[0]
+        for key in keys[1:]:
+            if await self._store.find_by_client_order_id(key) is None:
+                break
+            newest = key
+        return newest
+
+    async def _is_dead(self, key: str, row: dict[str, Any]) -> bool:
+        """Is this attempt finished with nothing filled? Unknown is NOT dead.
+
+        The BROKER is asked every time, our own record included. A row we wrote
+        REJECTED with no broker id is a refusal we saw - but a refusal by
+        Kite's HTTP 429 is not documented to guarantee nothing was placed
+        (audit TRD-002, unverified), so the key is freed only once the broker
+        also lists no order under it.
+        """
+        order = await self._placer.find_by_client_order_id(key)
+        if order is None:
+            refused = str(row.get("status", "")) == OrderStatus.REJECTED.value
+            return refused and not row.get("broker_order_id")
+        return order.status.is_terminal and order.filled_quantity == 0
 
     async def submit(self, request: OrderRequest) -> str:
         """Send one order, once. The only path to the broker for any intent.
@@ -430,16 +530,12 @@ class OrderGateway:
         if already is not None:
             return await self._resume(cid, already)
 
-        # BEFORE the record, so a refusal leaves nothing behind. A SUBMITTING
-        # row for an order that was never sent would send reconciliation
-        # hunting an order the broker has never heard of, every 30 seconds,
-        # for the rest of the day.
-        if self._limiter is not None and not await self._limiter.allow():
-            raise RateLimitedError(
-                f"the order-rate limiter refused {cid}. Nothing was sent, so "
-                f"there is nothing to reconcile — but the signal is stale by "
-                f"definition and must not be queued behind the bucket."
-            )
+        # There is no rate limiter HERE (audit RSK-010). This gateway had an
+        # optional one that nothing in src implemented, beside the broker
+        # adapter's required, account-wide bucket - two limiters with opposite
+        # retry rules. The adapter's is the one: a refusal there raises
+        # RateLimitError after TX1, the row is written REJECTED (known never
+        # sent), and a protective order may then take its next attempt.
 
         # TX1. If this raises, no broker call happens: a fact we cannot record
         # is a fact we must not create.
@@ -520,7 +616,9 @@ class OrderGateway:
             one_safe_line(str(exc)),
         )
 
-    def build_stop(self, position: Position, *, trade_date: dt.date) -> OrderRequest:
+    def build_stop(
+        self, position: Position, *, trade_date: dt.date, attempt: int = 0
+    ) -> OrderRequest:
         """The protective stop for an open position.
 
         **SL-M, not SL.** A stop-loss *limit* can fail to fill in exactly the
@@ -542,6 +640,7 @@ class OrderGateway:
                 side=side,
                 intent=OrderIntent.STOP,
                 trade_date=trade_date,
+                attempt=attempt,
             ),
             correlation_id=position.correlation_id,
             symbol=position.symbol,
@@ -561,6 +660,7 @@ class OrderGateway:
         *,
         trade_date: dt.date,
         intent: OrderIntent = OrderIntent.SQUAREOFF,
+        attempt: int = 0,
     ) -> OrderRequest:
         """A MARKET order closing the whole position, now.
 
@@ -577,6 +677,7 @@ class OrderGateway:
                 side=side,
                 intent=intent,
                 trade_date=trade_date,
+                attempt=attempt,
             ),
             correlation_id=position.correlation_id,
             symbol=position.symbol,
@@ -607,11 +708,6 @@ class OrderGateway:
         order = await self._placer.find_by_client_order_id(client_order_id_)
         if order is None or order.status.is_terminal or not order.broker_order_id:
             return False
-        if self._limiter is not None and not await self._limiter.allow():
-            raise RateLimitedError(
-                f"the order-rate limiter refused cancelling {client_order_id_}; it is "
-                f"still working and will be tried again next cycle"
-            )
         await self._placer.cancel_order(order.broker_order_id)
         log.warning(
             "cancel sent for %s (%s, broker %s): %s of %s filled",

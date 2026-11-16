@@ -22,6 +22,7 @@ exit order.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -116,18 +117,32 @@ class BrokerRateLimiter:
     def config(self) -> RateLimitConfig:
         return self._config
 
-    async def acquire_order(self) -> float:
-        """Take one order token or raise. Returns tokens remaining."""
-        allowed, left = await take_token(
-            self._client,
-            keys.order_rate_limit(),
-            capacity=self._config.order_burst,
-            refill_per_second=float(self._config.orders_per_second),
-        )
-        if not allowed:
-            log.warning("order refused by rate limiter; %.2f tokens left", left)
-            raise RateLimitExceededError("order", tokens_left=left)
-        return left
+    async def acquire_order(self, *, wait_seconds: float = 0.0) -> float:
+        """Take one order token, or raise. Returns tokens remaining.
+
+        ``wait_seconds`` (audit TRD-002) is for PROTECTIVE orders only - a stop,
+        an exit, a cancel. "Refusal, not delay" is right for an entry, whose
+        signal goes stale behind a queue; it is wrong for the order that closes
+        a position, where the alternative to a short wait is a refused exit with
+        the stop already cancelled. Five positions sharing a square-off deadline
+        need ten tokens against a burst of three, and must all get them.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, wait_seconds)
+        while True:
+            allowed, left = await take_token(
+                self._client,
+                keys.order_rate_limit(),
+                capacity=self._config.order_burst,
+                refill_per_second=float(self._config.orders_per_second),
+            )
+            if allowed:
+                return left
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                log.warning("order refused by rate limiter; %.2f tokens left", left)
+                raise RateLimitExceededError("order", tokens_left=left)
+            await asyncio.sleep(min(remaining, 1.0 / self._config.orders_per_second))
 
     async def acquire_data(self) -> float:
         """Take one data token or raise. Separate budget from orders."""

@@ -130,9 +130,16 @@ class FakeProtector:
         self.adopted: list[str] = []
         self.attached: list[Position] = []
         self.attach_raises: dict[str, Exception] = {}
+        self.cancelled_stops: list[str] = []
 
     async def is_protected(self, position: Position, *, trade_date: dt.date) -> bool:
         return position.symbol in self.live_stops
+
+    async def cancel_stops(self, position: Any, *, trade_date: dt.date) -> None:
+        """Audit TRD-008/TRD-009: every attempt of the stop is cancelled before
+        an emergency exit, and when the broker no longer holds the position."""
+        self.cancelled_stops.append(position.symbol)
+        self.live_stops.discard(position.symbol)
 
     async def exit_is_live(self, target: Any, *, trade_date: dt.date) -> bool:
         return target.symbol in self.live_exits
@@ -649,13 +656,77 @@ def _held_all(broker: FakeBroker, ledger: FakeLedger, manager: PositionManager) 
 
 class TestAc3EveryPositionEveryCycle:
     def test_a_live_stop_is_left_alone(self) -> None:
+        """CHANGED 16 Nov 2026 (audit TRD-008): the broker now holds the
+        position too. Before, a live stop was enough; a live stop on a holding
+        the broker does not have is an orphan that would sell shares not held,
+        and is cancelled and halted - TestAnOrphanedStopIsCancelled."""
         manager, _m = _manager()
         _book(manager, _protected("INFY"))
-        reconciler, _b, _l, protector, _h = _reconciler(manager=manager)
+        reconciler, broker, ledger, protector, _h = _reconciler(manager=manager)
+        _held_all(broker, ledger, manager)
         protector.live_stops = {"INFY"}
         report = _run(reconciler)
         assert protector.exits == []
+        assert protector.cancelled_stops == []
         assert report.clean
+
+
+class TestAnOrphanedStopIsCancelled:
+    """Audit TRD-008: a booked position whose stop was live was never compared
+    with the broker's holding, so a holding closed outside this system left a
+    stop that would later SELL shares not held."""
+
+    def test_a_live_stop_on_a_holding_the_broker_does_not_have_is_cancelled_and_halts(
+        self,
+    ) -> None:
+        manager, _m = _manager()
+        _book(manager, _protected("INFY"))
+        reconciler, _b, _l, protector, halter = _reconciler(manager=manager)
+        protector.live_stops = {"INFY"}
+        report = _run(reconciler)
+        assert protector.cancelled_stops == ["INFY"]
+        assert protector.exits == [], "nothing is sold for a holding that is not there"
+        assert HaltReason.POSITION_NOT_HELD in [r for r, _ in halter.armed]
+        assert not report.clean
+
+
+class TestTheEmergencyExitIsSizedFromAFreshRead:
+    """Audit TRD-007: step 4 decided protection from fresh per-position reads
+    but sized the exit from the cycle's EARLIER positions snapshot, so a
+    position closed between the two reads was exited again - a naked short."""
+
+    def test_a_position_closed_between_the_reads_is_not_exited_again(self) -> None:
+        manager, _m = _manager()
+        _book(manager, _protected("INFY"))
+        reconciler, broker, ledger, protector, halter = _reconciler(manager=manager)
+        _held_all(broker, ledger, manager)
+        snapshot = list(broker.positions)
+        reads = {"n": 0}
+
+        async def positions():
+            reads["n"] += 1
+            # The cycle's snapshot still shows the holding; by the time step 4
+            # asks again, it was closed outside this system.
+            return snapshot if reads["n"] == 1 else []
+
+        broker.fetch_positions = positions  # type: ignore[method-assign]
+        _run(reconciler)
+        assert protector.exits == [], "an exit for a holding that is gone sells short"
+        assert HaltReason.POSITION_NOT_HELD in [r for r, _ in halter.armed]
+
+
+class TestAStopIsCancelledBeforeAnEmergencyExit:
+    """Audit TRD-009: a stop reading 'not live' may still be working in a
+    status nobody modelled; one holding must not get two exits."""
+
+    def test_the_stop_is_cancelled_first(self) -> None:
+        manager, _m = _manager()
+        _book(manager, _protected("INFY"))
+        reconciler, broker, ledger, protector, _h = _reconciler(manager=manager)
+        _held_all(broker, ledger, manager)
+        _run(reconciler)  # the stop is not live: exit path
+        assert protector.cancelled_stops == ["INFY"]
+        assert [t.symbol for t, _ in protector.exits] == ["INFY"]
 
     def test_a_stop_rejected_after_it_was_verified_is_exited(self) -> None:
         """The asynchronous case E15-S04 named and no synchronous check reaches."""

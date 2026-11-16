@@ -9,6 +9,7 @@ only the end state.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 from decimal import Decimal
 from pathlib import Path
@@ -44,6 +45,7 @@ from algotrader.execution.positions import (
 )
 from algotrader.execution.protective_stop import (
     EstablishedPosition,
+    ProtectiveStop,
     exit_client_order_id,
     stop_client_order_id,
 )
@@ -92,6 +94,10 @@ class Account:
         self.fill_on_cancel = False
         #: Accept the exit but never list it.
         self.hide_exits = False
+        #: The exchange REJECTS the next N time exits after accepting them.
+        self.reject_exits = 0
+        #: The stop part-fills this many shares as it is cancelled (TRD-004).
+        self.partial_fill_on_cancel = 0
         self._pending: dict[str, int] = {}
         self._ids = 0
 
@@ -100,6 +106,10 @@ class Account:
         self._ids += 1
         broker_id = f"B-{self._ids}"
         self.calls.append(f"place:{request.intent.value}:{request.side.value}:{request.quantity}")
+        status = OrderStatus.OPEN
+        if request.intent is OrderIntent.SQUAREOFF and self.reject_exits:
+            self.reject_exits -= 1
+            status = OrderStatus.REJECTED
         if not (self.hide_exits and request.intent is OrderIntent.SQUAREOFF):
             self.orders[request.client_order_id] = Order(
                 client_order_id=request.client_order_id,
@@ -110,7 +120,7 @@ class Account:
                 order_type=request.order_type,
                 product=request.product,
                 quantity=request.quantity,
-                status=OrderStatus.OPEN,
+                status=status,
                 filled_quantity=0,
                 intent=request.intent,
                 placed_at=_ist(10, 0),
@@ -137,7 +147,18 @@ class Account:
             if order.broker_order_id != broker_order_id:
                 continue
             self.calls.append(f"cancel:{order.intent.value}")
-            if self.fill_on_cancel:
+            if self.partial_fill_on_cancel:
+                filled = self.partial_fill_on_cancel
+                self.orders[cid] = order.model_copy(
+                    update={"status": OrderStatus.CANCELLED, "filled_quantity": filled}
+                )
+                for i, held in enumerate(self.positions):
+                    if held.symbol == order.symbol:
+                        sign = 1 if held.quantity > 0 else -1
+                        self.positions[i] = dataclasses.replace(
+                            held, quantity=held.quantity - sign * filled
+                        )
+            elif self.fill_on_cancel:
                 self.orders[cid] = order.model_copy(
                     update={"status": OrderStatus.FILLED, "filled_quantity": order.quantity}
                 )
@@ -781,3 +802,54 @@ class TestItsMemoryIsBounded:
         rig.manager._book.clear()
         rig.sweep(NON_CAS_DEADLINE + dt.timedelta(seconds=62))
         assert rig.timer._recorded == set()
+
+
+class TestARefusedTimeExitIsSentAgain:
+    """Audit TRD-001: the timer cancelled the stop, the time exit was REJECTED,
+    and the exit's key was single-use per position-day - so no exit could ever
+    be re-sent, and the position ran with no stop and no automatic exit."""
+
+    def test_the_emergency_path_sends_a_second_exit_under_a_new_key(self) -> None:
+        """Through the REAL protective stop and gateway: the time exit is
+        rejected, the emergency close takes attempt 1, and a live exit stands."""
+        rig = Rig()
+        rig.timer._protector = ProtectiveStop(rig.gateway, halter=rig.halter)
+        rig.position()
+        rig.account.reject_exits = 1
+        rig.sweep(NON_CAS_DEADLINE)
+        exits = [o for o in rig.account.orders.values() if o.intent is OrderIntent.SQUAREOFF]
+        assert [o.status for o in exits] == [OrderStatus.REJECTED, OrderStatus.OPEN]
+        assert len({o.client_order_id for o in exits}) == 2
+        assert exits[-1].quantity == 40
+        assert HaltReason.NAKED_POSITION not in rig.halter.armed
+
+    def test_a_working_exit_is_never_doubled(self) -> None:
+        """The control: an exit that is live is resumed, never re-sent."""
+        rig = Rig()
+        rig.position()
+        rig.sweep(NON_CAS_DEADLINE)
+        rig.manager._book["INFY"] = ProtectedPosition(  # as if the book lagged
+            established=EstablishedPosition(
+                position=rig.manager.tracked("INFY").position,
+                stop_client_order_id="S",
+                stop_broker_order_id="BS",
+                established_at=_ist(10, 0),
+            )
+        )
+        rig.sweep(NON_CAS_DEADLINE + dt.timedelta(seconds=1))
+        exits = [o for o in rig.account.orders.values() if o.intent is OrderIntent.SQUAREOFF]
+        assert len(exits) == 1
+
+
+class TestAPartFilledStopIsNotOverSold:
+    """Audit TRD-004: the exit was sized from a holding read taken BEFORE the
+    stop was cancelled; a stop that part-filled inside the cancel window was
+    followed by an exit for the full pre-fill quantity."""
+
+    def test_the_exit_is_sized_from_the_holding_after_the_cancel(self) -> None:
+        rig = Rig()
+        rig.position(quantity=40)
+        rig.account.partial_fill_on_cancel = 15
+        rig.sweep(NON_CAS_DEADLINE)
+        exits = [o for o in rig.account.orders.values() if o.intent is OrderIntent.SQUAREOFF]
+        assert [o.quantity for o in exits] == [25], "15 were sold by the stop already"

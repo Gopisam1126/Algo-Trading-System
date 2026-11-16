@@ -409,14 +409,30 @@ class TestAc2ProtectionIsProved:
     @pytest.mark.asyncio
     async def test_a_naked_position_error_propagates_untouched(self) -> None:
         """The session is already halted by the time this arrives. The manager
-        must not swallow it into 'exiting' - there is no live exit."""
+        must not swallow it into 'exiting' - there is no live exit.
+
+        CHANGED 16 Nov 2026 (audit TRD-006): it is now booked as UNVERIFIED.
+        Leaving it out of the book left a persisted OPEN row and a real holding
+        that the square-off timer (which walks only the book) never time-exited
+        and reconciliation never re-tried."""
         manager, _p, _s, mirror, _c = _manager(
             protector=FakeProtector(raises=NakedPositionError("could not exit"))
         )
         with pytest.raises(NakedPositionError):
             await _open(manager, _order(), _sizing())
-        assert manager.tracked("INFY") is None
-        assert mirror.writes == []
+        assert isinstance(manager.tracked("INFY"), UnverifiedPosition)
+        assert len(mirror.writes) == 1
+
+    async def test_an_unreadable_stop_is_booked_unverified(self) -> None:
+        """TRD-006: the stop's verifying read raised. Not established, not failed."""
+        from algotrader.execution.protective_stop import StopUnverifiedError
+
+        manager, _p, _s, _m, _c = _manager(
+            protector=FakeProtector(raises=StopUnverifiedError("read failed"))
+        )
+        with pytest.raises(StopUnverifiedError):
+            await _open(manager, _order(), _sizing())
+        assert isinstance(manager.tracked("INFY"), UnverifiedPosition)
 
 
 # ---------------------------------------------------------------------------
