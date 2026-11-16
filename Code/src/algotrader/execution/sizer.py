@@ -66,6 +66,29 @@ boundary; a ``Recommendation`` whose suggested stop drove the quantity would be
 carrying a sizing field under another name. The suggested stop stays useful as
 a sanity signal — it is not arithmetic here.
 
+## The trigger price is checked against the market before anything divides by it
+
+Audit RSK-002. Every notional cap is rupees divided by a price, and until
+10 Nov 2026 that price was ``Recommendation.trigger_price`` alone - the
+strategy's claim about the market, never compared with the market. A trigger of
+100 for a stock trading at 1,000 sized 833 shares (Rs 8.33 lakh, 167% of
+capital against a 20% cap) with a stop at 94. Now:
+
+* the live last price is REQUIRED (``RiskContext.last_price``; no fresh quote
+  is a refusal), and a trigger more than ``max_price_divergence_pct`` from it
+  is refused as PRICE_DIVERGENCE - never re-priced, because a signal that
+  disagrees with the market about the price was computed on something else;
+* every notional cap divides by the HIGHER of the two prices, so the cap holds
+  at whichever of them the fill turns out nearer to.
+
+## Reductions apply last, and a token position is refused
+
+``RiskContext.size_factor`` (DEGRADED strategies, low AI confidence) multiplies
+the quantity AFTER every clamp, so a reduction cannot be swallowed by a cap
+that was binding anyway (audit RSK-006/AI-001). A position whose notional is
+below ``min_position_pct`` of capital is refused (audit RSK-012): two shares
+take a slot for the day and pay a full round trip for nothing.
+
 ## Tick rounding belongs to the order gateway, and is safe
 
 ``broker/kite/mapping.py``'s ``round_to_tick`` is documented as the one used
@@ -101,6 +124,12 @@ MARGIN_CAP = "margin_cap"
 SECTOR_CAP = "sector_cap"
 NET_EXPOSURE_CAP = "net_exposure_cap"
 LOT_ROUNDING = "lot_rounding"
+#: The trigger and the live price disagree by more than the band (RSK-002).
+PRICE_DIVERGENCE = "price_divergence"
+#: The quantity was reduced by ``RiskContext.size_factor`` after every clamp.
+REDUCED_SIZE = "reduced_size"
+#: The sized position is below ``min_position_pct`` of capital (RSK-012).
+BELOW_MINIMUM = "below_minimum"
 
 #: The clamps in the order §5.7 lists them, with E14-S10's two appended. Ties go
 #: to the EARLIER entry, which is why this is a sequence rather than a dict: when
@@ -160,6 +189,11 @@ class SizingPolicy:
     #: is enforced" told backwards.
     max_sector_exposure_pct: Decimal
     max_net_directional_exposure_pct: Decimal
+    #: Audit RSK-002: how far, as a percentage of the live price, the trigger
+    #: may sit from it. Beyond it the signal is refused.
+    max_price_divergence_pct: Decimal
+    #: Audit RSK-012: the smallest position, as a percentage of capital.
+    min_position_pct: Decimal
 
     def __post_init__(self) -> None:
         for name in (
@@ -170,6 +204,8 @@ class SizingPolicy:
             "target_r_multiple",
             "max_sector_exposure_pct",
             "max_net_directional_exposure_pct",
+            "max_price_divergence_pct",
+            "min_position_pct",
         ):
             value = getattr(self, name)
             if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
@@ -286,8 +322,23 @@ def size_position(rec: Recommendation, ctx: RiskContext, policy: SizingPolicy) -
     atr = ctx.require(ctx.atr, f"ATR for {rec.symbol}")
     margin = ctx.require(ctx.available_margin, f"live broker margin for {rec.symbol}")
     per_share = ctx.require(ctx.margin_per_share, f"per-share margin requirement for {rec.symbol}")
+    last_price = ctx.require(ctx.last_price, f"a fresh live price for {rec.symbol}")
+    factor = ctx.require(ctx.size_factor, f"the size factor for {rec.symbol}")
 
     entry = rec.trigger_price
+    divergence_pct = abs(entry - last_price) / last_price * 100
+    if divergence_pct > policy.max_price_divergence_pct:
+        return SizingResult(
+            quantity=0,
+            entry_price=entry,
+            stop_price=entry,
+            target_price=None,
+            capital_at_risk=Decimal(0),
+            binding_constraint=PRICE_DIVERGENCE,
+        )
+    #: Every notional cap divides by the HIGHER price: a share costs whichever
+    #: of the two the fill lands nearer, and the cap must hold at either.
+    priced_at = max(entry, last_price)
     stop_distance = _quantise(atr * policy.atr_multiplier_stop)
     risk_amount = ctx.capital * policy.risk_pct / 100
     if stop_distance <= 0:
@@ -310,19 +361,23 @@ def size_position(rec: Recommendation, ctx: RiskContext, policy: SizingPolicy) -
     sector_headroom, net_headroom = _portfolio_headroom(rec, ctx, policy)
     candidates: dict[str, Decimal] = {
         RISK_BUDGET: risk_amount / stop_distance,
-        POSITION_CAP: (ctx.capital * policy.max_position_pct / 100) / entry,
-        SLOT_CAP: (ctx.capital * policy.capital_per_slot_pct / 100) / entry,
+        POSITION_CAP: (ctx.capital * policy.max_position_pct / 100) / priced_at,
+        SLOT_CAP: (ctx.capital * policy.capital_per_slot_pct / 100) / priced_at,
         MARGIN_CAP: margin / per_share,
         # E14-S10. The clamp is on the room LEFT, so the resulting book lands at
         # or under the cap — not merely "the book was under the cap before this
         # trade", which is all checks 9 and 10 can assert from where they run.
-        SECTOR_CAP: sector_headroom / entry,
-        NET_EXPOSURE_CAP: net_headroom / entry,
+        SECTOR_CAP: sector_headroom / priced_at,
+        NET_EXPOSURE_CAP: net_headroom / priced_at,
     }
     smallest = min(candidates.values())
     # First in §5.7's order wins a tie: if the risk budget and a cap agree on
     # the number, risk is what bound it and the cap merely concurred.
     binding = next(name for name in _CLAMP_ORDER if candidates[name] == smallest)
+    if factor < 1 and smallest > 0:
+        # After every clamp, never before: see the module docstring.
+        smallest *= factor
+        binding = REDUCED_SIZE
 
     quantity = _floor_to_lot(smallest, ctx.lot_size)
     if quantity == 0 and smallest >= 1:
@@ -331,6 +386,10 @@ def size_position(rec: Recommendation, ctx: RiskContext, policy: SizingPolicy) -
         # where naming lot rounding would point at the wrong thing entirely —
         # `smallest >= 1` is the line between the two.
         binding = LOT_ROUNDING
+    minimum = ctx.capital * policy.min_position_pct / 100
+    if 0 < quantity and quantity * priced_at < minimum:
+        quantity = 0
+        binding = BELOW_MINIMUM
 
     reward = _quantise(stop_distance * policy.target_r_multiple)
     if rec.direction is Direction.LONG:

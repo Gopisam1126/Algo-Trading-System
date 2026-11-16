@@ -22,6 +22,8 @@ ATR computed on cleaned ticks must still be a placeable NSE price.
 
 from __future__ import annotations
 
+import dataclasses
+
 # --- E14-S02: the chain continues into the risk engine ---------------------
 import datetime as _dt
 import datetime as dt
@@ -65,7 +67,30 @@ from algotrader.strategy.dsl import compile_strategy, load_strategy_yaml
 from algotrader.strategy.primitives import registry as primitive_registry
 from algotrader.strategy.runtime import StrategyEvaluator
 
+
 #: What system.yaml configures.
+class _MarketAgrees:
+    """The engine, with the market agreeing with each Recommendation's trigger.
+
+    Audit RSK-002 made the live price a sizing input: the sizer refuses a
+    context without one, and refuses a trigger far from it. These seams build
+    their Recommendation from the pipeline's own trigger, and the market price
+    is that trigger unless a test states otherwise. The divergence guard itself
+    is tested in tests/unit/test_sizer.py and tests/unit/test_execution_service.py.
+    """
+
+    def __init__(self, engine: RiskEngine) -> None:
+        self._engine = engine
+
+    def evaluate(self, rec: Recommendation, ctx: RiskContext):  # type: ignore[no-untyped-def]
+        if ctx.last_price is None:
+            ctx = dataclasses.replace(ctx, last_price=rec.trigger_price)
+        return self._engine.evaluate(rec, ctx)
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._engine, name)
+
+
 NO_TRADE_WINDOWS = (
     (_dt.time(9, 15), _dt.time(9, 20)),
     (_dt.time(15, 0), _dt.time(15, 30)),
@@ -447,10 +472,12 @@ class TestTheTriggerReachesARiskDecision:
         )
         return MarketCalendar(status.dates, covers_years=status.covers_years)
 
-    def _engine(self, audit=None) -> RiskEngine:
-        return RiskEngine(
-            checks=build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
-            audit=audit,
+    def _engine(self, audit=None) -> _MarketAgrees:
+        return _MarketAgrees(
+            RiskEngine(
+                checks=build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                audit=audit,
+            )
         )
 
     @staticmethod
@@ -463,6 +490,8 @@ class TestTheTriggerReachesARiskDecision:
             "kill_switch_active": False,
             "unhealthy_services": (),
             "realised_pnl_today": Decimal(0),
+            "unrealised_pnl_today": Decimal(0),
+            "charges_today": Decimal(0),
             "consecutive_losses": 0,
             "daily_loss_halted": False,
             "consecutive_loss_halted": False,
@@ -474,6 +503,11 @@ class TestTheTriggerReachesARiskDecision:
             # E14-S03. `()` means "checked, and clean" -- NOT None, which means
             # eligibility was never established and must reject.
             "symbol_restrictions": (),
+            # Audit RSK-014/RSK-006: required book fields, full size.
+            "open_positions": (),
+            "correlations": {},
+            "lot_size": 1,
+            "size_factor": Decimal(1),
         }
         base.update(overrides)
         return RiskContext(**base)
@@ -586,14 +620,16 @@ class TestTheTriggerMeetsSymbolEligibility:
         )
         return MarketCalendar(status.dates, covers_years=status.covers_years)
 
-    def _engine(self, audit=None) -> RiskEngine:
+    def _engine(self, audit=None) -> _MarketAgrees:
         """All seven built checks, in their real order."""
-        return RiskEngine(
-            checks=[
-                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
-                *build_eligibility_checks(),
-            ],
-            audit=audit,
+        return _MarketAgrees(
+            RiskEngine(
+                checks=[
+                    *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                    *build_eligibility_checks(),
+                ],
+                audit=audit,
+            )
         )
 
     @staticmethod
@@ -604,6 +640,8 @@ class TestTheTriggerMeetsSymbolEligibility:
             "kill_switch_active": False,
             "unhealthy_services": (),
             "realised_pnl_today": Decimal(0),
+            "unrealised_pnl_today": Decimal(0),
+            "charges_today": Decimal(0),
             "consecutive_losses": 0,
             "daily_loss_halted": False,
             "consecutive_loss_halted": False,
@@ -613,6 +651,11 @@ class TestTheTriggerMeetsSymbolEligibility:
             "slots_total": 5,
             "slots_used": 0,
             "symbol_restrictions": (),
+            # Audit RSK-014/RSK-006: required book fields, full size.
+            "open_positions": (),
+            "correlations": {},
+            "lot_size": 1,
+            "size_factor": Decimal(1),
         }
         base.update(overrides)
         return RiskContext(**base)
@@ -748,20 +791,22 @@ class TestTheTriggerMeetsPortfolioExposure:
         )
         return MarketCalendar(status.dates, covers_years=status.covers_years)
 
-    def _engine(self, audit=None) -> RiskEngine:
+    def _engine(self, audit=None) -> _MarketAgrees:
         """All ten built checks, in their real order."""
-        return RiskEngine(
-            checks=[
-                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
-                *build_eligibility_checks(),
-                *build_exposure_checks(
-                    max_correlated_positions=2,
-                    correlation_threshold=Decimal("0.7"),
-                    max_sector_exposure_pct=Decimal("40"),
-                    max_net_directional_exposure_pct=Decimal("60"),
-                ),
-            ],
-            audit=audit,
+        return _MarketAgrees(
+            RiskEngine(
+                checks=[
+                    *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                    *build_eligibility_checks(),
+                    *build_exposure_checks(
+                        max_correlated_positions=2,
+                        correlation_threshold=Decimal("0.7"),
+                        max_sector_exposure_pct=Decimal("40"),
+                        max_net_directional_exposure_pct=Decimal("60"),
+                    ),
+                ],
+                audit=audit,
+            )
         )
 
     @staticmethod
@@ -772,6 +817,8 @@ class TestTheTriggerMeetsPortfolioExposure:
             "kill_switch_active": False,
             "unhealthy_services": (),
             "realised_pnl_today": Decimal(0),
+            "unrealised_pnl_today": Decimal(0),
+            "charges_today": Decimal(0),
             "consecutive_losses": 0,
             "daily_loss_halted": False,
             "consecutive_loss_halted": False,
@@ -782,6 +829,11 @@ class TestTheTriggerMeetsPortfolioExposure:
             "slots_used": 0,
             "symbol_restrictions": (),
             "symbol_sector": "IT",
+            # Audit RSK-014/RSK-006: required book fields, full size.
+            "open_positions": (),
+            "correlations": {},
+            "lot_size": 1,
+            "size_factor": Decimal(1),
         }
         base.update(overrides)
         return RiskContext(**base)
@@ -998,24 +1050,26 @@ class TestTheTriggerMeetsTheLossLimits:
         )
         return MarketCalendar(status.dates, covers_years=status.covers_years)
 
-    def _engine(self, audit=None) -> RiskEngine:
+    def _engine(self, audit=None) -> _MarketAgrees:
         """All TWELVE built checks, in their real order."""
-        return RiskEngine(
-            checks=[
-                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
-                *build_eligibility_checks(),
-                *build_exposure_checks(
-                    max_correlated_positions=2,
-                    correlation_threshold=Decimal("0.7"),
-                    max_sector_exposure_pct=Decimal("40"),
-                    max_net_directional_exposure_pct=Decimal("60"),
-                ),
-                *build_loss_checks(
-                    max_daily_loss_pct=Decimal("3.0"),
-                    consecutive_loss_halt=3,
-                ),
-            ],
-            audit=audit,
+        return _MarketAgrees(
+            RiskEngine(
+                checks=[
+                    *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                    *build_eligibility_checks(),
+                    *build_exposure_checks(
+                        max_correlated_positions=2,
+                        correlation_threshold=Decimal("0.7"),
+                        max_sector_exposure_pct=Decimal("40"),
+                        max_net_directional_exposure_pct=Decimal("60"),
+                    ),
+                    *build_loss_checks(
+                        max_daily_loss_pct=Decimal("3.0"),
+                        consecutive_loss_halt=3,
+                    ),
+                ],
+                audit=audit,
+            )
         )
 
     @staticmethod
@@ -1026,6 +1080,8 @@ class TestTheTriggerMeetsTheLossLimits:
             "kill_switch_active": False,
             "unhealthy_services": (),
             "realised_pnl_today": Decimal(0),
+            "unrealised_pnl_today": Decimal(0),
+            "charges_today": Decimal(0),
             "consecutive_losses": 0,
             "daily_loss_halted": False,
             "consecutive_loss_halted": False,
@@ -1036,6 +1092,11 @@ class TestTheTriggerMeetsTheLossLimits:
             "slots_used": 0,
             "symbol_restrictions": (),
             "symbol_sector": "IT",
+            # Audit RSK-014/RSK-006: required book fields, full size.
+            "open_positions": (),
+            "correlations": {},
+            "lot_size": 1,
+            "size_factor": Decimal(1),
         }
         base.update(overrides)
         return RiskContext(**base)
@@ -1092,6 +1153,8 @@ class TestTheTriggerMeetsTheLossLimits:
             self._risk_ctx(
                 symbol_restrictions=("T2T",),
                 realised_pnl_today=Decimal("-20000"),
+                unrealised_pnl_today=Decimal(0),
+                charges_today=Decimal(0),
                 consecutive_losses=5,
             ),
         )
@@ -1157,22 +1220,24 @@ class TestTheTriggerMeetsAllFourteenChecks:
         )
         return MarketCalendar(status.dates, covers_years=status.covers_years)
 
-    def _engine(self, audit=None) -> RiskEngine:
+    def _engine(self, audit=None) -> _MarketAgrees:
         """All FOURTEEN checks, in LOW_LEVEL_ARCHITECTURE 5.7's order."""
-        return RiskEngine(
-            checks=[
-                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
-                *build_eligibility_checks(),
-                *build_exposure_checks(
-                    max_correlated_positions=2,
-                    correlation_threshold=Decimal("0.7"),
-                    max_sector_exposure_pct=Decimal("40"),
-                    max_net_directional_exposure_pct=Decimal("60"),
-                ),
-                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
-                *build_margin_timing_checks(min_minutes_to_squareoff=30),
-            ],
-            audit=audit,
+        return _MarketAgrees(
+            RiskEngine(
+                checks=[
+                    *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                    *build_eligibility_checks(),
+                    *build_exposure_checks(
+                        max_correlated_positions=2,
+                        correlation_threshold=Decimal("0.7"),
+                        max_sector_exposure_pct=Decimal("40"),
+                        max_net_directional_exposure_pct=Decimal("60"),
+                    ),
+                    *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                    *build_margin_timing_checks(min_minutes_to_squareoff=30),
+                ],
+                audit=audit,
+            )
         )
 
     @staticmethod
@@ -1183,6 +1248,8 @@ class TestTheTriggerMeetsAllFourteenChecks:
             "kill_switch_active": False,
             "unhealthy_services": (),
             "realised_pnl_today": Decimal(0),
+            "unrealised_pnl_today": Decimal(0),
+            "charges_today": Decimal(0),
             "consecutive_losses": 0,
             "daily_loss_halted": False,
             "consecutive_loss_halted": False,
@@ -1195,6 +1262,11 @@ class TestTheTriggerMeetsAllFourteenChecks:
             "symbol_sector": "IT",
             "available_margin": Decimal("250000"),
             "margin_per_share": Decimal("240"),
+            # Audit RSK-014/RSK-006: required book fields, full size.
+            "open_positions": (),
+            "correlations": {},
+            "lot_size": 1,
+            "size_factor": Decimal(1),
         }
         base.update(overrides)
         return RiskContext(**base)
@@ -1266,6 +1338,8 @@ class TestTheTriggerMeetsAllFourteenChecks:
                 kill_switch_active=True,
                 symbol_restrictions=("T2T",),
                 realised_pnl_today=Decimal("-20000"),
+                unrealised_pnl_today=Decimal(0),
+                charges_today=Decimal(0),
                 available_margin=Decimal("1"),
                 now=_dt.datetime(2026, 8, 20, 9, 30, tzinfo=_dt.UTC),
             ),
@@ -1346,25 +1420,29 @@ class TestTheTriggerBecomesAnApprovedOrder:
             max_position_pct=Decimal("20"),
             capital_per_slot_pct=Decimal("20"),
             target_r_multiple=Decimal("2.0"),
+            max_price_divergence_pct=Decimal("1.0"),
+            min_position_pct=Decimal("0.0001"),
         )
 
-    def _engine(self, audit=None) -> RiskEngine:
+    def _engine(self, audit=None) -> _MarketAgrees:
         """The complete engine: fourteen checks AND a sizer."""
-        return RiskEngine(
-            checks=[
-                *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
-                *build_eligibility_checks(),
-                *build_exposure_checks(
-                    max_correlated_positions=2,
-                    correlation_threshold=Decimal("0.7"),
-                    max_sector_exposure_pct=Decimal("40"),
-                    max_net_directional_exposure_pct=Decimal("60"),
-                ),
-                *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
-                *build_margin_timing_checks(min_minutes_to_squareoff=30),
-            ],
-            sizer=build_sizer(self._policy()),
-            audit=audit,
+        return _MarketAgrees(
+            RiskEngine(
+                checks=[
+                    *build_precondition_checks(self._calendar(), NO_TRADE_WINDOWS),
+                    *build_eligibility_checks(),
+                    *build_exposure_checks(
+                        max_correlated_positions=2,
+                        correlation_threshold=Decimal("0.7"),
+                        max_sector_exposure_pct=Decimal("40"),
+                        max_net_directional_exposure_pct=Decimal("60"),
+                    ),
+                    *build_loss_checks(max_daily_loss_pct=Decimal("3.0"), consecutive_loss_halt=3),
+                    *build_margin_timing_checks(min_minutes_to_squareoff=30),
+                ],
+                sizer=build_sizer(self._policy()),
+                audit=audit,
+            )
         )
 
     @staticmethod
@@ -1383,6 +1461,8 @@ class TestTheTriggerBecomesAnApprovedOrder:
             "kill_switch_active": False,
             "unhealthy_services": (),
             "realised_pnl_today": Decimal(0),
+            "unrealised_pnl_today": Decimal(0),
+            "charges_today": Decimal(0),
             "consecutive_losses": 0,
             "daily_loss_halted": False,
             "consecutive_loss_halted": False,
@@ -1397,6 +1477,10 @@ class TestTheTriggerBecomesAnApprovedOrder:
             "margin_per_share": Decimal("240"),
             "atr": self._atr_from_the_engine(run),
             "lot_size": 1,
+            # Audit RSK-014/RSK-006: required book fields, full size.
+            "open_positions": (),
+            "correlations": {},
+            "size_factor": Decimal(1),
         }
         base.update(overrides)
         return RiskContext(**base)

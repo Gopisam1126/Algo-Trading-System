@@ -157,6 +157,7 @@ ERRORED = "check_errored"
 MARGIN_CAP = "margin_cap"
 SECTOR_CAP = "sector_cap"
 NET_EXPOSURE_CAP = "net_exposure_cap"
+PRICE_DIVERGENCE = "price_divergence"
 
 #: Which ``RejectReason`` a zero quantity earns, by the clamp that caused it.
 #: Anything absent here is POSITION_TOO_SMALL — the honest default for "every
@@ -171,6 +172,9 @@ _ZERO_QUANTITY_REASONS = {
     MARGIN_CAP: RejectReason.INSUFFICIENT_MARGIN,
     SECTOR_CAP: RejectReason.SECTOR_EXPOSURE_LIMIT,
     NET_EXPOSURE_CAP: RejectReason.NET_EXPOSURE_LIMIT,
+    # Audit RSK-002: not "too small" - the price the signal was sized on is
+    # not the market's.
+    PRICE_DIVERGENCE: RejectReason.PRICE_DIVERGENCE,
 }
 
 

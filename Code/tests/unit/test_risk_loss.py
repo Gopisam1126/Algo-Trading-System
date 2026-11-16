@@ -73,6 +73,8 @@ def _ctx(**overrides) -> RiskContext:
         "kill_switch_active": False,
         "unhealthy_services": (),
         "realised_pnl_today": Decimal(0),
+        "unrealised_pnl_today": Decimal(0),
+        "charges_today": Decimal(0),
         "consecutive_losses": 0,
         "daily_loss_halted": False,
         "consecutive_loss_halted": False,
@@ -81,6 +83,13 @@ def _ctx(**overrides) -> RiskContext:
         "capital": CAPITAL,
         "slots_total": 5,
         "slots_used": 0,
+        # Audit RSK-014/RSK-002/RSK-006: the book fields are required, and
+        # the sizer refuses without a live price and a size factor.
+        "open_positions": (),
+        "correlations": {},
+        "lot_size": 1,
+        "last_price": Decimal("1200.00"),
+        "size_factor": Decimal(1),
     }
     base.update(overrides)
     return RiskContext(**base)
@@ -99,6 +108,35 @@ def _both():
         max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
         consecutive_loss_halt=CONSECUTIVE_HALT,
     )
+
+
+class TestTheDayIsRealisedPlusOpenLessCharges:
+    """Audit RSK-005: the limit read gross realised P&L, so open losers and every
+    rupee of charges were outside it. Mutation testing (16 Nov 2026) found no
+    test that failed when charges were dropped from the figure - these are it."""
+
+    def test_charges_take_a_gross_loss_over_the_limit(self) -> None:
+        """The audit's own case: -14,990 gross with 50 in charges is -15,040."""
+        ctx = _ctx(realised_pnl_today=Decimal("-14990"), charges_today=Decimal("50"))
+        outcome = _daily()(_rec(), ctx)
+        assert not outcome.passed
+        assert outcome.reason is RejectReason.DAILY_LOSS_LIMIT
+
+    def test_open_losses_take_the_day_over_the_limit(self) -> None:
+        """-12,000 realised and -6,000 open is -18,000: past a 15,000 limit."""
+        ctx = _ctx(realised_pnl_today=Decimal("-12000"), unrealised_pnl_today=Decimal("-6000"))
+        assert not _daily()(_rec(), ctx).passed
+
+    def test_the_same_gross_loss_without_charges_passes(self) -> None:
+        """The control: 14,990 alone is under the limit."""
+        assert _daily()(_rec(), _ctx(realised_pnl_today=Decimal("-14990"))).passed
+
+    def test_an_unknown_charge_figure_raises_rather_than_reading_as_zero(self) -> None:
+        """The engine turns the raise into a RISK_ENGINE_FAULT rejection."""
+        from algotrader.execution.risk.context import RiskContextError
+
+        with pytest.raises(RiskContextError, match="transaction charges"):
+            _daily()(_rec(), _ctx(charges_today=None))
 
 
 class TestAC1DailyLossLimit:

@@ -35,6 +35,7 @@ from algotrader.common.db.repositories import (
 from algotrader.common.enums import OrderIntent, OrderType, Product, Side
 from algotrader.common.models.trading import OrderRequest
 from algotrader.execution.gateway import GatewayPolicy, OrderGateway
+from tests.doubles import CountingLimiter
 
 pytestmark = [pytest.mark.integration]
 
@@ -91,6 +92,7 @@ class _RecordingKite:
 
 def _adapter(instruments: InstrumentRepository | None, client: _RecordingKite):
     return KiteTradingAdapter(
+        limiter=CountingLimiter(),
         auth=None,
         client=client,
         algo_id="ALGO12345",

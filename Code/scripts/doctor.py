@@ -239,11 +239,18 @@ def check_compliance(r: Report) -> None:
     else:
         r.ok(f"{profile.display_name} supports programmatic daily login")
 
-    india = {"ap-south-1", "ap-south-2", "centralindia", "southindia", "asia-south1"}
-    if cfg.system.deployment_region.lower() in india:
-        r.ok(f"region {cfg.system.deployment_region}", "India - required by SEBI")
+    # The config already refused a non-India region at load; this reports it,
+    # and says what it is - a self-imposed rule, not a cited SEBI one (HAL-001).
+    r.ok(f"region {cfg.system.deployment_region}", "India - this system's own rule")
+    if cfg.broker.algo_tagging_confirmation.strip():
+        r.ok("algo tagging confirmed by the broker", cfg.broker.algo_tagging_confirmation[:60])
+    elif live:
+        r.fail("algo tagging not confirmed", "broker.algo_tagging_confirmation (LEG-001)")
     else:
-        r.fail(f"region {cfg.system.deployment_region} is not in India")
+        r.warn(
+            "algo tagging not yet confirmed with the broker",
+            "required before live (LEG-001, PRE_LIVE_CHECKLIST)",
+        )
 
     if cfg.system.static_ip:
         r.ok("static IP configured", cfg.system.static_ip)
@@ -282,27 +289,61 @@ def check_compliance(r: Report) -> None:
 
 
 def check_egress_ip(r: Report) -> None:
-    """The IP the broker sees must match what is whitelisted."""
+    """The IP the broker sees must match what is whitelisted.
+
+    Fails closed in LIVE mode (audit SEC-006): an unset expectation or an
+    egress lookup that fails used to be a WARNING whatever the mode, so the
+    go-live pre-flight could pass with the broker whitelist unverified - and a
+    wrong host would surface only as order rejections at market open. Outside
+    live mode both stay warnings: nothing is being sent.
+
+    The expected address is ``EXPECTED_EGRESS_IP`` if set, else the config's
+    ``system.static_ip`` (the address the broker whitelists); when both are set
+    they must agree.
+    """
     section("Network")
     import os
 
-    expected = os.environ.get("EXPECTED_EGRESS_IP", "").strip()
+    try:
+        from algotrader.common.config import load_config
+        from algotrader.common.enums import SystemMode
+
+        cfg = load_config()
+        live = cfg.system.mode is SystemMode.LIVE
+        configured = cfg.system.static_ip.strip()
+    except Exception:
+        live, configured = True, ""  # an unreadable config is judged as strictly as live
+    flag = r.fail if live else r.warn
+
+    override = os.environ.get("EXPECTED_EGRESS_IP", "").strip()
+    if override and configured and override != configured:
+        r.fail(
+            "EXPECTED_EGRESS_IP disagrees with system.static_ip",
+            f"{override} vs {configured}",
+        )
+        return
+    expected = override or configured
     if not expected:
-        r.warn("EXPECTED_EGRESS_IP not set", "cannot verify broker whitelist match")
+        flag("no expected egress IP", "set system.static_ip (or EXPECTED_EGRESS_IP)")
         return
     try:
-        import urllib.request
-
-        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
-            actual = resp.read().decode().strip()
+        actual = _egress_ip()
     except Exception as exc:
-        r.warn("could not determine egress IP", str(exc)[:60])
+        flag("could not determine egress IP", str(exc)[:60])
         return
 
     if actual == expected:
         r.ok("egress IP matches whitelist", actual)
     else:
         r.fail("egress IP MISMATCH", f"expected {expected}, got {actual}")
+
+
+def _egress_ip() -> str:
+    """The public address this host's traffic leaves from (one HTTPS call)."""
+    import urllib.request
+
+    with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
+        return str(resp.read().decode().strip())
 
 
 def check_market_calendar(r: Report) -> None:

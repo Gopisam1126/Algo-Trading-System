@@ -27,6 +27,7 @@ from algotrader.common.enums import Exchange, OrderIntent, OrderStatus, OrderTyp
 from algotrader.common.models.market import Instrument
 from algotrader.common.models.trading import OrderRequest
 from algotrader.common.secrets import SecretString
+from tests.doubles import CountingLimiter
 
 
 def _auth() -> KiteAuthManager:
@@ -222,19 +223,21 @@ class TestTickRoundingHasADirection:
 class TestOrderSubmission:
     async def test_a_placed_order_returns_the_broker_id(self) -> None:
         client = FakeKite()
-        adapter = KiteTradingAdapter(auth=_auth(), client=client)
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=client)
         assert await adapter.place_order(_request()) == "240819000000001"
 
     async def test_the_tag_reaches_the_broker(self) -> None:
         client = FakeKite()
-        adapter = KiteTradingAdapter(auth=_auth(), client=client)
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=client)
         await adapter.place_order(_request())
         _, kwargs = client.calls[0]
         assert kwargs["tag"] == mapping.broker_tag("a" * 32)
 
     async def test_an_empty_order_id_is_ambiguous_not_success(self) -> None:
         """A blank id means we cannot identify what may have been created."""
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(place_order=""))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(place_order="")
+        )
         with pytest.raises(AmbiguousOrderError, match="Reconcile by tag"):
             await adapter.place_order(_request())
 
@@ -243,7 +246,9 @@ class TestOrderSubmission:
         """``str(None)`` is "None", which is truthy, so the old guard let a null
         id through as broker order "None" - recorded as landed under an id that
         names nothing."""
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(place_order=returned))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(place_order=returned)
+        )
         with pytest.raises(AmbiguousOrderError, match="Reconcile by tag"):
             await adapter.place_order(_request())
 
@@ -256,7 +261,9 @@ class TestOrderSubmission:
         symbol allowlist. The recovery path would then have ADOPTED it."""
         row = _order_row(tag=mapping.broker_tag("b" * 32))
         del row[missing]
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=[row]))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=[row])
+        )
         with pytest.raises(mapping.MappingError, match=missing):
             await adapter.find_by_client_order_id("b" * 32)
         # The modelled orderbook skips it rather than losing every other row.
@@ -266,13 +273,15 @@ class TestOrderSubmission:
         import kiteconnect.exceptions as kx
 
         adapter = KiteTradingAdapter(
-            auth=_auth(), client=FakeKite(place_order=kx.NetworkException("timeout"))
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=FakeKite(place_order=kx.NetworkException("timeout")),
         )
         with pytest.raises(AmbiguousOrderError):
             await adapter.place_order(_request())
 
     async def test_modify_with_nothing_to_change_is_refused(self) -> None:
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite())
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=FakeKite())
         with pytest.raises(ValueError, match="nothing to modify"):
             await adapter.modify_order("240819000000001")
 
@@ -283,7 +292,9 @@ class TestRecoveryByTag:
     async def test_an_order_is_found_by_its_client_order_id(self) -> None:
         client_order_id = "a" * 32
         rows = [_order_row(tag=mapping.broker_tag(client_order_id))]
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=rows)
+        )
         found = await adapter.find_by_client_order_id(client_order_id)
         assert found is not None
         assert found.broker_order_id == "240819000000001"
@@ -291,16 +302,22 @@ class TestRecoveryByTag:
 
     async def test_an_absent_order_returns_none_not_an_error(self) -> None:
         """Absent is a real answer — it is what authorises a resubmission."""
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=[]))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=[])
+        )
         assert await adapter.find_by_client_order_id("b" * 32) is None
 
     async def test_another_orders_tag_does_not_match(self) -> None:
         rows = [_order_row(tag=mapping.broker_tag("z" * 32))]
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=rows)
+        )
         assert await adapter.find_by_client_order_id("a" * 32) is None
 
     async def test_the_orderbook_maps_into_our_order_model(self) -> None:
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=[_order_row()]))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=[_order_row()])
+        )
         orders = await adapter.fetch_orderbook()
         assert len(orders) == 1
         order = orders[0]
@@ -320,13 +337,17 @@ class TestMarginStaleness:
     }
 
     async def test_margins_map_to_decimals(self) -> None:
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(margins=self._MARGINS))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(margins=self._MARGINS)
+        )
         snapshot = await adapter.fetch_margins()
         assert snapshot.available_margin == Decimal("487500")
         assert snapshot.used_margin == Decimal("12500")
 
     async def test_a_fresh_snapshot_is_usable(self) -> None:
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(margins=self._MARGINS))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(margins=self._MARGINS)
+        )
         await adapter.fetch_margins()
         assert adapter.margin_for_sizing().available_margin == Decimal("487500")
 
@@ -334,7 +355,10 @@ class TestMarginStaleness:
         """Margin falls after every fill; a stale reading authorises a position
         the account cannot carry."""
         adapter = KiteTradingAdapter(
-            auth=_auth(), client=FakeKite(margins=self._MARGINS), margin_ttl_seconds=5.0
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=FakeKite(margins=self._MARGINS),
+            margin_ttl_seconds=5.0,
         )
         await adapter.fetch_margins()
         later = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=30)
@@ -342,7 +366,7 @@ class TestMarginStaleness:
             adapter.margin_for_sizing(now=later)
 
     def test_sizing_before_any_fetch_is_refused(self) -> None:
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite())
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=FakeKite())
         with pytest.raises(StaleMarginError, match="no margin fetched"):
             adapter.margin_for_sizing()
 
@@ -515,7 +539,9 @@ class TestTheOrderbookSurvivesForeignOrders:
 
     async def test_an_unmappable_row_does_not_lose_the_rest_of_the_book(self) -> None:
         rows = [self._foreign_row(), _order_row(order_id="OURS")]
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=rows)
+        )
         orders = await adapter.fetch_orderbook()
         assert [o.broker_order_id for o in orders] == ["OURS"], (
             "the modelled order must survive an unmappable sibling"
@@ -525,17 +551,23 @@ class TestTheOrderbookSurvivesForeignOrders:
         """Nothing may disappear. Reconciliation diffs on identity, which needs
         no enum mapping — so the foreign order is still visible there."""
         rows = [self._foreign_row(), _order_row(order_id="OURS")]
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=rows)
+        )
         raw = await adapter.fetch_raw_orders()
         assert {str(r["order_id"]) for r in raw} == {"FOREIGN", "OURS"}
 
     async def test_an_unmodelled_product_is_also_tolerated(self) -> None:
         rows = [_order_row(order_id="ODD", product="BO"), _order_row(order_id="OURS")]
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=rows)
+        )
         assert [o.broker_order_id for o in await adapter.fetch_orderbook()] == ["OURS"]
 
     async def test_an_empty_book_is_not_an_error(self) -> None:
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=[]))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=[])
+        )
         assert await adapter.fetch_orderbook() == []
 
 
@@ -553,7 +585,9 @@ class TestADuplicateTagIsNeverResolvedByPicking:
             _order_row(order_id="OLD", tag=tag, status="REJECTED"),
             _order_row(order_id="NEW", tag=tag, status="OPEN"),
         ]
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=rows)
+        )
         with pytest.raises(DuplicateBrokerOrderError) as exc:
             await adapter.find_by_client_order_id("a" * 32)
         assert set(exc.value.broker_order_ids) == {"OLD", "NEW"}
@@ -561,7 +595,9 @@ class TestADuplicateTagIsNeverResolvedByPicking:
     async def test_the_error_names_both_orders_for_the_human(self) -> None:
         tag = mapping.broker_tag("a" * 32)
         rows = [_order_row(order_id="OLD", tag=tag), _order_row(order_id="NEW", tag=tag)]
-        adapter = KiteTradingAdapter(auth=_auth(), client=FakeKite(orders=rows))
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(), auth=_auth(), client=FakeKite(orders=rows)
+        )
         with pytest.raises(DuplicateBrokerOrderError, match="do not place anything else"):
             await adapter.find_by_client_order_id("a" * 32)
 
@@ -569,7 +605,9 @@ class TestADuplicateTagIsNeverResolvedByPicking:
         """The control — the fix must not break the normal recovery path."""
         tag = mapping.broker_tag("a" * 32)
         adapter = KiteTradingAdapter(
-            auth=_auth(), client=FakeKite(orders=[_order_row(order_id="ONE", tag=tag)])
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=FakeKite(orders=[_order_row(order_id="ONE", tag=tag)]),
         )
         found = await adapter.find_by_client_order_id("a" * 32)
         assert found is not None and found.broker_order_id == "ONE"

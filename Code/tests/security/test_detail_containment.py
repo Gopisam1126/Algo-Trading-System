@@ -93,6 +93,8 @@ def _ctx(**overrides) -> RiskContext:
         "kill_switch_active": False,
         "unhealthy_services": (),
         "realised_pnl_today": Decimal(0),
+        "unrealised_pnl_today": Decimal(0),
+        "charges_today": Decimal(0),
         "consecutive_losses": 0,
         "daily_loss_halted": False,
         "consecutive_loss_halted": False,
@@ -103,6 +105,13 @@ def _ctx(**overrides) -> RiskContext:
         "slots_used": 0,
         "symbol_restrictions": (),
         "symbol_sector": "PSU_BANK",
+        # Audit RSK-014/RSK-002/RSK-006: the book fields are required, and
+        # the sizer refuses without a live price and a size factor.
+        "open_positions": (),
+        "correlations": {},
+        "lot_size": 1,
+        "last_price": Decimal("100"),
+        "size_factor": Decimal(1),
     }
     base.update(overrides)
     return RiskContext(**base)
@@ -118,6 +127,8 @@ def _policy() -> SizingPolicy:
         max_position_pct=Decimal("20"),
         capital_per_slot_pct=Decimal("20"),
         target_r_multiple=Decimal("2.0"),
+        max_price_divergence_pct=Decimal("1.0"),
+        min_position_pct=Decimal("2"),
     )
 
 
@@ -456,6 +467,8 @@ class TestNoNonFiniteNumberReachesACheck:
         test above and stop the system dead."""
         ctx = _ctx(
             realised_pnl_today=Decimal("-5000"),
+            unrealised_pnl_today=Decimal(0),
+            charges_today=Decimal(0),
             available_margin=Decimal("250000"),
             atr=Decimal("13.5"),
             margin_per_share=Decimal("240"),

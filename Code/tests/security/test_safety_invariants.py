@@ -11,13 +11,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 
 from algotrader.common.config import (
+    CONFIRM_LIVE_VARIABLE,
     MAX_ORDERS_PER_SECOND,
     SEBI_ALGO_REGISTRATION_OPS,
     AIConfig,
@@ -33,6 +34,7 @@ from algotrader.common.config import (
 )
 from algotrader.common.models.trading import Recommendation
 from algotrader.common.secrets import REDACTED, SecretString
+from tests.doubles import live_config
 
 #: Sentinel for the AUDIT-005 probes: 'do not pass this field at all',
 #: which is a different claim from passing None.
@@ -269,7 +271,9 @@ class TestLiveModeRequiresCompliance:
                 {"system": {"mode": "live", "static_ip": ""}, "broker": {"algo_id": "ALGO123"}}
             )
 
-    def test_live_mode_does_not_require_an_algo_id_below_the_threshold(self) -> None:
+    def test_live_mode_does_not_require_an_algo_id_below_the_threshold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """CORRECTED 9 Sep 2026. This assertion used to be its exact opposite.
 
         SEBI requires a registered Algo-ID only for algos at or above the
@@ -278,16 +282,19 @@ class TestLiveModeRequiresCompliance:
         and the old gate would have refused to start LIVE mode forever,
         waiting on paperwork that is never issued.
         """
-        cfg = AppConfig.model_validate(
+        cfg = live_config(
+            monkeypatch,
             {
                 "system": {"mode": "live", "static_ip": "1.2.3.4"},
                 "broker": {"algo_id": ""},
-            }
+            },
         )
         assert cfg.system.mode.value == "live"
         assert cfg.broker.algo_id == ""
 
-    def test_live_mode_does_require_one_at_or_above_the_threshold(self) -> None:
+    def test_live_mode_does_require_one_at_or_above_the_threshold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The control, and the reason the check still exists.
 
         This state is NOT reachable from a config file — the field validator
@@ -297,8 +304,9 @@ class TestLiveModeRequiresCompliance:
         not pass silently. ``model_copy`` does not re-validate, so the
         threshold branch is driven directly.
         """
-        cfg = AppConfig.model_validate(
-            {"system": {"mode": "live", "static_ip": "1.2.3.4"}, "broker": {"algo_id": ""}}
+        cfg = live_config(
+            monkeypatch,
+            {"system": {"mode": "live", "static_ip": "1.2.3.4"}, "broker": {"algo_id": ""}},
         )
         at_threshold = cfg.model_copy(
             update={
@@ -307,12 +315,16 @@ class TestLiveModeRequiresCompliance:
                 )
             }
         )
+        # The confirmation is of a file's hash (RSK-008); these hand-edited
+        # copies are different configurations, so each is confirmed in turn.
+        monkeypatch.setenv(CONFIRM_LIVE_VARIABLE, at_threshold.config_hash())
         with pytest.raises(ValueError, match="algo_id"):
             at_threshold._live_mode_requires_compliance()
 
         registered = at_threshold.model_copy(
             update={"broker": cfg.broker.model_copy(update={"algo_id": "NSE-ALGO-1"})}
         )
+        monkeypatch.setenv(CONFIRM_LIVE_VARIABLE, registered.config_hash())
         assert registered._live_mode_requires_compliance() is registered
 
     def test_the_import_guard_refuses_a_cap_at_or_above_the_threshold(self) -> None:
@@ -497,6 +509,8 @@ class TestSessionRiskStateIsNeverAssumed:
         "kill_switch_active": False,
         "unhealthy_services": (),
         "realised_pnl_today": Decimal(0),
+        "unrealised_pnl_today": Decimal(0),
+        "charges_today": Decimal(0),
         "consecutive_losses": 0,
         "daily_loss_halted": False,
         "consecutive_loss_halted": False,
@@ -559,6 +573,8 @@ class TestSessionRiskStateIsNeverAssumed:
                     max_position_pct=Decimal("20"),
                     capital_per_slot_pct=Decimal("20"),
                     target_r_multiple=Decimal("2.0"),
+                    max_price_divergence_pct=Decimal("1.0"),
+                    min_position_pct=Decimal("2"),
                 )
             ),
         )
@@ -575,8 +591,13 @@ class TestSessionRiskStateIsNeverAssumed:
             # E14-S10: the sizer reads the book for exposure headroom.
             symbol_sector="IT",
             open_positions=(),
+            correlations={},
             available_margin=Decimal("400000"),
             margin_per_share=Decimal("240"),
+            # Audit RSK-002/RSK-006: a live price agreeing with the trigger,
+            # and full size.
+            last_price=Decimal("1200.00"),
+            size_factor=Decimal(1),
             **state,  # type: ignore[arg-type]
         )
         return engine.evaluate(rec, ctx)
@@ -655,3 +676,74 @@ class TestSessionRiskStateIsNeverAssumed:
             f"means 'nobody asked' is indistinguishable from 'nothing is halted', "
             f"which is the fail-open AUDIT-005 closed."
         )
+
+
+class TestLiveModeIsDeliberate:
+    """Audit RSK-008: one YAML line - or ALGOTRADER_CONFIG pointing at another
+    file - enabled real orders, gated only by a non-empty static_ip string."""
+
+    RAW: ClassVar[dict[str, Any]] = {
+        "system": {"mode": "live", "static_ip": "1.2.3.4"},
+        "broker": {"algo_tagging_confirmation": "Zerodha support ticket TEST-1, 16 Nov 2026"},
+    }
+
+    def test_the_control_a_confirmed_production_config_loads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert live_config(monkeypatch, self.RAW).system.mode.value == "live"
+
+    @pytest.mark.parametrize(
+        "ip", ["x", "not-an-ip", "10.0.0.5", "192.168.1.10", "127.0.0.1", "203.0.113.10"]
+    )
+    def test_a_static_ip_that_no_broker_could_whitelist_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, ip: str
+    ) -> None:
+        with pytest.raises(ValidationError, match="static_ip"):
+            live_config(monkeypatch, {"system": {"mode": "live", "static_ip": ip}})
+
+    @pytest.mark.parametrize("environment", ["", "development", "paper", "Production"])
+    def test_live_outside_production_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, environment: str
+    ) -> None:
+        live_config(monkeypatch, self.RAW)  # sets a valid confirmation
+        monkeypatch.setenv("ALGOTRADER_ENV", environment)
+        with pytest.raises(ValidationError, match="ALGOTRADER_ENV"):
+            AppConfig.model_validate(self.RAW)
+
+    def test_live_without_the_confirmation_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        live_config(monkeypatch, self.RAW)
+        monkeypatch.delenv(CONFIRM_LIVE_VARIABLE)
+        with pytest.raises(ValidationError, match="unset"):
+            AppConfig.model_validate(self.RAW)
+
+    def test_a_confirmation_of_a_different_file_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Confirm one file, then load an edit of it: the hash moves."""
+        live_config(monkeypatch, self.RAW)
+        edited = {**self.RAW, "risk": {"capital": 900000}}
+        with pytest.raises(ValidationError, match="a different value"):
+            AppConfig.model_validate(edited)
+
+    def test_full_autonomy_on_live_capital_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """RSK-001: L4 needs months of L3 evidence, and L3 cannot run yet."""
+        with pytest.raises(ValidationError, match="L4 is not permitted"):
+            live_config(monkeypatch, {**self.RAW, "autonomy": {"level": "L4"}})
+
+    def test_live_without_the_brokers_tagging_answer_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LEG-001: who applies the generic algo ID to a sub-threshold client
+        algo's orders is unconfirmed; live waits for the broker's written answer."""
+        with pytest.raises(ValidationError, match="algo_tagging_confirmation"):
+            live_config(monkeypatch, {**self.RAW, "broker": {"algo_tagging_confirmation": ""}})
+
+    def test_paper_needs_none_of_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The control: the gate is for live capital only."""
+        monkeypatch.delenv("ALGOTRADER_ENV", raising=False)
+        monkeypatch.delenv(CONFIRM_LIVE_VARIABLE, raising=False)
+        assert AppConfig.model_validate({"system": {"mode": "paper"}}).system.static_ip == ""

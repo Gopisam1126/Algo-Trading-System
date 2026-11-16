@@ -18,6 +18,7 @@ worth of stop distance, and the breach would be invisible.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 from decimal import Decimal
 from uuid import UUID
@@ -32,10 +33,13 @@ from algotrader.common.models.trading import Recommendation
 from algotrader.execution.risk.context import OpenPosition, RiskContext, RiskContextError
 from algotrader.execution.risk.framework import RiskCheck, RiskEngine
 from algotrader.execution.sizer import (
+    BELOW_MINIMUM,
     LOT_ROUNDING,
     MARGIN_CAP,
     NET_EXPOSURE_CAP,
     POSITION_CAP,
+    PRICE_DIVERGENCE,
+    REDUCED_SIZE,
     RISK_BUDGET,
     SECTOR_CAP,
     SLOT_CAP,
@@ -58,6 +62,8 @@ POLICY = SizingPolicy(
     max_position_pct=Decimal("20"),
     capital_per_slot_pct=Decimal("20"),
     target_r_multiple=Decimal("2.0"),
+    max_price_divergence_pct=Decimal("1.0"),
+    min_position_pct=Decimal("0.0001"),
 )
 CAPITAL = Decimal("500000")
 
@@ -101,6 +107,8 @@ def _ctx(**overrides) -> RiskContext:
         "kill_switch_active": False,
         "unhealthy_services": (),
         "realised_pnl_today": Decimal(0),
+        "unrealised_pnl_today": Decimal(0),
+        "charges_today": Decimal(0),
         "consecutive_losses": 0,
         "daily_loss_halted": False,
         "consecutive_loss_halted": False,
@@ -121,13 +129,22 @@ def _ctx(**overrides) -> RiskContext:
         # control by default.
         "symbol_sector": "IT",
         "open_positions": (),
+        # Audit RSK-014/RSK-002/RSK-006: the book fields are required, and
+        # the sizer refuses without a live price and a size factor.
+        "correlations": {},
+        "last_price": Decimal("100.00"),
+        "size_factor": Decimal(1),
     }
     base.update(overrides)
     return RiskContext(**base)
 
 
 def _size(rec=None, **ctx_kwargs):
-    return size_position(rec or _rec(), _ctx(**ctx_kwargs), POLICY)
+    rec = rec or _rec()
+    # The market agrees with the trigger unless a test says otherwise: the
+    # RSK-002 divergence guard is tested on its own, below.
+    ctx_kwargs.setdefault("last_price", rec.trigger_price)
+    return size_position(rec, _ctx(**ctx_kwargs), POLICY)
 
 
 class TestAC1RiskNeverExceedsTheBudget:
@@ -187,8 +204,10 @@ class TestAC1RiskNeverExceedsTheBudget:
             max_position_pct=Decimal("20"),
             capital_per_slot_pct=Decimal("20"),
             target_r_multiple=Decimal("2.0"),
+            max_price_divergence_pct=Decimal("1.0"),
+            min_position_pct=Decimal("0.0001"),
         )
-        ctx = _ctx(capital=capital, atr=atr, lot_size=lot_size)
+        ctx = _ctx(capital=capital, atr=atr, lot_size=lot_size, last_price=Decimal(str(entry)))
         result = size_position(_rec(entry=str(entry)), ctx, policy)
         budget = capital * risk_pct / 100
         assert result.capital_at_risk <= budget, (
@@ -579,6 +598,8 @@ class TestAC10SizingIsPureAndDeterministic:
             "target_r_multiple": Decimal("2.0"),
             "max_sector_exposure_pct": Decimal("40"),
             "max_net_directional_exposure_pct": Decimal("60"),
+            "max_price_divergence_pct": Decimal("1.0"),
+            "min_position_pct": Decimal("2"),
         }
         assert set(base) == set(self._policy_fields()), (
             "SizingPolicy gained or lost a field; this test must cover all of them"
@@ -600,6 +621,8 @@ class TestAC10SizingIsPureAndDeterministic:
             "target_r_multiple": Decimal("2.0"),
             "max_sector_exposure_pct": Decimal("40"),
             "max_net_directional_exposure_pct": Decimal("60"),
+            "max_price_divergence_pct": Decimal("1.0"),
+            "min_position_pct": Decimal("2"),
         }
         for field in ("max_sector_exposure_pct", "max_net_directional_exposure_pct"):
             with pytest.raises(ValueError, match="more than 100"):
@@ -619,6 +642,8 @@ class TestAC10SizingIsPureAndDeterministic:
                 max_position_pct=Decimal("20"),
                 capital_per_slot_pct=Decimal("20"),
                 target_r_multiple=Decimal("2.0"),
+                max_price_divergence_pct=Decimal("1.0"),
+                min_position_pct=Decimal("0.0001"),
             )
 
 
@@ -954,3 +979,125 @@ class TestS10AnUntrustedSymbolCannotForgeALogLine:
         of information the message exists to carry."""
         with pytest.raises(ValueError, match="RELIANCE"):
             _size(open_positions=(_held("RELIANCE", notional="1000", sector=None),))
+
+
+# ---------------------------------------------------------------------------
+# Audit 10 Nov 2026 - RSK-002 (the trigger against the market), RSK-006 /
+# AI-001 (reductions apply last), RSK-012 (no token positions)
+# ---------------------------------------------------------------------------
+
+
+class TestTheTriggerIsCheckedAgainstTheMarket:
+    """RSK-002. The audit's own case: a Recommendation priced at 100 for a stock
+    trading at 1,000 sized 833 shares - Rs 8.33 lakh, 167% of capital against
+    a 20% cap - with a stop at 94."""
+
+    def test_the_audits_case_is_refused(self) -> None:
+        result = size_position(
+            _rec(entry="100.00"), _ctx(atr=Decimal("4"), last_price=Decimal("1000.00")), POLICY
+        )
+        assert result.quantity == 0
+        assert result.binding_constraint == PRICE_DIVERGENCE
+
+    @pytest.mark.parametrize(
+        ("live", "refused"),
+        [("101.01", False), ("101.02", True), ("99.01", False), ("99.00", True)],
+    )
+    def test_the_band_is_one_percent_of_the_live_price(self, live: str, refused: bool) -> None:
+        """|trigger - live| / live <= 1%: with a trigger of 100 the band runs from
+        100/1.01 = 99.0099 to 100/0.99 = 101.0101, derived by hand."""
+        result = size_position(_rec(entry="100.00"), _ctx(last_price=Decimal(live)), POLICY)
+        assert (result.binding_constraint == PRICE_DIVERGENCE) is refused, result
+
+    def test_no_live_price_raises_rather_than_trusting_the_trigger(self) -> None:
+        with pytest.raises(RiskContextError, match="live price"):
+            size_position(_rec(), _ctx(last_price=None), POLICY)
+
+    def test_caps_divide_by_the_higher_of_the_two_prices(self) -> None:
+        """A trigger 1% under the market must not buy 1% more than the cap."""
+        at_trigger = size_position(
+            _rec(entry="1200.00"), _ctx(last_price=Decimal("1200.00")), POLICY
+        )
+        above = size_position(_rec(entry="1200.00"), _ctx(last_price=Decimal("1212.00")), POLICY)
+        assert at_trigger.binding_constraint == above.binding_constraint == POSITION_CAP
+        assert above.quantity * Decimal("1212.00") <= CAPITAL * POLICY.max_position_pct / 100
+        assert above.quantity < at_trigger.quantity
+
+
+class TestReductionsApplyAfterEveryClamp:
+    """RSK-006 / AI-001: a reduction applied to the risk budget alone would be
+    swallowed whenever a cap binds - and the position cap binds on most trades
+    under the shipped configuration (RSK-020)."""
+
+    def test_half_size_halves_a_position_bound_by_a_cap(self) -> None:
+        full = _size(rec=_rec(entry="1200.00"))
+        half = _size(rec=_rec(entry="1200.00"), size_factor=Decimal("0.5"))
+        assert full.binding_constraint == POSITION_CAP
+        assert half.binding_constraint == REDUCED_SIZE
+        assert half.quantity == full.quantity // 2
+
+    def test_half_size_halves_a_position_bound_by_risk(self) -> None:
+        full = _size()
+        half = _size(size_factor=Decimal("0.5"))
+        assert full.binding_constraint == RISK_BUDGET
+        assert half.quantity == full.quantity // 2
+        assert half.capital_at_risk <= full.capital_at_risk / 2
+
+    def test_full_size_changes_nothing(self) -> None:
+        """The control: a factor of 1 is not a reduction."""
+        assert _size(size_factor=Decimal(1)) == _size()
+
+    def test_no_factor_raises_rather_than_meaning_full_size(self) -> None:
+        with pytest.raises(RiskContextError, match="size factor"):
+            _size(size_factor=None)
+
+    @pytest.mark.parametrize("factor", ["0", "-0.5", "1.01", "2"])
+    def test_a_factor_that_is_not_a_reduction_is_unrepresentable(self, factor: str) -> None:
+        with pytest.raises(RiskContextError, match="size_factor"):
+            _ctx(size_factor=Decimal(factor))
+
+
+class TestATokenPositionIsRefused:
+    """RSK-012: the sizer approved 2 shares (Rs 2,000) when sector headroom was
+    nearly used - a slot for the day and a full round trip of costs."""
+
+    POLICY_WITH_MINIMUM = dataclasses.replace(POLICY, min_position_pct=Decimal("2"))
+
+    def test_a_position_below_the_minimum_is_refused(self) -> None:
+        # 3 shares of a 1,200 stock = 3,600 < 2% of 5,00,000 = 10,000.
+        result = size_position(
+            _rec(entry="1200.00"),
+            _ctx(
+                last_price=Decimal("1200.00"),
+                available_margin=Decimal("720"),
+                margin_per_share=Decimal("240"),
+            ),
+            self.POLICY_WITH_MINIMUM,
+        )
+        assert result.quantity == 0
+        assert result.binding_constraint == BELOW_MINIMUM
+
+    def test_a_position_at_the_minimum_is_kept(self) -> None:
+        # 9 shares x 1,200 = 10,800 >= 10,000.
+        result = size_position(
+            _rec(entry="1200.00"),
+            _ctx(
+                last_price=Decimal("1200.00"),
+                available_margin=Decimal("2160"),
+                margin_per_share=Decimal("240"),
+            ),
+            self.POLICY_WITH_MINIMUM,
+        )
+        assert result.quantity == 9
+
+    def test_the_engine_reports_it_as_too_small(self) -> None:
+        engine = RiskEngine(checks=[], sizer=build_sizer(self.POLICY_WITH_MINIMUM))
+        decision = engine.evaluate(
+            _rec(entry="1200.00"),
+            _ctx(
+                last_price=Decimal("1200.00"),
+                available_margin=Decimal("720"),
+                margin_per_share=Decimal("240"),
+            ),
+        )
+        assert decision.reason is RejectReason.POSITION_TOO_SMALL

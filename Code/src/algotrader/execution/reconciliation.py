@@ -1509,15 +1509,24 @@ class ReconciliationLoop:
                 # message is in the ERROR line above, which is redacted. Keeping
                 # it out of this sink is one rung above scrubbing it on the way in.
                 cause = exc.__cause__ if exc.__cause__ is not None else exc
-                await self._halter.arm(
-                    HaltReason.BROKER_DISCONNECTED,
-                    detail=(
-                        f"{self.consecutive_failures} consecutive reconciliation cycles "
-                        f"failed ({type(cause).__name__}); the book cannot be seen"
-                    ),
-                    armed_by="reconciler",
-                    now=now,
-                )
+                try:
+                    await self._halter.arm(
+                        HaltReason.BROKER_DISCONNECTED,
+                        detail=(
+                            f"{self.consecutive_failures} consecutive reconciliation cycles "
+                            f"failed ({type(cause).__name__}); the book cannot be seen"
+                        ),
+                        armed_by="reconciler",
+                        now=now,
+                    )
+                except Exception:
+                    # Audit ENG-001: an arm that raised (Redis down along with
+                    # the broker) escaped this except block and tore down the
+                    # service's TaskGroup - reconciliation and square-off with
+                    # it. It is retried on the next failed cycle; meanwhile the
+                    # service refuses entries because this cycle failed
+                    # (RSK-011), and a halt read that fails reads as halted.
+                    log.exception("could not arm BROKER_DISCONNECTED; retrying next cycle")
             return None
         self.consecutive_failures = 0
         return report

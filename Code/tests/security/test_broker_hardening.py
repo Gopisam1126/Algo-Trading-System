@@ -25,6 +25,7 @@ from algotrader.broker.kite.trading import KiteTradingAdapter
 from algotrader.common.enums import OrderIntent, OrderType, Product, Side
 from algotrader.common.models.trading import OrderRequest
 from algotrader.common.secrets import SecretString
+from tests.doubles import CountingLimiter
 
 API_SECRET = "api_secret_DO_NOT_LEAK_7c1d"
 
@@ -144,26 +145,35 @@ class TestAPricedOrderIsAlwaysOnTheTickGrid:
     def test_without_a_resolver_a_priced_order_is_refused(self) -> None:
         """Fail closed. A hardcoded 0.05 fallback would be right for most of the
         market and silently wrong for the rest."""
-        adapter = KiteTradingAdapter(auth=_auth(), client=object())
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=object())
         with pytest.raises(OrderRejectedError, match="tick-size resolver"):
             adapter._build_params(self._limit(Side.BUY, "1234.5678"))
 
     def test_a_buy_is_snapped_down(self) -> None:
         adapter = KiteTradingAdapter(
-            auth=_auth(), client=object(), tick_size_for=lambda _s: Decimal("0.05")
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=object(),
+            tick_size_for=lambda _s: Decimal("0.05"),
         )
         assert adapter._build_params(self._limit(Side.BUY, "1234.5678"))["price"] == 1234.55
 
     def test_a_sell_is_snapped_up(self) -> None:
         adapter = KiteTradingAdapter(
-            auth=_auth(), client=object(), tick_size_for=lambda _s: Decimal("0.05")
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=object(),
+            tick_size_for=lambda _s: Decimal("0.05"),
         )
         assert adapter._build_params(self._limit(Side.SELL, "1234.5678"))["price"] == 1234.60
 
     def test_a_trigger_price_is_snapped_too(self) -> None:
         """An SL order's trigger is off-grid just as often as its limit."""
         adapter = KiteTradingAdapter(
-            auth=_auth(), client=object(), tick_size_for=lambda _s: Decimal("0.05")
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=object(),
+            tick_size_for=lambda _s: Decimal("0.05"),
         )
         request = _request(
             order_type=OrderType.SL,
@@ -176,14 +186,17 @@ class TestAPricedOrderIsAlwaysOnTheTickGrid:
 
     def test_a_non_standard_tick_is_used(self) -> None:
         adapter = KiteTradingAdapter(
-            auth=_auth(), client=object(), tick_size_for=lambda _s: Decimal("0.01")
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=object(),
+            tick_size_for=lambda _s: Decimal("0.01"),
         )
         assert adapter._build_params(self._limit(Side.BUY, "13.4567"))["price"] == 13.45
 
     def test_a_market_order_needs_no_resolver(self) -> None:
         """A MARKET order carries no price, so nothing needs snapping — the
         fail-closed rule must not block the most common order type."""
-        adapter = KiteTradingAdapter(auth=_auth(), client=object())
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=object())
         assert "price" not in adapter._build_params(_request())
 
 

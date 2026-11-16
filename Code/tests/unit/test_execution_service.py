@@ -40,6 +40,7 @@ from algotrader.execution.positions import PositionManager, UnverifiedPosition
 from algotrader.execution.risk.checks import all_check_ids
 from algotrader.execution.service import ExecutionService, Outcome
 from algotrader.execution.session_context import NoProducerYet
+from tests.doubles import live_config
 
 # 10:30 IST on an ordinary Tuesday.
 NOW = dt.datetime(2026, 8, 25, 5, 0, tzinfo=dt.UTC)
@@ -169,9 +170,23 @@ class Store:
         }
         self.open_rows: list[dict[str, Any]] = []
         self.fail_restore = False
+        #: The registered strategies' states (RSK-006). The default strategy is
+        #: ACTIVE; a test about state sets its own.
+        self.states: dict[str, str] = {"orb_long_v1": "ACTIVE"}
+        self.fail_state = False
+        #: Today's orders - the day ledger's input (RSK-004/RSK-005).
+        self.orders: list[dict[str, Any]] = []
 
     async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]:
         return []
+
+    async def orders_since(self, since: dt.datetime) -> list[dict[str, Any]]:
+        return [dict(o) for o in self.orders]
+
+    async def strategy_state(self, strategy_id: str) -> str | None:
+        if self.fail_state:
+            raise ConnectionError("the strategy table is unreachable")
+        return self.states.get(strategy_id)
 
     async def occupied_slots(self) -> set[int]:
         return {int(r["slot_index"]) for r in self.open_rows}
@@ -228,6 +243,11 @@ class Facts:
 
     async def correlations(self, symbol, against, *, now):
         return {s: Decimal("0.1") for s in against}
+
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        # The market agrees with the trigger (`_rec`), so the RSK-002 guard
+        # passes; TestTheTriggerIsCheckedAgainstTheMarket moves it.
+        return Decimal("1200.00")
 
 
 class Reconciler:
@@ -290,11 +310,30 @@ class Harness:
         slots: int = 5,
         facts: Any = None,
         limiter: Any = None,
+        autonomy: str = "L4",
+        approval: bool = False,
+        monkeypatch: pytest.MonkeyPatch | None = None,
     ) -> None:
-        overrides: dict[str, Any] = {"system": {"mode": mode}, "risk": {"position_slots": slots}}
+        # L4 with no per-trade approval is the one configuration that places
+        # orders today (audit RSK-001; execution/autonomy.py) - and only in
+        # PAPER. The shipped defaults (L1, approval required) place nothing,
+        # which TestAutonomyLadderIsEnforced asserts on its own.
+        overrides: dict[str, Any] = {
+            "system": {"mode": mode},
+            # A correlation cap above the slot count is refused (RSK-009).
+            "risk": {
+                "position_slots": slots,
+                "portfolio": {"max_correlated_positions": min(2, slots)},
+            },
+            "autonomy": {"level": autonomy},
+            "notifications": {"require_approval_before_entry": approval},
+        }
         if mode is SystemMode.LIVE:
-            overrides["system"]["static_ip"] = "203.0.113.10"
-        self.config = AppConfig(**overrides)
+            assert monkeypatch is not None, "a LIVE harness needs monkeypatch (RSK-008)"
+            overrides["system"]["static_ip"] = "1.2.3.4"
+            self.config = live_config(monkeypatch, overrides)
+        else:
+            self.config = AppConfig(**overrides)
         self.ref: dict[str, Any] = {}
         self.redis = FakeRedis()
         self.halts = HaltController(self.redis)  # type: ignore[arg-type]
@@ -354,16 +393,19 @@ def _rec(
     verdict: AIVerdict = AIVerdict.CONFIRM,
     emitted_at: dt.datetime = NOW,
     direction: Direction = Direction.LONG,
+    confidence: str = "0.82",
+    agreement: int = 3,
+    strategy_id: str = "orb_long_v1",
 ) -> Recommendation:
     return Recommendation(
         correlation_id=uuid4(),
         symbol=symbol,
-        strategy_id="orb_long_v1",
+        strategy_id=strategy_id,
         direction=direction,
         trigger_price=Decimal("1200.00"),
         suggested_stop=Decimal("1186.45") if direction is Direction.LONG else Decimal("1213.55"),
-        timeframe_agreement=3,
-        ai_confidence=Decimal("0.82"),
+        timeframe_agreement=agreement,
+        ai_confidence=Decimal(confidence),
         ai_verdict=verdict,
         ai_rationale="probe",
         emitted_at=emitted_at,
@@ -486,9 +528,28 @@ class TestAc1AnApprovalIsSentWithItsPlan:
         assert second.outcome is Outcome.SUBMITTED, second.detail
         assert second.slot_index == 0
 
-    async def test_live_mode_sends_too(self) -> None:
-        h = await Harness(mode=SystemMode.LIVE).started()
-        assert (await h.service.handle(_rec())).outcome is Outcome.SUBMITTED
+    async def test_live_mode_sends_nothing_until_the_ladder_exists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CHANGED by the 10 Nov 2026 audit (RSK-001). This was
+        ``test_live_mode_sends_too``, asserting a LIVE entry was SUBMITTED -
+        at the shipped autonomy L1 with every entry configured to need a
+        human's approval, neither of which anything read.
+
+        Live capital is permitted only at L2 (approval) or L3 (envelope), and
+        neither control exists yet, so both refuse every entry. L4 needs months
+        of L3 evidence, so a live configuration at L4 does not even load."""
+        from pydantic import ValidationError
+
+        for level in ("L2", "L3"):
+            h = await Harness(
+                mode=SystemMode.LIVE, autonomy=level, monkeypatch=monkeypatch
+            ).started()
+            result = await h.service.handle(_rec())
+            assert result.outcome is Outcome.REFUSED, (level, result.detail)
+            assert h.placer.submitted == [], level
+        with pytest.raises(ValidationError, match="L4 is not permitted"):
+            Harness(mode=SystemMode.LIVE, autonomy="L4", monkeypatch=monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -931,7 +992,11 @@ class TestTheSignalAgeLimit:
 
     async def test_the_configured_limit_is_the_one_applied(self) -> None:
         h = Harness()
-        h.config = AppConfig(execution={"max_signal_age_seconds": 120})
+        h.config = h.config.model_copy(
+            update={
+                "execution": h.config.execution.model_copy(update={"max_signal_age_seconds": 120})
+            }
+        )
         h.service = ExecutionService(
             config=h.config,
             calendar=_calendar(),
@@ -1204,3 +1269,356 @@ class TestE20S05TheServiceHeartbeats:
         assert len(writes) >= 3, "the loop kept beating after the failed write"
         assert h.service._timer_heartbeat is not None
         assert _stored_beat(h).state is ServiceState.READY
+
+
+# ---------------------------------------------------------------------------
+# Audit 10 Nov 2026 - the controls the configuration promised (RSK-001,
+# AI-001, RSK-006, RSK-002)
+# ---------------------------------------------------------------------------
+
+
+class TestAutonomyLadderIsEnforced:
+    """RSK-001 (Critical): ``autonomy.level`` and ``require_approval_before_entry``
+    were validated and read by nothing; the service traded on ``system.mode``."""
+
+    @pytest.mark.parametrize(
+        ("level", "approval", "says"),
+        [
+            ("L0", False, "places no orders"),
+            ("L1", False, "places no orders"),
+            ("L2", False, "approval"),
+            ("L3", False, "envelope"),
+            ("L4", True, "approval"),
+        ],
+    )
+    async def test_every_level_whose_control_is_missing_refuses(
+        self, level: str, approval: bool, says: str
+    ) -> None:
+        h = await Harness(autonomy=level, approval=approval).started()
+        result = await h.service.handle(_rec())
+        assert result.outcome is Outcome.REFUSED
+        assert says in result.detail
+        assert h.placer.submitted == []
+        assert ("REFUSED", None) in h.execution_rows(), "audited, with no fault code"
+
+    async def test_the_shipped_defaults_place_nothing(self) -> None:
+        """AppConfig()'s own autonomy: L1 and approval required."""
+        config = AppConfig()
+        assert config.autonomy.level.value == "L1"
+        assert config.notifications.require_approval_before_entry is True
+        h = await Harness(
+            autonomy=config.autonomy.level.value,
+            approval=config.notifications.require_approval_before_entry,
+        ).started()
+        assert (await h.service.handle(_rec())).outcome is Outcome.REFUSED
+        assert h.placer.submitted == []
+
+    async def test_l4_without_approval_places_a_paper_order(self) -> None:
+        """The control: a ladder that refused everything would pass the above."""
+        h = await Harness(autonomy="L4", approval=False).started()
+        assert (await h.service.handle(_rec())).outcome is Outcome.SUBMITTED
+
+
+class TestTheConfiguredAIGatesApply:
+    """AI-001: ``ai.confidence`` was read by nothing - a WEAK review at 0.0
+    confidence was sized exactly like a CONFIRM at 0.99."""
+
+    async def test_confidence_below_min_to_act_is_refused(self) -> None:
+        h = await Harness().started()
+        result = await h.service.handle(_rec(verdict=AIVerdict.WEAK, confidence="0.10"))
+        assert result.outcome is Outcome.REFUSED
+        assert result.reason is RejectReason.AI_LOW_CONFIDENCE
+        assert h.placer.submitted == []
+
+    async def test_the_boundary_is_inclusive_of_min_to_act(self) -> None:
+        h = await Harness().started()
+        result = await h.service.handle(_rec(confidence="0.65"))
+        assert result.outcome is Outcome.SUBMITTED, result.detail
+
+    async def test_a_timeframe_conflict_is_no_trade(self) -> None:
+        h = await Harness().started()
+        result = await h.service.handle(_rec(agreement=1))
+        assert result.outcome is Outcome.REFUSED
+        assert result.reason is RejectReason.TIMEFRAME_CONFLICT
+
+    async def test_two_of_three_is_not_a_conflict(self) -> None:
+        h = await Harness().started()
+        assert (await h.service.handle(_rec(agreement=2))).outcome is Outcome.SUBMITTED
+
+    async def test_confidence_below_full_size_halves_the_quantity(self) -> None:
+        full = await Harness().started()
+        await full.service.handle(_rec(confidence="0.90"))
+        reduced = await Harness().started()
+        await reduced.service.handle(_rec(confidence="0.70"))
+        q_full = full.placer.submitted[0].quantity
+        q_reduced = reduced.placer.submitted[0].quantity
+        assert 0 < q_reduced <= q_full // 2, (q_full, q_reduced)
+
+
+class TestTheStrategyStateIsReadFromTheDatabase:
+    """RSK-006: DEGRADED routed to LIVE exactly like ACTIVE, at full size, and
+    nothing at all checked that a signal's strategy may trade."""
+
+    @pytest.mark.parametrize("state", ["SHADOW", "DRAFT", "RETIRED", "QUARANTINED"])
+    async def test_a_state_that_does_not_trade_is_refused(self, state: str) -> None:
+        h = await Harness().started()
+        h.store.states["orb_long_v1"] = state
+        result = await h.service.handle(_rec())
+        assert result.outcome is Outcome.REFUSED
+        assert result.reason is RejectReason.STRATEGY_NOT_PERMITTED
+        assert h.placer.submitted == []
+
+    async def test_an_unregistered_strategy_is_refused(self) -> None:
+        h = await Harness().started()
+        result = await h.service.handle(_rec(strategy_id="never_registered"))
+        assert result.reason is RejectReason.STRATEGY_NOT_PERMITTED
+
+    async def test_an_unreadable_state_is_refused_not_assumed(self) -> None:
+        h = await Harness().started()
+        h.store.fail_state = True
+        result = await h.service.handle(_rec())
+        assert result.reason is RejectReason.STRATEGY_NOT_PERMITTED
+
+    async def test_a_paper_strategy_trades_in_paper_mode(self) -> None:
+        h = await Harness().started()
+        h.store.states["orb_long_v1"] = "PAPER"
+        assert (await h.service.handle(_rec())).outcome is Outcome.SUBMITTED
+
+    async def test_degraded_trades_at_half_size(self) -> None:
+        active = await Harness().started()
+        await active.service.handle(_rec())
+        degraded = await Harness().started()
+        degraded.store.states["orb_long_v1"] = "DEGRADED"
+        await degraded.service.handle(_rec())
+        q_active = active.placer.submitted[0].quantity
+        q_degraded = degraded.placer.submitted[0].quantity
+        assert 0 < q_degraded <= q_active // 2, (q_active, q_degraded)
+
+    async def test_degraded_and_low_confidence_compose(self) -> None:
+        active = await Harness().started()
+        await active.service.handle(_rec(confidence="0.90"))
+        both = await Harness().started()
+        both.store.states["orb_long_v1"] = "DEGRADED"
+        await both.service.handle(_rec(confidence="0.70"))
+        assert 0 < both.placer.submitted[0].quantity <= active.placer.submitted[0].quantity // 4
+
+
+class _MarketAt(Facts):
+    def __init__(self, price: Decimal | None) -> None:
+        self.price = price
+
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        return self.price
+
+
+class TestTheTriggerIsCheckedAgainstTheMarket:
+    """RSK-002: every notional cap divided rupees by the TRIGGER price, which
+    nothing compared with the market."""
+
+    async def test_a_trigger_far_from_the_market_is_refused(self) -> None:
+        h = await Harness(facts=_MarketAt(Decimal("1000.00"))).started()
+        result = await h.service.handle(_rec())  # trigger 1200
+        assert result.outcome is Outcome.REJECTED
+        assert result.reason is RejectReason.PRICE_DIVERGENCE
+        assert h.placer.submitted == []
+
+    async def test_no_fresh_price_is_a_refusal(self) -> None:
+        h = await Harness(facts=_MarketAt(None)).started()
+        result = await h.service.handle(_rec())
+        assert result.outcome is Outcome.REJECTED
+        assert h.placer.submitted == []
+
+    async def test_a_trigger_inside_the_band_trades(self) -> None:
+        h = await Harness(facts=_MarketAt(Decimal("1205.00"))).started()
+        assert (await h.service.handle(_rec())).outcome is Outcome.SUBMITTED
+
+
+# ---------------------------------------------------------------------------
+# Audit 10 Nov 2026 - RSK-003 (the loss latches are armed), RSK-011 (a failed
+# cycle refuses entries), ENG-001 (the loops outlive a transient failure)
+# ---------------------------------------------------------------------------
+
+
+def _trip(buy: str, sell: str, qty: int = 1000, minute: int = 0) -> list[dict[str, Any]]:
+    corr = uuid4()
+    at = NOW - dt.timedelta(minutes=60 - minute)
+    return [
+        {
+            "correlation_id": corr,
+            "symbol": "SBIN",
+            "side": "BUY",
+            "filled_quantity": qty,
+            "average_price": Decimal(buy),
+            "last_update_at": at,
+        },
+        {
+            "correlation_id": corr,
+            "symbol": "SBIN",
+            "side": "SELL",
+            "filled_quantity": qty,
+            "average_price": Decimal(sell),
+            "last_update_at": at + dt.timedelta(minutes=1),
+        },
+    ]
+
+
+class TestTheLossLatchesAreArmedByTheService:
+    """RSK-003: every SIT test proving 'a recovered P&L does not resume trading'
+    armed the latch by hand. These arm nothing by hand."""
+
+    async def test_a_breach_seen_after_a_cycle_arms_the_daily_latch(self) -> None:
+        h = await Harness().started()
+        h.store.orders = _trip("1000", "984")  # -16,000 gross on 5,00,000 capital
+        await h.service.on_reconnect()
+        state = await h.halts.state()
+        assert state.daily_loss
+        assert state.records["daily_loss"].armed_by == "loss-latch"
+
+    async def test_a_recovered_day_stays_halted(self) -> None:
+        """The failure loss.py exists to prevent: breach, then a winner."""
+        h = await Harness().started()
+        h.store.orders = _trip("1000", "984")
+        await h.service.on_reconnect()
+        h.store.orders += _trip("1000", "1010", minute=30)  # back to -6,000-ish
+        result = await h.service.handle(_rec())
+        assert result.outcome is Outcome.REJECTED
+        assert result.reason is RejectReason.DAILY_LOSS_LIMIT
+        assert h.placer.submitted == []
+
+    async def test_a_breach_seen_at_signal_time_arms_it_without_a_cycle(self) -> None:
+        h = await Harness().started()
+        h.store.orders = _trip("1000", "984")
+        result = await h.service.handle(_rec())
+        assert result.reason is RejectReason.DAILY_LOSS_LIMIT
+        assert (await h.halts.state()).daily_loss
+
+    async def test_three_losers_in_a_row_arm_the_streak_latch(self) -> None:
+        h = await Harness().started()
+        h.store.orders = (
+            _trip("1000", "999", qty=10, minute=0)
+            + _trip("1000", "999", qty=10, minute=10)
+            + _trip("1000", "999", qty=10, minute=20)
+        )
+        await h.service.on_reconnect()
+        assert (await h.halts.state()).consecutive_loss
+
+    async def test_open_losses_count_towards_the_limit(self) -> None:
+        """RSK-005: -12,000 realised with an open position at -6,000 is -3.6%."""
+        h = await Harness().started()
+        corr = uuid4()
+        h.store.orders = [
+            *_trip("1000", "988"),
+            {
+                "correlation_id": corr,
+                "symbol": "INFY",
+                "side": "BUY",
+                "filled_quantity": 50,
+                "average_price": Decimal("1320.00"),
+                "last_update_at": NOW,
+            },
+        ]  # INFY live at 1200 (Facts): 50 x -120 = -6,000 open
+        result = await h.service.handle(_rec("TCS"))
+        assert result.reason is RejectReason.DAILY_LOSS_LIMIT
+
+    async def test_a_quiet_day_arms_nothing(self) -> None:
+        """The control."""
+        h = await Harness().started()
+        h.store.orders = _trip("1000", "1001", qty=10)
+        await h.service.on_reconnect()
+        assert not (await h.halts.state()).any_halted
+        assert (await h.service.handle(_rec())).outcome is Outcome.SUBMITTED
+
+
+class TestAFailedCycleRefusesEntries:
+    """RSK-011: after the first good cycle, signals kept being sent while later
+    cycles failed, until the third failure armed BROKER_DISCONNECTED."""
+
+    async def test_one_failed_cycle_refuses_the_next_signal(self) -> None:
+        h = await Harness().started()
+        h.reconciler.raises = ConnectionError("broker read failed")
+        await h.service.on_reconnect()
+        assert not h.service.ready
+        result = await h.service.handle(_rec())
+        assert result.outcome is Outcome.REFUSED
+        assert result.reason is RejectReason.HEALTH_GATE_FAILED
+
+    async def test_the_next_good_cycle_lifts_it(self) -> None:
+        h = await Harness().started()
+        h.reconciler.raises = ConnectionError("broker read failed")
+        await h.service.on_reconnect()
+        h.reconciler.raises = None
+        await h.service.on_reconnect()
+        assert (await h.service.handle(_rec())).outcome is Outcome.SUBMITTED
+
+
+class _FlakySource:
+    def __init__(self, stop: asyncio.Event) -> None:
+        self.stop = stop
+        self.reads = 0
+
+    async def start(self) -> None:
+        return None
+
+    async def next_batch(self) -> list[Any]:
+        self.reads += 1
+        if self.reads == 1:
+            raise ConnectionError("redis blip")
+        self.stop.set()
+        return []
+
+    async def done(self, delivery: Any) -> None:
+        return None
+
+    async def poison(self, delivery: Any, reason: str) -> None:
+        return None
+
+
+class TestTheLoopsOutliveATransientFailure:
+    """ENG-001: inside the TaskGroup, one Redis error reading stream:signals
+    cancelled reconciliation and the square-off timer with positions open."""
+
+    async def test_the_signal_reader_retries_instead_of_raising(self) -> None:
+        h = await Harness().started()
+        h.service._retry_after = 0
+        stop = asyncio.Event()
+        source = _FlakySource(stop)
+        await asyncio.wait_for(h.service._consume_until(source, stop), timeout=5)
+        assert source.reads == 2
+
+    async def test_a_reconciliation_iteration_that_raises_is_retried(self) -> None:
+        h = await Harness().started()
+        stop = asyncio.Event()
+        calls = {"n": 0}
+
+        async def tick() -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("redis blip while arming")
+            stop.set()
+
+        async def no_wait(_: float) -> None:
+            return None
+
+        h.service.tick = tick  # type: ignore[method-assign]
+        h.service._sleep = no_wait
+        await asyncio.wait_for(h.service._reconcile_until(stop), timeout=5)
+        assert calls["n"] == 2
+
+    async def test_a_square_off_sweep_that_raises_is_retried(self) -> None:
+        h = await Harness().started()
+        stop = asyncio.Event()
+        calls = {"n": 0}
+
+        async def sweep() -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("broker read failed")
+            stop.set()
+
+        async def no_wait(_: float) -> None:
+            return None
+
+        h.service.sweep = sweep  # type: ignore[method-assign]
+        h.service._sleep = no_wait
+        await asyncio.wait_for(h.service._squareoff_until(stop), timeout=5)
+        assert calls["n"] == 2

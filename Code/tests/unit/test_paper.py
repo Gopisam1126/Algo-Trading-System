@@ -30,6 +30,7 @@ from algotrader.broker.paper import (
 from algotrader.common.enums import OrderIntent, OrderStatus, OrderType, Product, Side, SystemMode
 from algotrader.common.models.trading import OrderRequest
 from algotrader.ingest.quotes import QuoteState, quote_reader
+from tests.doubles import CountingLimiter
 
 NOW = dt.datetime(2026, 8, 25, 5, 0, tzinfo=dt.UTC)  # 10:30 IST
 
@@ -59,6 +60,7 @@ def _paper(**config: Any) -> tuple[PaperKite, Tape, Clock, KiteTradingAdapter]:
     tape, clock = Tape({}), Clock()
     client = PaperKite(quotes=tape, clock=clock, config=PaperConfig(**config))
     adapter = KiteTradingAdapter(
+        limiter=CountingLimiter(),
         auth=None,  # type: ignore[arg-type]
         client=client,
         tick_size_for=lambda _s: Decimal("0.05"),

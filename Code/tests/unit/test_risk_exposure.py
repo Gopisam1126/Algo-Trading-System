@@ -98,6 +98,8 @@ def _ctx(**overrides) -> RiskContext:
         "kill_switch_active": False,
         "unhealthy_services": (),
         "realised_pnl_today": Decimal(0),
+        "unrealised_pnl_today": Decimal(0),
+        "charges_today": Decimal(0),
         "consecutive_losses": 0,
         "daily_loss_halted": False,
         "consecutive_loss_halted": False,
@@ -107,6 +109,13 @@ def _ctx(**overrides) -> RiskContext:
         "slots_total": 5,
         "slots_used": 0,
         "symbol_sector": "PSU_BANK",
+        # Audit RSK-014/RSK-002/RSK-006: the book fields are required, and
+        # the sizer refuses without a live price and a size factor.
+        "open_positions": (),
+        "correlations": {},
+        "lot_size": 1,
+        "last_price": Decimal("1200.00"),
+        "size_factor": Decimal(1),
     }
     base.update(overrides)
     return RiskContext(**base)
@@ -339,11 +348,35 @@ class TestAC6NetDirectionalExposureCap:
 
     def test_a_short_book_is_capped_the_same_way(self) -> None:
         """abs(), not the raw signed value — otherwise a heavily short book
-        would read as -60% and pass a `>= 60` test."""
+        would read as -60% and pass a `>= 60` test.
+
+        CHANGED 16 Nov 2026 (audit RSK-017): the candidate is now a SHORT. It
+        was a LONG, which REDUCES a short book's lean and is now - correctly -
+        permitted (see TestRSK017AHedgeIsNotRefused)."""
         ctx = _ctx(open_positions=(_pos("PNB", notional="300000", direction=Direction.SHORT),))
-        outcome = _net()(_rec(), ctx)
+        outcome = _net()(_rec(direction=Direction.SHORT), ctx)
         assert not outcome.passed
         assert "short" in outcome.detail
+
+
+class TestRSK017AHedgeIsNotRefused:
+    """Audit RSK-017: check 10 was direction-blind, so at |net| >= 60% it
+    refused the SHORT that would cut a long book's lean - the trade the
+    sizer's signed headroom (`cap + net` for a short) exists to permit."""
+
+    def test_a_short_into_a_long_book_at_the_cap_passes(self) -> None:
+        ctx = _ctx(open_positions=(_pos("PNB", notional="300000"),))
+        assert _net()(_rec(direction=Direction.SHORT), ctx).passed
+
+    def test_a_long_into_a_short_book_at_the_cap_passes(self) -> None:
+        ctx = _ctx(open_positions=(_pos("PNB", notional="300000", direction=Direction.SHORT),))
+        assert _net()(_rec(direction=Direction.LONG), ctx).passed
+
+    def test_a_long_into_a_long_book_at_the_cap_is_still_refused(self) -> None:
+        """The control: the cap still binds the direction it exists for."""
+        ctx = _ctx(open_positions=(_pos("PNB", notional="300000"),))
+        outcome = _net()(_rec(direction=Direction.LONG), ctx)
+        assert outcome.reason is RejectReason.NET_EXPOSURE_LIMIT
 
     @pytest.mark.parametrize("bad", [Decimal("0"), Decimal("101")])
     def test_a_nonsensical_cap_is_refused_at_construction(self, bad: Decimal) -> None:

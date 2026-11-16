@@ -86,6 +86,7 @@ from algotrader.indicators.engine import IndicatorSet
 from algotrader.indicators.publish import publish_indicator_state
 from algotrader.ingest.quotes import QuoteState
 from algotrader.strategy.dsl import load_strategy_yaml
+from tests.doubles import CountingLimiter, MarketAt, RegisteredStrategies
 
 pytestmark = [pytest.mark.integration]
 
@@ -271,6 +272,10 @@ class Facts:
     async def correlations(self, symbol, against, *, now):
         return {s: Decimal("0.1") for s in against}
 
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        # Audit RSK-002: the market agrees with every recommendation's trigger.
+        return Decimal("1200.00")
+
 
 class Stack:
     """The real execution stack over one Kite account."""
@@ -282,7 +287,11 @@ class Stack:
         self.redis = redis
         self.account = account or KiteAccount()
         self.adapter = KiteTradingAdapter(
-            auth=None, client=self.account, algo_id="", tick_size_for=instruments.tick_size
+            limiter=CountingLimiter(),
+            auth=None,
+            client=self.account,
+            algo_id="",
+            tick_size_for=instruments.tick_size,
         )
         self.orders = OrderRepository(session, instruments)
         self.gateway = OrderGateway(
@@ -309,7 +318,12 @@ class Stack:
             audit=audit.write,
         )
         self.service = ExecutionService(
-            config=AppConfig(),
+            # Audit RSK-001: L4 without approval is the one configuration that
+            # places (paper) orders; the shipped L1 places none.
+            config=AppConfig(
+                autonomy={"level": "L4"},
+                notifications={"require_approval_before_entry": False},
+            ),
             calendar=calendar,
             gateway=self.gateway,
             manager=self.manager,
@@ -322,6 +336,10 @@ class Stack:
                 positions=self.positions,
                 instruments=instruments,
                 daily_status=DailyStatusRepository(session, instruments),
+                # Audit RSK-006: execution reads the strategy's state; RSK-004/5:
+                # the day ledger reads today's orders.
+                strategies=RegisteredStrategies({"orb_long_v1": "ACTIVE", "orb_classic": "ACTIVE"}),
+                orders=self.orders,
             ),
             orders=self.orders,
             redis=redis,
@@ -798,6 +816,7 @@ def _live(session, instruments, calendar):
             correlations=DailyCloseCorrelations(
                 BarRepository(session, instruments), calendar=calendar
             ),
+            prices=MarketAt(Decimal("1200.00")),
         )
 
     return facts
@@ -1020,6 +1039,7 @@ def _live_with_health(session, instruments, calendar):
             correlations=DailyCloseCorrelations(
                 BarRepository(session, instruments), calendar=calendar
             ),
+            prices=MarketAt(Decimal("1200.00")),
         )
 
     return facts

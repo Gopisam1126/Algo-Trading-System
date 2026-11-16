@@ -267,6 +267,8 @@ class Session:
                     "kill_switch_active": False,
                     "unhealthy_services": (),
                     "realised_pnl_today": Decimal(0),
+                    "unrealised_pnl_today": Decimal(0),
+                    "charges_today": Decimal(0),
                     "consecutive_losses": 0,
                     "daily_loss_halted": False,
                     "consecutive_loss_halted": False,
@@ -278,6 +280,14 @@ class Session:
                     # `()` is "checked, and clean" -- NOT None, which means
                     # eligibility was never established and must reject.
                     "symbol_restrictions": (),
+                    # Audit RSK-014/RSK-002/RSK-006: the book fields are
+                    # required, and the sizer needs the market's price (the
+                    # recommendation's 1200 trigger) and a size factor.
+                    "open_positions": (),
+                    "correlations": {},
+                    "lot_size": 1,
+                    "last_price": Decimal("1200.00"),
+                    "size_factor": Decimal(1),
                 }
                 kwargs.update(self.ctx_overrides)
                 if mutate is not None:
@@ -447,10 +457,17 @@ class TestSit2WhenSomethingBreaksMidSession:
         decision = engine.evaluate(
             _recommendation(now),
             RiskContext(
+                open_positions=(),
+                correlations={},
+                lot_size=1,
+                size_factor=Decimal(1),
+                last_price=Decimal("1200.00"),
                 # Session risk state, stated rather than defaulted (AUDIT-005).
                 kill_switch_active=False,
                 unhealthy_services=(),
                 realised_pnl_today=Decimal(0),
+                unrealised_pnl_today=Decimal(0),
+                charges_today=Decimal(0),
                 consecutive_losses=0,
                 daily_loss_halted=False,
                 consecutive_loss_halted=False,
@@ -477,10 +494,17 @@ class TestSit2WhenSomethingBreaksMidSession:
 
         now = _at(TRADING_DAY, 10, 0)
         ctx = RiskContext(
+            open_positions=(),
+            correlations={},
+            lot_size=1,
+            size_factor=Decimal(1),
+            last_price=Decimal("1200.00"),
             # Session risk state, stated rather than defaulted (AUDIT-005).
             kill_switch_active=False,
             unhealthy_services=(),
             realised_pnl_today=Decimal(0),
+            unrealised_pnl_today=Decimal(0),
+            charges_today=Decimal(0),
             consecutive_losses=0,
             daily_loss_halted=False,
             consecutive_loss_halted=False,
@@ -498,9 +522,16 @@ class TestSit2WhenSomethingBreaksMidSession:
         ).evaluate(
             _recommendation(now),
             RiskContext(
+                open_positions=(),
+                correlations={},
+                lot_size=1,
+                size_factor=Decimal(1),
+                last_price=Decimal("1200.00"),
                 # Session risk state, stated rather than defaulted (AUDIT-005).
                 kill_switch_active=False,
                 realised_pnl_today=Decimal(0),
+                unrealised_pnl_today=Decimal(0),
+                charges_today=Decimal(0),
                 consecutive_losses=0,
                 daily_loss_halted=False,
                 consecutive_loss_halted=False,
@@ -525,10 +556,17 @@ class TestSit2WhenSomethingBreaksMidSession:
         decision = engine.evaluate(
             _recommendation(now),
             RiskContext(
+                open_positions=(),
+                correlations={},
+                lot_size=1,
+                size_factor=Decimal(1),
+                last_price=Decimal("1200.00"),
                 # Session risk state, stated rather than defaulted (AUDIT-005).
                 kill_switch_active=False,
                 unhealthy_services=(),
                 realised_pnl_today=Decimal(0),
+                unrealised_pnl_today=Decimal(0),
+                charges_today=Decimal(0),
                 consecutive_losses=0,
                 daily_loss_halted=False,
                 consecutive_loss_halted=False,
@@ -736,6 +774,8 @@ class TestSit6EligibilityAcrossASession:
             "kill_switch_active": False,
             "unhealthy_services": (),
             "realised_pnl_today": Decimal(0),
+            "unrealised_pnl_today": Decimal(0),
+            "charges_today": Decimal(0),
             "consecutive_losses": 0,
             "daily_loss_halted": False,
             "consecutive_loss_halted": False,
@@ -744,6 +784,10 @@ class TestSit6EligibilityAcrossASession:
             "capital": Decimal("500000"),
             "slots_total": 5,
             "slots_used": 0,
+            # Audit RSK-014: the book fields are required.
+            "open_positions": (),
+            "correlations": {},
+            "lot_size": 1,
         }
         unknown = engine.evaluate(
             _recommendation(now), RiskContext(**base, symbol_restrictions=None)
@@ -1207,6 +1251,8 @@ class TestSit8LossLimitsAcrossASession:
             TRADING_DAY,
             checks=_twelve(calendar),
             realised_pnl_today=Decimal("25000"),
+            unrealised_pnl_today=Decimal(0),
+            charges_today=Decimal(0),
             **self._clean(),
         ).run()
         assert len(session.fully_cleared()) == 340
@@ -1220,6 +1266,8 @@ class TestSit8LossLimitsAcrossASession:
             TRADING_DAY,
             checks=_twelve(calendar),
             realised_pnl_today=Decimal("-14000"),
+            unrealised_pnl_today=Decimal(0),
+            charges_today=Decimal(0),
             **self._clean(),
         ).run()
         assert len(session.fully_cleared()) == 340
@@ -1233,6 +1281,8 @@ class TestSit8LossLimitsAcrossASession:
             checks=_twelve(calendar),
             symbol_restrictions=("T2T",),
             realised_pnl_today=Decimal("-20000"),
+            unrealised_pnl_today=Decimal(0),
+            charges_today=Decimal(0),
             **{"symbol_sector": "IT", "correlations": {}},
         ).run(start=(10, 0), end=(11, 0))
         for stage in session.stopped_by().values():
@@ -1474,6 +1524,8 @@ def _sizing_policy() -> SizingPolicy:
         max_position_pct=Decimal("20"),
         capital_per_slot_pct=Decimal("20"),
         target_r_multiple=Decimal("2.0"),
+        max_price_divergence_pct=Decimal("1.0"),
+        min_position_pct=Decimal("2"),
     )
 
 
@@ -1673,9 +1725,15 @@ class TestSit11ExposureCapsHoldAcrossAWholeSession:
     #: so the sector clamp — not the ₹1200 position cap — is the smallest
     #: constraint, and is therefore doing the work on every minute.
     CONCENTRATED_SECTOR = "180000"
-    #: 2,90,000 net long against a 60% (3,00,000) cap, held OUTSIDE the
+    #: 2,50,000 net long against a 60% (3,00,000) cap, held OUTSIDE the
     #: candidate's sector so the two clamps can be observed separately.
-    ONE_SIDED_BOOK = "290000"
+    #:
+    #: CHANGED 16 Nov 2026 (audit RSK-012): it was 2,90,000, which left 10,000
+    #: of headroom - 8 shares, 9,600 - and the sizer now refuses a position
+    #: below 2% of capital (10,000) as a token position not worth a slot. With
+    #: 50,000 of headroom the net cap still binds (41 shares, under the
+    #: 1,00,000 position and slot caps), which is what this group tests.
+    ONE_SIDED_BOOK = "250000"
 
     @staticmethod
     def _healthy() -> dict:
