@@ -137,6 +137,11 @@ _TABLE: Final[dict[OrderStatus, frozenset[OrderStatus]]] = {
             OrderStatus.SUBMITTED,
             OrderStatus.SUBMIT_FAILED,
             OrderStatus.OPEN,
+            # Audit ENG-018: a submission whose response was lost can be found
+            # by the recovery query already PART-filled. Without this edge the
+            # case QA-E15-07 widened SUBMITTING for was refused exactly then,
+            # and the order sat RECONCILE_REQUIRED for a cycle.
+            OrderStatus.PARTIAL,
             OrderStatus.FILLED,
             OrderStatus.CANCELLED,
             OrderStatus.REJECTED,

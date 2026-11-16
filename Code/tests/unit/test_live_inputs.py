@@ -360,7 +360,7 @@ class Limiter:
         self.data += 1
         return 1.0
 
-    async def acquire_order(self) -> float:
+    async def acquire_order(self, *, wait_seconds: float = 0.0) -> float:
         self.orders += 1
         return 1.0
 

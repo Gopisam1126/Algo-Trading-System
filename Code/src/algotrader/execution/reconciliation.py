@@ -99,6 +99,7 @@ from algotrader.common.db.models import DecisionLog
 from algotrader.common.enums import Direction, ExitReason, OrderIntent, OrderStatus, Side
 from algotrader.common.models.trading import Order
 from algotrader.common.text import one_safe_line
+from algotrader.execution.gateway import MAX_PROTECTIVE_ATTEMPTS, protective_keys
 from algotrader.execution.halt import HaltReason
 from algotrader.execution.order_state import is_legal
 from algotrader.execution.positions import (
@@ -113,8 +114,6 @@ from algotrader.execution.protective_stop import (
     NakedPositionError,
     ProtectiveStop,
     StopNotEstablishedError,
-    exit_client_order_id,
-    stop_client_order_id,
 )
 
 log = logging.getLogger(__name__)
@@ -1079,17 +1078,24 @@ class Reconciler:
         for tracked in list(self._manager.open_positions()):
             position = tracked.position
             if isinstance(tracked, ExitingPosition):
-                key = exit_client_order_id(position, trade_date=trade_date)
+                intent = OrderIntent.SQUAREOFF
                 # The book says why it is exiting (E15-S06): the timer's exit
                 # and the emergency exit share this key.
                 reason = tracked.reason
             else:
-                key = stop_client_order_id(position, trade_date=trade_date)
+                intent = OrderIntent.STOP
                 reason = ExitReason.STOP
-            found = by_key.get(self._broker.order_key(key), [])
-            if len(found) != 1 or found[0].filled_quantity < position.quantity:
+            # Any attempt may be the one that filled (TRD-001).
+            filled = [
+                (key, found[0])
+                for key in protective_keys(position, intent=intent, trade_date=trade_date)
+                if len(found := by_key.get(self._broker.order_key(key), [])) == 1
+                and found[0].filled_quantity >= position.quantity
+            ]
+            if len(filled) != 1:
                 continue
-            order = found[0].model_copy(
+            key, order = filled[0]
+            order = order.model_copy(
                 update={"correlation_id": position.correlation_id, "client_order_id": key}
             )
             try:
@@ -1206,6 +1212,13 @@ class Reconciler:
                     because = "restored position has no live stop at the broker"
                 elif isinstance(tracked, ProtectedPosition):
                     if await self._protector.is_protected(position, trade_date=trade_date):
+                        # Audit TRD-008: a live stop is only protection while the
+                        # holding is there. Closed outside this system (the Kite
+                        # app, the broker's own square-off), the stop would later
+                        # SELL shares that are not held. Cancel it and halt.
+                        if held_by_broker(positions, position) == 0:
+                            await self._protector.cancel_stops(position, trade_date=trade_date)
+                            await self._not_held(position, 0, report, now=now)
                         continue
                     because = "its stop is no longer live at the broker"
                 elif isinstance(tracked, ExitingPosition):
@@ -1217,9 +1230,16 @@ class Reconciler:
                     # here rather than be skipped silently by a loop whose job
                     # is to look at every one of them.
                     assert_never(tracked)
+                # Audit TRD-009: a stop that reads "not live" may still be
+                # WORKING in a status nobody modelled; cancel every attempt of it
+                # before the exit, or one holding gets two exits.
+                await self._protector.cancel_stops(position, trade_date=trade_date)
                 # Never exit more than the broker holds (E15-S06): the book can
-                # name a position the broker closed outside our view.
-                held = held_by_broker(positions, position)
+                # name a position the broker closed outside our view. Asked
+                # AGAIN here (audit TRD-007): the cycle's snapshot predates the
+                # per-position reads above, and a position that closed between
+                # them would be exited again - a naked short.
+                held = held_by_broker(await self._broker.fetch_positions(), position)
                 if held == 0:
                     await self._not_held(position, held, report, now=now)
                     continue
@@ -1305,13 +1325,27 @@ class Reconciler:
                 )
                 if open_qty <= covering:
                     continue
-                if any(str(r["intent"]) == OrderIntent.SQUAREOFF.value for r, _o in exits):
+                squareoffs = [
+                    o for r, o in exits if str(r["intent"]) == OrderIntent.SQUAREOFF.value
+                ]
+                # Audit TRD-001: an exit key is no longer single-use - a further
+                # attempt follows a confirmed-DEAD one (OrderGateway.next_attempt).
+                # So the holding is stuck only when every attempt is used, or an
+                # existing attempt is NOT dead: working or part filled, which the
+                # next exit would RESUME rather than replace - leaving what it
+                # does not cover unprotected.
+                spent = len(squareoffs) >= MAX_PROTECTIVE_ATTEMPTS or any(
+                    not (o.status.is_terminal and o.filled_quantity == 0) for o in squareoffs
+                )
+                if spent:
                     await self._stuck(
                         correlation,
                         entry.symbol,
                         Drift.EXIT_SPENT,
                         f"{open_qty} still held after the day's exit for this position was "
-                        f"used; the key cannot be used twice, so they cannot be exited",
+                        f"used (an attempt that is working or part filled is resumed, never "
+                        f"replaced, and at most {MAX_PROTECTIVE_ATTEMPTS} are taken); a "
+                        f"further exit is a human's decision",
                         report,
                         now=now,
                     )

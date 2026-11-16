@@ -76,15 +76,13 @@ from algotrader.broker.adapter import BrokerPosition
 from algotrader.common.audit import AuditEntry
 from algotrader.common.calendar import IST
 from algotrader.common.db.models import DecisionLog
-from algotrader.common.enums import ExitReason
+from algotrader.common.enums import ExitReason, OrderIntent
 from algotrader.common.models.trading import Order
 from algotrader.common.text import one_safe_line
 from algotrader.execution.halt import HaltReason
 from algotrader.execution.positions import ExitingPosition, PositionManager, TrackedPosition
 from algotrader.execution.protective_stop import (
-    exit_client_order_id,
     is_live,
-    stop_client_order_id,
 )
 from algotrader.execution.reconciliation import UnbookedHolding, held_by_broker
 
@@ -146,6 +144,10 @@ class TimerGateway(Protocol):
     async def submit_exit(self, position: Any, *, trade_date: dt.date) -> str: ...
 
     async def find_order(self, client_order_id_: str) -> Order | None: ...
+
+    async def current_key(
+        self, position: Any, *, intent: OrderIntent, trade_date: dt.date
+    ) -> str: ...
 
 
 class PositionsReader(Protocol):
@@ -301,7 +303,11 @@ class SquareOffTimer:
         now: dt.datetime,
     ) -> None:
         position = tracked.position
-        stop_key = stop_client_order_id(position, trade_date=trade_date)
+        # The NEWEST stop attempt (TRD-001): after a re-placed stop, attempt 0
+        # is the dead one, and cancelling it would leave the working stop on.
+        stop_key = await self._gateway.current_key(
+            position, intent=OrderIntent.STOP, trade_date=trade_date
+        )
         stop = await self._gateway.find_order(stop_key)
         # The stop FIRST, then the broker's holding. A stop that filled just
         # before the deadline leaves the broker flat while the book still holds
@@ -330,6 +336,17 @@ class SquareOffTimer:
                     tracked, Outcome.CANCELLING, "the stop's cancel is not yet visible", now
                 )
                 return
+            if stop is not None and stop.filled_quantity > 0:
+                # Audit TRD-004: the stop part-filled and was then cancelled
+                # inside the cancel window. The holding read above predates
+                # that fill, so an exit sized from it would sell shares the
+                # stop already sold - an unintended opposite position. Ask
+                # again; if the read fails, send nothing this sweep (the next
+                # one, a second later, starts from a fresh read).
+                held = held_by_broker(await self._broker.fetch_positions(), position)
+                if held == 0:
+                    await self._not_held(tracked, held, report, now=now)
+                    return
 
         quantity = min(held, position.quantity)
         target: Any = position
@@ -345,14 +362,20 @@ class SquareOffTimer:
         try:
             await self._gateway.submit_exit(target, trade_date=trade_date)
             exit_order = await self._gateway.find_order(
-                exit_client_order_id(position, trade_date=trade_date)
+                await self._gateway.current_key(
+                    target, intent=OrderIntent.SQUAREOFF, trade_date=trade_date
+                )
             )
             if not is_live(exit_order):
                 raise RuntimeError("the time exit was sent but the broker does not list it live")
         except Exception as exc:
             # The stop is gone and the time exit did not establish: that IS the
-            # naked case, and it has one owner. exit_now retries under the same
-            # key (so nothing is sent twice) and arms the halt if it fails too.
+            # naked case, and it has one owner. exit_now takes the NEXT attempt
+            # if this one is confirmed dead (TRD-001 - it used to retry the
+            # same, spent key, so a refused time exit could never be re-sent),
+            # resumes it if its outcome is unknown, and arms the halt if no
+            # exit can be established. A raise here leaves the position in the
+            # book, so the next sweep tries again under the next attempt.
             await self._record(tracked, Outcome.EXIT_FAILED, type(exc).__name__, now)
             log.error(
                 "square-off exit for %s failed (%s); taking the emergency path",

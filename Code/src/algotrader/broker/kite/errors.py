@@ -89,6 +89,14 @@ def classify(exc: Exception, *, mutating: bool) -> BrokerError:
         return BrokerError(f"network failure during a read: {exc}")
 
     if isinstance(exc, kx.DataException):
+        # Audit TRD-015: on a MUTATING call this is a response we could not
+        # read - a non-JSON 502 after the order was accepted is the realistic
+        # case - so the outcome is unknown, and the gateway must query by tag
+        # now rather than leave the order SUBMITTING for a cycle.
+        if mutating:
+            return AmbiguousOrderError(
+                f"unreadable broker response to a mutating call - outcome unknown: {exc}"
+            )
         return BrokerError(f"broker returned unusable data: {exc}")
 
     # Unmapped. Loud, because a new code appearing mid-session is something to

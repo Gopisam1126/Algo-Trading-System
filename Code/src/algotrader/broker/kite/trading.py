@@ -32,7 +32,7 @@ import datetime as dt
 import logging
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from algotrader.broker.adapter import (
     AmbiguousOrderError,
@@ -46,7 +46,7 @@ from algotrader.broker.kite import mapping
 from algotrader.broker.kite.errors import classify
 from algotrader.broker.kite.market_data import KiteReads
 from algotrader.broker.ratelimit import BrokerRateLimiter, RateLimitExceededError
-from algotrader.common.enums import OrderType, Product, Side
+from algotrader.common.enums import OrderIntent, OrderType, Product, Side
 from algotrader.common.models.trading import Order, OrderRequest
 
 log = logging.getLogger(__name__)
@@ -101,7 +101,13 @@ class KiteTradingAdapter(KiteReads):
 
     # -- the write path ------------------------------------------------------
 
-    async def _mutate(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    #: How long a protective order (a stop, an exit, a cancel) may wait for an
+    #: order token before it is refused (audit TRD-002). An entry waits for none.
+    PROTECTIVE_TOKEN_WAIT_SECONDS: ClassVar[float] = 2.0
+
+    async def _mutate(
+        self, fn: Any, *args: Any, token_wait_seconds: float = 0.0, **kwargs: Any
+    ) -> Any:
         """Every state-changing broker call goes through here.
 
         Takes an ORDER token, not a data token — the two budgets are separate
@@ -110,7 +116,7 @@ class KiteTradingAdapter(KiteReads):
         """
         if self._limiter is not None:
             try:
-                await self._limiter.acquire_order()
+                await self._limiter.acquire_order(wait_seconds=token_wait_seconds)
             except RateLimitExceededError as exc:
                 # Into the taxonomy. The limiter's own type is a bare
                 # RuntimeError that no caller of this adapter handles, so a
@@ -199,7 +205,16 @@ class KiteTradingAdapter(KiteReads):
         if trigger_price is not None:
             params["trigger_price"] = float(trigger_price)
         if request.market_protection is not None:
-            params["market_protection"] = float(request.market_protection)
+            # As the SDK documents it (kiteconnect 5.2.1 connect.py place_order:
+            # "accepts `-1` for automatic market protection ... or a value
+            # greater than `0` up to `100`"): an integer where the value is
+            # whole, so -1 is sent as "-1", not "-1.0" (audit NR-001).
+            protection = request.market_protection
+            params["market_protection"] = (
+                int(protection)
+                if protection == protection.to_integral_value()
+                else float(protection)
+            )
 
         # Algo-ID: sent only when configured. SEBI's framework has the BROKER
         # tag strategies for self-developed algos under 10 orders/sec, and
@@ -229,7 +244,12 @@ class KiteTradingAdapter(KiteReads):
             request.symbol,
             params["tag"],
         )
-        result = await self._mutate(self._client.place_order, **params)
+        protective = request.intent in (OrderIntent.STOP, OrderIntent.SQUAREOFF)
+        result = await self._mutate(
+            self._client.place_order,
+            token_wait_seconds=self.PROTECTIVE_TOKEN_WAIT_SECONDS if protective else 0.0,
+            **params,
+        )
         # `str(None)` is "None", which is truthy: the old `if not str(result)`
         # guard let a null id through as broker order "None", and the gateway
         # would have recorded the order as landed under an id that names nothing.
@@ -245,23 +265,46 @@ class KiteTradingAdapter(KiteReads):
         self,
         broker_order_id: str,
         *,
+        symbol: str | None = None,
+        side: Side | None = None,
         quantity: int | None = None,
         limit_price: Decimal | None = None,
         trigger_price: Decimal | None = None,
     ) -> None:
+        """Modify a working order. Prices are snapped to the tick (audit TRD-016).
+
+        A modified price is as exposed to the exchange's tick grid as a placed
+        one, and the placement path snapped while this one did not - so any
+        price edit off the grid was rejected. Snapping needs the symbol (its
+        tick) and the side (which way to round), so a price edit requires both.
+        """
         params: dict[str, Any] = {"variety": "regular", "order_id": broker_order_id}
         if quantity is not None:
             params["quantity"] = quantity
-        if limit_price is not None:
-            params["price"] = float(limit_price)
-        if trigger_price is not None:
-            params["trigger_price"] = float(trigger_price)
+        for key, price in (("price", limit_price), ("trigger_price", trigger_price)):
+            if price is None:
+                continue
+            if symbol is None or side is None:
+                raise ValueError(
+                    "a price modification needs the symbol and side to snap to the tick"
+                )
+            snapped = self._snap(price, symbol, side)
+            if snapped is None:  # pragma: no cover - _snap returns None only for None
+                raise ValueError(f"could not snap {key} {price} for {symbol}")
+            params[key] = float(snapped)
         if len(params) == 2:
             raise ValueError("modify_order called with nothing to modify")
         await self._mutate(self._client.modify_order, **params)
 
     async def cancel_order(self, broker_order_id: str) -> None:
-        await self._mutate(self._client.cancel_order, variety="regular", order_id=broker_order_id)
+        # A cancel is protective (TRD-002): the square-off timer cancels the
+        # stop before it exits, and a refused cancel delays the time exit.
+        await self._mutate(
+            self._client.cancel_order,
+            token_wait_seconds=self.PROTECTIVE_TOKEN_WAIT_SECONDS,
+            variety="regular",
+            order_id=broker_order_id,
+        )
 
     # -- reads that execution needs -----------------------------------------
 

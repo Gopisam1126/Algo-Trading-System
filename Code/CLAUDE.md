@@ -830,6 +830,13 @@ E24) records each. The shapes worth remembering, because each passed QA:
   latches; every SIT proving a halt "stays halted" armed it by hand.
   `execution/loss_latch.py` is the writer. A test that sets up the state it
   claims the system produces proves the reader, not the system.
+- **"An idempotency key per decision."** One key per position-day for exits
+  meant a rejected time exit could never be re-sent, with the stop already
+  cancelled (TRD-001). Stops and exits now carry an attempt number
+  (`gateway.next_attempt`) that advances only past an attempt the BROKER
+  confirms dead - terminal with nothing filled; anything live, part filled or
+  unknown is resumed, never replaced. Readers of "the stop" ask
+  `current_key`; reconciliation matches every attempt (`protective_keys`).
 - **"Realised P&L is the day's P&L."** Gross, closed trades only: open losers,
   every charge and every unbooked round trip were outside the loss limit.
   `execution/day_ledger.py` reads today's orders, net of charges.

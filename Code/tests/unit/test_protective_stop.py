@@ -19,8 +19,10 @@ from decimal import Decimal
 
 import pytest
 
+from algotrader.broker.adapter import OrderRejectedError, RateLimitError
 from algotrader.common.enums import Direction, OrderIntent, OrderStatus, OrderType, Side
 from algotrader.common.models.trading import Order, Position
+from algotrader.execution.gateway import ProtectiveAttemptsExhaustedError, protective_keys
 from algotrader.execution.halt import HaltReason
 from algotrader.execution.protective_stop import (
     EstablishedPosition,
@@ -78,12 +80,19 @@ def _order(cid: str, status: OrderStatus = OrderStatus.OPEN, symbol: str = "INFY
 
 
 class FakeGateway:
-    """Records what was submitted; fails on demand.
+    """Records what was submitted; fails on demand; keys like the real gateway.
 
     ``orderbook`` is what ``find_order`` returns, and it is populated
     SEPARATELY from ``submit_stop`` succeeding — that separation is the whole
     subject of AC3. A broker that accepts an order and does not list it is not
     a contrived case; it is the case the story's build concern names.
+
+    CHANGED 16 Nov 2026 (audit ENG-004): the double accepted any number of
+    exits under one key, so the exit dead end the real gateway had (TRD-001)
+    could not appear in any test here. It now keys exactly as
+    ``OrderGateway.next_attempt`` does: a further attempt only past one that is
+    confirmed dead (refused, or terminal with nothing filled); anything else
+    is RESUMED, and nothing new is sent.
     """
 
     def __init__(self) -> None:
@@ -95,39 +104,76 @@ class FakeGateway:
         self.exit_fails_with: Exception | None = None
         self.auto_list = True
         self.auto_list_exit = True
+        #: Keys a row exists for (the gateway's TX1), and those refused outright.
+        self.recorded: set[str] = set()
+        self.refused: set[str] = set()
+        self.cancelled: list[str] = []
+
+    def _next(self, position, intent: OrderIntent, trade_date: dt.date) -> tuple[str, bool]:
+        """(key, is_new) - the real gateway's rule."""
+        for key in protective_keys(position, intent=intent, trade_date=trade_date):
+            if key not in self.recorded:
+                return key, True
+            order = self.orderbook.get(key)
+            dead = (order is None and key in self.refused) or (
+                order is not None and order.status.is_terminal and order.filled_quantity == 0
+            )
+            if not dead:
+                return key, False
+        raise ProtectiveAttemptsExhaustedError(f"every attempt for {position.symbol} is used")
+
+    async def _submit(self, position, intent, trade_date, fails_with, listed: bool) -> str:
+        key, is_new = self._next(position, intent, trade_date)
+        if not is_new:
+            return "RESUMED"
+        self.recorded.add(key)
+        if fails_with is not None:
+            if isinstance(fails_with, OrderRejectedError | RateLimitError):
+                self.refused.add(key)
+            raise fails_with
+        if listed:
+            self.orderbook[key] = _order(key, symbol=position.symbol)
+        return key
 
     async def submit_stop(self, position: Position, *, trade_date: dt.date) -> str:
         self.stops.append(position)
-        if self.stop_fails_with is not None:
-            raise self.stop_fails_with
-        if self.auto_list:
-            # Derived through the REAL gateway builder, not through
-            # `stop_client_order_id`. Using the same helper the attacher uses
-            # made the double self-consistent: flipping the side inside that
-            # helper changed both the key written here and the key looked up,
-            # so the error cancelled out and the mutation survived (M12).
-            cid = _real_gateway().build_stop(position, trade_date=trade_date).client_order_id
-            self.orderbook[cid] = _order(cid, symbol=position.symbol)
+        await self._submit(
+            position, OrderIntent.STOP, trade_date, self.stop_fails_with, self.auto_list
+        )
         return "STOP-BROKER-1"
 
     async def submit_exit(self, position: Position, *, trade_date: dt.date) -> str:
         self.exits.append(position)
-        if self.exit_fails_with is not None:
-            raise self.exit_fails_with
         # A real broker LISTS an order it accepted, and the attacher verifies
-        # the exit exactly as it verifies the stop. The double did not list it
-        # at first, which made every contained failure look like a naked
-        # position — the double was wrong, not the code.
-        if self.auto_list_exit:
-            built = _real_gateway().build_exit(position, trade_date=trade_date)
-            self.exit_orders.append(built)
-            self.orderbook[built.client_order_id] = _order(
-                built.client_order_id, symbol=position.symbol
-            )
+        # the exit exactly as it verifies the stop.
+        key = await self._submit(
+            position, OrderIntent.SQUAREOFF, trade_date, self.exit_fails_with, self.auto_list_exit
+        )
+        if key != "RESUMED":
+            self.exit_orders.append(_real_gateway().build_exit(position, trade_date=trade_date))
         return "EXIT-BROKER-1"
 
     async def find_order(self, client_order_id_: str) -> Order | None:
         return self.orderbook.get(client_order_id_)
+
+    async def current_key(self, position, *, intent: OrderIntent, trade_date: dt.date) -> str:
+        keys = protective_keys(position, intent=intent, trade_date=trade_date)
+        newest = keys[0]
+        for key in keys[1:]:
+            if key not in self.recorded:
+                break
+            newest = key
+        return newest
+
+    async def cancel(self, client_order_id_: str) -> bool:
+        order = self.orderbook.get(client_order_id_)
+        if order is None or order.status.is_terminal:
+            return False
+        self.cancelled.append(client_order_id_)
+        self.orderbook[client_order_id_] = order.model_copy(
+            update={"status": OrderStatus.CANCELLED}
+        )
+        return True
 
 
 class FakeHalter:
@@ -383,6 +429,33 @@ class TestAc3AcceptanceIsNotLiveness:
         with pytest.raises(StopNotEstablishedError, match="RECONCILE_REQUIRED"):
             await _attacher(gateway).attach(_position(), trade_date=TRADE_DATE, now=NOW)
         assert len(gateway.exits) == 1, "an uninterpretable stop must lead to an exit"
+        # Audit TRD-005: and the stop is CANCELLED first - it may still be working,
+        # and left beside the exit it could later sell shares no longer held.
+        assert gateway.cancelled == [cid]
+
+    async def test_an_ambiguous_stop_submit_is_cancelled_before_the_exit(self) -> None:
+        """TRD-005: a submit whose outcome is unknown may have landed."""
+        gateway = FakeGateway()
+        gateway.stop_fails_with = RuntimeError("timed out")
+        cid = stop_client_order_id(_position(), trade_date=TRADE_DATE)
+        gateway.orderbook[cid] = _order(cid, status=OrderStatus.OPEN)  # it did land
+        with pytest.raises(StopNotEstablishedError):
+            await _attacher(gateway).attach(_position(), trade_date=TRADE_DATE, now=NOW)
+        assert gateway.cancelled == [cid]
+        assert len(gateway.exits) == 1
+
+    async def test_an_unreadable_stop_is_neither_trusted_nor_exited(self) -> None:
+        """TRD-006: the verifying read itself failed - state UNKNOWN."""
+        from algotrader.execution.protective_stop import StopUnverifiedError
+
+        class Unreadable(FakeGateway):
+            async def find_order(self, client_order_id_):
+                raise ConnectionError("broker read timed out")
+
+        gateway = Unreadable()
+        with pytest.raises(StopUnverifiedError):
+            await _attacher(gateway).attach(_position(), trade_date=TRADE_DATE, now=NOW)
+        assert gateway.exits == [], "an exit beside a possibly-live stop would double it"
 
     async def test_no_established_position_is_returned_when_not_live(self) -> None:
         """AC3 stated structurally: the caller gets an exception, not an object

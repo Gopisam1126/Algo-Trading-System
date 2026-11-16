@@ -789,6 +789,15 @@ class PositionManager:
             self._book[position.symbol] = exiting
             await self._mirror.write(position.symbol, PositionSnapshot.of(exiting))
             raise
+        except Exception:
+            # Audit TRD-006. Anything else - an unreadable stop, a naked position
+            # whose exit also failed - leaves a persisted row and a holding the
+            # BOOK must know about: the square-off timer walks only the book,
+            # and reconciliation adopts or exits only what it finds there.
+            unverified = UnverifiedPosition(position=position)
+            self._book[position.symbol] = unverified
+            await self._mirror.write(position.symbol, PositionSnapshot.of(unverified))
+            raise
 
         tracked = ProtectedPosition(established=established)
         self._book[position.symbol] = tracked

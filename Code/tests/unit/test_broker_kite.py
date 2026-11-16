@@ -707,3 +707,82 @@ class TestTheBrokerBoundaryRefusesToGuessANumber:
         assert present == 0
         with pytest.raises(mapping.MappingError):
             mapping.require_field({}, "debits", what="used margin")
+
+
+# ---------------------------------------------------------------------------
+# Audit 16 Nov 2026 - TRD-002 (protective orders wait for a token), TRD-015,
+# TRD-016, NR-001
+# ---------------------------------------------------------------------------
+
+
+class _WaitRecorder(CountingLimiter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits: list[float] = []
+
+    async def acquire_order(self, *, wait_seconds: float = 0.0) -> float:
+        self.waits.append(wait_seconds)
+        return await super().acquire_order(wait_seconds=wait_seconds)
+
+
+class TestProtectiveOrdersWaitForAToken:
+    async def test_a_stop_and_an_exit_wait_an_entry_does_not(self) -> None:
+        limiter = _WaitRecorder()
+        adapter = KiteTradingAdapter(limiter=limiter, auth=_auth(), client=FakeKite())
+        for intent in (OrderIntent.ENTRY, OrderIntent.STOP, OrderIntent.SQUAREOFF):
+            await adapter.place_order(_request().model_copy(update={"intent": intent}))
+        assert limiter.waits == [0.0, 2.0, 2.0]
+
+    async def test_a_cancel_waits_too(self) -> None:
+        limiter = _WaitRecorder()
+        adapter = KiteTradingAdapter(limiter=limiter, auth=_auth(), client=FakeKite())
+        await adapter.cancel_order("240819000000001")
+        assert limiter.waits == [2.0]
+
+
+class TestTheRequestShapes:
+    async def test_market_protection_is_sent_as_the_sdk_documents_it(self) -> None:
+        """NR-001: kiteconnect documents -1, and float(-1) is sent as '-1.0'."""
+        client = FakeKite()
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=client)
+        await adapter.place_order(_request())
+        _, kwargs = client.calls[0]
+        assert kwargs["market_protection"] == -1
+        assert isinstance(kwargs["market_protection"], int)
+
+    async def test_a_modified_price_is_snapped_to_the_tick(self) -> None:
+        """TRD-016: the placement path snapped and the modification path did not."""
+        client = FakeKite()
+        adapter = KiteTradingAdapter(
+            limiter=CountingLimiter(),
+            auth=_auth(),
+            client=client,
+            tick_size_for=lambda _s: Decimal("0.05"),
+        )
+        await adapter.modify_order(
+            "240819000000001", symbol="INFY", side=Side.SELL, trigger_price=Decimal("1186.43")
+        )
+        (name, kwargs) = client.calls[-1]
+        assert name == "modify_order"
+        assert Decimal(str(kwargs["trigger_price"])) % Decimal("0.05") == 0
+
+    async def test_a_price_modification_without_its_symbol_is_refused(self) -> None:
+        adapter = KiteTradingAdapter(limiter=CountingLimiter(), auth=_auth(), client=FakeKite())
+        with pytest.raises(ValueError, match="snap to the tick"):
+            await adapter.modify_order("240819000000001", trigger_price=Decimal("1186.43"))
+
+
+class TestAnUnreadableResponseToAnOrderIsAmbiguous:
+    def test_a_data_exception_on_a_mutating_call_is_ambiguous(self) -> None:
+        """TRD-015: a non-JSON 502 after the order was accepted is the realistic
+        case; the gateway must query by tag at once, not wait a cycle."""
+        import kiteconnect.exceptions as kx
+
+        from algotrader.broker.adapter import AmbiguousOrderError, BrokerError
+        from algotrader.broker.kite.errors import classify
+
+        assert isinstance(
+            classify(kx.DataException("bad json"), mutating=True), AmbiguousOrderError
+        )
+        read = classify(kx.DataException("bad json"), mutating=False)
+        assert isinstance(read, BrokerError) and not isinstance(read, AmbiguousOrderError)
