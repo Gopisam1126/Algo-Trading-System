@@ -499,6 +499,7 @@ class TestReadPath:
                 Timeframe.W1,
                 dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
                 dt.datetime(2026, 2, 1, tzinfo=dt.UTC),
+                symbol="INFY",
             )
 
     async def test_an_inverted_range_is_refused(self) -> None:
@@ -511,7 +512,63 @@ class TestReadPath:
                 Timeframe.D1,
                 dt.datetime(2026, 2, 1, tzinfo=dt.UTC),
                 dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+                symbol="INFY",
             )
+
+    async def test_the_window_is_sent_as_ist_wall_time(self) -> None:
+        """Audit TRD-019: the SDK strftime()s the wall time and Kite reads it
+        as IST, so a UTC 03:45 (09:15 IST) was asked for as 03:45 IST."""
+        from algotrader.common.enums import Timeframe
+
+        client = FakeKite()
+        adapter = KiteMarketDataAdapter(auth=_auth(), client=client)
+        await adapter.fetch_historical(
+            "408065",
+            Timeframe.M5,
+            dt.datetime(2026, 8, 20, 3, 45, tzinfo=dt.UTC),
+            dt.datetime(2026, 8, 20, 10, 0, tzinfo=dt.UTC),
+            symbol="INFY",
+        )
+        (_name, call), *_ = [c for c in client.calls if c[0] == "historical_data"]
+        _token, start, end, _interval = call["args"]
+        assert (start, end) == ("2026-08-20 09:15:00", "2026-08-20 15:30:00")
+
+    async def test_a_naive_window_is_refused(self) -> None:
+        from algotrader.common.enums import Timeframe
+
+        adapter = KiteMarketDataAdapter(auth=_auth(), client=FakeKite())
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await adapter.fetch_historical(
+                "408065",
+                Timeframe.M5,
+                dt.datetime(2026, 8, 20, 9, 15),
+                dt.datetime(2026, 8, 20, 15, 30),
+                symbol="INFY",
+            )
+
+    async def test_bars_carry_the_symbol_not_the_token(self) -> None:
+        from algotrader.common.enums import Timeframe
+
+        row = {
+            "date": dt.datetime(2026, 8, 20, 9, 15),
+            "open": 100,
+            "high": 101,
+            "low": 99,
+            "close": 100.5,
+            "volume": 1000,
+        }
+        client = FakeKite()
+        client.canned["historical_data"] = [row]
+        adapter = KiteMarketDataAdapter(auth=_auth(), client=client)
+        (bar,) = await adapter.fetch_historical(
+            "408065",
+            Timeframe.M5,
+            dt.datetime(2026, 8, 20, 3, 45, tzinfo=dt.UTC),
+            dt.datetime(2026, 8, 20, 10, 0, tzinfo=dt.UTC),
+            symbol="INFY",
+        )
+        assert bar.symbol == "INFY"
+        assert bar.open_ts == dt.datetime(2026, 8, 20, 3, 45, tzinfo=dt.UTC)
 
 
 class TestTheOrderbookSurvivesForeignOrders:
@@ -786,3 +843,16 @@ class TestAnUnreadableResponseToAnOrderIsAmbiguous:
         )
         read = classify(kx.DataException("bad json"), mutating=False)
         assert isinstance(read, BrokerError) and not isinstance(read, AmbiguousOrderError)
+
+
+class TestTheInstrumentMasterHoldsOneExchange:
+    """Audit ENG-002: translations key on the trading symbol alone, while the
+    table is unique on (exchange, tradingsymbol)."""
+
+    async def test_syncing_another_exchange_is_refused(self) -> None:
+        from algotrader.broker.kite.instruments import InstrumentSync
+
+        with pytest.raises(ValueError, match="NSE only"):
+            await InstrumentSync(KiteMarketDataAdapter(auth=_auth(), client=FakeKite()), None).run(
+                "BSE"
+            )

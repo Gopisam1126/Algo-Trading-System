@@ -52,7 +52,7 @@ from algotrader.strategy.runtime import StrategyEvaluator
 
 SIGNALS = Path(__file__).resolve().parents[2] / "src" / "algotrader" / "signals"
 DAY = dt.date(2026, 8, 20)
-CAL = MarketCalendar()
+CAL = MarketCalendar(allow_uncovered=True)
 
 #: What the signal engine may not import. ``algotrader.common.db`` is the ORM
 #: boundary (E01-S02); the rest is the order path.
@@ -245,25 +245,58 @@ class _Trending:
 
 
 async def _rising_session(loop: SignalLoop) -> list[StrategyOutcome]:
-    moment, price, decisions = ist(9, 15), 1000.0, []
+    """09:15-11:00, every timeframe, as the producer publishes it.
+
+    CHANGED 16 Nov 2026 (audit TRD-018): the 15m and 1h bars closing inside the
+    window are delivered too, in ``publication_order`` (close time, longest
+    first). The loop refuses a decision whose higher timeframe is behind, and a
+    session of 5m bars alone is not one the producer can emit.
+    """
+    from algotrader.ingest.bars import bar_close, publication_order
+
+    m5, moment, price = [], ist(9, 15), 1000.0
     while moment < ist(11, 0):
         p = Decimal(f"{price:.2f}")
-        bar = Bar(
-            symbol="INFY",
-            timeframe=Timeframe.M5,
-            open_ts=moment,
-            open=p,
-            high=p + 1,
-            low=p - 1,
-            close=p,
-            volume=20_000,
+        m5.append(
+            Bar(
+                symbol="INFY",
+                timeframe=Timeframe.M5,
+                open_ts=moment,
+                open=p,
+                high=p + 1,
+                low=p - 1,
+                close=p,
+                volume=20_000,
+            )
         )
-        loop._clock = lambda m=moment: m + dt.timedelta(minutes=5, seconds=1)  # type: ignore[method-assign]
-        report = await loop.on_bar(bar)
-        assert report.outcome is BarOutcome.EVALUATED
-        decisions += [d.outcome for d in report.decisions]
         moment += dt.timedelta(minutes=5)
         price += 3
+    longer = []
+    for tf in (Timeframe.M15, Timeframe.H1):
+        slot = ist(9, 15)
+        while slot + dt.timedelta(seconds=tf.seconds) <= ist(11, 0):
+            end = slot + dt.timedelta(seconds=tf.seconds)
+            inside = [b for b in m5 if slot <= b.open_ts < end]
+            longer.append(
+                Bar(
+                    symbol="INFY",
+                    timeframe=tf,
+                    open_ts=slot,
+                    open=inside[0].open,
+                    high=max(b.high for b in inside),
+                    low=min(b.low for b in inside),
+                    close=inside[-1].close,
+                    volume=sum(b.volume for b in inside),
+                )
+            )
+            slot = end
+    decisions: list[StrategyOutcome] = []
+    for bar in publication_order(m5 + longer):
+        closed = bar_close(bar)
+        loop._clock = lambda c=closed: c + dt.timedelta(seconds=1)  # type: ignore[method-assign]
+        report = await loop.on_bar(bar)
+        assert report.outcome is BarOutcome.EVALUATED, (bar.timeframe, bar.open_ts, report)
+        decisions += [d.outcome for d in report.decisions]
     return decisions
 
 

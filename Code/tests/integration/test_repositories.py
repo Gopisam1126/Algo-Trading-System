@@ -625,3 +625,29 @@ class _QueryCounter:
 
     def __exit__(self, *_exc: object) -> None:
         event.remove(self._sync_engine, "before_cursor_execute", self._on_execute)
+
+
+class TestOneExchangeInTheMaster:
+    """Audit ENG-002: the table is unique on (exchange, tradingsymbol), and every
+    translation keys on the symbol alone - so a BSE RELIANCE replaced the NSE
+    one's id and tick size for every NSE order."""
+
+    async def test_a_symbol_on_two_exchanges_is_refused_not_overwritten(
+        self, session: AsyncSession, instruments: InstrumentRepository
+    ) -> None:
+        nse_tick = instruments.tick_size("RELIANCE")
+        await instruments.upsert(
+            [
+                {
+                    "tradingsymbol": "RELIANCE",
+                    "exchange": "BSE",
+                    "broker_token": "bse-tok",
+                    "tick_size": Decimal("0.01"),
+                    "lot_size": 1,
+                }
+            ]
+        )
+        await session.flush()
+        with pytest.raises(ValueError, match="more than one exchange"):
+            await instruments.refresh_cache()
+        assert instruments.tick_size("RELIANCE") == nse_tick == Decimal("0.05")

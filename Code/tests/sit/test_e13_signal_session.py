@@ -73,7 +73,7 @@ pytestmark = [pytest.mark.integration]
 
 DAY = dt.date(2026, 8, 20)  # an ordinary Thursday
 YESTERDAY = dt.date(2026, 8, 19)
-CAL = MarketCalendar()
+CAL = MarketCalendar(allow_uncovered=True)
 PLANNED = ("SITAAA", "SITBBB")
 VETOED = "SITCCC"
 TIMEFRAMES = (Timeframe.M5, Timeframe.M15, Timeframe.H1)

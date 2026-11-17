@@ -31,7 +31,7 @@ import datetime as dt
 import json
 import logging
 import random
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, field
 
 import websockets
@@ -149,6 +149,10 @@ class KiteFeed:
     idle_timeout_seconds: float = 45.0
     max_attempts: int | None = None
     stats: FeedStats = field(default_factory=FeedStats)
+    #: The clock the reconnect rule reads. Injected so the "healthy for
+    #: healthy_after_seconds" rule can be tested against time that passes
+    #: (audit TRD-012: the test meant to prove it never installed its clock).
+    clock: Callable[[], dt.datetime] = field(default=lambda: dt.datetime.now(dt.UTC), repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.access_token, SecretString):
@@ -170,7 +174,15 @@ class KiteFeed:
     # -- the stream ----------------------------------------------------------
 
     async def stream(self) -> AsyncGenerator[RawTick | FeedGap, None]:
-        """Yield ticks forever, with a :class:`FeedGap` after every interruption."""
+        """Yield ticks forever, with a :class:`FeedGap` after every interruption.
+
+        ``attempt`` counts CONSECUTIVE unhealthy connections - including ones that
+        opened and dropped at once. CHANGED 16 Nov 2026 (audit TRD-012): it was
+        reset to 0 the moment any socket opened, so a socket that connected and
+        dropped every second reconnected every ~1 s forever and ``max_attempts``
+        never tripped. It is now reset only after a connection that stayed up
+        for ``healthy_after_seconds``.
+        """
         attempt = 0
         disconnected_at: dt.datetime | None = None
 
@@ -191,7 +203,7 @@ class KiteFeed:
                     ping_timeout=10,
                     max_size=2**22,
                 ) as socket:
-                    opened_at = dt.datetime.now(dt.UTC)
+                    opened_at = self.clock()
                     self.stats.connects += 1
                     self.stats.connected_since = opened_at
                     # The URL carries the credential, so it must never be logged.
@@ -216,7 +228,6 @@ class KiteFeed:
                         yield gap
                         disconnected_at = None
 
-                    attempt = 0
                     async for item in self._read(socket):
                         yield item
 
@@ -227,13 +238,15 @@ class KiteFeed:
                 # the context manager, so the connection cannot leak into the
                 # next attempt and eat the concurrent-connection cap.
                 if disconnected_at is None:
-                    disconnected_at = dt.datetime.now(dt.UTC)
+                    disconnected_at = self.clock()
                 self.stats.connected_since = None
 
                 if opened_at is not None:
-                    alive = (dt.datetime.now(dt.UTC) - opened_at).total_seconds()
+                    alive = (self.clock() - opened_at).total_seconds()
                     if alive >= self.healthy_after_seconds:
-                        attempt = 1  # the connection was good; do not inherit old backoff
+                        # The connection was good: this drop is the FIRST failure
+                        # of a new run, not the next one of the old streak.
+                        attempt = 1
                 delay = self.backoff.delay(attempt)
                 log.warning(
                     "market feed dropped (%s: %s); reconnecting in %.1fs",

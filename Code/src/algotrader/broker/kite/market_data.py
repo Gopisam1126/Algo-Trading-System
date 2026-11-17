@@ -169,12 +169,29 @@ class KiteReads:
         timeframe: Timeframe,
         start: dt.datetime,
         end: dt.datetime,
+        *,
+        symbol: str,
     ) -> list[Bar]:
         """Historical candles.
 
         Included in the ₹500/month Connect plan — there is no longer a separate
         historical add-on, so E03-S03's cost blocker (B4) is resolved.
+
+        CHANGED 16 Nov 2026 (audit TRD-019). The SDK ``strftime``s a datetime's
+        WALL time and Kite reads it as IST, so a UTC instant asked for a window
+        5h30m early. The instants are converted to IST wall time here and sent
+        as the SDK's documented string form; a naive one is refused, since its
+        zone is a guess. And the bars were stamped with the instrument TOKEN as
+        their symbol, so nothing downstream could join them to a symbol's
+        state - the caller now names the symbol.
         """
+        from algotrader.common.calendar import IST
+
+        for name, moment in (("start", start), ("end", end)):
+            if moment.tzinfo is None:
+                raise ValueError(f"{name} must be timezone-aware; its zone would be a guess")
+        if not symbol or not symbol.strip():
+            raise ValueError("symbol is required: bars are stamped with it")
         interval = _INTERVAL.get(timeframe)
         if interval is None:
             raise mapping.MappingError(
@@ -184,12 +201,19 @@ class KiteReads:
         if start >= end:
             raise ValueError(f"start {start.isoformat()} is not before end {end.isoformat()}")
 
-        raw = await self._call(self._client.historical_data, int(token), start, end, interval)
+        wall = "%Y-%m-%d %H:%M:%S"  # the SDK's documented string form, in IST
+        raw = await self._call(
+            self._client.historical_data,
+            int(token),
+            start.astimezone(IST).strftime(wall),
+            end.astimezone(IST).strftime(wall),
+            interval,
+        )
         bars: list[Bar] = []
         for row in raw:
             bars.append(
                 Bar(
-                    symbol=str(token),
+                    symbol=symbol,
                     timeframe=timeframe,
                     open_ts=mapping.parse_broker_timestamp(row["date"]),
                     open=Decimal(str(row["open"])),

@@ -46,7 +46,7 @@ from algotrader.common.redis import keys
 from algotrader.execution.live_inputs import PublishedATR, strategy_timeframes
 from algotrader.indicators.engine import IndicatorEngine
 from algotrader.indicators.publish import publish_indicator_state
-from algotrader.ingest.bars import bar_id, publication_order, publish_sealed_bars
+from algotrader.ingest.bars import bar_close, bar_id, publication_order, publish_sealed_bars
 from algotrader.signals.loop import (
     BarOutcome,
     MarketFacts,
@@ -71,7 +71,7 @@ pytestmark = [pytest.mark.integration]
 
 DAY = dt.date(2026, 8, 20)
 YESTERDAY = dt.date(2026, 8, 19)
-CAL = MarketCalendar()
+CAL = MarketCalendar(allow_uncovered=True)
 SYMBOLS = ("SLAAA", "SLBBB", "SLCCC")
 
 
@@ -545,14 +545,44 @@ class _Desk:
 
 
 def _rising_session(symbol: str, until: tuple[int, int]) -> list[Bar]:
-    """09:15 onward, quiet for the opening range, then a strong rise through it."""
+    """09:15 onward, quiet for the opening range, then a strong rise through it.
+
+    CHANGED 16 Nov 2026 (audit TRD-018): every timeframe, as the producer
+    publishes it - the 15m and 1h bars that close inside the window, in
+    ``publication_order`` (close time, longest first). The loop now refuses a
+    decision whose higher timeframe is behind, and a session of 5m bars alone
+    is not one the producer can emit.
+    """
     bars, moment, price = [], ist(DAY, 9, 15), 1000.0
     while moment < ist(DAY, *until):
         before_seal = moment < ist(DAY, 9, 30)
         price += 0.2 if before_seal else 2.5
         bars.append(_bar(symbol, Timeframe.M5, moment, price))
         moment += dt.timedelta(minutes=5)
-    return bars
+    end = ist(DAY, *until)
+    for tf in (Timeframe.M15, Timeframe.H1):
+        slot = ist(DAY, 9, 15)
+        while bar_close(_bar(symbol, tf, slot, 100.0)) <= end:
+            inside = [
+                b
+                for b in bars
+                if b.timeframe is Timeframe.M5
+                and slot <= b.open_ts < slot + dt.timedelta(seconds=tf.seconds)
+            ]
+            bars.append(
+                Bar(
+                    symbol=symbol,
+                    timeframe=tf,
+                    open_ts=slot,
+                    open=inside[0].open,
+                    high=max(b.high for b in inside),
+                    low=min(b.low for b in inside),
+                    close=inside[-1].close,
+                    volume=sum(b.volume for b in inside),
+                )
+            )
+            slot += dt.timedelta(seconds=tf.seconds)
+    return publication_order(bars)
 
 
 class TestTheStateIsPublishedBeforeTheTriggerLeaves:
@@ -564,7 +594,7 @@ class TestTheStateIsPublishedBeforeTheTriggerLeaves:
     ) -> None:
         doc = load_strategy_yaml(_STRATEGY.format(sid="sl_live", r="2.0"))
         reader = PublishedATR(r, timeframes=strategy_timeframes([doc]))
-        seen: list[tuple[Trigger, Decimal | None]] = []
+        seen: list[tuple[Trigger, Decimal | None, Decimal | None]] = []
 
         async def read_at_arrival(trigger: Trigger, strategy: RunnableStrategy) -> None:
             atr = await reader.atr(
@@ -572,7 +602,9 @@ class TestTheStateIsPublishedBeforeTheTriggerLeaves:
                 strategy_id=trigger.strategy_id,
                 now=trigger.fired_at + dt.timedelta(seconds=2),
             )
-            seen.append((trigger, atr))
+            # The engine's own ATR at the moment the trigger leaves - THIS bar's.
+            here = desk.engine.set_for(trigger.symbol, Timeframe.M5).indicators["atr_14"]
+            seen.append((trigger, atr, here.as_decimal()))
 
         runnable = await _registered(factory, owner, doc, StrategyState.ACTIVE)
 
@@ -581,14 +613,16 @@ class TestTheStateIsPublishedBeforeTheTriggerLeaves:
 
         desk = _Desk([runnable], publish=publish, live=_Capture(read_at_arrival))
         for bar in _rising_session("SLAAA", (10, 0)):
-            desk.now = bar.open_ts + dt.timedelta(minutes=5, seconds=2)
+            desk.now = bar_close(bar) + dt.timedelta(seconds=2)
             await desk.loop.on_bar(bar)
 
-        assert seen, "the strategy never fired on a rising session"
-        engine_atr = desk.engine.set_for("SLAAA", Timeframe.M5).indicators["atr_14"]
-        _, last_atr = seen[-1]
-        assert last_atr is not None and last_atr == engine_atr.as_decimal()
-        assert all(atr is not None for _, atr in seen)
+        # CHANGED 16 Nov 2026 (audit TRD-017): a break is a crossing, so the
+        # strategy fires ONCE, on the bar that crosses the range - it fired on
+        # every bar beyond it, and this compared the LAST trigger with the
+        # engine's final ATR. It now compares each trigger with its own bar's.
+        assert len(seen) == 1, "a break fires once, on the crossing bar"
+        ((_trigger, published, here),) = seen
+        assert published is not None and published == here
 
     async def test_without_publishing_the_same_trigger_finds_no_atr(
         self,
@@ -613,7 +647,7 @@ class TestTheStateIsPublishedBeforeTheTriggerLeaves:
         runnable = await _registered(factory, owner, doc, StrategyState.ACTIVE)
         desk = _Desk([runnable], live=_Capture(read_at_arrival))
         for bar in _rising_session("SLAAA", (10, 0)):
-            desk.now = bar.open_ts + dt.timedelta(minutes=5, seconds=2)
+            desk.now = bar_close(bar) + dt.timedelta(seconds=2)
             await desk.loop.on_bar(bar)
         assert seen and all(atr is None for atr in seen)
 
@@ -670,14 +704,14 @@ class TestTheLoopOverTheRealStores:
             symbols=frozenset({"SLAAA", "SLBBB"}),
         )
         desk.loop._plan = plan  # the plan as Postgres says it, SLBBB not in it
-        source = RedisBarSource(r, (Timeframe.M5,), block_ms=50)
+        source = RedisBarSource(r, (Timeframe.M5, Timeframe.M15, Timeframe.H1), block_ms=50)
         await source.start()
 
         session_bars = _rising_session("SLAAA", (10, 0)) + _rising_session("SLBBB", (10, 0))
         outcomes = []
-        for bar in sorted(session_bars, key=lambda b: b.open_ts):
-            await publish_sealed_bars(r, [bar], now=bar.open_ts + dt.timedelta(minutes=5))
-            desk.now = bar.open_ts + dt.timedelta(minutes=5, seconds=2)
+        for bar in publication_order(session_bars):
+            await publish_sealed_bars(r, [bar], now=bar_close(bar))
+            desk.now = bar_close(bar) + dt.timedelta(seconds=2)
             for delivery in await source.next_batch():
                 report = await deliver(desk.loop, source, delivery)
                 assert report is not None

@@ -392,12 +392,24 @@ class _Day:
     range_high: Decimal | None = None
     range_low: Decimal | None = None
     opening_range: OpeningRange | None = None
+    #: (open, high, low) of every real bar folded today - at most 75 - so the
+    #: extremes BEFORE any bar can be answered exactly, whatever the evaluated
+    #: timeframe (audit TRD-025).
+    _folded: list[tuple[dt.datetime, Decimal, Decimal]] = field(default_factory=list)
+
+    def extremes_before(self, moment: dt.datetime) -> tuple[Decimal | None, Decimal | None]:
+        """The day's (high, low) over bars that opened before ``moment``."""
+        earlier = [(high, low) for opened, high, low in self._folded if opened < moment]
+        if not earlier:
+            return None, None
+        return max(h for h, _ in earlier), min(lo for _, lo in earlier)
 
     def fold(self, bar: Bar) -> None:
         if bar.synthetic:
             # Flat at the previous close with no trades: it says nothing about
             # where today traded, and would put yesterday's close into the range.
             return
+        self._folded.append((bar.open_ts, bar.high, bar.low))
         self.open = bar.open if self.open is None else self.open
         self.high = bar.high if self.high is None else max(self.high, bar.high)
         self.low = bar.low if self.low is None else min(self.low, bar.low)
@@ -508,6 +520,56 @@ class SignalLoop:
             return self._session_open
         return last + dt.timedelta(seconds=timeframe.seconds)
 
+    def _latest_close(self, timeframe: Timeframe, moment: dt.datetime) -> dt.datetime:
+        """The newest bar CLOSE at or before ``moment`` on ``timeframe``: today's
+        latest boundary, or the previous session's close before today's first."""
+        session_close = self._session_open.astimezone(IST).replace(hour=15, minute=30)
+        closes_today = int((moment - self._session_open).total_seconds() // timeframe.seconds)
+        if closes_today >= 1:
+            return min(
+                self._session_open + dt.timedelta(seconds=closes_today * timeframe.seconds),
+                session_close.astimezone(dt.UTC),
+            )
+        previous = self._calendar.previous_trading_day(self._plan.trade_date)
+        return self._calendar.session_bounds(previous)[1]
+
+    def _out_of_time(
+        self, snapshot: MultiTimeframeSnapshot, decided_at: dt.datetime, evaluated: Timeframe
+    ) -> str | None:
+        """Is every timeframe's state as of the newest bar it should have?
+
+        Audit TRD-018 (16 Nov 2026): the snapshot carried no per-timeframe time,
+        so a higher-timeframe state from the future (a 1h bar folded early) or
+        left behind (1h bars stopped arriving while 5m continued) was read as
+        current; the protection rested on publication order and the LATE gate.
+
+        A timeframe at least as long as the evaluated bar's must be as of its
+        latest close at the decision. A SHORTER one may be one bar behind and no
+        more: at a shared close the producer publishes the longest bar first
+        (``ingest.bars.publication_order``), so a 15m decision at 09:30 is made
+        before the 5m bar closing at 09:30 arrives - by design. ``None`` when
+        every timeframe is current.
+        """
+        for timeframe in self._engine.timeframes:
+            as_of = snapshot.as_of.get(timeframe)
+            if as_of is None:
+                return one_safe_line(f"{timeframe.value} state has no as-of time")
+            if as_of > decided_at:
+                return one_safe_line(
+                    f"{timeframe.value} state is as of {as_of.isoformat()}, after the "
+                    f"decision at {decided_at.isoformat()}"
+                )
+            moment = decided_at
+            if timeframe.seconds < evaluated.seconds:
+                moment -= dt.timedelta(microseconds=1)  # its bar closing NOW comes after
+            expected = self._latest_close(timeframe, moment)
+            if as_of < expected:
+                return one_safe_line(
+                    f"{timeframe.value} state is as of {as_of.isoformat()}; its newest bar "
+                    f"closed at {expected.isoformat()}"
+                )
+        return None
+
     # -- one bar ----------------------------------------------------------------
 
     async def replay(self, bar: Bar) -> BarReport:
@@ -563,6 +625,10 @@ class SignalLoop:
                 )
                 self._engine.mark_stale(bar.symbol, gap)
 
+        # The previous close on this timeframe, BEFORE this bar is folded: what
+        # a crossing is measured from (audit TRD-017). None after a gap - the
+        # bar is not evaluated then anyway.
+        previous_close = indicator_set.last_close if gap is None else None
         indicator_set.update(bar)
         closed_at = bar_close(bar)
         if bar.timeframe is DAY_TIMEFRAME:
@@ -592,6 +658,9 @@ class SignalLoop:
                 BarOutcome.NOT_READY,
                 one_safe_line(str({tf.value: n for tf, n in snapshot.not_ready.items()})),
             )
+        out_of_time = self._out_of_time(snapshot, closed_at, bar.timeframe)
+        if out_of_time is not None:
+            return report(BarOutcome.NOT_READY, out_of_time)
 
         candidates = [
             s
@@ -602,7 +671,7 @@ class SignalLoop:
             return report(BarOutcome.EVALUATED)
         market = await self._market_facts(closed_at)
         decisions = [
-            await self._evaluate(strategy, bar, closed_at, snapshot, market)
+            await self._evaluate(strategy, bar, closed_at, snapshot, market, previous_close)
             for strategy in candidates
         ]
         return report(BarOutcome.EVALUATED, decisions=decisions)
@@ -628,10 +697,12 @@ class SignalLoop:
         closed_at: dt.datetime,
         snapshot: MultiTimeframeSnapshot,
         market: MarketFacts | None,
+        previous_close: Decimal | None = None,
     ) -> StrategyDecision:
         doc = strategy.record.document
         facts = self._facts[bar.symbol]
         day = self._days.get(bar.symbol)
+        high_before, low_before = day.extremes_before(bar.open_ts) if day else (None, None)
         seconds = bar.timeframe.seconds
         since_open = int((closed_at - self._session_open).total_seconds() // seconds)
         until_squareoff = max(
@@ -656,6 +727,9 @@ class SignalLoop:
                 day_high=day.high if day else None,
                 day_low=day.low if day else None,
                 prev_close=levels.prior_close if levels is not None else None,
+                day_high_before_bar=high_before,
+                day_low_before_bar=low_before,
+                previous_bar_close=previous_close,
                 levels=levels,
                 opening_range=day.opening_range if day else None,
                 bars_since_open=since_open,
@@ -669,8 +743,10 @@ class SignalLoop:
             trigger = strategy.evaluator.fire(
                 ctx, correlation_id=signal_id(strategy.strategy_id, bar)
             )
-        except (ContextError, ValueError) as exc:
+        except (ContextError, ValueError, ArithmeticError) as exc:
             # One strategy that cannot be evaluated must not stop the others.
+            # ArithmeticError too (audit ENG-017): a decimal.InvalidOperation
+            # escaped this and dead-lettered the whole bar.
             log.error("%s on %s: not evaluable: %s", strategy.strategy_id, bar.symbol, exc)
             return decided(StrategyOutcome.ERROR, detail=one_safe_line(str(exc)))
         if trigger is None:

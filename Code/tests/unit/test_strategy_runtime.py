@@ -32,6 +32,7 @@ from algotrader.strategy.dsl import (
     REGISTRY,
     Condition,
     ConditionGroup,
+    StrategyDocument,
     compile_strategy,
     load_strategy_yaml,
 )
@@ -111,6 +112,10 @@ def ctx(snapshot: MultiTimeframeSnapshot, opening_range: OpeningRange):
             "timeframe": Timeframe.M5,
             "direction": Direction.LONG,
             "last_price": Decimal("1200.00"),
+            # The previous bar closed INSIDE the 1140-1150 range, so a close of
+            # 1200 is a break - a crossing, not merely a price above the level
+            # (audit TRD-017). Tests about the crossing override it.
+            "previous_bar_close": Decimal("1145.00"),
             "snapshot": snapshot,
             "opening_range": opening_range,
             # The strategy under test declares TRENDING/RISK_ON applicability,
@@ -1263,3 +1268,198 @@ class TestADefaultHasOneDefinition:
         evaluate_stop(doc, ctx())
         assert received == {"multiplier": 1.5, "period": 14}
         assert evaluate_target(doc, Decimal("1200"), Decimal("1190")) == Decimal("1220.00")
+
+
+# ---------------------------------------------------------------------------
+# Audit 16 Nov 2026 - TRD-017, TRD-025, TRD-026, ENG-017, the trail refusal
+# ---------------------------------------------------------------------------
+
+
+class TestABreakIsACrossing:
+    """Audit TRD-017: price_breaks_level compared one price with the level, so
+    it stayed True on every bar beyond it and let a strategy enter an hour
+    after the break, far from it."""
+
+    def test_the_bar_that_crosses_breaks(self, ctx) -> None:
+        c = _cond("price_breaks_level", level="opening_range_high", direction="above")
+        assert evaluate_condition(c, ctx(previous_bar_close=Decimal("1145"))).outcome is True
+
+    def test_a_bar_already_beyond_the_level_does_not_break_again(self, ctx) -> None:
+        c = _cond("price_breaks_level", level="opening_range_high", direction="above")
+        assert evaluate_condition(c, ctx(previous_bar_close=Decimal("1190"))).outcome is False
+
+    def test_without_the_previous_close_a_crossing_is_unknown(self, ctx) -> None:
+        c = _cond("price_breaks_level", level="opening_range_high", direction="above")
+        assert evaluate_condition(c, ctx(previous_bar_close=None)).outcome is None
+
+    def test_a_break_below_is_a_crossing_too(self, ctx) -> None:
+        c = _cond("price_breaks_level", level="opening_range_low", direction="below")
+        crossed = ctx(last_price=Decimal("1130"), previous_bar_close=Decimal("1145"))
+        already = ctx(last_price=Decimal("1130"), previous_bar_close=Decimal("1135"))
+        assert evaluate_condition(c, crossed).outcome is True
+        assert evaluate_condition(c, already).outcome is False
+
+    def test_a_previous_close_inside_the_buffer_has_not_broken_yet(self, ctx) -> None:
+        """1150 + 0.05% = 1150.575: a close of 1150.50 did not break, so the
+        next bar beyond the buffer does."""
+        c = _cond("price_breaks_level", level="opening_range_high", direction="above")
+        assert evaluate_condition(c, ctx(previous_bar_close=Decimal("1150.50"))).outcome is True
+
+
+class TestTheDaysHighIsTheOneBeforeThisBar:
+    """Audit TRD-025: the day's high already included the bar being evaluated,
+    and a close cannot exceed its own bar's high - so 'break the day's high'
+    could never be True."""
+
+    def test_a_close_above_every_earlier_high_breaks_it(self, ctx) -> None:
+        c = _cond("price_breaks_level", level="day_high", direction="above", buffer_pct=0)
+        context = ctx(
+            last_price=Decimal("1200"),
+            day_high=Decimal("1201"),  # includes this bar
+            day_high_before_bar=Decimal("1190"),
+            previous_bar_close=Decimal("1188"),
+        )
+        assert evaluate_condition(c, context).outcome is True
+
+    def test_the_days_low_likewise(self, ctx) -> None:
+        c = _cond("price_breaks_level", level="day_low", direction="below", buffer_pct=0)
+        context = ctx(
+            last_price=Decimal("1100"),
+            day_low=Decimal("1099"),
+            day_low_before_bar=Decimal("1110"),
+            previous_bar_close=Decimal("1112"),
+        )
+        assert evaluate_condition(c, context).outcome is True
+
+    def test_with_no_earlier_bar_the_days_high_is_unknown(self, ctx) -> None:
+        c = _cond("price_breaks_level", level="day_high", direction="above")
+        assert evaluate_condition(c, ctx(day_high=Decimal("1201"))).outcome is None
+
+    def test_other_primitives_still_read_the_full_days_high(self, ctx) -> None:
+        """Only a BREAK is measured against the earlier bars; 'within 1% of the
+        day's high' still means the day's high."""
+        c = _cond("price_within_pct_of_level", level="day_high", max_distance_pct=0.5)
+        context = ctx(day_high=Decimal("1201"), day_high_before_bar=Decimal("1100"))
+        assert evaluate_condition(c, context).outcome is True
+
+
+class TestOneWindowConvention:
+    """Audit TRD-026: within_window was end-inclusive while
+    constraints.entry_window is end-exclusive, so the same window stated both
+    ways gave two answers at its last minute."""
+
+    @staticmethod
+    def _at(hour: int, minute: int) -> dt.datetime:
+        from algotrader.common.calendar import IST
+
+        return dt.datetime(2026, 8, 20, hour, minute, tzinfo=IST).astimezone(dt.UTC)
+
+    def test_the_end_minute_is_outside_the_window(self, ctx) -> None:
+        c = _cond("within_window", start="09:30", end="11:00")
+        assert evaluate_condition(c, ctx(now=self._at(11, 0))).outcome is False
+        assert evaluate_condition(c, ctx(now=self._at(10, 59))).outcome is True
+        assert evaluate_condition(c, ctx(now=self._at(9, 30))).outcome is True
+
+    def test_it_agrees_with_the_entry_window_constraint(self, ctx) -> None:
+        data = load_strategy_yaml(STRATEGY_YAML).model_dump(mode="json")
+        data["constraints"] = {"entry_window": ["09:30", "11:00"]}
+        evaluator = StrategyEvaluator(compile_strategy(StrategyDocument.model_validate(data)))
+        c = _cond("within_window", start="09:30", end="11:00")
+        for hour, minute in ((9, 29), (9, 30), (10, 59), (11, 0)):
+            context = ctx(now=self._at(hour, minute), bars_since_open=10)
+            assert evaluator.applies_to(context).applies == bool(
+                evaluate_condition(c, context).outcome
+            ), f"{hour}:{minute:02d}"
+
+
+class TestTheContextRefusesNonFiniteNumbers:
+    """Audit ENG-017: only indicator values were filtered. A news_score of +inf
+    passed every 'above' gate; a NaN raised InvalidOperation, which escaped the
+    signal loop's handler and dead-lettered the bar."""
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"news_score": float("inf")},
+            {"news_score": float("nan")},
+            {"hours_since_material_news": float("nan")},
+            {"hours_since_material_news": -1.0},
+            {"india_vix": Decimal("NaN")},
+            {"index_change_pct": {"NIFTY": Decimal("Infinity")}},
+            {"day_high": Decimal("Infinity")},
+            {"previous_bar_close": Decimal("NaN")},
+        ],
+        ids=lambda o: next(iter(o)),
+    )
+    def test_a_non_finite_input_is_refused(self, ctx, override: dict) -> None:
+        with pytest.raises(ContextError, match=r"finite|negative"):
+            ctx(**override)
+
+    def test_finite_inputs_still_build(self, ctx) -> None:
+        context = ctx(news_score=0.4, hours_since_material_news=30.0, india_vix=Decimal("14.2"))
+        assert context.news_score == 0.4
+
+
+class TestATrailingStopCannotBeDeclared:
+    """Nothing moves a stop after entry (audit NR-009). A strategy declaring a
+    trail would load promising a trailing stop that never runs."""
+
+    def test_a_strategy_with_a_trail_does_not_construct(self) -> None:
+        data = load_strategy_yaml(STRATEGY_YAML).model_dump(mode="json")
+        data["exit"]["trail"] = {
+            "primitive": "trail_after_r",
+            "params": {"activate_at_r": 1, "atr_mult": 1},
+        }
+        doc = compile_strategy(StrategyDocument.model_validate(data))
+        with pytest.raises(UnevaluableStrategyError, match="no trailing stop is implemented"):
+            StrategyEvaluator(doc)
+
+    def test_the_same_strategy_without_it_constructs(self) -> None:
+        StrategyEvaluator(compile_strategy(load_strategy_yaml(STRATEGY_YAML)))
+
+
+class TestCrossParameterRulesHoldAtLoad:
+    """Audit ENG-025: 'a strategy that cannot be evaluated cannot be
+    constructed' held for indicators and timeframes only. An inverted window
+    raised on every bar; an empty band loaded and could never fire; an
+    atr_stop period the engine does not compute raised at fire time."""
+
+    @pytest.mark.parametrize(
+        ("condition", "message"),
+        [
+            (_cond("within_window", start="10:00", end="09:00"), "not before end"),
+            (_cond("within_window", start="10:00", end="10:00"), "not before end"),
+            (_cond("within_window", start="ten", end="11:00"), "HH:MM"),
+            (_cond("gap_from_prev_close", min_pct=2, max_pct=1), "exceeds max_pct"),
+            (_cond("atr_pct_between", min_pct=3, max_pct=1), "exceeds max_pct"),
+            (_cond("range_pct_between", source="bar", min_pct=3, max_pct=1), "exceeds max_pct"),
+            (_cond("india_vix_between", min=20, max=10), "exceeds max"),
+            (_cond("atr_stop", multiplier=1.5, period=7), "atr_7"),
+        ],
+        ids=[
+            "window-inverted",
+            "window-empty",
+            "window-unparseable",
+            "gap",
+            "atr-pct",
+            "range",
+            "vix",
+            "atr-stop-period",
+        ],
+    )
+    def test_the_unanswerable_is_refused_at_load(self, condition: Condition, message: str) -> None:
+        with pytest.raises(UnevaluableStrategyError, match=message):
+            verify_condition(condition)
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            _cond("within_window", start="09:30", end="11:00"),
+            _cond("gap_from_prev_close", min_pct=1, max_pct=1),
+            _cond("india_vix_between", min=10, max=20),
+            _cond("atr_stop", multiplier=1.5, period=14),
+        ],
+        ids=["window", "gap-point", "vix", "atr-stop"],
+    )
+    def test_the_answerable_still_loads(self, condition: Condition) -> None:
+        verify_condition(condition)

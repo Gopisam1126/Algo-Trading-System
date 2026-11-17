@@ -395,12 +395,19 @@ def check_market_calendar(r: Report) -> None:
     # Sanity: a known fixed holiday must actually be excluded.
     from datetime import date as _date
 
-    from algotrader.common.calendar import MarketCalendar
+    from algotrader.common.calendar import HolidayDataError, MarketCalendar
 
-    cal = MarketCalendar(status.dates)
+    # With its years (audit ENG-024): built without them it answered for any
+    # year, and an undeclared calendar now refuses every date.
+    cal = MarketCalendar(status.dates, covers_years=status.covers_years)
     republic_day = _date(2026, 1, 26)
     if status.count:
-        if cal.is_trading_day(republic_day):
+        try:
+            excluded = not cal.is_trading_day(republic_day)
+        except HolidayDataError as exc:
+            r.fail("holiday list does not cover 2026", str(exc)[:80])
+            return
+        if not excluded:
             r.fail("Republic Day treated as a trading day", "holiday list is not applied")
         else:
             r.ok("holiday exclusion works", "26 Jan 2026 correctly excluded")

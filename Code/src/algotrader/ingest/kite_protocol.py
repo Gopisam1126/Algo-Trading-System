@@ -45,6 +45,30 @@ PAISE: Final = Decimal(100)
 
 #: Currency instruments are quoted to seven places rather than two.
 CURRENCY_DIVISOR: Final = Decimal(10_000_000)
+#: BSE currency derivatives, to four.
+BSE_CURRENCY_DIVISOR: Final = Decimal(10_000)
+
+#: The exchange segment is the low byte of an instrument token. Values from the
+#: installed kiteconnect SDK's ``KiteTicker.EXCHANGE_MAP`` (read 16 Nov 2026).
+SEGMENT_CDS: Final = 3
+SEGMENT_BCD: Final = 6
+
+
+def divisor_for(token: int) -> Decimal:
+    """The price divisor for ONE packet, from its token's segment.
+
+    CHANGED 16 Nov 2026 (audit ENG-052): the divisor was one argument for a
+    whole frame, and every caller left it at paise - so a currency token in a
+    frame would have been priced 100,000 times too high. A frame can mix
+    segments, so the SDK derives it per packet, and so does this.
+    """
+    segment = token & 0xFF
+    if segment == SEGMENT_CDS:
+        return CURRENCY_DIVISOR
+    if segment == SEGMENT_BCD:
+        return BSE_CURRENCY_DIVISOR
+    return PAISE
+
 
 #: Packet sizes, in bytes, for the three subscription modes.
 LTP_SIZE: Final = 8
@@ -185,18 +209,28 @@ def split_frame(frame: bytes) -> list[bytes]:
     return packets
 
 
-def parse_packet(packet: bytes, *, divisor: Decimal = PAISE) -> RawTick:
+def parse_packet(packet: bytes) -> RawTick:
     """One packet -> a :class:`RawTick`.
 
     Mode is inferred from length, which is how the protocol distinguishes them.
     An unrecognised length raises: it means either a protocol change or a
     misaligned read, and both are conditions to stop on rather than interpret.
+
+    Field signedness (audit TRD-023, 16 Nov 2026): quantities, volume, OI and
+    timestamps are UNSIGNED, as the installed SDK reads them. They were read as
+    signed int32, so a cumulative day volume above 2,147,483,647 shares became
+    negative and every later tick for the symbol was refused as negative_volume.
+    Prices stay SIGNED on purpose: no price this system trades comes near 2^31
+    paise (Rs 2.1 crore), so a set high bit can only be corruption, and signed
+    turns it into a negative price that validation refuses rather than a huge
+    positive one that might pass as an outlier.
     """
     size = len(packet)
     if size < LTP_SIZE:
         raise ProtocolError(f"packet is {size} bytes; the smallest valid packet is {LTP_SIZE}")
 
     token = struct.unpack_from(">I", packet, 0)[0]
+    divisor = divisor_for(token)
 
     # Index packets are shorter than tradable ones of the same mode and carry no
     # volume or depth. Distinguished by length alone.
@@ -228,7 +262,7 @@ def parse_packet(packet: bytes, *, divisor: Decimal = PAISE) -> RawTick:
         high_price,
         low_price,
         close_price,
-    ) = struct.unpack_from(">iiiiiiiiii", packet, 4)
+    ) = struct.unpack_from(">iIiIIIiiii", packet, 4)
 
     tick = RawTick(
         instrument_token=token,
@@ -248,7 +282,7 @@ def parse_packet(packet: bytes, *, divisor: Decimal = PAISE) -> RawTick:
         return tick
 
     last_trade_time, oi, _oi_high, _oi_low, exchange_timestamp = struct.unpack_from(
-        ">iiiii", packet, 44
+        ">IIIII", packet, 44
     )
     bids, asks = _parse_depth(packet, divisor)
     return RawTick(
@@ -283,7 +317,7 @@ def _parse_index(packet: bytes, token: int, divisor: Decimal) -> RawTick:
     last_price, high, low, open_price, close = struct.unpack_from(">iiiii", packet, 4)
     exchange_timestamp = None
     if len(packet) == INDEX_FULL_SIZE:
-        exchange_timestamp = _epoch(struct.unpack_from(">i", packet, 28)[0])
+        exchange_timestamp = _epoch(struct.unpack_from(">I", packet, 28)[0])
     return RawTick(
         instrument_token=token,
         mode=Mode.QUOTE if len(packet) == INDEX_QUOTE_SIZE else Mode.FULL,
@@ -304,7 +338,7 @@ def _parse_depth(
     levels: list[DepthLevel] = []
     offset = 64
     for _ in range(DEPTH_LEVELS * 2):
-        quantity, price, orders = struct.unpack_from(">iiH", packet, offset)
+        quantity, price, orders = struct.unpack_from(">IiH", packet, offset)
         levels.append(
             DepthLevel(quantity=quantity, price=to_price(price, divisor=divisor), orders=orders)
         )
@@ -312,9 +346,9 @@ def _parse_depth(
     return tuple(levels[:DEPTH_LEVELS]), tuple(levels[DEPTH_LEVELS:])
 
 
-def parse_frame(frame: bytes, *, divisor: Decimal = PAISE) -> list[RawTick]:
-    """Convenience: a whole binary frame -> ticks."""
-    return [parse_packet(p, divisor=divisor) for p in split_frame(frame)]
+def parse_frame(frame: bytes) -> list[RawTick]:
+    """Convenience: a whole binary frame -> ticks, each priced by its own segment."""
+    return [parse_packet(p) for p in split_frame(frame)]
 
 
 # ---------------------------------------------------------------------------

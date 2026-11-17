@@ -27,6 +27,7 @@ what :meth:`Indicator.snapshot` captured — asserted in the tests, not assumed.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import math
 from abc import ABC, abstractmethod
@@ -35,6 +36,7 @@ from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
+from algotrader.common.calendar import IST
 from algotrader.common.models.market import Bar
 
 log = logging.getLogger(__name__)
@@ -268,7 +270,15 @@ class EMA(Indicator):
 
 
 class RSI(Indicator):
-    """Relative strength index, Wilder-smoothed."""
+    """Relative strength index, Wilder-smoothed.
+
+    One deliberate departure from TA-Lib (audit TRD-021, 16 Nov 2026): when the
+    window holds no change at all - every close identical, a halted or untraded
+    symbol - RSI is UNDEFINED (0/0), and this returns ``None`` and stays not
+    ready. It used to return 100, "maximally overbought", for a stock that had
+    not moved; TA-Lib returns 0, "maximally oversold", which is no better. Once
+    any close differs, the Wilder averages are non-zero and the two agree again.
+    """
 
     def __init__(self, period: int = 14, name: str | None = None) -> None:
         if period < 2:
@@ -301,7 +311,10 @@ class RSI(Indicator):
         if avg_gain is None or avg_loss is None:
             return None
 
-        if avg_loss == 0:
+        if avg_gain == 0 and avg_loss == 0:
+            # No change at all: 0/0, undefined - see the class docstring.
+            self._value = None
+        elif avg_loss == 0:
             # No down moves in the window. RSI is 100 by definition; computing
             # it would divide by zero.
             self._value = 100.0
@@ -444,7 +457,14 @@ class MACD(Indicator):
 
     @property
     def value(self) -> float | None:
-        return self._macd
+        """The MACD line, ``None`` until the SIGNAL line exists too.
+
+        CHANGED 16 Nov 2026 (audit TRD-022): the line was returned for the eight
+        bars between the slow EMA's seed and the signal's (indices 25-32 for
+        12/26/9) while ``is_ready`` was False - the provisional number the
+        Indicator contract forbids, and TA-Lib emits nothing there either.
+        """
+        return self._macd if self.is_ready else None
 
     @property
     def signal(self) -> float | None:
@@ -474,7 +494,7 @@ class MACD(Indicator):
 
         self._macd = self._fast_value - self._slow_value
         self._signal.update_raw(self._macd)
-        return self._macd
+        return self.value
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -571,15 +591,28 @@ class VWAP(Indicator):
 
     Anchored to the session, not a rolling window: VWAP's meaning comes from
     being the day's average cost basis, and a rolling version is a different
-    statistic wearing the same name. :meth:`reset` is called at the session
-    boundary, and forgetting to call it is the way this silently becomes a
-    multi-day average.
+    statistic wearing the same name.
+
+    CHANGED 16 Nov 2026 (audit TRD-003). This used to say ":meth:`reset` is
+    called at the session boundary" - and nothing called it, so every set warmed
+    from multi-day history published a VWAP averaged since the first warm-up bar
+    (47.7 rupees off on the audit fixture's second day). The anchor is now the
+    indicator's own: it records the IST trading date of the bars it has folded,
+    and a bar from a different date starts a new session. Nothing outside has to
+    remember anything, and warm-up, live updates and restore take the same path.
+
+    The date is the IST date of the bar's OPEN. Every bar of a session opens
+    between 09:15 and 15:30 IST, so the date never straddles midnight, on any
+    timeframe this engine carries.
     """
 
     def __init__(self, name: str = "vwap") -> None:
         self.name = name
         self._pv = 0.0
         self._volume = 0.0
+        #: The IST trading date the running sums belong to. ``None`` until the
+        #: first bar.
+        self._session: dt.date | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -589,7 +622,19 @@ class VWAP(Indicator):
     def value(self) -> float | None:
         return self._pv / self._volume if self._volume > 0 else None
 
+    @property
+    def session(self) -> dt.date | None:
+        """The trading date the current value averages over."""
+        return self._session
+
     def update(self, bar: Bar) -> float | None:
+        session = bar.open_ts.astimezone(IST).date()
+        if session != self._session:
+            # A new session starts from nothing - even when its first bar is
+            # synthetic. Until something trades today there is no VWAP for
+            # today, and yesterday's is not a substitute.
+            self.reset()
+            self._session = session
         # Typical price, matching the standard definition. Using close alone
         # makes VWAP drift toward a plain moving average on wide bars.
         typical = (float(bar.high) + float(bar.low) + float(bar.close)) / 3.0
@@ -603,16 +648,39 @@ class VWAP(Indicator):
         return self.value
 
     def reset(self) -> None:
-        """Call at the session boundary."""
+        """Clear the running sums. :meth:`update` calls it at each new session."""
         self._pv = 0.0
         self._volume = 0.0
+        self._session = None
 
     def snapshot(self) -> dict[str, Any]:
-        return {"pv": self._pv, "volume": self._volume}
+        return {
+            "pv": self._pv,
+            "volume": self._volume,
+            "session": self._session.isoformat() if self._session is not None else None,
+        }
 
     def restore(self, state: dict[str, Any]) -> None:
-        self._pv = float(state["pv"])
-        self._volume = float(state["volume"])
+        """Reload, anchor included.
+
+        A snapshot holding sums but no session date is refused rather than
+        guessed: restored with no anchor, the next bar would either wipe a
+        morning's sums (if it reset) or carry another day's into today (if it
+        did not), and nothing downstream could tell which happened.
+        """
+        pv, volume = float(state["pv"]), float(state["volume"])
+        raw = state.get("session")
+        if raw is None and volume > 0:
+            raise IndicatorError(
+                "VWAP snapshot carries sums but no session date; re-warm from history"
+            )
+        try:
+            session = dt.date.fromisoformat(str(raw)) if raw is not None else None
+        except ValueError:
+            raise IndicatorError(f"VWAP snapshot has an unreadable session {raw!r}") from None
+        if not (math.isfinite(pv) and math.isfinite(volume)) or volume < 0:
+            raise IndicatorError("VWAP snapshot has non-finite or negative sums")
+        self._pv, self._volume, self._session = pv, volume, session
 
 
 class VolumeRatio(Indicator):

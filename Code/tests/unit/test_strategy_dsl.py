@@ -511,3 +511,61 @@ class TestTheYamlLoaderIsBounded:
     def test_the_shipped_strategy_still_loads(self, seed_doc: StrategyDocument) -> None:
         """The control: the bounds must not refuse a real document."""
         assert compile_strategy(seed_doc) is seed_doc
+
+
+# ---------------------------------------------------------------------------
+# Audit 16 Nov 2026 - SEC-007 (duplicate keys), TRD-010 (absence under none_of)
+# ---------------------------------------------------------------------------
+
+
+class TestAKeyMeansOneThing:
+    """Audit SEC-007: PyYAML keeps the LAST of two equal keys silently, so the
+    stop a reviewer reads could differ from the one that compiles."""
+
+    def test_a_top_level_key_given_twice_is_refused(self) -> None:
+        text = SEED.read_text(encoding="utf-8") + "\ndirection: SHORT\n"
+        with pytest.raises(CompilationError, match="'direction' twice"):
+            load_strategy_yaml(text)
+
+    def test_a_nested_key_given_twice_is_refused(self) -> None:
+        text = SEED.read_text(encoding="utf-8").replace(
+            "      multiplier: 1.5\n", "      multiplier: 1.5\n      multiplier: 9.0\n", 1
+        )
+        assert text.count("multiplier: 9.0") == 1
+        with pytest.raises(CompilationError, match="'multiplier' twice"):
+            load_strategy_yaml(text)
+
+    def test_a_merge_key_is_refused(self) -> None:
+        text = SEED.read_text(encoding="utf-8").replace(
+            "constraints:\n", "constraints:\n  <<: {max_entries_per_day: 5}\n", 1
+        )
+        with pytest.raises(CompilationError, match="merge keys"):
+            load_strategy_yaml(text)
+
+    def test_the_shipped_file_still_loads(self) -> None:
+        """The control."""
+        assert load_strategy_yaml(SEED.read_text(encoding="utf-8")).id == "orb_classic"
+
+
+class TestAnAbsenceIsNotNegatedAgain:
+    """Audit TRD-010: orb_classic put no_material_news under none_of, so it
+    could enter ONLY when material news had landed."""
+
+    def test_an_absence_under_none_of_is_refused(self, seed_doc: StrategyDocument) -> None:
+        data = seed_doc.model_dump(mode="json")
+        news = next(c for c in data["entry"]["all_of"] if c["primitive"] == "no_material_news")
+        data["entry"]["all_of"].remove(news)
+        data["entry"]["none_of"] = [news]
+        with pytest.raises(CompilationError, match="asserts an ABSENCE"):
+            compile_strategy(StrategyDocument.model_validate(data))
+
+    def test_the_same_condition_under_all_of_compiles(self, seed_doc: StrategyDocument) -> None:
+        compile_strategy(seed_doc)
+
+    def test_every_no_primitive_is_listed_as_an_absence(self) -> None:
+        """A new 'no_*' primitive must be added to ABSENCE_PRIMITIVES."""
+        from algotrader.strategy.dsl import ABSENCE_PRIMITIVES
+
+        named = {n for n in REGISTRY.names() if n.startswith("no_")}
+        assert named and named <= ABSENCE_PRIMITIVES
+        assert ABSENCE_PRIMITIVES <= set(REGISTRY.names())

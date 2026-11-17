@@ -162,6 +162,17 @@ def parse_clock(text: str) -> dt.time:
 
 
 def price_breaks_level(ctx: EvalContext, p: Mapping[str, Any]) -> bool | None:
+    """A CROSSING: this bar closes beyond the level, the previous bar did not.
+
+    CHANGED 16 Nov 2026 (audit TRD-017, TRD-025). This compared one price with
+    the level - a state, not the crossing the spec describes - so it stayed True
+    on every bar beyond the level and let a strategy enter an hour after the
+    break, far from it. And ``day_high``/``day_low`` included the bar being
+    evaluated, so a break of the day's high could never be True: a close cannot
+    exceed its own bar's high. The day's extremes are now those of the bars
+    BEFORE this one, and a missing previous close is UNKNOWN - a crossing cannot
+    be read from one price.
+    """
     # Parameters are checked BEFORE market data is consulted. Reversed, a
     # strategy with a misspelled direction would return UNKNOWN whenever the
     # level happened to be unavailable — which reads as "conditions not met"
@@ -171,14 +182,25 @@ def price_breaks_level(ctx: EvalContext, p: Mapping[str, Any]) -> bool | None:
         raise PrimitiveError(f"direction must be 'above' or 'below', got {_echo(direction)}")
     buffer_pct = _num(p, "buffer_pct", "0.05")
 
-    level = ctx.named_level(_str(p, "level"))
+    name = _str(p, "level")
+    if name == "day_high":
+        level = ctx.day_high_before_bar
+    elif name == "day_low":
+        level = ctx.day_low_before_bar
+    else:
+        level = ctx.named_level(name)
     if level is None or level <= 0:
+        return None
+    previous = ctx.previous_bar_close
+    if previous is None:
         return None
     buffer = level * buffer_pct / Decimal(100)
     if direction == "above":
-        return ctx.last_price > level + buffer
+        threshold = level + buffer
+        return ctx.last_price > threshold >= previous
     if direction == "below":
-        return ctx.last_price < level - buffer
+        threshold = level - buffer
+        return ctx.last_price < threshold <= previous
     raise PrimitiveError(f"direction must be 'above' or 'below', got {_echo(direction)}")
 
 
@@ -458,12 +480,17 @@ def no_material_news(ctx: EvalContext, p: Mapping[str, Any]) -> bool | None:
 
 
 def within_window(ctx: EvalContext, p: Mapping[str, Any]) -> bool | None:
-    """Window bounds are IST wall-clock, because that is how a trader states them."""
+    """Window bounds are IST wall-clock, because that is how a trader states them.
+
+    Start inclusive, END EXCLUSIVE - the convention ``constraints.entry_window``
+    documents and enforces. This was end-inclusive, so a strategy stating the
+    same window both ways got two answers at 11:00 exactly (audit TRD-026).
+    """
     start, end = parse_clock(_str(p, "start")), parse_clock(_str(p, "end"))
     if start >= end:
         raise PrimitiveError(f"window start {start} is not before end {end}")
     now = ctx.now.astimezone(IST).time()
-    return start <= now <= end
+    return start <= now < end
 
 
 def min_bars_since_open(ctx: EvalContext, p: Mapping[str, Any]) -> bool | None:

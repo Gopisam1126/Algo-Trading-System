@@ -217,20 +217,23 @@ class TestSit26TheRegistryAcrossStartsAndASession:
         assert "hashes to" in loaded.rejected["e2e_breakout"]
         assert any("e2e_breakout" in r.getMessage() for r in caplog.records)
 
-    async def test_a_retired_strategy_stays_retired_and_the_seed_cannot_run_here(
+    async def test_a_retired_strategy_stays_retired_and_the_seed_runs_in_shadow(
         self, factory: async_sessionmaker[AsyncSession], operator: psycopg.Connection
     ) -> None:
         """Two operator moves a start must answer honestly: one strategy
         retired (re-seeding must not revive it), and the shipped seed put in
-        shadow - which this engine cannot evaluate (1d/1w agreement), so it is
-        refused by name while the other still runs."""
+        shadow.
+
+        CHANGED 16 Nov 2026 (audit TRD-014): the seed asked for 1d/1w agreement
+        this engine cannot evaluate, and was refused by name. It asks for
+        15m/1h now, so shadow loads it beside the other."""
         await _start(factory, START_1, BREAKOUT)
         _move(operator, "e2e_breakout", StrategyState.PAPER)
         _move(operator, "orb_classic", StrategyState.SHADOW)
 
         _, loaded = await _start(factory, START_2)
-        assert [r.strategy_id for r in loaded.runnable] == ["e2e_breakout"]
-        assert "cannot run here" in loaded.rejected["orb_classic"]
+        assert [r.strategy_id for r in loaded.runnable] == ["e2e_breakout", "orb_classic"]
+        assert "orb_classic" not in loaded.rejected
 
         _move(operator, "e2e_breakout", StrategyState.RETIRED)
         _move(operator, "orb_classic", StrategyState.RETIRED)

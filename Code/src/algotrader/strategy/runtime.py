@@ -52,6 +52,7 @@ from algotrader.strategy.primitives.evaluators import (
     STOP_EVALUATORS,
     PrimitiveError,
     directional_agreement,
+    parse_clock,
     parse_regimes,
     parse_timeframe,
     r_multiple_target,
@@ -191,6 +192,30 @@ def verify_condition(condition: Condition, caps: Capabilities = DEFAULT_CAPABILI
         value = params.get(param)
         return None if value is None else int(value)
 
+    # Cross-parameter rules, checked for EVERY primitive (audit ENG-025, 16 Nov
+    # 2026). Only rsi_between checked its band; within_window's clock strings
+    # were parsed on every bar and raised there, and a gap band of 2..1 loaded
+    # and could never fire.
+    for low_name, high_name in (("min", "max"), ("min_pct", "max_pct")):
+        low, high = params.get(low_name), params.get(high_name)
+        if low is not None and high is not None and Decimal(str(low)) > Decimal(str(high)):
+            raise UnevaluableStrategyError(
+                f"{name}: {low_name}={low} exceeds {high_name}={high}, so the band is "
+                f"empty and the condition can never be true."
+            )
+    if name == "within_window":
+        try:
+            start, end = parse_clock(str(params["start"])), parse_clock(str(params["end"]))
+        except (KeyError, PrimitiveError) as exc:
+            raise UnevaluableStrategyError(f"within_window: {exc}") from exc
+        if start >= end:
+            raise UnevaluableStrategyError(
+                f"within_window: start {start:%H:%M} is not before end {end:%H:%M}, so the "
+                f"window is empty (end exclusive)."
+            )
+    if name == "atr_stop":
+        _require_indicator(f"atr_{period('period')}", caps, name, "period")
+
     if name in ("price_above_ma", "ma_slope_positive"):
         p = period("period")
         if p is not None:
@@ -241,7 +266,20 @@ def verify_condition(condition: Condition, caps: Capabilities = DEFAULT_CAPABILI
 
 
 def verify_strategy(doc: StrategyDocument, caps: Capabilities = DEFAULT_CAPABILITIES) -> None:
-    """Every condition in the document, entry and exit alike."""
+    """Every condition in the document, entry and exit alike.
+
+    A ``trail`` exit is refused (16 Nov 2026, the strategy-level twin of audit
+    NR-009): nothing moves a stop after entry, and ``Position`` cannot even
+    represent a long stop above its entry. A strategy declaring one would load
+    promising a trailing stop that never runs. The position manager's trailing
+    story replaces this refusal with the real control.
+    """
+    if doc.exit.trail is not None:
+        raise UnevaluableStrategyError(
+            f"exit.trail ({doc.exit.trail.primitive}) is declared, but no trailing stop is "
+            f"implemented: nothing moves a stop after entry. Remove it; the stop and the "
+            f"time exit are what will run."
+        )
     for condition in doc.entry.all_conditions():
         verify_condition(condition, caps)
     exits: tuple[Condition | None, ...] = (

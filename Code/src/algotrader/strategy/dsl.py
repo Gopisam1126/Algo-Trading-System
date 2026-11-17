@@ -274,6 +274,20 @@ class ConditionGroup(BaseModel):
     def validate_against(self, registry: PrimitiveRegistry) -> None:
         for condition in self.all_conditions():
             condition.validate_against(registry)
+        for condition in self.none_of:
+            if condition.primitive in ABSENCE_PRIMITIVES:
+                raise ValueError(
+                    f"{condition.primitive} asserts an ABSENCE, so under none_of it reads "
+                    f"'enter only when it is false' - a double negative that inverted "
+                    f"orb_classic (audit TRD-010). Put it under all_of."
+                )
+
+
+#: Primitives whose truth is "X did NOT happen". Under ``none_of`` each is a
+#: double negative; ``ConditionGroup.validate_against`` refuses that placement.
+#: Every registered primitive named ``no_*`` must be listed here - asserted in
+#: tests/unit/test_strategy_dsl.py, so a new one cannot slip past.
+ABSENCE_PRIMITIVES: frozenset[str] = frozenset({"no_material_news"})
 
 
 class ExitRules(BaseModel):
@@ -611,6 +625,37 @@ def load_strategy_yaml(text: str) -> StrategyDocument:
             if getattr(event, "anchor", None):
                 raise CompilationError("strategy YAML may not use anchors (&name)")
             return super().compose_node(parent, index)
+
+        def construct_mapping(self, node: Any, deep: bool = False) -> Any:
+            """Refuse a key given twice, and merge keys.
+
+            PyYAML keeps the LAST of two equal keys silently, so the stop a
+            reviewer reads at the top of a file could differ from the one that
+            compiles (audit SEC-007, 16 Nov 2026). A merge key (``<<``) is the
+            other way two values meet under one name.
+            """
+            seen: set[Any] = set()
+            for key_node, _value in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    raise CompilationError(
+                        "strategy YAML may not use merge keys (<<), "
+                        f"line {key_node.start_mark.line + 1}"
+                    )
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in seen
+                except TypeError:
+                    raise CompilationError(
+                        "strategy YAML has an unhashable key at "
+                        f"line {key_node.start_mark.line + 1}"
+                    ) from None
+                if duplicate:
+                    raise CompilationError(
+                        f"strategy YAML gives the key {str(key)[:40]!r} twice "
+                        f"(line {key_node.start_mark.line + 1}); the last would silently win"
+                    )
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
 
     # A SafeLoader subclass: same constructors as safe_load, plus the refusals
     # above. Backed by an executed check, not this comment -

@@ -132,7 +132,7 @@ entry:
     - primitive: volume_ratio_above
       params: {window: 20, threshold: 1.5}
     - primitive: timeframe_agreement_at_least
-      params: {count: 2, of: [1h, 1d, 1w]}
+      params: {count: 2, of: [15m, 1h]}     # the engine carries 5m/15m/1h (audit TRD-014)
     - primitive: india_vix_between
       params: {min: 15, max: 28}
     - primitive: index_not_opposing
@@ -141,7 +141,7 @@ entry:
 exit:
   stop:   {primitive: atr_stop,            params: {multiplier: 1.5}}
   target: {primitive: r_multiple_target,   params: {r: 2.0}}
-  trail:  {primitive: trail_after_r,       params: {activate_at_r: 1.0, atr_mult: 1.0}}
+  # no trail: nothing moves a stop after entry, and a declared trail is refused at load
   time:   {primitive: squareoff_deadline}          # always present, non-removable
 
 constraints:

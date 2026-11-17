@@ -187,8 +187,29 @@ def _history(n: int, timeframe: Timeframe, seed: int = 9) -> list[Bar]:
     return out
 
 
+@dataclasses.dataclass(frozen=True)
+class _View:
+    """What the strategy loop sees when a 5m bar seals: the bar's close, the
+    close before it (a break is a CROSSING, audit TRD-017), the bar's close
+    time and the snapshot after the bar was folded."""
+
+    last_price: Decimal
+    previous_bar_close: Decimal | None
+    now: dt.datetime
+    snapshot: object
+
+
 class Pipeline:
-    """The assembly under test, wired the way a real service would wire it."""
+    """The assembly under test, wired the way a real service would wire it.
+
+    CHANGED 16 Nov 2026 (audit TRD-017, ENG-034). The strategy was evaluated
+    ONCE, at the end of the session, against the last price - which only worked
+    while ``price_breaks_level`` was a state ("above the level") rather than a
+    crossing. The pipeline now evaluates on every sealed 5m bar, as
+    ``SignalLoop`` does, and applies the loop's gap rule (the next bar must open
+    one interval after the last, or at the session's first slot); ``context()``
+    is the view at the bar where the strategy first fired.
+    """
 
     def __init__(self) -> None:
         self.cleaner = cleaning.CleaningPipeline()
@@ -198,7 +219,7 @@ class Pipeline:
         # own fixtures by construction.
         self.builder = MultiTimeframeBuilder(
             symbol=SYMBOL,
-            calendar=MarketCalendar(),
+            calendar=MarketCalendar(allow_uncovered=True),
             timeframes=(Timeframe.M5, Timeframe.M15, Timeframe.H1),
         )
         self.bars_built = 0
@@ -206,6 +227,11 @@ class Pipeline:
         self.opening_range = OpeningRange(symbol=SYMBOL, trade_date=dt.date(2026, 8, 20))
         self.rejected = 0
         self.last_price: Decimal | None = None
+        self._evaluator = StrategyEvaluator(compile_strategy(load_strategy_yaml(STRATEGY)))
+        self._previous_m5: Bar | None = None
+        self.latest: _View | None = None
+        self.fired: _View | None = None
+        self.gaps = 0
 
     def warm_up(self) -> object:
         """E06-S03: load history before the feed connects.
@@ -235,20 +261,65 @@ class Pipeline:
         self.opening_range.update(tick)
         for bar in self.builder.add(tick):
             self.bars_built += 1
-            self.engine.update(bar)
+            self._fold(bar)
+
+    def _fold(self, bar: Bar) -> None:
+        """Fold, detecting a gap the way the signal loop does, then evaluate."""
+        indicator_set = self.engine.set_for(bar.symbol, bar.timeframe)
+        last = indicator_set.last_bar_open
+        if last is not None:
+            session_open = SESSION_OPEN
+            expected = (
+                session_open
+                if last < session_open
+                else last + dt.timedelta(seconds=bar.timeframe.seconds)
+            )
+            if bar.open_ts != expected:
+                self.gaps += 1
+                self.engine.mark_stale(
+                    bar.symbol, f"{bar.timeframe.value} gap before {bar.open_ts}"
+                )
+        indicator_set.update(bar)
+        if bar.timeframe is not Timeframe.M5:
+            return
+        previous, self._previous_m5 = self._previous_m5, bar
+        self.latest = _View(
+            last_price=bar.close,
+            previous_bar_close=previous.close if previous is not None else None,
+            now=bar.close_ts,
+            snapshot=self.engine.snapshot(SYMBOL),
+        )
+        if self.fired is None and self._evaluator.fire(
+            self._context(self.latest), correlation_id=CID
+        ):
+            self.fired = self.latest
 
     def seal_opening_range(self) -> None:
         self.opening_range.seal()
 
     def context(self, **overrides) -> EvalContext:
-        assert self.last_price is not None
+        """The context at the bar where the strategy fired - or, if it never
+        did, at the latest sealed bar."""
+        view = self.fired or self.latest
+        if view is None:  # nothing has sealed yet: the tick state, no previous bar
+            assert self.last_price is not None, "no tick has been fed"
+            view = _View(
+                last_price=self.last_price,
+                previous_bar_close=None,
+                now=SESSION_OPEN + dt.timedelta(hours=2),
+                snapshot=self.engine.snapshot(SYMBOL),
+            )
+        return self._context(view, **overrides)
+
+    def _context(self, view: _View, **overrides) -> EvalContext:
         base: dict = {
             "symbol": SYMBOL,
-            "now": SESSION_OPEN + dt.timedelta(hours=2),
+            "now": view.now,
             "timeframe": Timeframe.M5,
             "direction": Direction.LONG,
-            "last_price": self.last_price,
-            "snapshot": self.engine.snapshot(SYMBOL),
+            "last_price": view.last_price,
+            "previous_bar_close": view.previous_bar_close,
+            "snapshot": view.snapshot,
             "opening_range": self.opening_range,
             "regime": Regime.TRENDING,
             # Stated, not defaulted: "no entries yet today" is a claim the
@@ -327,14 +398,24 @@ class TestATriggerComesOutOfTheOtherEnd:
         risk_pct = trigger.stop_distance / trigger.trigger_price * 100
         assert Decimal("0.05") < risk_pct < Decimal("10"), f"stop is {risk_pct}% away"
 
-    def test_the_same_session_replays_identically(
-        self, run: Pipeline, evaluator: StrategyEvaluator
-    ) -> None:
+    def test_the_same_session_replays_identically(self, evaluator: StrategyEvaluator) -> None:
         """Determinism across the whole chain, which is what makes a backtest a
-        replay rather than an approximation."""
-        first = evaluator.fire(run.context(), correlation_id=CID)
-        second = evaluator.fire(run.context(), correlation_id=CID)
-        assert first == second
+        replay rather than an approximation.
+
+        CHANGED 16 Nov 2026 (audit ENG-034): this re-fired the evaluator twice
+        on ONE already-built pipeline, which proves only that a pure function
+        is pure. Two pipelines now replay the same ticks from nothing."""
+        triggers = []
+        for _ in range(2):
+            pipeline = Pipeline()
+            pipeline.warm_up()
+            for i, raw in enumerate(_session_ticks()):
+                if i == 180:
+                    pipeline.seal_opening_range()
+                pipeline.feed(raw)
+            assert pipeline.fired is not None
+            triggers.append(evaluator.fire(pipeline.context(), correlation_id=CID))
+        assert triggers[0] is not None and triggers[0] == triggers[1]
 
 
 class TestBadDataDoesNotReachTheStrategy:
@@ -361,9 +442,7 @@ class TestBadDataDoesNotReachTheStrategy:
                 SYMBOL
             ).value(Timeframe.M5, name), f"{name} moved because of one bad print"
 
-    def test_a_feed_gap_stops_the_strategy_firing(
-        self, run: Pipeline, evaluator: StrategyEvaluator
-    ) -> None:
+    def test_a_feed_gap_stops_the_strategy_firing(self, run: Pipeline) -> None:
         """Found by running this chain for the first time: the evaluator TRADED
         through a twelve-minute feed gap.
 
@@ -372,18 +451,29 @@ class TestBadDataDoesNotReachTheStrategy:
         warm ema_20 never noticed that every indicator beside it was computed
         across a hole in the data. That is the "data stale -> block entries"
         invariant, and it was not held.
+
+        CHANGED 16 Nov 2026 (audit ENG-034): this called mark_stale itself, so
+        it proved the reader and not the detection. The ticks now carry the
+        twelve-minute hole, right after the opening range seals; the gap rule
+        marks the symbol stale and nothing fires for the rest of the session -
+        while the same session without the hole fires (``run``).
         """
-        assert evaluator.fire(run.context(), correlation_id=CID) is not None
-
-        run.engine.mark_stale(SYMBOL, "feed gap 12m")
-        try:
-            assert not run.engine.snapshot(SYMBOL).all_ready
-            assert evaluator.fire(run.context(), correlation_id=CID) is None
-        finally:
-            for timeframe in run.engine.timeframes:
-                run.engine.set_for(SYMBOL, timeframe).clear_stale()
-
-        assert evaluator.fire(run.context(), correlation_id=CID) is not None
+        assert run.fired is not None and run.gaps == 0, "the control must fire"
+        gapped = Pipeline()
+        gapped.warm_up()
+        # Twelve minutes of ticks missing from 09:30, as the range seals - so no
+        # bar straddles the hole and seals late (the loop refuses a late bar
+        # separately; this pipeline has no clock).
+        hole = range(180, 180 + 12 * 60 // 5)
+        for i, raw in enumerate(_session_ticks()):
+            if i == 180:
+                gapped.seal_opening_range()
+            if i in hole:
+                continue
+            gapped.feed(raw)
+        assert gapped.gaps > 0, "the hole was not detected"
+        assert not gapped.engine.snapshot(SYMBOL).all_ready
+        assert gapped.fired is None, "the strategy traded through a feed gap"
 
     def test_warm_up_made_the_symbol_ready(self, run: Pipeline) -> None:
         """A 200-EMA on 5-minute bars needs sixteen hours of trading, so no

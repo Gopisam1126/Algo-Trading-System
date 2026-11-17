@@ -32,7 +32,9 @@ def _quote_packet(
     volume: int = 1_234_567,
     ohlc: tuple[int, int, int, int] = (248000, 251000, 247500, 249000),
 ) -> bytes:
-    return struct.pack(">Iiiiiiiiiii", token, last, 10, 249900, volume, 500, 600, *ohlc)
+    # The wire layout as the SDK reads it: quantities and volume unsigned,
+    # prices signed (audit TRD-023).
+    return struct.pack(">IiIiIIIiiii", token, last, 10, 249900, volume, 500, 600, *ohlc)
 
 
 def _full_packet(token: int = TOKEN, last: int = 250075) -> bytes:
@@ -81,10 +83,66 @@ class TestPricesAreExact:
         assert tick.last_price == Decimal("2500.75")
         assert isinstance(tick.last_price, Decimal)
 
-    def test_a_currency_divisor_can_be_supplied(self) -> None:
-        """Currencies are quoted to seven places, not two."""
-        tick = kp.parse_packet(_ltp_packet(paise=875_000_00), divisor=kp.CURRENCY_DIVISOR)
+    def test_a_currency_token_is_priced_to_seven_places(self) -> None:
+        """Currencies are quoted to seven places, not two - decided by the
+        token's segment byte, per packet (audit ENG-052)."""
+        cds_token = (1234 << 8) | kp.SEGMENT_CDS
+        tick = kp.parse_packet(_ltp_packet(token=cds_token, paise=875_000_00))
         assert tick.last_price == Decimal("8.75")
+
+    def test_a_frame_mixing_segments_prices_each_packet_by_its_own(self) -> None:
+        """The defect: one divisor for the whole frame."""
+        cds_token = (1234 << 8) | kp.SEGMENT_CDS
+        bcd_token = (99 << 8) | kp.SEGMENT_BCD
+        ticks = kp.parse_frame(
+            _frame(
+                _ltp_packet(paise=250075),
+                _ltp_packet(token=cds_token, paise=875_000_00),
+                _ltp_packet(token=bcd_token, paise=87_500),
+            )
+        )
+        assert [t.last_price for t in ticks] == [
+            Decimal("2500.75"),
+            Decimal("8.75"),
+            Decimal("8.75"),
+        ]
+
+    def test_the_segment_divisors_are_the_sdks(self) -> None:
+        """Pinned against the installed kiteconnect, not memory."""
+        from kiteconnect import KiteTicker
+
+        assert KiteTicker.EXCHANGE_MAP["cds"] == kp.SEGMENT_CDS
+        assert KiteTicker.EXCHANGE_MAP["bcd"] == kp.SEGMENT_BCD
+        assert kp.divisor_for(TOKEN) == kp.PAISE
+
+
+class TestQuantitiesAreUnsigned:
+    """Audit TRD-023: volume was read as signed int32, so a day volume above
+    2^31 became negative and every later tick was refused."""
+
+    def test_a_volume_above_two_to_the_31_parses(self) -> None:
+        tick = kp.parse_packet(_quote_packet(volume=2_200_000_000))
+        assert tick.volume == 2_200_000_000
+
+    def test_it_passes_the_tick_validator(self) -> None:
+        import datetime as dt
+
+        from algotrader.ingest.cleaning import TickValidator
+
+        now = dt.datetime(2026, 8, 20, 5, 0, tzinfo=dt.UTC)
+        validator = TickValidator()
+        assert (
+            validator.check(kp.parse_packet(_quote_packet(volume=2_100_000_000)), now=now) is None
+        )
+        assert (
+            validator.check(kp.parse_packet(_quote_packet(volume=2_200_000_000)), now=now) is None
+        )
+
+    def test_a_price_with_its_high_bit_set_is_still_negative(self) -> None:
+        """Prices stay signed: a set high bit is corruption, and negative is
+        what validation refuses."""
+        tick = kp.parse_packet(struct.pack(">II", TOKEN, 0x80000001))
+        assert tick.last_price < 0
 
     def test_ohlc_survives_the_round_trip(self) -> None:
         tick = kp.parse_packet(_quote_packet(ohlc=(248000, 251000, 247500, 249000)))

@@ -47,14 +47,13 @@ T0 = dt.datetime(2026, 11, 3, 3, 0, tzinfo=dt.UTC)
 
 
 def _runnable_seed() -> StrategyDocument:
-    """orb_classic, asking for agreement on timeframes this engine carries.
+    """orb_classic as shipped.
 
-    The shipped file asks for 1h/1d/1w and the engine carries 5m/15m/1h, so
-    the shipped document is refused as "cannot run here" (see the unit tests).
+    CHANGED 16 Nov 2026 (audit TRD-014): the shipped file asked for 1h/1d/1w
+    agreement, which the engine (5m/15m/1h) cannot answer, and this rewrote it
+    to 5m/15m/1h. It now asks for 15m/1h and runs as shipped.
     """
-    data = load_strategy_yaml(SEED.read_text(encoding="utf-8")).model_dump(mode="json")
-    data["entry"]["all_of"][2]["params"]["of"] = "5m,15m,1h"
-    return StrategyDocument.model_validate(data)
+    return load_strategy_yaml(SEED.read_text(encoding="utf-8"))
 
 
 def _variant(doc: StrategyDocument, new_id: str, threshold: float) -> StrategyDocument:
