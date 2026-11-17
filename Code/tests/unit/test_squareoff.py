@@ -270,6 +270,21 @@ class Emergency:
             raise self.raises
 
 
+class Prices:
+    """The live price per symbol, or None (no fresh quote). Raises on demand."""
+
+    def __init__(self) -> None:
+        self.by_symbol: dict[str, Decimal | None] = {}
+        self.fails = False
+        self.asked: list[str] = []
+
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None:
+        self.asked.append(symbol)
+        if self.fails:
+            raise ConnectionError("redis is down")
+        return self.by_symbol.get(symbol)
+
+
 class Rig:
     def __init__(self) -> None:
         self.account = Account()
@@ -286,6 +301,7 @@ class Rig:
         )
         self.halter = Halter()
         self.emergency = Emergency()
+        self.prices = Prices()
         self.audit: list[AuditEntry] = []
         self.sleeps: list[float] = []
 
@@ -301,6 +317,7 @@ class Rig:
             manager=self.manager,
             protector=self.emergency,
             halter=self.halter,
+            prices=self.prices,
             audit=write,
             metrics=get_metrics(),
             sleep=sleep,
@@ -316,6 +333,7 @@ class Rig:
         kind: str = "protected",
         held: int | None = None,
         stop: bool = True,
+        target: Decimal | None = None,
     ) -> Position:
         long = direction is Direction.LONG
         position = Position(
@@ -327,6 +345,7 @@ class Rig:
             quantity=quantity,
             entry_price=Decimal("1200.0000"),
             stop_price=Decimal("1186.4500") if long else Decimal("1213.5500"),
+            target_price=target,
             opened_at=_ist(10, 0),
             squareoff_deadline=deadline,
         )
@@ -761,6 +780,7 @@ class TestAPositionPastItsDeadlineIsAlerted:
                 manager=None,  # type: ignore[arg-type]
                 protector=None,  # type: ignore[arg-type]
                 halter=None,  # type: ignore[arg-type]
+                prices=None,  # type: ignore[arg-type]
                 overdue_after_seconds=0,
             )
         with pytest.raises(ValueError, match="cancel_settle_attempts"):
@@ -770,6 +790,7 @@ class TestAPositionPastItsDeadlineIsAlerted:
                 manager=None,  # type: ignore[arg-type]
                 protector=None,  # type: ignore[arg-type]
                 halter=None,  # type: ignore[arg-type]
+                prices=None,  # type: ignore[arg-type]
                 cancel_settle_attempts=0,
             )
 
@@ -853,3 +874,144 @@ class TestAPartFilledStopIsNotOverSold:
         rig.sweep(NON_CAS_DEADLINE)
         exits = [o for o in rig.account.orders.values() if o.intent is OrderIntent.SQUAREOFF]
         assert [o.quantity for o in exits] == [25], "15 were sold by the stop already"
+
+
+# ---------------------------------------------------------------------------
+# E15-S07 - the target exit
+# ---------------------------------------------------------------------------
+
+LONG_TARGET = Decimal("1227.1000")  # 1200 + 2 x 13.55
+SHORT_TARGET = Decimal("1172.9000")
+BEFORE_DEADLINE = _ist(11, 30)
+
+
+def _exits(rig: Rig) -> list[Order]:
+    return [o for o in rig.account.orders.values() if o.intent is OrderIntent.SQUAREOFF]
+
+
+class TestAReachedTargetIsExited:
+    """target_price was computed and stored on every position and nothing ever
+    exited at it: the configured 2R target was a number, not a control."""
+
+    def test_a_long_at_its_target_exits_at_market_with_reason_target(self) -> None:
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        rig.prices.by_symbol["INFY"] = Decimal("1227.50")
+        report = rig.sweep(BEFORE_DEADLINE)
+        assert report.exited == ["INFY"]
+        (exit_order,) = _exits(rig)
+        assert exit_order.quantity == 40 and exit_order.side is Side.SELL
+        tracked = rig.manager.tracked("INFY")
+        assert isinstance(tracked, ExitingPosition) and tracked.reason is ExitReason.TARGET
+        assert "target 1227.1000 reached at 1227.50" in tracked.because
+        assert Outcome.TARGET_EXIT.value in rig.outcomes()
+
+    def test_the_stop_is_cancelled_before_the_exit_is_sent(self) -> None:
+        """Two working sells for one holding: if both fill, the account is short."""
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        rig.prices.by_symbol["INFY"] = LONG_TARGET
+        rig.sweep(BEFORE_DEADLINE)
+        stops = [o for o in rig.account.orders.values() if o.intent is OrderIntent.STOP]
+        assert stops and all(o.status.is_terminal for o in stops)
+        assert len(_exits(rig)) == 1
+
+    def test_a_short_at_its_target_exits(self) -> None:
+        rig = Rig()
+        rig.position(direction=Direction.SHORT, target=SHORT_TARGET)
+        rig.prices.by_symbol["INFY"] = Decimal("1172.00")
+        assert rig.sweep(BEFORE_DEADLINE).exited == ["INFY"]
+        (exit_order,) = _exits(rig)
+        assert exit_order.side is Side.BUY
+
+    def test_a_target_not_yet_reached_is_left_alone(self) -> None:
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        rig.position("TCS", direction=Direction.SHORT, target=SHORT_TARGET)
+        rig.prices.by_symbol.update({"INFY": Decimal("1227.05"), "TCS": Decimal("1173.00")})
+        report = rig.sweep(BEFORE_DEADLINE)
+        assert report.exited == [] and _exits(rig) == []
+        assert isinstance(rig.manager.tracked("INFY"), ProtectedPosition)
+
+    def test_a_position_with_no_target_is_never_target_exited(self) -> None:
+        rig = Rig()
+        rig.position(target=None)
+        rig.prices.by_symbol["INFY"] = Decimal("5000")
+        assert rig.sweep(BEFORE_DEADLINE).exited == []
+        assert rig.prices.asked == [], "nothing to check, nothing read"
+
+    def test_an_exiting_position_is_not_exited_again(self) -> None:
+        """Nor is its price read: it is already leaving at market, and a read
+        every second per exiting position is data budget spent on nothing."""
+        rig = Rig()
+        rig.position(target=LONG_TARGET, kind="exiting")
+        rig.prices.by_symbol["INFY"] = Decimal("1300")
+        assert rig.sweep(BEFORE_DEADLINE).exited == [] and _exits(rig) == []
+        assert rig.prices.asked == []
+
+
+class TestATargetIsNeverTakenOnAPriceNobodyCanVouchFor:
+    """Taking profit is never protection: with no fresh price the position
+    stays under its stop and its time exit, which bound it."""
+
+    def test_no_fresh_price_takes_no_exit(self) -> None:
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        rig.prices.by_symbol["INFY"] = None
+        assert rig.sweep(BEFORE_DEADLINE).exited == [] and _exits(rig) == []
+        assert get_metrics().target_price_unavailable_total._value.get() >= 1
+
+    def test_an_unreadable_price_takes_no_exit_and_does_not_stop_the_sweep(self) -> None:
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        rig.prices.fails = True
+        assert rig.sweep(BEFORE_DEADLINE).exited == []
+        rig.prices.fails = False
+        rig.prices.by_symbol["INFY"] = LONG_TARGET
+        assert rig.sweep(BEFORE_DEADLINE + dt.timedelta(seconds=1)).exited == ["INFY"]
+
+    def test_the_time_exit_does_not_need_a_price(self) -> None:
+        """The control: a dead price feed never delays the deadline."""
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        rig.prices.fails = True
+        assert rig.sweep(NON_CAS_DEADLINE).exited == ["INFY"]
+
+
+class TestExitPrecedence:
+    """LOW_LEVEL_ARCHITECTURE.md §5.8: deadline, then stop, then target."""
+
+    def test_a_due_deadline_wins_over_a_reached_target(self) -> None:
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        rig.prices.by_symbol["INFY"] = Decimal("1300")
+        rig.sweep(NON_CAS_DEADLINE)
+        tracked = rig.manager.tracked("INFY")
+        assert isinstance(tracked, ExitingPosition) and tracked.reason is ExitReason.TIME
+        assert len(_exits(rig)) == 1
+        assert rig.prices.asked == [], "a due position's target is not even read"
+
+    def test_a_stop_already_filling_is_the_exit(self) -> None:
+        """At the target, a stop that has triggered (a gap through both) is
+        taking the position off; no second exit is sent."""
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        (stop,) = [o for o in rig.account.orders.values() if o.intent is OrderIntent.STOP]
+        rig.account.orders[stop.client_order_id] = stop.model_copy(
+            update={"status": OrderStatus.PARTIAL, "filled_quantity": 10}
+        )
+        rig.prices.by_symbol["INFY"] = LONG_TARGET
+        rig.sweep(BEFORE_DEADLINE)
+        assert _exits(rig) == []
+
+    def test_a_refused_target_exit_takes_the_emergency_path(self) -> None:
+        """The stop is gone and the exit did not establish: the naked case, and
+        it has one owner - exactly as for a refused time exit."""
+        rig = Rig()
+        rig.position(target=LONG_TARGET)
+        rig.account.reject_exits = 1
+        rig.prices.by_symbol["INFY"] = LONG_TARGET
+        rig.sweep(BEFORE_DEADLINE)
+        assert rig.emergency.exits, "the emergency path took the refused target exit"
+        tracked = rig.manager.tracked("INFY")
+        assert isinstance(tracked, ExitingPosition) and tracked.reason is ExitReason.TARGET

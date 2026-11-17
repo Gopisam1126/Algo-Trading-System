@@ -97,10 +97,10 @@ exit:
       multiplier: 1.5
       period: 14
 
-  target:
-    primitive: r_multiple_target
-    params:
-      r: 2.0
+  # No `target`: every position takes profit at the risk policy's target
+  # (risk.per_trade.target_r_multiple, 2R in system.yaml), which the exit timer
+  # enforces (E15-S07). A strategy-level target travels nowhere, so declaring
+  # one is refused at load.
 
   # No `trail`: nothing moves a stop after entry (audit NR-009), and a strategy
   # declaring one is refused at load rather than shipped promising a trailing

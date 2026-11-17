@@ -74,7 +74,6 @@ entry:
 exit:
   stop: {primitive: atr_stop, params: {multiplier: 1.5, period: 14}}
   time: {primitive: squareoff_deadline}
-  target: {primitive: r_multiple_target, params: {r: 2.0}}
 constraints: {max_entries_per_day: 1, entry_window: ["09:30", "11:00"]}
 """
 
@@ -180,7 +179,7 @@ class TestTheContentHashIsAHashOfBehaviour:
         base = _base()
 
         def respell(d: dict[str, Any]) -> None:
-            d["exit"]["target"]["params"]["r"] = 2  # 2.0 as written
+            d["exit"]["stop"]["params"]["multiplier"] = 1.50  # 1.5 as written
             d["entry"]["all_of"][1]["params"]["threshold"] = 1.50
             d["applicability"]["min_price"] = "100.000"
 
@@ -242,8 +241,9 @@ class TestTheContentHashIsAHashOfBehaviour:
             ),
             pytest.param(lambda d: d["entry"]["all_of"].pop(1), id="condition-removed"),
             pytest.param(lambda d: d["exit"]["stop"]["params"].update(period=10), id="stop-period"),
-            pytest.param(lambda d: d["exit"]["target"]["params"].update(r=3.0), id="target"),
-            pytest.param(lambda d: d["exit"].update(target=None), id="target-removed"),
+            pytest.param(
+                lambda d: d["exit"]["stop"]["params"].update(multiplier=2.0), id="stop-multiplier"
+            ),
             pytest.param(
                 lambda d: d["constraints"].update(max_entries_per_day=2), id="max-entries"
             ),
@@ -412,7 +412,7 @@ class TestOneStrategyPerBehaviour:
 
         def respell(d: dict[str, Any]) -> None:
             d.update(id="orb_fresh_idea_v1", name="A fresh idea", origin="AI_PROPOSED_JOURNAL")
-            d["exit"]["target"]["params"]["r"] = 2
+            d["exit"]["stop"]["params"]["multiplier"] = 1.50
             d["entry"]["all_of"].reverse()
             del d["exit"]["stop"]["params"]["period"]
 

@@ -1,4 +1,35 @@
-"""The square-off timer: every position closed on our schedule (E15-S06).
+"""The exit timer: every position closed on our schedule (E15-S06, E15-S07).
+
+## The target exit (E15-S07, 17 Nov 2026)
+
+**The decision.** The same sweep exits a position whose FRESH live price has
+reached its ``target_price`` - through the identical path a time exit takes
+(cancel the stop, wait until the broker shows it dead, exit
+``min(book, broker)`` at market under the attempt-numbered SQUAREOFF key), and
+marks it EXITING with reason ``TARGET``. Precedence (LOW_LEVEL_ARCHITECTURE.md
+§5.8): a due DEADLINE wins - the position leaves at market either way, and the
+deadline is the reason that must be visible; a stop that is already filling is
+the exit; the target comes after both.
+
+**The alternatives rejected.** *A resting LIMIT order at the target beside the
+stop* - two working sells for one holding; if both fill, the account is short
+(the case the time exit already refuses), and Kite has no OCO for MIS orders.
+*A target with no price check* - there is no other way to know it was reached.
+
+**The failure it prevents.** Before this, ``target_price`` was computed and
+stored on every position and nothing ever exited at it: the configured 2R
+target - "2R target" in MASTER_REFERENCE §-risk - was a number, not a control.
+
+**Fail closed, for profit-taking.** A missing, stale (older than the quote
+limit) or unreadable price takes NO target exit: the position stays under its
+stop and its time exit, which bound it. Taking profit is never protection, so
+acting on a price nobody can vouch for is the only wrong answer here.
+
+**What would make this wrong.** A quote feed so slow that "reached" is read
+seconds late (the exit is at MARKET, so it gets whatever the market is then),
+or a strategy that needs its OWN target: the target is the risk policy's
+(``risk.per_trade.target_r_multiple``), and a strategy declaring one is refused
+at load until the target travels with the signal.
 
 Invariant 5 is *every position has a stop and a time exit*. E15-S04 gave every
 position its stop; this is the time exit. Without it a position stays open
@@ -69,6 +100,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Final, Protocol, TypeGuard
 
@@ -76,7 +108,7 @@ from algotrader.broker.adapter import BrokerPosition
 from algotrader.common.audit import AuditEntry
 from algotrader.common.calendar import IST
 from algotrader.common.db.models import DecisionLog
-from algotrader.common.enums import ExitReason, OrderIntent
+from algotrader.common.enums import Direction, ExitReason, OrderIntent
 from algotrader.common.models.trading import Order
 from algotrader.common.text import one_safe_line
 from algotrader.execution.halt import HaltReason
@@ -100,6 +132,8 @@ class Outcome(StrEnum):
 
     #: The stop is cancelled and the MARKET exit is live.
     TIME_EXIT = "TIME_EXIT"
+    #: The live price reached the target; the stop is cancelled and the exit is live.
+    TARGET_EXIT = "TARGET_EXIT"
     #: The stop has triggered and is filling at market: it IS the exit.
     STOP_FILLING = "STOP_FILLING"
     #: The stop's cancel is not yet visible; the exit waits for the next sweep.
@@ -162,6 +196,12 @@ class EmergencyExit(Protocol):
     ) -> None: ...
 
 
+class PriceReader(Protocol):
+    """A FRESH last traded price, or ``None`` (``SessionFacts.last_price``)."""
+
+    async def last_price(self, symbol: str, *, now: dt.datetime) -> Decimal | None: ...
+
+
 class Halter(Protocol):
     async def arm(
         self, reason: HaltReason, *, detail: str, armed_by: str, now: dt.datetime
@@ -186,6 +226,11 @@ class TimerReport:
 # ---------------------------------------------------------------------------
 # The timer
 # ---------------------------------------------------------------------------
+
+
+def _deadline_reason(position: Any) -> str:
+    deadline = position.squareoff_deadline.astimezone(IST).strftime("%H:%M")
+    return f"square-off deadline {deadline} IST"
 
 
 def _is_the_exit(stop: Order | None) -> TypeGuard[Order]:
@@ -213,6 +258,7 @@ class SquareOffTimer:
         manager: PositionManager,
         protector: EmergencyExit,
         halter: Halter,
+        prices: PriceReader,
         audit: AuditSink | None = None,
         metrics: object | None = None,
         overdue_after_seconds: float = 60.0,
@@ -231,6 +277,9 @@ class SquareOffTimer:
         #: REQUIRED: a holding the broker does not have must stop the session,
         #: and a timer that could be built without a halter would only log it.
         self._halter = halter
+        #: REQUIRED (E15-S07): a timer built without prices would never take a
+        #: target exit, and nothing in its constructor would say so.
+        self._prices = prices
         self._audit = audit
         self._metrics = metrics
         self._overdue_after = dt.timedelta(seconds=overdue_after_seconds)
@@ -255,13 +304,19 @@ class SquareOffTimer:
         held = {t.position.correlation_id for t in book}
         self._recorded = {key for key in self._recorded if key[0] in held}
         due = [t for t in book if t.position.squareoff_deadline <= now]
-        if not due:
+        reached = await self._targets_reached(
+            [t for t in book if t.position.squareoff_deadline > now], now=now
+        )
+        if not due and not reached:
             return report
 
         trade_date = now.astimezone(IST).date()
         positions: Sequence[BrokerPosition] | None = None
         read_failed = False
-        for tracked in due:
+        work: list[tuple[TrackedPosition, ExitReason, str]] = [
+            (t, ExitReason.TIME, _deadline_reason(t.position)) for t in due
+        ] + [(t, ExitReason.TARGET, why) for t, why in reached]
+        for tracked, reason, because in work:
             if isinstance(tracked, ExitingPosition):
                 continue  # already leaving at market; reconciliation confirms it
             if (tracked.position.correlation_id, Outcome.NOT_HELD) in self._recorded:
@@ -284,7 +339,15 @@ class SquareOffTimer:
                 await self._record(tracked, Outcome.UNREADABLE, "broker positions unreadable", now)
                 continue
             try:
-                await self._square_off(tracked, positions, report, trade_date=trade_date, now=now)
+                await self._square_off(
+                    tracked,
+                    positions,
+                    report,
+                    trade_date=trade_date,
+                    now=now,
+                    reason=reason,
+                    because=because,
+                )
             except Exception as exc:
                 report.errors.append(f"{tracked.position.symbol}: {type(exc).__name__}")
                 log.error("square-off of %s failed", tracked.position.symbol, exc_info=True)
@@ -292,6 +355,41 @@ class SquareOffTimer:
         for tracked in due:
             await self._check_overdue(tracked, report, now=now)
         return report
+
+    async def _targets_reached(
+        self, candidates: Sequence[TrackedPosition], *, now: dt.datetime
+    ) -> list[tuple[TrackedPosition, str]]:
+        """Positions not yet due whose FRESH live price has reached the target.
+
+        An exiting position is already leaving; a position with no target has
+        nothing to reach; a price that is missing, stale or unreadable takes no
+        exit (see the module docstring: fail closed, for profit-taking).
+        """
+        out: list[tuple[TrackedPosition, str]] = []
+        for tracked in candidates:
+            position = tracked.position
+            target = position.target_price
+            if target is None or isinstance(tracked, ExitingPosition):
+                continue
+            try:
+                price = await self._prices.last_price(position.symbol, now=now)
+            except Exception as exc:
+                log.warning(
+                    "target check for %s: price unreadable (%s); no target exit",
+                    position.symbol,
+                    one_safe_line(str(exc)),
+                )
+                price = None
+            if price is None:
+                self._count("target_price_unavailable_total")
+                continue
+            if position.direction is Direction.LONG:
+                hit = price >= target
+            else:
+                hit = price <= target
+            if hit:
+                out.append((tracked, f"target {target} reached at {price}"))
+        return out
 
     async def _square_off(
         self,
@@ -301,6 +399,8 @@ class SquareOffTimer:
         *,
         trade_date: dt.date,
         now: dt.datetime,
+        reason: ExitReason = ExitReason.TIME,
+        because: str = "",
     ) -> None:
         position = tracked.position
         # The NEWEST stop attempt (TRD-001): after a re-placed stop, attempt 0
@@ -357,8 +457,7 @@ class SquareOffTimer:
                 direction=position.direction,
                 quantity=quantity,
             )
-        deadline = position.squareoff_deadline.astimezone(IST).strftime("%H:%M")
-        because = f"square-off deadline {deadline} IST"
+        because = because or _deadline_reason(position)
         try:
             await self._gateway.submit_exit(target, trade_date=trade_date)
             exit_order = await self._gateway.find_order(
@@ -367,7 +466,7 @@ class SquareOffTimer:
                 )
             )
             if not is_live(exit_order):
-                raise RuntimeError("the time exit was sent but the broker does not list it live")
+                raise RuntimeError("the exit was sent but the broker does not list it live")
         except Exception as exc:
             # The stop is gone and the time exit did not establish: that IS the
             # naked case, and it has one owner. exit_now takes the NEXT attempt
@@ -384,11 +483,17 @@ class SquareOffTimer:
             )
             await self._protector.exit_now(target, trade_date=trade_date, now=now, because=because)
 
-        await self._manager.mark_exiting(position.symbol, because=because, reason=ExitReason.TIME)
+        await self._manager.mark_exiting(position.symbol, because=because, reason=reason)
         report.exited.append(position.symbol)
-        self._count("squareoff_exits_total")
-        await self._record(tracked, Outcome.TIME_EXIT, f"{quantity} at market; {because}", now)
-        log.warning("square-off: %s x%s exiting at market (%s)", position.symbol, quantity, because)
+        if reason is ExitReason.TARGET:
+            self._count("target_exits_total")
+            await self._record(
+                tracked, Outcome.TARGET_EXIT, f"{quantity} at market; {because}", now
+            )
+        else:
+            self._count("squareoff_exits_total")
+            await self._record(tracked, Outcome.TIME_EXIT, f"{quantity} at market; {because}", now)
+        log.warning("exit timer: %s x%s exiting at market (%s)", position.symbol, quantity, because)
         if quantity < position.quantity:
             await self._not_held(tracked, held, report, now=now)
 

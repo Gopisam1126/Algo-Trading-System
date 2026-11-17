@@ -110,12 +110,13 @@ entry:
     - {{primitive: price_breaks_level, params: {{level: opening_range_high, direction: above}}}}
     - {{primitive: price_above_ma, params: {{period: 20}}}}
 exit:
-  stop: {{primitive: atr_stop, params: {{multiplier: 1.5, period: 14}}}}
+  # Two strategies differ by their stop multiplier; a strategy-level target
+  # is refused at load (E15-S07), so it can no longer tell them apart.
+  stop: {{primitive: atr_stop, params: {{multiplier: {m}, period: 14}}}}
   time: {{primitive: squareoff_deadline}}
-  target: {{primitive: r_multiple_target, params: {{r: {r}}}}}
 """
-PAPER_DOC = load_strategy_yaml(STRATEGY.format(sid="sit27_paper", r="2.0"))
-SHADOW_DOC = load_strategy_yaml(STRATEGY.format(sid="sit27_shadow", r="3.0"))
+PAPER_DOC = load_strategy_yaml(STRATEGY.format(sid="sit27_paper", m="1.5"))
+SHADOW_DOC = load_strategy_yaml(STRATEGY.format(sid="sit27_shadow", m="2.0"))
 
 
 def _owner_dsn(url: str) -> str:

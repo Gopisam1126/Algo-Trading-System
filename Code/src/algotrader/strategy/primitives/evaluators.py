@@ -592,26 +592,6 @@ def structure_stop(ctx: EvalContext, p: Mapping[str, Any]) -> Decimal | None:
     return snap_stop(raw, ctx.tick_size, ctx.direction)
 
 
-def r_multiple_target(
-    entry: Decimal,
-    stop: Decimal,
-    direction: Direction,
-    p: Mapping[str, Any],
-    tick: Decimal = Decimal("0.05"),
-) -> Decimal | None:
-    """Target at R multiples of the risk ACTUALLY taken.
-
-    Measured against the snapped stop, not the theoretical one, so the reward
-    ratio a journal reports is the ratio the position really had.
-    """
-    risk = abs(entry - stop)
-    if risk <= 0:
-        return None
-    reward = risk * _num(p, "r")
-    raw = entry + reward if direction is Direction.LONG else entry - reward
-    return snap_target(raw, tick, direction)
-
-
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------

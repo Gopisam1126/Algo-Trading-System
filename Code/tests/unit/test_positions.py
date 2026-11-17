@@ -829,6 +829,26 @@ class TestTheStopFollowsTheFill:
         )
         assert protector.attached[0].stop_price == Decimal("1204.0000")
 
+    @pytest.mark.asyncio
+    async def test_the_target_moves_with_the_fill(self) -> None:
+        """E15-S07, through the path that opens a position: trigger 1200 and
+        target 1230 (a reward of 30); filled at 1210 the target is 1240, so the
+        exit timer takes the policy's R from where the position opened."""
+        manager, protector, store, _m, _c = _manager()
+        await _open(manager, _order(price="1210.0000"), _sizing())
+        assert protector.attached[0].target_price == Decimal("1240.0000")
+        assert store.inserts[0]["target_price"] == Decimal("1240.0000")
+
+    @pytest.mark.asyncio
+    async def test_a_short_target_moves_with_its_fill(self) -> None:
+        manager, protector, _s, _m, _c = _manager()
+        await _open(
+            manager,
+            _order(side=Side.SELL, price="1190.0000"),
+            _sizing(stop="1214.0000", target="1170.0000"),
+        )
+        assert protector.attached[0].target_price == Decimal("1160.0000")
+
     def test_the_rule_never_loosens(self) -> None:
         sizing = _sizing()
         for fill in ("1150", "1187", "1200", "1250"):
@@ -955,3 +975,99 @@ class TestTheCalendarIsRequiredUpFront:
                 mirror=RecordingMirror(),
                 calendar=object(),
             )
+
+
+class TestTheTargetMovesWithTheFill:
+    """E15-S07: the exit timer takes profit at target_price, so it must be the
+    policy's R from where the position OPENED, not from the trigger."""
+
+    @staticmethod
+    def _sizing(target: Decimal | None) -> Any:
+        from algotrader.common.models.trading import SizingResult
+
+        return SizingResult(
+            quantity=10,
+            entry_price=Decimal("1000"),
+            stop_price=Decimal("985"),
+            target_price=target,
+            capital_at_risk=Decimal("150"),
+            binding_constraint="risk",
+        )
+
+    def test_a_long_target_is_the_reward_from_the_fill(self) -> None:
+        from algotrader.execution.positions import anchored_target
+
+        sizing = self._sizing(Decimal("1030"))
+        assert anchored_target(Direction.LONG, fill=Decimal("1004"), sizing=sizing) == Decimal(
+            "1034"
+        )
+
+    def test_a_short_target_likewise(self) -> None:
+        from algotrader.common.models.trading import SizingResult
+        from algotrader.execution.positions import anchored_target
+
+        sizing = SizingResult(
+            quantity=10,
+            entry_price=Decimal("1000"),
+            stop_price=Decimal("1015"),
+            target_price=Decimal("970"),
+            capital_at_risk=Decimal("150"),
+            binding_constraint="risk",
+        )
+        assert anchored_target(Direction.SHORT, fill=Decimal("996"), sizing=sizing) == Decimal(
+            "966"
+        )
+
+    def test_no_target_stays_no_target(self) -> None:
+        from algotrader.execution.positions import anchored_target
+
+        assert (
+            anchored_target(Direction.LONG, fill=Decimal("1004"), sizing=self._sizing(None)) is None
+        )
+
+
+class TestATargetMustBeOnTheProfitSide:
+    """A target at or through the entry would read as reached at once and exit
+    at market on the first sweep."""
+
+    @pytest.mark.parametrize(
+        ("direction", "stop", "target"),
+        [
+            (Direction.LONG, "990", "1000"),
+            (Direction.LONG, "990", "995"),
+            (Direction.SHORT, "1010", "1000"),
+            (Direction.SHORT, "1010", "1005"),
+        ],
+    )
+    def test_a_target_on_the_wrong_side_is_refused(
+        self, direction: Direction, stop: str, target: str
+    ) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="target must be"):
+            _target_position(direction, Decimal(stop), Decimal(target))
+
+    def test_a_target_on_the_profit_side_builds(self) -> None:
+        assert _target_position(Direction.LONG, Decimal("990"), Decimal("1020")).target_price
+
+
+def _target_position(direction: Direction, stop: Decimal, target: Decimal) -> Any:
+    import datetime as _dt
+    from uuid import uuid4 as _uuid4
+
+    from algotrader.common.calendar import IST as _IST
+    from algotrader.common.models.trading import Position as _Position
+
+    opened = _dt.datetime(2026, 8, 20, 10, 0, tzinfo=_IST).astimezone(_dt.UTC)
+    return _Position(
+        correlation_id=_uuid4(),
+        symbol="INFY",
+        slot_index=0,
+        direction=direction,
+        quantity=10,
+        entry_price=Decimal("1000"),
+        stop_price=stop,
+        target_price=target,
+        opened_at=opened,
+        squareoff_deadline=opened.replace(hour=9, minute=45),
+    )

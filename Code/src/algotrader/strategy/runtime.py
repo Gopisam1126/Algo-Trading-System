@@ -55,7 +55,6 @@ from algotrader.strategy.primitives.evaluators import (
     parse_clock,
     parse_regimes,
     parse_timeframe,
-    r_multiple_target,
 )
 
 log = logging.getLogger(__name__)
@@ -274,6 +273,17 @@ def verify_strategy(doc: StrategyDocument, caps: Capabilities = DEFAULT_CAPABILI
     promising a trailing stop that never runs. The position manager's trailing
     story replaces this refusal with the real control.
     """
+    if doc.exit.target is not None:
+        # E15-S07 (17 Nov 2026): every position's target is the risk policy's -
+        # risk.per_trade.target_r_multiple, set by the sizer and exited at by
+        # the exit timer. A strategy's own `r` travels nowhere (the signal
+        # carries no exit parameters), so a declared target was a number the
+        # system never read: a strategy saying 3R would be exited at 2R.
+        raise UnevaluableStrategyError(
+            f"exit.target ({doc.exit.target.primitive}) is declared, but a strategy cannot "
+            f"set its own target: every position takes profit at the risk policy's "
+            f"risk.per_trade.target_r_multiple. Remove it."
+        )
     if doc.exit.trail is not None:
         raise UnevaluableStrategyError(
             f"exit.trail ({doc.exit.trail.primitive}) is declared, but no trailing stop is "
@@ -419,18 +429,6 @@ def evaluate_stop(doc: StrategyDocument, ctx: EvalContext) -> Decimal | None:
     if evaluator is None:
         raise UnevaluableStrategyError(f"exit stop {doc.exit.stop.primitive!r} has no evaluator")
     return evaluator(ctx, resolved_params(doc.exit.stop))
-
-
-def evaluate_target(
-    doc: StrategyDocument,
-    entry: Decimal,
-    stop: Decimal,
-    tick: Decimal = Decimal("0.05"),
-) -> Decimal | None:
-    target = doc.exit.target
-    if target is None or target.primitive != "r_multiple_target":
-        return None
-    return r_multiple_target(entry, stop, doc.direction, resolved_params(target), tick)
 
 
 # ---------------------------------------------------------------------------
@@ -700,7 +698,6 @@ __all__ = [
     "evaluate_condition",
     "evaluate_group",
     "evaluate_stop",
-    "evaluate_target",
     "load_evaluators",
     "resolved_params",
     "verify_condition",

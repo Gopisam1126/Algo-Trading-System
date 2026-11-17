@@ -52,7 +52,6 @@ from algotrader.strategy.runtime import (
     evaluate_condition,
     evaluate_group,
     evaluate_stop,
-    evaluate_target,
     load_evaluators,
     verify_condition,
 )
@@ -162,7 +161,6 @@ entry:
 exit:
   stop: {primitive: atr_stop, params: {multiplier: 1.5, period: 14}}
   time: {primitive: squareoff_deadline}
-  target: {primitive: r_multiple_target, params: {r: 2.0}}
 """
 
 
@@ -646,11 +644,6 @@ class TestStopsAreRealPlaceablePrices:
     def test_a_zero_tick_is_refused(self) -> None:
         with pytest.raises(PrimitiveError, match="tick size"):
             snap_stop(Decimal("100"), Decimal("0"), Direction.LONG)
-
-    def test_the_target_is_measured_against_the_snapped_stop(self, document) -> None:
-        """So the R multiple a journal reports is the one the position had."""
-        target = evaluate_target(document, Decimal("100"), Decimal("95"))
-        assert target == Decimal("110.0000")
 
 
 class TestFiringProducesATrigger:
@@ -1267,7 +1260,6 @@ class TestADefaultHasOneDefinition:
         doc = compile_strategy(load_strategy_yaml(STRATEGY_YAML.replace(", period: 14", "")))
         evaluate_stop(doc, ctx())
         assert received == {"multiplier": 1.5, "period": 14}
-        assert evaluate_target(doc, Decimal("1200"), Decimal("1190")) == Decimal("1220.00")
 
 
 # ---------------------------------------------------------------------------
@@ -1463,3 +1455,16 @@ class TestCrossParameterRulesHoldAtLoad:
     )
     def test_the_answerable_still_loads(self, condition: Condition) -> None:
         verify_condition(condition)
+
+
+class TestAStrategyCannotSetItsOwnTarget:
+    """E15-S07: every position takes profit at the risk policy's target
+    (risk.per_trade.target_r_multiple). A strategy's own `r` travelled nowhere -
+    the sizer never read it - so a strategy saying 3R would be exited at 2R."""
+
+    def test_a_strategy_with_a_target_does_not_construct(self) -> None:
+        data = load_strategy_yaml(STRATEGY_YAML).model_dump(mode="json")
+        data["exit"]["target"] = {"primitive": "r_multiple_target", "params": {"r": 3.0}}
+        doc = compile_strategy(StrategyDocument.model_validate(data))
+        with pytest.raises(UnevaluableStrategyError, match="target_r_multiple"):
+            StrategyEvaluator(doc)
