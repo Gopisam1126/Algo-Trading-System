@@ -655,12 +655,14 @@ Recorded because each was believed, written down, and wrong.
   strategy could return under a new name with one respelling. It is now a
   hash of behaviour; changing it needs a data migration, because the load
   refuses a row whose recomputed hash differs from `dsl_hash`.
-- **"The shipped strategy runs."** `orb_classic` compiles and asks for
-  1h/1d/1w trend agreement; the indicator engine carries 5m/15m/1h. It can
-  never be evaluated here, and `doctor` said OK because it only compiled it.
-  `doctor` now warns, and the registry refuses it by name if it is ever made
-  runnable. A paper session needs either 1d/1w in the engine (with E03's
-  daily bars) or a seed that asks for what the engine carries.
+- **"The shipped strategy runs."** `orb_classic` compiled and asked for
+  1h/1d/1w trend agreement; the indicator engine carries 5m/15m/1h, so it
+  could never be evaluated, and `doctor` said OK because it only compiled it.
+  It now asks for 15m/1h (audit TRD-014, 16 Nov 2026); `doctor`,
+  `validate_strategies.py` and `tests/unit/test_shipped_strategies.py` build the
+  evaluator, so an unrunnable file fails there. Its news guard sat under
+  `none_of` - it could enter ONLY on news days (TRD-010); an absence primitive
+  under `none_of` is now refused at compile.
 - **E13-S01 the strategy loop** — `signals/loop.py` (`SignalLoop.on_bar`,
   `replay`) and `signals/source.py` (`RedisBarSource`, `deliver`, `run`,
   `replay_today`). Only today's LOCKED plan (`PlanRepository`); each sealed
@@ -679,8 +681,29 @@ Recorded because each was believed, written down, and wrong.
 - **"The bar builder fills quiet intervals."** It has `carry_forward`, and
   nothing calls it: a tick after a silent interval seals the old bar and
   starts a new one with nothing between. The loop reads the missing bar as a
-  gap (correctly - the series is irregular either way); the producer
-  composition must call `carry_forward` for liquid-but-quiet names.
+  gap (correctly - the series is irregular either way). DECIDED 16 Nov 2026
+  (audit TRD-024): the live path never calls it, because a tickless interval
+  cannot be told from a feed that stopped sending the symbol; it serves a
+  backfill that KNOWS nothing traded. Every seal path now records its close.
+- **"A break of a level is a price beyond it."** `price_breaks_level` was a
+  state, True on every bar beyond the level, so a strategy could enter an
+  hour after the break; and `day_high` included the bar being judged, so a
+  break of it could never be True. It is a CROSSING now (`previous_bar_close`
+  in the context) against the day's extremes BEFORE the bar (TRD-017/025).
+- **"VWAP resets at the session."** Its docstring said so and nothing called
+  `reset()`: every set warmed from history published a multi-day average
+  (TRD-003). It anchors itself to the IST date of the bars it folds now.
+- **"A tick is a tick."** Pre-open, closing-auction and post-close ticks were
+  folded into bars (the opening range among them), bar volume lost every
+  first tick's shares, a volume above 2^31 went negative, and one divisor
+  priced a whole frame (TRD-011/013/020/023, ENG-052). Only continuous trading
+  makes bars now, volume is a difference of running totals, quantities are
+  unsigned and the divisor comes from each packet's segment.
+- **"The snapshot is current."** It carried no time per timeframe, so a 1h
+  state that stopped updating while 5m continued was read as current
+  (TRD-018). `MultiTimeframeSnapshot.as_of` is checked at every decision: a
+  timeframe at least as long as the bar's must be as of its latest close, a
+  shorter one at most one bar behind (the producer publishes longest first).
 - **"Replay everything on the stream after a restart."** That also folded the
   bars the dead process was holding, and the backlog then handed them back as
   duplicates: a bar in flight at a crash was never evaluated (SIT-009, found
@@ -899,8 +922,9 @@ registry (E12-S01) and the strategy loop (E13-S01). A paper session still
 needs: what sits behind the loop's LIVE/PAPER routes and turns a Trigger into
 a Recommendation on `stream:signals` (E13-S03 AI review - which needs the
 Anthropic client, E10-S01 - and E13-S04 emission), a market context with a
-regime (E09), the day's locked plan (E11-S08), a strategy this engine can
-evaluate (the shipped `orb_classic` cannot), daily and intraday bars (E03 -
+regime (E09), the day's locked plan (E11-S08), a news source (the shipped
+`orb_classic` enters only when no material news landed, so it never fires until
+one reports), daily and intraday bars (E03 -
 E03-S01 is blocked by B8, NSE refusing this host), and the process
 entrypoints (E23-S03). That vertical slice is the first thing that would be
 evidence about the system rather than its parts.

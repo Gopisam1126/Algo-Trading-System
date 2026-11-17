@@ -28,7 +28,9 @@ from algotrader.common.calendar import (
 
 @pytest.fixture
 def cal() -> MarketCalendar:
-    return MarketCalendar(holidays=frozenset({date(2026, 8, 15)}))  # Independence Day
+    return MarketCalendar(
+        holidays=frozenset({date(2026, 8, 15)}), allow_uncovered=True
+    )  # Independence Day
 
 
 def ist_at(y: int, m: int, d: int, hh: int, mm: int) -> datetime:
@@ -125,9 +127,50 @@ class TestBarAlignment:
         aligned = cal.bar_open_time(ist_at(2026, 8, 4, 10, 5), 3600)
         assert aligned.astimezone(IST).time() == time(9, 15)
 
-    def test_before_open_clamps_to_open(self, cal: MarketCalendar) -> None:
-        aligned = cal.bar_open_time(ist_at(2026, 8, 4, 8, 30), 300)
-        assert aligned.astimezone(IST).time() == time(9, 15)
+    @pytest.mark.parametrize(("hour", "minute"), [(8, 30), (9, 7), (15, 30), (15, 45)])
+    def test_a_moment_outside_the_session_belongs_to_no_bar(
+        self, cal: MarketCalendar, hour: int, minute: int
+    ) -> None:
+        """CHANGED 16 Nov 2026 (audit TRD-013): this asserted that 08:30 was
+        CLAMPED to 09:15 - which put pre-open prints into the bar the opening
+        range is built from. Outside 09:15-15:30 there is no bar to name."""
+        with pytest.raises(ValueError, match="outside the continuous session"):
+            cal.bar_open_time(ist_at(2026, 8, 4, hour, minute), 300)
+
+    def test_the_last_moment_of_the_session_still_has_a_bar(self, cal: MarketCalendar) -> None:
+        aligned = cal.bar_open_time(ist_at(2026, 8, 4, 15, 29), 300)
+        assert aligned.astimezone(IST).time() == time(15, 25)
+
+
+class TestOneBarCloseDefinition:
+    """Audit ENG-022: two definitions of a bar's close disagreed by 45 minutes
+    for the day's last hourly bar."""
+
+    @pytest.mark.parametrize(
+        ("open_at", "seconds", "close_at"),
+        [
+            ((9, 15), 300, (9, 20)),
+            ((14, 15), 3600, (15, 15)),
+            ((15, 15), 3600, (15, 30)),
+            ((15, 15), 900, (15, 30)),
+            ((9, 15), 86_400, (15, 30)),
+        ],
+    )
+    def test_a_bar_closes_at_its_interval_or_the_session_close(
+        self, open_at: tuple[int, int], seconds: int, close_at: tuple[int, int]
+    ) -> None:
+        from algotrader.common.calendar import bar_close_time
+
+        opened = ist_at(2026, 8, 4, *open_at)
+        assert bar_close_time(opened, seconds) == ist_at(2026, 8, 4, *close_at)
+
+    def test_a_naive_open_is_refused(self) -> None:
+        import datetime as _dt
+
+        from algotrader.common.calendar import bar_close_time
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            bar_close_time(_dt.datetime(2026, 8, 4, 9, 15), 300)
 
 
 class TestTimezoneDiscipline:
@@ -203,7 +246,9 @@ class TestTradingDaySearchIsBounded:
         from datetime import date as _d
         from datetime import timedelta as _td
 
-        return MarketCalendar(frozenset({_d(2026, 1, 1) + _td(days=i) for i in range(400)}))
+        return MarketCalendar(
+            frozenset({_d(2026, 1, 1) + _td(days=i) for i in range(400)}), allow_uncovered=True
+        )
 
     def test_previous_trading_day_refuses_to_walk_months_back(self) -> None:
         import datetime as _dt
@@ -241,7 +286,7 @@ class TestTradingDaySearchIsBounded:
         holidays = frozenset(
             {_dt.date(2026, 3, 19), _dt.date(2026, 3, 20)}  # Thursday, Friday
         )
-        cal = MarketCalendar(holidays)
+        cal = MarketCalendar(holidays, allow_uncovered=True)
         # From Saturday, the previous trading day is Wednesday the 18th.
         assert cal.previous_trading_day(_dt.date(2026, 3, 21)) == _dt.date(2026, 3, 18)
         # From Friday, the next is Monday the 23rd.
@@ -257,14 +302,14 @@ class TestTradingDaysBetweenRejectsAnInvertedRange:
         """
         import datetime as _dt
 
-        cal = MarketCalendar(frozenset())
+        cal = MarketCalendar(frozenset(), allow_uncovered=True)
         with pytest.raises(ValueError, match="inverted range"):
             cal.trading_days_between(_dt.date(2026, 6, 15), _dt.date(2026, 6, 1))
 
     def test_a_single_day_range_is_still_valid(self) -> None:
         import datetime as _dt
 
-        cal = MarketCalendar(frozenset())
+        cal = MarketCalendar(frozenset(), allow_uncovered=True)
         assert cal.trading_days_between(_dt.date(2026, 6, 15), _dt.date(2026, 6, 15)) == [
             _dt.date(2026, 6, 15)
         ]
@@ -272,7 +317,7 @@ class TestTradingDaysBetweenRejectsAnInvertedRange:
     def test_a_normal_range_excludes_weekends_and_holidays(self) -> None:
         import datetime as _dt
 
-        cal = MarketCalendar(frozenset({_dt.date(2026, 6, 17)}))
+        cal = MarketCalendar(frozenset({_dt.date(2026, 6, 17)}), allow_uncovered=True)
         days = cal.trading_days_between(_dt.date(2026, 6, 15), _dt.date(2026, 6, 21))
         assert days == [
             _dt.date(2026, 6, 15),
@@ -374,12 +419,43 @@ class TestAnUncoveredYearIsRefusedNotAnswered:
         with pytest.raises(HolidayDataError, match=r"nse_holidays\.yaml"):
             self._calendar().is_trading_day(date(2027, 1, 5))
 
-    def test_a_calendar_with_no_declared_coverage_still_answers(self) -> None:
-        """Hand-built calendars in tests declare no coverage and must keep
-        working — the guard is for the loaded file, not for every instance."""
+    def test_a_calendar_with_no_declared_coverage_refuses_every_date(self) -> None:
+        """CHANGED 16 Nov 2026 (audit ENG-024): this asserted that a calendar
+        declaring no coverage still answered - for any year, with no holidays
+        - and doctor.py built its calendar exactly that way."""
+        from algotrader.common.calendar import HolidayDataError, MarketCalendar
+
+        for calendar in (MarketCalendar(), MarketCalendar(frozenset({date(2026, 1, 26)}))):
+            with pytest.raises(HolidayDataError):
+                calendar.is_trading_day(date(2026, 8, 20))
+
+    def test_a_test_calendar_says_by_name_that_it_answers_for_every_year(self) -> None:
         from algotrader.common.calendar import MarketCalendar
 
-        assert MarketCalendar(frozenset()).is_trading_day(date(2030, 8, 20))
+        assert MarketCalendar(frozenset(), allow_uncovered=True).is_trading_day(date(2030, 8, 20))
+
+    def test_the_factory_builds_the_shipped_file_with_its_years(self) -> None:
+        from algotrader.common.calendar import HolidayDataError, MarketCalendar
+
+        path = Path(__file__).resolve().parents[2] / "config" / "nse_holidays.yaml"
+        calendar = MarketCalendar.from_file(str(path))
+        assert not calendar.is_trading_day(date(2026, 1, 26))
+        with pytest.raises(HolidayDataError):
+            calendar.is_trading_day(date(2027, 1, 5))
+
+    def test_the_factory_refuses_a_missing_file(self, tmp_path: Path) -> None:
+        from algotrader.common.calendar import HolidayDataError, MarketCalendar
+
+        with pytest.raises(HolidayDataError, match="not found"):
+            MarketCalendar.from_file(str(tmp_path / "absent.yaml"))
+
+    def test_the_factory_refuses_a_file_naming_no_year(self, tmp_path: Path) -> None:
+        from algotrader.common.calendar import HolidayDataError, MarketCalendar
+
+        empty = tmp_path / "empty.yaml"
+        empty.write_text("holidays: []\n", encoding="utf-8")
+        with pytest.raises(HolidayDataError, match="no year"):
+            MarketCalendar.from_file(str(empty))
 
     def test_coverage_is_inferred_when_the_file_forgets_to_declare_it(self) -> None:
         from algotrader.common.calendar import HolidayCalendarStatus

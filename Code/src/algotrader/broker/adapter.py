@@ -180,7 +180,13 @@ class MarketDataAdapter(Protocol):
         timeframe: Timeframe,
         start: datetime,
         end: datetime,
-    ) -> list[Bar]: ...
+        *,
+        symbol: str,
+    ) -> list[Bar]:
+        """Candles for ``token``, stamped with ``symbol``. ``start``/``end`` are
+        timezone-aware instants; the implementation turns them into whatever
+        wall-clock form its broker reads."""
+        ...
 
 
 @runtime_checkable

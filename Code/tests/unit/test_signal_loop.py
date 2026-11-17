@@ -42,7 +42,7 @@ from algotrader.strategy.registry import RunnableStrategy, row_for, verify_row
 
 DAY = dt.date(2026, 8, 20)  # a Thursday
 YESTERDAY = dt.date(2026, 8, 19)
-CAL = MarketCalendar()
+CAL = MarketCalendar(allow_uncovered=True)
 
 
 def ist(day: dt.date, hour: int, minute: int) -> dt.datetime:
@@ -249,6 +249,8 @@ class Desk:
         return self.now if self.now is not None else self._latest + dt.timedelta(seconds=2)
 
     _latest = ist(DAY, 9, 15)
+    #: The longer timeframes the desk's producer delivers. A test stops one.
+    longer: tuple[Timeframe, ...] = (Timeframe.H1, Timeframe.M15)
 
     async def _publish(self, indicator_set: IndicatorSet) -> None:
         self.events.append(f"publish:{indicator_set.symbol}:{indicator_set.timeframe.value}")
@@ -259,8 +261,34 @@ class Desk:
         )
 
     async def feed(self, bar: Bar):  # type: ignore[no-untyped-def]
+        if bar.timeframe is Timeframe.M5:
+            await self._longer_bars_before(bar)
         self._latest = bar.open_ts + dt.timedelta(seconds=bar.timeframe.seconds)
         return await self.loop.on_bar(bar)
+
+    async def _longer_bars_before(self, bar: Bar) -> None:
+        """Deliver the 15m and 1h bars the producer publishes at or before this
+        5m bar's close, longest first (audit TRD-018: the loop refuses a
+        decision whose higher timeframe is behind, and the producer publishes
+        every timeframe - a desk feeding 5m alone describes no real session)."""
+        from algotrader.common.calendar import bar_close_time
+
+        if bar.open_ts.astimezone(IST).date() != DAY:
+            return
+        close = bar_close_time(bar.open_ts, bar.timeframe.seconds)
+        for tf in self.longer:
+            indicator_set = self.engine.set_for(bar.symbol, tf)
+            while (last := indicator_set.last_bar_open) is not None:
+                slot = (
+                    ist(DAY, 9, 15)
+                    if last.astimezone(IST).date() != DAY
+                    else last + dt.timedelta(seconds=tf.seconds)
+                )
+                slot_close = bar_close_time(slot, tf.seconds)
+                if slot_close > close:
+                    break
+                self._latest = slot_close
+                await self.loop.on_bar(_bar(bar.symbol, tf, slot, float(bar.close)))
 
     async def session(self, symbol: str, until: tuple[int, int], *, start: float = 1010.0):  # type: ignore[no-untyped-def]
         """Contiguous 5m bars from 09:15 up to (not including) ``until``."""
@@ -600,6 +628,8 @@ class TestTheContext:
         desk = Desk([five, fifteen])
         report = await desk.feed(_bar("INFY", Timeframe.M5, ist(DAY, 9, 15), 1010))
         assert [d.strategy_id for d in report.decisions] == ["probe_5m"]
+        # The 5m state must be current to the bar before 09:30 (audit TRD-018).
+        await desk.feed(_bar("INFY", Timeframe.M5, ist(DAY, 9, 20), 1010))
         report = await desk.feed(_bar("INFY", Timeframe.M15, ist(DAY, 9, 15), 1010))
         assert [d.strategy_id for d in report.decisions] == ["probe_15m"]
 
@@ -749,3 +779,48 @@ class TestSymbolFacts:
         assert set(facts) == {"INFY"}
         assert refused["GHOST"] == "not in the instrument master"
         assert "could not be read" in refused["TCS"]
+
+
+class TestEveryTimeframeIsAsOfTheDecision:
+    """Audit TRD-018: the snapshot carried no per-timeframe as-of time, so a
+    higher-timeframe state from the future, or one left behind, was read as
+    current."""
+
+    async def test_a_higher_timeframe_from_the_future_is_refused(self) -> None:
+        spy = strategy("probe", StrategyState.PAPER)
+        desk = Desk([spy])
+        await desk.session("INFY", (10, 5))
+        # The 09:15 hourly bar closes at 10:15; folded before the 5m bar
+        # closing 10:10 is decided, the hourly state is from the future.
+        await desk.loop.replay(_bar("INFY", Timeframe.H1, ist(DAY, 9, 15), 1020))
+        report = await desk.feed(_bar("INFY", Timeframe.M5, ist(DAY, 10, 5), 1015))
+        assert report.outcome is BarOutcome.NOT_READY
+        assert "after the decision" in (report.detail or "")
+
+    async def test_a_higher_timeframe_left_behind_is_refused(self) -> None:
+        """1h bars stop arriving while 5m continues: from 10:15, when the first
+        hourly bar should have closed, the 5m decision is refused."""
+        spy = strategy("probe", StrategyState.PAPER)
+        desk = Desk([spy])
+        desk.longer = (Timeframe.M15,)
+        reports = await desk.session("INFY", (10, 30))
+        by_close = {r.open_ts + dt.timedelta(minutes=5): r.outcome for r in reports}
+        assert by_close[ist(DAY, 10, 10)] is BarOutcome.EVALUATED
+        assert by_close[ist(DAY, 10, 15)] is BarOutcome.NOT_READY
+        assert by_close[ist(DAY, 10, 25)] is BarOutcome.NOT_READY
+
+    async def test_a_session_with_every_timeframe_is_evaluated_throughout(self) -> None:
+        """The control: the producer's normal output is never refused."""
+        desk = Desk([strategy("probe", StrategyState.PAPER)])
+        reports = await desk.session("INFY", (11, 30))
+        assert {r.outcome for r in reports} == {BarOutcome.EVALUATED}
+
+    async def test_a_longer_strategy_may_see_the_shorter_bar_closing_with_it_later(self) -> None:
+        """At a shared close the longest bar is published first, so a 15m
+        decision at 09:30 sees 5m as of 09:25 - one bar behind by design, and
+        no more."""
+        desk = Desk([strategy("probe_15m", StrategyState.PAPER, tf="15m")])
+        for minute in (15, 20):
+            await desk.feed(_bar("INFY", Timeframe.M5, ist(DAY, 9, minute), 1010))
+        report = await desk.feed(_bar("INFY", Timeframe.M15, ist(DAY, 9, 15), 1010))
+        assert report.outcome is BarOutcome.EVALUATED

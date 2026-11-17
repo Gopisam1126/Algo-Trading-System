@@ -95,16 +95,42 @@ class MarketCalendar:
         holidays: frozenset[date] | None = None,
         *,
         covers_years: frozenset[int] | None = None,
+        allow_uncovered: bool = False,
     ) -> None:
         self._holidays = holidays if holidays is not None else _FALLBACK_HOLIDAYS_2026
-        #: Years the holiday list actually describes. Empty means "unknown",
-        #: which is how the fallback and hand-built calendars in tests behave.
+        #: Years the holiday list actually describes.
         self._covers_years = covers_years or frozenset()
+        #: A hand-built calendar that answers for EVERY year. Tests only.
+        #:
+        #: CHANGED 16 Nov 2026 (audit ENG-024): an empty ``covers_years`` used
+        #: to mean "covers everything", so a calendar built without it - as
+        #: doctor.py built its own - answered for 2027 with no 2027 holidays.
+        #: Undeclared coverage now covers nothing, and every trading-day
+        #: question raises HolidayDataError; a test that wants the old
+        #: behaviour says so by name. Production builds through
+        #: :meth:`from_file`.
+        self._allow_uncovered = allow_uncovered
+
+    @classmethod
+    def from_file(cls, path: str | None = None) -> MarketCalendar:
+        """THE way to build the production calendar: the file, with its years.
+
+        Refuses a missing file and a file that names no year, rather than
+        degrading to an empty, unverified list that treats every holiday as a
+        trading day.
+        """
+        path = path or DEFAULT_HOLIDAY_FILE
+        status = load_holidays_with_status(path)
+        if status.path is None or status.source.startswith("file not found"):
+            raise HolidayDataError(f"holiday file {path!r} was not found; refusing to guess")
+        if not status.covers_years:
+            raise HolidayDataError(f"holiday file {path!r} declares and implies no year")
+        return cls(status.dates, covers_years=status.covers_years)
 
     # -- Trading days -------------------------------------------------------
 
     def covers(self, d: date) -> bool:
-        return not self._covers_years or d.year in self._covers_years
+        return self._allow_uncovered or d.year in self._covers_years
 
     def is_trading_day(self, d: date) -> bool:
         """Whether the market is open on ``d``.
@@ -292,11 +318,20 @@ class MarketCalendar:
         So a 15-minute bar runs 09:15–09:30, never 09:00–09:15.  Getting this
         wrong shifts every indicator by an offset that is hard to spot and
         makes backtests disagree with live.
+
+        CHANGED 16 Nov 2026 (audit TRD-013): a moment outside 09:15-15:30 IST
+        RAISES. It used to be clamped to 09:15, which put a pre-open print into
+        the first 5m bar - the bar the opening range is built from - and a
+        post-close print into a 15:45 bar. No such instant belongs to any bar.
         """
         ist = self._ist(moment)
         session_start = datetime.combine(ist.date(), MARKET_OPEN, tzinfo=IST)
-        if ist < session_start:
-            return session_start.astimezone(UTC)
+        session_end = datetime.combine(ist.date(), MARKET_CLOSE, tzinfo=IST)
+        if not session_start <= ist < session_end:
+            raise ValueError(
+                f"{ist.isoformat()} is outside the continuous session "
+                f"({MARKET_OPEN.isoformat()}-{MARKET_CLOSE.isoformat()} IST) and belongs to no bar"
+            )
         elapsed = int((ist - session_start).total_seconds())
         aligned = session_start + timedelta(
             seconds=(elapsed // interval_seconds) * interval_seconds
@@ -309,6 +344,30 @@ class MarketCalendar:
             datetime.combine(d, MARKET_OPEN, tzinfo=IST).astimezone(UTC),
             datetime.combine(d, MARKET_CLOSE, tzinfo=IST).astimezone(UTC),
         )
+
+
+def bar_close_time(open_ts: datetime, interval_seconds: int) -> datetime:
+    """When a bar that opened at ``open_ts`` closes: open + interval, capped at the
+    session close.
+
+    THE definition (audit ENG-022, 16 Nov 2026). There were two: one said the
+    day's last hourly bar (opening 15:15) closes at 15:30 with the market, the
+    other at 16:15 - and the execution reader then refused that bar's ATR as
+    "from the future" for 45 minutes. ``Bar.close_ts``, the bar publisher and
+    the indicator snapshot all read this one.
+
+    A weekly span is not capped: it ends with the week's LAST session, which only
+    the holiday calendar knows, and nothing in the intraday path reads it.
+    """
+    if open_ts.tzinfo is None:
+        raise ValueError("open_ts must be timezone-aware")
+    nominal = open_ts + timedelta(seconds=interval_seconds)
+    if interval_seconds > 86_400:
+        return nominal
+    session_close = datetime.combine(
+        open_ts.astimezone(IST).date(), MARKET_CLOSE, tzinfo=IST
+    ).astimezone(open_ts.tzinfo)
+    return min(nominal, session_close)
 
 
 DEFAULT_HOLIDAY_FILE = "config/nse_holidays.yaml"
@@ -344,11 +403,15 @@ class HolidayCalendarStatus:
         #: 2027 — and an empty answer for 2027 is indistinguishable from "no
         #: holidays that year", which is a working-looking calendar that trades
         #: on Republic Day.
-        self.covers_years = covers_years
+        #:
+        #: Inferred from the dates when not declared - the loader's own rule -
+        #: and EMPTY covers nothing (audit ENG-024, 16 Nov 2026): this used to
+        #: read an empty set as "every year", the fail-open MarketCalendar had.
+        self.covers_years = covers_years or frozenset(d.year for d in dates)
 
     def covers(self, d: date) -> bool:
         """Whether this list has anything to say about ``d``'s year."""
-        return not self.covers_years or d.year in self.covers_years
+        return d.year in self.covers_years
 
     @property
     def is_trustworthy(self) -> bool:

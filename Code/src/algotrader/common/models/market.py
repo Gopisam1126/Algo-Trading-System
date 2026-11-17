@@ -22,6 +22,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from algotrader.common.calendar import bar_close_time
 from algotrader.common.enums import Exchange, Timeframe
 
 Price = Annotated[Decimal, Field(gt=0, decimal_places=4)]
@@ -139,9 +140,8 @@ class Bar(_Frozen):
 
     @property
     def close_ts(self) -> datetime:
-        from datetime import timedelta
-
-        return self.open_ts + timedelta(seconds=self.timeframe.seconds)
+        """When this bar's interval ends - see ``calendar.bar_close_time``."""
+        return bar_close_time(self.open_ts, self.timeframe.seconds)
 
 
 class InstrumentDailyStatus(_Frozen):

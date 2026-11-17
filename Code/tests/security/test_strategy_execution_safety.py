@@ -231,10 +231,18 @@ class TestMissingDataNeverBecomesPermission:
     trade."""
 
     def test_killing_the_news_feed_does_not_satisfy_a_news_guard(self) -> None:
-        group = ConditionGroup(
-            none_of=[Condition(primitive="no_material_news", params={"lookback_hours": 24})]
-        )
-        assert evaluate_group(group, _ctx(hours_since_material_news=None)).fired is False
+        """CHANGED 16 Nov 2026: the guard is placed as a strategy may place it -
+        under all_of. Under none_of it is a double negative, now refused at
+        compile (audit TRD-010); a dead feed must satisfy it in neither."""
+        for group in (
+            ConditionGroup(
+                all_of=[Condition(primitive="no_material_news", params={"lookback_hours": 24})]
+            ),
+            ConditionGroup(
+                none_of=[Condition(primitive="no_material_news", params={"lookback_hours": 24})]
+            ),
+        ):
+            assert evaluate_group(group, _ctx(hours_since_material_news=None)).fired is False
 
     def test_killing_the_macro_feed_does_not_satisfy_a_vix_gate(self) -> None:
         group = ConditionGroup(

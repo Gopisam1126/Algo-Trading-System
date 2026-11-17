@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from algotrader.common.calendar import bar_close_time
 from algotrader.common.enums import Timeframe
 from algotrader.common.models.market import Bar, IndicatorSnapshot
 from algotrader.indicators.framework import (
@@ -211,7 +212,8 @@ class IndicatorSet:
         return IndicatorSnapshot(
             symbol=self.symbol,
             timeframe=self.timeframe,
-            as_of=self.last_bar_open + dt.timedelta(seconds=self.timeframe.seconds),
+            # The bar's CLOSE, by the one definition (audit ENG-022).
+            as_of=bar_close_time(self.last_bar_open, self.timeframe.seconds),
             ready=self.is_ready,
             close=self.last_close,
             ema_20=to_decimal(values.get("ema_20")),
@@ -298,6 +300,10 @@ class MultiTimeframeSnapshot:
     #: Recent values per timeframe, oldest first. Only the moving averages
     #: (:data:`HISTORICAL_INDICATORS`) are retained — see the note there.
     history: dict[Timeframe, dict[str, tuple[float | None, ...]]] = field(default_factory=dict)
+    #: The CLOSE of the newest bar behind each timeframe's values (audit
+    #: TRD-018): what a decision checks so a higher timeframe is neither from
+    #: the future nor left behind. Absent for a timeframe with no bar folded.
+    as_of: dict[Timeframe, dt.datetime] = field(default_factory=dict)
 
     def value(self, timeframe: Timeframe, indicator: str) -> float | None:
         return self.per_timeframe.get(timeframe, {}).get(indicator)
@@ -374,6 +380,7 @@ class IndicatorEngine:
         """
         per_timeframe: dict[Timeframe, dict[str, float | None]] = {}
         history: dict[Timeframe, dict[str, tuple[float | None, ...]]] = {}
+        as_of: dict[Timeframe, dt.datetime] = {}
         not_ready: dict[Timeframe, list[str]] = {}
         ready = True
         for timeframe in self.timeframes:
@@ -383,6 +390,8 @@ class IndicatorEngine:
                 not_ready[timeframe] = ["<no bars yet>"]
                 continue
             per_timeframe[timeframe] = indicator_set.values()
+            if indicator_set.last_bar_open is not None:
+                as_of[timeframe] = bar_close_time(indicator_set.last_bar_open, timeframe.seconds)
             history[timeframe] = {
                 name: indicator_set.history(name) for name in HISTORICAL_INDICATORS
             }
@@ -396,6 +405,7 @@ class IndicatorEngine:
             all_ready=ready,
             not_ready=not_ready,
             history=history,
+            as_of=as_of,
         )
 
     def ready_symbols(self) -> list[str]:

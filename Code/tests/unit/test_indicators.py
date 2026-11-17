@@ -89,10 +89,18 @@ def _incremental(indicator, bars: list[Bar]) -> list[float | None]:
 
 
 def _compare(ours: list[float | None], reference: np.ndarray, label: str) -> None:
-    """Every index where the reference has a value, ours must agree."""
+    """Every index where the reference has a value, ours must agree - and where
+    it has NONE, ours must have none either.
+
+    CHANGED 16 Nov 2026 (audit ENG-023): the warm-up indices were skipped, so a
+    provisional value during warm-up (MACD's, TRD-022) passed this comparison.
+    """
     compared = 0
     for i, expected in enumerate(reference):
         if np.isnan(expected):
+            assert ours[i] is None, (
+                f"{label}: batch has no value at {i}, incremental emitted {ours[i]!r}"
+            )
             continue
         got = ours[i]
         assert got is not None, f"{label}: batch has a value at {i}, incremental does not"
@@ -141,6 +149,28 @@ class TestAgainstTaLib:
         reference, _signal, _hist = talib.MACD(_closes(bars), 12, 26, 9)
         _compare(ours, reference, "MACD line")
 
+    def test_macd_signal_and_histogram_match(self) -> None:
+        """Audit ENG-023: only the line was compared; the signal line is what a
+        crossover reads."""
+        bars = _series(n=200)
+        macd = MACD()
+        signals, histograms = [], []
+        for bar in bars:
+            macd.update(bar)
+            signals.append(macd.signal)
+            histograms.append(macd.histogram)
+        _line, ref_signal, ref_hist = talib.MACD(_closes(bars), 12, 26, 9)
+        _compare(signals, ref_signal, "MACD signal")
+        _compare(histograms, ref_hist, "MACD histogram")
+
+    def test_macd_emits_nothing_until_it_is_ready(self) -> None:
+        """Audit TRD-022: indices 25-32 carried a line value while not ready."""
+        bars = _series(n=40)
+        macd = MACD(12, 26, 9)
+        out = _incremental(macd, bars)
+        assert out[:33] == [None] * 33
+        assert out[33] is not None and macd.is_ready
+
     def test_bollinger_bands_match(self) -> None:
         """Population vs sample standard deviation differ by ~2.6% at n=20 —
         small enough to look like rounding, large enough to move a band through
@@ -188,6 +218,54 @@ class TestReadinessIsHonest:
         expected = sum(float(b.close) for b in bars) / 5
         assert first is not None and abs(first - expected) < 1e-9
 
+    def test_rsi_of_a_window_with_no_change_is_undefined(self) -> None:
+        """Audit TRD-021: 20 identical closes read 100 - 'maximally overbought'
+        for a stock that never moved. 0/0 is undefined; TA-Lib's 0 ('maximally
+        oversold') is no better, so this is a recorded departure from it."""
+        flat = [
+            b.model_copy(
+                update={
+                    "open": Decimal("100"),
+                    "high": Decimal("100"),
+                    "low": Decimal("100"),
+                    "close": Decimal("100"),
+                }
+            )
+            for b in _series(n=20)
+        ]
+        rsi = RSI(14)
+        assert all(v is None for v in _incremental(rsi, flat))
+        assert not rsi.is_ready
+        assert talib.RSI(_closes(flat), 14)[-1] == 0.0, "the departure, pinned"
+
+    def test_rsi_is_defined_again_once_anything_moves(self) -> None:
+        """The control: one up-move after a flat window gives 100, as it
+        should - every change in the window is a gain."""
+        bars = _series(n=17)
+        flat = [
+            b.model_copy(
+                update={
+                    "open": Decimal("100"),
+                    "high": Decimal("101"),
+                    "low": Decimal("100"),
+                    "close": Decimal("100"),
+                }
+            )
+            for b in bars[:16]
+        ]
+        up = bars[16].model_copy(
+            update={
+                "open": Decimal("100"),
+                "high": Decimal("101"),
+                "low": Decimal("100"),
+                "close": Decimal("101"),
+            }
+        )
+        rsi = RSI(14)
+        rsi.warm_up(flat)
+        assert rsi.update(up) == 100.0
+        assert talib.RSI(_closes([*flat, up]), 14)[-1] == pytest.approx(100.0)
+
     def test_rsi_needs_one_more_bar_than_its_period(self) -> None:
         """RSI works on CHANGES, so N changes need N+1 closes."""
         rsi = RSI(14)
@@ -222,8 +300,9 @@ class TestStateSurvivesARestart:
             lambda: MACD(),
             lambda: BollingerBands(20),
             lambda: VolumeRatio(20),
+            lambda: VWAP(),
         ],
-        ids=["sma", "ema", "rsi", "atr", "macd", "bb", "volume_ratio"],
+        ids=["sma", "ema", "rsi", "atr", "macd", "bb", "volume_ratio", "vwap"],
     )
     def test_restore_reproduces_the_live_instance_exactly(self, factory) -> None:
         bars = _series(n=100)
@@ -288,6 +367,108 @@ class TestVwapIsSessionAnchored:
         assert vwap.is_ready
         vwap.reset()
         assert not vwap.is_ready and vwap.value is None
+
+    def test_the_value_is_the_hand_computed_weighted_mean(self) -> None:
+        """Audit ENG-023: the 'weighting' test above only checked not-None."""
+        light, heavy = _series(n=2)
+        light = light.model_copy(
+            update={
+                "high": Decimal("103"),
+                "low": Decimal("97"),
+                "close": Decimal("100"),
+                "open": Decimal("100"),
+                "volume": 1_000,
+            }
+        )
+        heavy = heavy.model_copy(
+            update={
+                "high": Decimal("112"),
+                "low": Decimal("108"),
+                "close": Decimal("110"),
+                "open": Decimal("110"),
+                "volume": 9_000,
+            }
+        )
+        vwap = VWAP()
+        vwap.update(light)
+        vwap.update(heavy)
+        assert vwap.value == pytest.approx((100 * 1_000 + 110 * 9_000) / 10_000, abs=1e-9)
+
+
+def _two_sessions() -> list[Bar]:
+    """Two 5m sessions, 20 Aug and 21 Aug 2026, 09:15-10:55 IST each."""
+    day_one = _series(n=21, seed=3)
+    day_two = [
+        b.model_copy(update={"open_ts": b.open_ts + dt.timedelta(days=1)})
+        for b in _series(n=21, seed=4)
+    ]
+    return day_one + day_two
+
+
+class TestVwapAnchorsItselfToTheSession:
+    """Audit TRD-003: nothing called reset(), so a set warmed from multi-day
+    history published a VWAP averaged since its first warm-up bar - 47.7 rupees
+    off on the audit fixture's second day."""
+
+    def test_the_first_bar_of_a_new_session_is_its_own_vwap(self) -> None:
+        bars = _two_sessions()
+        vwap = VWAP()
+        vwap.warm_up(bars[:22])  # all of day one, and day two's first bar
+        first = bars[21]
+        typical = (float(first.high) + float(first.low) + float(first.close)) / 3.0
+        assert vwap.value == pytest.approx(typical, abs=1e-9)
+        assert vwap.session == dt.date(2026, 8, 21)
+
+    def test_a_session_matches_a_fresh_indicator_over_that_session_alone(self) -> None:
+        bars = _two_sessions()
+        carried, fresh = VWAP(), VWAP()
+        carried.warm_up(bars)
+        fresh.warm_up(bars[21:])
+        assert carried.value == pytest.approx(fresh.value, abs=1e-9)
+
+    def test_a_synthetic_first_bar_of_the_day_leaves_no_vwap(self) -> None:
+        """Until something trades today there is no VWAP for today."""
+        bars = _two_sessions()
+        vwap = VWAP()
+        vwap.warm_up(bars[:21])
+        assert vwap.is_ready
+        vwap.update(bars[21].model_copy(update={"volume": 0, "synthetic": True}))
+        assert not vwap.is_ready and vwap.value is None
+
+    def test_restore_then_continue_equals_never_stopping(self) -> None:
+        bars = _two_sessions()
+        live = VWAP()
+        live.warm_up(bars[:15])
+        restored = VWAP()
+        restored.restore(json.loads(json.dumps(live.snapshot())))
+        for bar in bars[15:]:
+            assert live.update(bar) == restored.update(bar)
+        assert restored.session == dt.date(2026, 8, 21)
+
+    def test_a_snapshot_with_sums_but_no_session_is_refused(self) -> None:
+        """The pre-fix snapshot shape: restored without an anchor, the next bar
+        would either wipe a morning or carry another day into today."""
+        with pytest.raises(IndicatorError, match="no session date"):
+            VWAP().restore({"pv": 1_000_000.0, "volume": 1_000.0})
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {"pv": 1.0, "volume": 1.0, "session": "not-a-date"},
+            {"pv": float("nan"), "volume": 1.0, "session": "2026-08-20"},
+            {"pv": 1.0, "volume": -1.0, "session": "2026-08-20"},
+        ],
+        ids=["bad-date", "nan", "negative"],
+    )
+    def test_a_corrupt_snapshot_is_refused(self, state: dict) -> None:
+        with pytest.raises(IndicatorError):
+            VWAP().restore(state)
+
+    def test_an_empty_snapshot_still_restores(self) -> None:
+        """The control: nothing folded yet, nothing to anchor."""
+        vwap = VWAP()
+        vwap.restore(VWAP().snapshot())
+        assert vwap.value is None and vwap.session is None
 
 
 class TestVolumeRatioExcludesTheCurrentBar:

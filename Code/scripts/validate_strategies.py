@@ -1,9 +1,15 @@
 #!/usr/bin/env python
-"""Compile every strategy file in config/strategies/.
+"""Compile every strategy file in config/strategies/, and check it can RUN here.
 
 Run before committing a strategy change. Compilation is only the first gate
 (G1–G2 of the validation gauntlet) — passing here means the strategy is
-well-formed, NOT that it may trade. See STRATEGY_ENGINE.md §5.
+well-formed and evaluable by this deployment, NOT that it may trade. See
+STRATEGY_ENGINE.md §5.
+
+CHANGED 16 Nov 2026 (audit TRD-014): this compiled only, and printed OK for an
+orb_classic that asked for daily and weekly agreement the engine does not
+carry - every load refused it. It now builds the runtime evaluator too, exactly
+as the registry does, and fails on what the registry would refuse.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from algotrader.strategy.dsl import (
     compile_strategy,
     load_strategy_yaml,
 )
+from algotrader.strategy.runtime import StrategyEvaluator
 
 
 def main() -> int:
@@ -43,6 +50,7 @@ def main() -> int:
         try:
             doc = load_strategy_yaml(path.read_text(encoding="utf-8"))
             compile_strategy(doc)
+            StrategyEvaluator(doc)  # what the registry builds; refuses the unrunnable
         except (CompilationError, ValueError) as exc:
             print(f"  FAIL  {path.name}")
             print(f"        {exc}")
@@ -61,10 +69,10 @@ def main() -> int:
 
     print()
     if failures:
-        print(f"{failures} of {len(files)} strategies failed to compile")
+        print(f"{failures} of {len(files)} strategies failed to compile or cannot run here")
         return 1
 
-    print(f"All {len(files)} strategies compile.")
+    print(f"All {len(files)} strategies compile and can be evaluated here.")
     print("\nNote: compilation is gate G1-G2 only. A strategy must still pass the")
     print("full validation gauntlet (walk-forward, Deflated Sharpe, PBO) and a")
     print("human approval gate before it can trade live capital.")

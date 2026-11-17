@@ -277,3 +277,89 @@ class TestWarmUpExcludesRatherThanDegrades:
             other = streamed.values()[name]
             if value is not None:
                 assert other is not None and abs(value - other) < 1e-12, name
+
+
+# ---------------------------------------------------------------------------
+# Audit 16 Nov 2026 - TRD-003 (VWAP per session), ENG-022 (one bar close)
+# ---------------------------------------------------------------------------
+
+
+def _session_bars(day: dt.date, n: int, seed: int) -> list[Bar]:
+    """``n`` 5m bars from 09:15 IST on ``day`` - real session bars, no night."""
+    from algotrader.common.calendar import IST
+
+    start = dt.datetime.combine(day, dt.time(9, 15), tzinfo=IST).astimezone(dt.UTC)
+    rng = random.Random(seed)
+    out: list[Bar] = []
+    price = 1000.0 + seed
+    for i in range(n):
+        price = max(10.0, price * (1 + rng.uniform(-0.01, 0.01)))
+        out.append(
+            Bar(
+                symbol="INFY",
+                timeframe=Timeframe.M5,
+                open_ts=start + dt.timedelta(minutes=5 * i),
+                open=Decimal(f"{price:.4f}"),
+                high=Decimal(f"{price * 1.004:.4f}"),
+                low=Decimal(f"{price * 0.996:.4f}"),
+                close=Decimal(f"{price:.4f}"),
+                volume=rng.randint(1_000, 20_000),
+            )
+        )
+    return out
+
+
+class TestVwapIsTheSessionsInsideTheSet:
+    """Audit TRD-003's acceptance: two sessions folded into one IndicatorSet;
+    right after session 2's first bar, vwap is that bar's typical price."""
+
+    def test_the_new_session_starts_from_its_first_bar(self) -> None:
+        day_one = _session_bars(dt.date(2026, 8, 20), 75, seed=1)
+        day_two = _session_bars(dt.date(2026, 8, 21), 45, seed=2)
+        s = IndicatorSet(symbol="INFY", timeframe=Timeframe.M5)
+        s.warm_up(day_one)
+        s.update(day_two[0])
+        first = day_two[0]
+        typical = (float(first.high) + float(first.low) + float(first.close)) / 3.0
+        assert s.values()["vwap"] == pytest.approx(typical, abs=1e-9)
+
+    def test_restore_then_continue_gives_the_same_session_vwap(self) -> None:
+        day_one = _session_bars(dt.date(2026, 8, 20), 75, seed=1)
+        day_two = _session_bars(dt.date(2026, 8, 21), 45, seed=2)
+        live = IndicatorSet(symbol="INFY", timeframe=Timeframe.M5)
+        live.warm_up(day_one)
+        restored = IndicatorSet(symbol="INFY", timeframe=Timeframe.M5)
+        restored.restore(json.loads(json.dumps(live.snapshot())))
+        for bar in day_two:
+            live.update(bar)
+            restored.update(bar)
+        reference = IndicatorSet(symbol="INFY", timeframe=Timeframe.M5)
+        reference.warm_up(day_two)
+        assert restored.values()["vwap"] == live.values()["vwap"]
+        assert live.values()["vwap"] == pytest.approx(reference.values()["vwap"], abs=1e-9)
+
+
+class TestThePublishedTimeIsTheBarsClose:
+    """Audit ENG-022: the 15:15 hourly bar was published as of 16:15, and the
+    execution reader refused its ATR as 'from the future' for 45 minutes."""
+
+    def test_the_last_hourly_bar_is_published_as_of_the_market_close(self) -> None:
+        from algotrader.common.calendar import IST
+
+        opened = dt.datetime(2026, 8, 20, 15, 15, tzinfo=IST).astimezone(dt.UTC)
+        bar = Bar(
+            symbol="INFY",
+            timeframe=Timeframe.H1,
+            open_ts=opened,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100"),
+            volume=1_000,
+        )
+        s = IndicatorSet(symbol="INFY", timeframe=Timeframe.H1)
+        s.update(bar)
+        published = s.published()
+        assert published is not None
+        expected = dt.datetime(2026, 8, 20, 15, 30, tzinfo=IST)
+        assert published.as_of == bar.close_ts == expected

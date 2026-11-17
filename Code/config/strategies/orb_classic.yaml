@@ -56,10 +56,14 @@ entry:
         window: 20
         threshold: 1.5
 
+    # Both higher timeframes the engine carries must agree. This asked for
+    # 2 of "1h,1d,1w" - daily and weekly are not computed live, so every load
+    # refused the strategy while validate_strategies.py reported it OK
+    # (audit TRD-014, 16 Nov 2026).
     - primitive: timeframe_agreement_at_least
       params:
         count: 2
-        of: "1h,1d,1w"
+        of: "15m,1h"
 
     - primitive: range_pct_between      # too tight = noise, too wide = unaffordable stop
       params:
@@ -76,8 +80,11 @@ entry:
       params:
         bars: 12                         # enough runway for the trade to work
 
-  none_of:
-    - primitive: no_material_news        # inverted: skip if material news landed
+    # Enter only when NO material news landed in the last 12 hours. This sat
+    # under none_of, which inverted it: the strategy could enter ONLY on news
+    # days (audit TRD-010; the owner's decision, 16 Nov 2026). Until a news
+    # source reports, the primitive is UNKNOWN and the strategy does not fire.
+    - primitive: no_material_news
       params:
         lookback_hours: 12
 
@@ -95,11 +102,9 @@ exit:
     params:
       r: 2.0
 
-  trail:
-    primitive: trail_after_r
-    params:
-      activate_at_r: 1.0
-      atr_mult: 1.0
+  # No `trail`: nothing moves a stop after entry (audit NR-009), and a strategy
+  # declaring one is refused at load rather than shipped promising a trailing
+  # stop that never runs.
 
   time:
     primitive: squareoff_deadline        # per-stock: 15:10 CAS / 15:20 / 15:25 F&O

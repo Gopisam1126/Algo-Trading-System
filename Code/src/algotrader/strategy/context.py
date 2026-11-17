@@ -95,6 +95,16 @@ class EvalContext:
     day_high: Decimal | None = None
     day_low: Decimal | None = None
     prev_close: Decimal | None = None
+    #: The session's high and low from the bars that OPENED BEFORE ``bar`` -
+    #: what "breaks the day's high" is measured against (audit TRD-025). The
+    #: day's high including the current bar cannot be exceeded by that bar's
+    #: own close, so ``price_breaks_level(day_high)`` could never be True.
+    day_high_before_bar: Decimal | None = None
+    day_low_before_bar: Decimal | None = None
+    #: The close of the previous bar on the strategy's timeframe. A BREAK is a
+    #: crossing - this bar's close beyond the level and the previous one not
+    #: (audit TRD-017) - and a crossing cannot be told from one price.
+    previous_bar_close: Decimal | None = None
 
     # -- structure ----------------------------------------------------------
     levels: LevelSet | None = None
@@ -133,6 +143,7 @@ class EvalContext:
     def __post_init__(self) -> None:
         if self.now.tzinfo is None:
             raise ContextError("EvalContext.now must be timezone-aware")
+        self._every_number_is_finite()
         if self.entries_today is not None and (
             not isinstance(self.entries_today, int)
             or isinstance(self.entries_today, bool)
@@ -151,6 +162,44 @@ class EvalContext:
                 f"{self.symbol!r} — evaluating one symbol against another's "
                 f"indicators would produce a plausible, entirely wrong signal"
             )
+
+    def _every_number_is_finite(self) -> None:
+        """No field may hold NaN or an infinity (audit ENG-017, 16 Nov 2026).
+
+        Only indicator values were filtered (``_finite``). A ``news_score`` of
+        +inf passed every "above" gate; a NaN reached ``Decimal(repr(...))``
+        and raised ``InvalidOperation``, which the signal loop did not catch,
+        so the bar was dead-lettered. Refused here, at construction, the one
+        place every primitive reads through; the loop catches ContextError and
+        reports the strategy unevaluable for that bar.
+        """
+        floats = {
+            "news_score": self.news_score,
+            "hours_since_material_news": self.hours_since_material_news,
+        }
+        for name, number in floats.items():
+            if number is not None and not math.isfinite(number):
+                raise ContextError(f"{name} is not finite: {number!r}")
+        if self.hours_since_material_news is not None and self.hours_since_material_news < 0:
+            raise ContextError(
+                f"hours_since_material_news is negative: {self.hours_since_material_news!r}"
+            )
+        decimals: dict[str, Decimal | None] = {
+            "last_price": self.last_price,
+            "tick_size": self.tick_size,
+            "day_open": self.day_open,
+            "day_high": self.day_high,
+            "day_low": self.day_low,
+            "prev_close": self.prev_close,
+            "day_high_before_bar": self.day_high_before_bar,
+            "day_low_before_bar": self.day_low_before_bar,
+            "previous_bar_close": self.previous_bar_close,
+            "india_vix": self.india_vix,
+            **{f"index_change_pct[{k}]": v for k, v in self.index_change_pct.items()},
+        }
+        for name, value in decimals.items():
+            if value is not None and not Decimal(value).is_finite():
+                raise ContextError(f"{name} is not finite: {value!r}")
 
     # -- helpers primitives share ------------------------------------------
 

@@ -26,6 +26,7 @@ import datetime as dt
 import logging
 import re
 import uuid
+from collections import Counter
 from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol, cast, runtime_checkable
@@ -145,6 +146,20 @@ class InstrumentRepository:
             )
         ).all()
         triples = [(int(sid), str(symbol), Decimal(str(tick))) for sid, symbol, tick in rows]
+        # Every translation here keys on the trading symbol alone, while the
+        # table is unique on (exchange, tradingsymbol). A second exchange's
+        # RELIANCE would silently replace the NSE one - its id, its tick size -
+        # for every NSE order (audit ENG-002, 16 Nov 2026). The master holds one
+        # exchange (``instruments.TRADED_EXCHANGE``); a symbol listed twice is
+        # refused, never overwritten.
+        listed = Counter(symbol for _, symbol, _ in triples)
+        twice = sorted(symbol for symbol, count in listed.items() if count > 1)
+        if twice:
+            raise ValueError(
+                f"the instrument master lists {len(twice)} symbol(s) on more than one "
+                f"exchange (first: {twice[0][:32]!r}); symbol translation is not "
+                f"exchange-aware, so refusing to guess which is meant"
+            )
         self._by_symbol = {symbol: sid for sid, symbol, _ in triples}
         self._by_id = {sid: symbol for sid, symbol, _ in triples}
         self._tick_by_symbol = {symbol: tick for _, symbol, tick in triples}

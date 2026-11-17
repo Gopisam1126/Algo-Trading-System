@@ -69,7 +69,7 @@ entry:
     - {primitive: price_breaks_level, params: {level: opening_range_high, direction: above}}
     - {primitive: volume_ratio_above, params: {threshold: 1.5}}
     - {primitive: timeframe_agreement_at_least, params: {count: 2, of: "5m,15m,1h"}}
-  none_of:
+    # all_of, not none_of: it asserts an absence (audit TRD-010).
     - {primitive: no_material_news, params: {lookback_hours: 12}}
 exit:
   stop: {primitive: atr_stop, params: {multiplier: 1.5, period: 14}}
@@ -199,7 +199,7 @@ class TestTheContentHashIsAHashOfBehaviour:
     def test_order_and_repetition_within_a_group_change_nothing(self) -> None:
         def shuffle(d: dict[str, Any]) -> None:
             group = d["entry"]["all_of"]
-            d["entry"]["all_of"] = [group[2], group[0], group[1], group[0]]
+            d["entry"]["all_of"] = [group[2], group[3], group[0], group[1], group[0]]
 
         assert _variant(shuffle).content_hash() == _base().content_hash()
 
@@ -281,7 +281,7 @@ class TestTheContentHashIsAHashOfBehaviour:
         assert stating.content_hash(retuned) == stating.content_hash()
 
     @settings(max_examples=60, deadline=None)
-    @given(order=st.permutations(range(3)), regimes=st.permutations(["TRENDING", "RISK_ON"]))
+    @given(order=st.permutations(range(4)), regimes=st.permutations(["TRENDING", "RISK_ON"]))
     def test_any_permutation_hashes_the_same(self, order: list[int], regimes: list[str]) -> None:
         def permute(d: dict[str, Any]) -> None:
             d["entry"]["all_of"] = [d["entry"]["all_of"][i] for i in order]
@@ -772,13 +772,26 @@ class TestTheStartupLoad:
         assert record.document == doc and record.state is StrategyState.DRAFT
         assert record.registered_at == T0 and record.dsl_hash == doc.content_hash()
 
-    async def test_the_shipped_seed_is_refused_at_load_until_the_engine_carries_1d_and_1w(
+    async def test_the_shipped_seed_loads_runnable(
         self, registry: StrategyRegistry, store: MemoryStore
     ) -> None:
-        """A fact the load surfaces rather than hides (3 Nov 2026): orb_classic
-        asks for 1h/1d/1w trend agreement and the indicator engine carries
-        5m/15m/1h. Promoted to a runnable state, it is refused by name."""
+        """CHANGED 16 Nov 2026 (audit TRD-014). This pinned the fact that
+        orb_classic, asking for 1h/1d/1w agreement the engine (5m/15m/1h) does
+        not carry, was refused at every load. It now asks for 15m and 1h, and a
+        runnable state loads it."""
         seed = load_strategy_yaml((CONFIG / "orb_classic.yaml").read_text(encoding="utf-8"))
+        await registry.register(seed, now=T0)
+        store.set_state("orb_classic", StrategyState.SHADOW)
+        loaded = await registry.load()
+        assert "orb_classic" not in loaded.rejected
+        assert loaded.records["orb_classic"].state is StrategyState.SHADOW
+
+    async def test_a_seed_asking_for_daily_agreement_is_still_refused_by_name(
+        self, registry: StrategyRegistry, store: MemoryStore
+    ) -> None:
+        """The control: the refusal itself is unchanged."""
+        text = (CONFIG / "orb_classic.yaml").read_text(encoding="utf-8")
+        seed = load_strategy_yaml(text.replace('of: "15m,1h"', 'of: "1h,1d"'))
         await registry.register(seed, now=T0)
         store.set_state("orb_classic", StrategyState.SHADOW)
         loaded = await registry.load()

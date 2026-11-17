@@ -348,42 +348,71 @@ class TestTheSilentSocketIsTreatedAsDead:
         assert any(isinstance(i, FeedGap) for i in items), "idle socket did not become a gap"
 
 
-class TestBackoffResetsAfterAHealthyConnection:
-    @pytest.mark.asyncio
-    async def test_one_bad_hour_does_not_pin_the_delay_all_day(
-        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float]
-    ) -> None:
-        """A connection that stayed up must not inherit the previous streak's
-        backoff — otherwise a single bad hour keeps reconnection at its ceiling
-        for the rest of the session."""
-        real_now = kite_ws.dt.datetime.now
+class _Clock:
+    """A clock that moves only when told. Installed on the feed, so the
+    reconnect rule reads THIS - the old test patched nothing it read."""
 
-        class Clock:
-            """First reading is the open; the next is two minutes later."""
+    def __init__(self) -> None:
+        self.now = dt.datetime(2026, 8, 20, 4, 0, tzinfo=dt.UTC)
 
-            def __init__(self) -> None:
-                self.calls = 0
+    def __call__(self) -> dt.datetime:
+        return self.now
 
-            def now(self, tz: object = None) -> dt.datetime:
-                self.calls += 1
-                return real_now(dt.UTC) + dt.timedelta(minutes=2 * (self.calls > 1))
 
-        monkeypatch.setattr(
-            kite_ws.websockets,
-            "connect",
-            FakeConnect([FakeSocket([ConnectionError("late drop")]), FakeSocket([_ltp_frame()])]),
-        )
-        feed = KiteFeed(
+class _UpFor(FakeSocket):
+    """Connects; the clock advances by ``seconds``; then the socket drops."""
+
+    def __init__(self, clock: _Clock, seconds: float) -> None:
+        super().__init__([ConnectionError("dropped")])
+        self._clock, self._seconds = clock, seconds
+
+    async def recv(self):  # type: ignore[override]
+        self._clock.now += dt.timedelta(seconds=self._seconds)
+        return await super().recv()
+
+
+class TestBackoffResetsOnlyAfterAHealthyConnection:
+    """Audit TRD-012: the counter reset whenever a socket OPENED, so a socket
+    that connected and dropped at once reconnected every ~1 s, forever."""
+
+    @staticmethod
+    def _feed(clock: _Clock, max_attempts: int) -> KiteFeed:
+        return KiteFeed(
             api_key="k",
             access_token=_TOKEN,
             tokens=[TOKEN],
             healthy_after_seconds=60.0,
             backoff=BackoffPolicy(initial_seconds=1.0, multiplier=2.0, jitter=0.0),
-            max_attempts=4,
+            max_attempts=max_attempts,
+            clock=clock,
         )
-        await _drain(feed, 2)
-        assert no_sleep, "no backoff was applied"
-        assert no_sleep[0] <= 2.0, f"backoff did not reset after a healthy connection: {no_sleep}"
+
+    @pytest.mark.asyncio
+    async def test_connect_then_drop_sockets_back_off_and_give_up(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float]
+    ) -> None:
+        clock = _Clock()
+        sockets = [_UpFor(clock, 0.5) for _ in range(4)]
+        connect = FakeConnect(list(sockets))
+        monkeypatch.setattr(kite_ws.websockets, "connect", connect)
+        feed = self._feed(clock, max_attempts=4)
+        items = await _drain(feed, 10)
+        assert no_sleep == [1.0, 2.0, 4.0, 8.0], "delays must grow across short-lived connections"
+        assert connect.calls == 4, "the stream ends after max_attempts, opened or not"
+        assert not [i for i in items if not isinstance(i, FeedGap)]
+
+    @pytest.mark.asyncio
+    async def test_a_connection_that_stayed_up_starts_the_backoff_again(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float]
+    ) -> None:
+        """The control, and what the old test claimed: one bad hour must not
+        pin the delay at its ceiling for the rest of the session."""
+        clock = _Clock()
+        sockets = [_UpFor(clock, 0.5), _UpFor(clock, 0.5), _UpFor(clock, 120.0), _UpFor(clock, 0.5)]
+        monkeypatch.setattr(kite_ws.websockets, "connect", FakeConnect(list(sockets)))
+        feed = self._feed(clock, max_attempts=10)
+        await _drain(feed, 10)
+        assert no_sleep[:4] == [1.0, 2.0, 1.0, 2.0]
 
 
 class TestControlFrames:

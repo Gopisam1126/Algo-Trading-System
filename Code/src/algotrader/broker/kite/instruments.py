@@ -49,6 +49,13 @@ class SyncResult:
         return self.fetched < 500 or len(self.missing_symbols) > max(50, self.fetched // 10)
 
 
+#: The one exchange the instrument master holds (audit ENG-002, 16 Nov 2026).
+#: Every symbol-to-id translation keys on the trading symbol alone, so a second
+#: exchange would remap NSE symbols silently; trading BSE needs those keyed by
+#: exchange first, and this refusal is what makes that a deliberate change.
+TRADED_EXCHANGE = "NSE"
+
+
 class InstrumentSync:
     """Pulls the broker dump and reconciles it into ``instruments``."""
 
@@ -56,7 +63,12 @@ class InstrumentSync:
         self._adapter = adapter
         self._repository = repository
 
-    async def run(self, exchange: str = "NSE") -> SyncResult:
+    async def run(self, exchange: str = TRADED_EXCHANGE) -> SyncResult:
+        if exchange != TRADED_EXCHANGE:
+            raise ValueError(
+                f"refusing to sync {exchange[:8]!r}: the instrument master holds "
+                f"{TRADED_EXCHANGE} only, because symbol translation is not exchange-aware"
+            )
         instruments = await self._adapter.fetch_instruments(exchange)
         fetched = len(instruments)
 
