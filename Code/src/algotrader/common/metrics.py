@@ -158,6 +158,19 @@ class Metrics:
             "Time exits placed at a position's square-off deadline.",
             registry=self.registry,
         )
+        # -- target exits (E15-S07) -----------------------------------------
+        self.target_exits_total = Counter(
+            "target_exits_total",
+            "Exits placed because a fresh live price reached the position's target.",
+            registry=self.registry,
+        )
+        self.target_price_unavailable_total = Counter(
+            "target_price_unavailable_total",
+            "Sweeps that could not check a target because no fresh price was "
+            "readable. The position stays under its stop and time exit; a rising "
+            "count means targets are not being watched.",
+            registry=self.registry,
+        )
         self.positions_overdue_total = Counter(
             "positions_overdue_total",
             "Positions still held a minute past their square-off deadline. Each "

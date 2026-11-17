@@ -144,7 +144,7 @@ refuses every entry at L0-L3 until the approval flow (E16-S03) and the envelope
 | `indicators/` | Components | incremental EMA/SMA/RSI/ATR/MACD/Bollinger/VWAP/VolumeRatio, warm-up, multi-timeframe snapshot, levels, state publishing |
 | `strategy/` | Components | the DSL, 27 primitives and their evaluators, the tri-state runtime, the approval-gated registry |
 | `signals/` | Components | the strategy loop and bar source (E13-S01); its LIVE/PAPER routes end at a port |
-| `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, square-off timer, autonomy gate, day ledger, execution service |
+| `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, exit timer (time and target exits), autonomy gate, day ledger, execution service |
 | `ai/` `macro/` `premarket/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
 
 "Components" means built and tested on their own and against each other in
@@ -921,7 +921,7 @@ India-only deployment region.
 | system | `mode: paper`, `region: ap-south-1` |
 | broker | `primary: zerodha`, `fallback: fyers`, redirect auth, re-auth 07:00 |
 | universe | Nifty 200, 10 hard filters, 6 scoring weights summing to 1.00, shortlist 15 |
-| risk | ₹5,00,000 · 5 slots × 20% · 1% risk/trade (₹5,000) · 3% daily loss (₹15,000) · ATR 1.5× stop · 2R target |
+| risk | ₹5,00,000 · 5 slots × 20% · 1% risk/trade (₹5,000) · 3% daily loss (₹15,000) · ATR 1.5× stop · 2R target (exited by the exit timer, E15-S07) |
 | execution | 3 orders/sec · adaptive interval 5m–15m · `market_protection: -1` |
 | ai | Opus/Sonnet/Haiku · confidence 0.65 act, 0.80 full size · 2M token/day budget |
 | strategy_engine | 6 active max · PBO ≤ 0.5 · DSR ≥ 0.95 · **AI generation disabled** |

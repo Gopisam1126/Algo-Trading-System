@@ -932,6 +932,19 @@ a partial one exits what is held and halts.
 
 **Exit precedence** (first match wins): kill switch → hard deadline → stop hit → target hit → trailing stop → AI thesis invalidation → manual.
 
+**The target exit (E15-S07, 17 Nov 2026).** The exit timer's sweep exits a
+position whose FRESH live price (`SessionFacts.last_price`, refused past the
+quote limit) has reached `target_price`, through the time exit's own path:
+cancel the stop, wait until the broker shows it dead, exit `min(book, broker)`
+at market, reason `TARGET`. A due deadline wins over a reached target; a stop
+already filling is the exit. No fresh price takes no target exit - the stop and
+time exit still bound the position, and taking profit is never protection. The
+target is the risk policy's (`risk.per_trade.target_r_multiple`), anchored at
+the fill like the stop; a strategy-level `target` is refused at load because
+the signal carries no exit parameters. Not built: trailing (E15-S08), thesis
+invalidation (needs the AI review, E13-S03), the manual and kill-switch close
+(E14-S13).
+
 ### 5.9 `LatencyProfiler` — the adaptive interval scheduler
 
 Implements companion doc §8 as a concrete mechanism.

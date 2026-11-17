@@ -488,6 +488,20 @@ class Position(_Frozen):
         return self
 
     @model_validator(mode="after")
+    def _target_on_the_profit_side(self) -> Position:
+        """E15-S07: the exit timer takes profit at ``target_price``. A target at
+        or through the entry - a row edited by hand, or corrupted - would read
+        as "reached" at once and exit at market on the first sweep."""
+        target = self.target_price
+        if target is None:
+            return self
+        if self.direction is Direction.LONG and target <= self.entry_price:
+            raise ValueError("long target must be above entry")
+        if self.direction is Direction.SHORT and target >= self.entry_price:
+            raise ValueError("short target must be below entry")
+        return self
+
+    @model_validator(mode="after")
     def _an_intraday_deadline(self) -> Position:
         """The deadline falls on the IST day the position opened, by the close.
 

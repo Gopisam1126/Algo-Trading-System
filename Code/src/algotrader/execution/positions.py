@@ -311,6 +311,22 @@ def anchored_stop(direction: Direction, *, fill: Decimal, sizing: SizingResult) 
     return min(sizing.stop_price, fill + distance)
 
 
+def anchored_target(direction: Direction, *, fill: Decimal, sizing: SizingResult) -> Decimal | None:
+    """The target for a position that FILLED at ``fill`` (E15-S07).
+
+    The sizer put the target R stop-distances from the TRIGGER. With the stop
+    anchored at the fill (above), a target left at the trigger would no longer
+    be R away from anything: an adverse fill would shrink the reward, a
+    favourable one stretch it. Anchored the same way - the sizer's reward
+    distance, from the fill - the target is what the risk policy priced.
+    ``None`` when the sizer set none.
+    """
+    if sizing.target_price is None:
+        return None
+    reward = abs(sizing.target_price - sizing.entry_price)
+    return fill + reward if direction is Direction.LONG else fill - reward
+
+
 # ---------------------------------------------------------------------------
 # Marks
 # ---------------------------------------------------------------------------
@@ -749,6 +765,11 @@ class PositionManager:
             ) from exc
 
         anchored = anchored_stop(direction, fill=entry.price, sizing=sizing)
+        target = anchored_target(direction, fill=entry.price, sizing=sizing)
+        if target != position.target_price:
+            # E15-S07: the exit timer takes profit at this price, so it is the
+            # policy's R from where the position actually opened.
+            position = Position(**{**position.model_dump(), "target_price": target})
         if anchored != position.stop_price:
             log.info(
                 "%s filled at %s against a %s trigger; stop tightened %s -> %s so the "

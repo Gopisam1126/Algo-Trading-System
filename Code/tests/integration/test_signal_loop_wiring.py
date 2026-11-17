@@ -393,7 +393,7 @@ class TestTheStoresTheLoopReads:
     async def test_a_shadow_signal_is_a_row_under_the_application_role(
         self, owner: psycopg.Connection, factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        doc = load_strategy_yaml(_STRATEGY.format(sid="sl_shadow", r="2.0"))
+        doc = load_strategy_yaml(_STRATEGY.format(sid="sl_shadow", m="1.5"))
         async with db_engine.unit_of_work(factory) as session:
             await StrategyRegistry(StrategyRepository(await _as_app(session))).register(
                 doc, now=ist(YESTERDAY, 9, 0)
@@ -468,9 +468,10 @@ entry:
     - {{primitive: price_breaks_level, params: {{level: opening_range_high, direction: above}}}}
     - {{primitive: price_above_ma, params: {{period: 20}}}}
 exit:
-  stop: {{primitive: atr_stop, params: {{multiplier: 1.5, period: 14}}}}
+  # Two strategies differ by their stop multiplier; a strategy-level target
+  # is refused at load (E15-S07), so it can no longer tell them apart.
+  stop: {{primitive: atr_stop, params: {{multiplier: {m}, period: 14}}}}
   time: {{primitive: squareoff_deadline}}
-  target: {{primitive: r_multiple_target, params: {{r: {r}}}}}
 """
 
 
@@ -592,7 +593,7 @@ class TestTheStateIsPublishedBeforeTheTriggerLeaves:
         owner: psycopg.Connection,
         factory: async_sessionmaker[AsyncSession],
     ) -> None:
-        doc = load_strategy_yaml(_STRATEGY.format(sid="sl_live", r="2.0"))
+        doc = load_strategy_yaml(_STRATEGY.format(sid="sl_live", m="1.5"))
         reader = PublishedATR(r, timeframes=strategy_timeframes([doc]))
         seen: list[tuple[Trigger, Decimal | None, Decimal | None]] = []
 
@@ -631,7 +632,7 @@ class TestTheStateIsPublishedBeforeTheTriggerLeaves:
         factory: async_sessionmaker[AsyncSession],
     ) -> None:
         """The control: the reader is not seeing something else."""
-        doc = load_strategy_yaml(_STRATEGY.format(sid="sl_live", r="2.0"))
+        doc = load_strategy_yaml(_STRATEGY.format(sid="sl_live", m="1.5"))
         reader = PublishedATR(r, timeframes=strategy_timeframes([doc]))
         seen: list[Decimal | None] = []
 
@@ -682,8 +683,8 @@ class TestTheLoopOverTheRealStores:
         owner: psycopg.Connection,
         factory: async_sessionmaker[AsyncSession],
     ) -> None:
-        paper_doc = load_strategy_yaml(_STRATEGY.format(sid="sl_paper", r="2.0"))
-        shadow_doc = load_strategy_yaml(_STRATEGY.format(sid="sl_shadow", r="3.0"))
+        paper_doc = load_strategy_yaml(_STRATEGY.format(sid="sl_paper", m="1.5"))
+        shadow_doc = load_strategy_yaml(_STRATEGY.format(sid="sl_shadow", m="2.0"))
         paper = await _registered(factory, owner, paper_doc, StrategyState.PAPER)
         shadow = await _registered(factory, owner, shadow_doc, StrategyState.SHADOW)
         _plan(owner, locked=True, statuses={"SLAAA": "ACTIVE"})

@@ -389,6 +389,9 @@ class ExecutionService:
             manager=manager,
             protector=protector,
             halter=halts,
+            # The target exit (E15-S07) reads the same fresh quote the sizer
+            # does: SessionFacts.last_price, refused past QUOTE_MAX_AGE.
+            prices=facts,
             audit=audit,
             metrics=get_metrics(),
             sleep=sleep,

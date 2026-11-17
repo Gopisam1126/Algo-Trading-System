@@ -122,6 +122,10 @@ risk:
     max_position_pct: 20
     min_position_pct: 2           # smaller than Rs 10,000 is not worth a slot
     max_price_divergence_pct: 1.0 # trigger vs live price; beyond -> refused
+    # Every position takes profit here: the exit timer exits at market once a
+    # fresh live price reaches entry +/- this many stop distances, anchored at
+    # the fill (E15-S07). A strategy cannot set its own; one that declares a
+    # target is refused at load.
     target_r_multiple: 2.0
     # trailing_stop_after_r: unset. No trailing stop is implemented, so the
     # loader refuses any value rather than describe a control that never runs.

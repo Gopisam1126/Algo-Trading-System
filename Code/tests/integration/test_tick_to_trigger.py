@@ -131,7 +131,6 @@ entry:
 exit:
   stop: {primitive: atr_stop, params: {multiplier: 1.5, period: 14}}
   time: {primitive: squareoff_deadline}
-  target: {primitive: r_multiple_target, params: {r: 2.0}}
 """
 
 

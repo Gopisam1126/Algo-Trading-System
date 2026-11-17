@@ -699,6 +699,11 @@ Recorded because each was believed, written down, and wrong.
   priced a whole frame (TRD-011/013/020/023, ENG-052). Only continuous trading
   makes bars now, volume is a difference of running totals, quantities are
   unsigned and the divisor comes from each packet's segment.
+- **"Every position has a 2R target."** Every position had a `target_price`
+  and nothing ever exited at it; a strategy's own `target: r` was read by
+  nothing at all (the sizer used the config). E15-S07: the exit timer exits at
+  the policy's target on a fresh price (none: no exit, the stop still holds),
+  anchored at the fill; a strategy-level target is refused at load.
 - **"The snapshot is current."** It carried no time per timeframe, so a 1h
   state that stopped updating while 5m continued was read as current
   (TRD-018). `MultiTimeframeSnapshot.as_of` is checked at every decision: a
