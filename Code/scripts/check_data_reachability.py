@@ -39,6 +39,12 @@ from dataclasses import dataclass, field
 #: its own site. This is not an attempt to evade a block — the site is public
 #: and free — it is the handshake its CDN expects, and omitting it produces a
 #: "blocked" result that says nothing about whether the host is allowed.
+#:
+#: Whether sending it meets NSE's terms of use is a judgement for the owner,
+#: not for this script (audit NR-012, open): its robots policy excludes
+#: crawlers, and this is a handful of requests at 2 a second, run by hand. The
+#: egress lookup below also tells api.ipify.org this host's address - which
+#: any server it connects to learns anyway.
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -54,6 +60,15 @@ BROWSER_HEADERS = {
 #: the job done.
 MAX_REQUESTS_PER_SECOND = 2.0
 
+#: How much of a non-JSON reply is read: enough to know an answer came back.
+PEEK_BYTES = 4096
+#: How much of a JSON reply may be read to parse it whole. The first version
+#: read 4 KB of every reply and parsed that, so a JSON answer longer than 4 KB
+#: was reported as "not JSON - an interstitial or block page" from a host that
+#: had reached it (audit ENG-014). Capped, so a runaway reply cannot exhaust
+#: memory; a reply over the cap fails and says so.
+MAX_JSON_BYTES = 8 * 1024 * 1024
+
 
 @dataclass
 class Probe:
@@ -62,6 +77,11 @@ class Probe:
     blocks: str
     required: bool = True
     expect_json: bool = False
+    #: False when the URL is a stand-in - a page or API on the same host -
+    #: rather than the endpoint the dependent story will fetch. A pass then
+    #: proves the host is reachable, not that the endpoint is (audit ENG-041),
+    #: and the summary says so instead of declaring B8 resolved.
+    is_the_endpoint: bool = True
 
 
 PROBES = [
@@ -71,9 +91,11 @@ PROBES = [
         blocks="every other NSE probe — its API needs the cookie this issues",
     ),
     Probe(
-        name="NSE equity bhavcopy archive",
+        name="NSE all-reports page",
         url="https://www.nseindia.com/all-reports",
-        blocks="E03-S01 daily bhavcopy ingest",
+        blocks="E03-S01 daily bhavcopy ingest - the page that lists it; the "
+        "download URL is E03-S01's to define and probe",
+        is_the_endpoint=False,
     ),
     Probe(
         name="NSE ASM list",
@@ -82,10 +104,12 @@ PROBES = [
         expect_json=True,
     ),
     Probe(
-        name="NSE F&O ban list",
+        name="NSE market status API",
         url="https://www.nseindia.com/api/marketStatus",
-        blocks="E04-S03 F&O ban list",
+        blocks="E04-S03 F&O ban list - an NSE API answering with the session "
+        "cookie; the ban-list file is E04-S03's to define and probe",
         expect_json=True,
+        is_the_endpoint=False,
     ),
     Probe(
         name="BSE (independent fallback)",
@@ -94,6 +118,9 @@ PROBES = [
         required=False,
     ),
     Probe(
+        # Verified 18 Nov 2026 (audit NR-011): an unauthenticated GET answers
+        # HTTP 200 with the ~10 MB CSV, so a 401 here is a real change, not a
+        # missing header.
         name="Kite instruments dump",
         url="https://api.kite.trade/instruments",
         blocks="E02-S06 instrument master (needs no credential)",
@@ -145,9 +172,18 @@ def _probe(probe: Probe, opener: urllib.request.OpenerDirector) -> Result:
     request = urllib.request.Request(probe.url, headers=BROWSER_HEADERS)  # noqa: S310
     try:
         with opener.open(request, timeout=20) as response:
-            body = response.read(4096)
+            limit = MAX_JSON_BYTES if probe.expect_json else PEEK_BYTES
+            body = response.read(limit + 1 if probe.expect_json else limit)
             elapsed = time.monotonic() - started
             if probe.expect_json:
+                if len(body) > MAX_JSON_BYTES:
+                    return Result(
+                        probe,
+                        False,
+                        f"HTTP {response.status} but the reply exceeds {MAX_JSON_BYTES} "
+                        f"bytes - not parsed",
+                        elapsed,
+                    )
                 try:
                     json.loads(body.decode("utf-8", "replace"))
                 except ValueError:
@@ -174,6 +210,25 @@ def _probe(probe: Probe, opener: urllib.request.OpenerDirector) -> Result:
         return Result(probe, False, "timed out", time.monotonic() - started)
     except Exception as exc:  # pragma: no cover - defensive
         return Result(probe, False, f"{type(exc).__name__}: {exc}", time.monotonic() - started)
+
+
+def summary_when_reachable(report: Report) -> str:
+    """What a clean run proves - and, by name, what it does not."""
+    stand_ins = [
+        r.probe for r in report.results if r.probe.required and not r.probe.is_the_endpoint
+    ]
+    lines = ["All required probes answered from THIS host."]
+    if stand_ins:
+        lines.append(
+            "B8 is NOT yet resolved: these probes reached a stand-in on the right host, "
+            "not the endpoint the story will fetch:"
+        )
+        lines.extend(f"  - {p.name}: {p.blocks}" for p in stand_ins)
+        lines.append("Probe those endpoints when their stories define them.")
+    else:
+        lines.append("B8 is resolved for THIS host.")
+    lines.append("Record the egress IP above in the tracker and whitelist it with the broker.")
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -225,8 +280,7 @@ def main(argv: list[str] | None = None) -> int:
 
     blocked = report.blocked
     if not blocked:
-        print("All required sources reachable. B8 is resolved for THIS host.")
-        print("Record the egress IP above in the tracker and whitelist it with the broker.")
+        print(summary_when_reachable(report))
         return 0
 
     print(f"{len(blocked)} required source(s) unreachable from this host:\n")

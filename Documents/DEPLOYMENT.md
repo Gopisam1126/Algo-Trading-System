@@ -13,7 +13,7 @@ them causes bad decisions.**
 | | What moves | Contains |
 |---|---|---|
 | **Branch promotion** | The whole source tree, by merge | Everything — code, tests, design documents, tracker |
-| **Artifact deployment** | The container image | **Only `src/` and `config/`** |
+| **Artifact deployment** | The container image | **Exactly `src/`, `config/` and an empty `data/`** |
 
 The branch is the *record*; the image is the *thing that runs*.
 
@@ -24,8 +24,11 @@ every subsequent promotion would conflict, and a bug found in QA could not be
 reproduced on DEV. So the branch merge is complete and the *image* is minimal.
 
 The CI `image` job asserts that minimality rather than trusting it: it fails the
-build if `tests/`, `Documents/`, `migrations/`, `.git`, `.venv` or any `.env`
-appears inside `/app`.
+build unless `/app` holds **exactly** `config`, `data` and `src` - not merely
+"none of five forbidden names", which a sixth entry nobody thought of would
+pass (audit ENG-048, 18 Nov 2026) - and unless `src` and `config` are owned by
+root and NOT writable by the runtime user, while `data` is (ENG-031). It also
+round-trips a Parquet file in the image as shipped.
 
 ---
 
@@ -192,11 +195,37 @@ running it.
 
 ```bash
 cd Code
-cp .env.example .env        # fill in POSTGRES_PASSWORD and GRAFANA_PASSWORD
+cp .env.example .env        # fill in POSTGRES_PASSWORD, ALGOTRADER_APP_DB_PASSWORD
+                            # (a DIFFERENT one) and GRAFANA_PASSWORD
 make up                     # or: docker compose --env-file .env -f ops/docker-compose.yml up -d
-make migrate                # apply the schema
+make migrate                # apply the schema, as the OWNER, from the host
 make doctor                 # config, compliance and datastore posture
 ```
+
+**Two database logins, on purpose (audit SEC-002, 18 Nov 2026).** The owner
+(`POSTGRES_USER`) initialises the database and runs `make migrate`; it can
+UPDATE and DELETE the audit trail. The services connect as
+`ALGOTRADER_APP_DB_USER` (`algotrader_svc`), a member of `algotrader_app` that
+owns nothing, created on the database's first start by
+`ops/postgres/initdb/10-app-login.sh`. A service handed the owner's DSN refuses
+to start (`open_service_engine`). A database initialised **before** 18 Nov
+2026 has no such login; create it once, as the owner, with a generated
+password:
+
+```sql
+CREATE ROLE algotrader_svc LOGIN PASSWORD '<generated>' IN ROLE algotrader_app;
+```
+
+**No container reads `.env` whole (audit SEC-001).** `ops/docker-compose.yml`
+interpolates each value into the one service whose job uses it - every Kite
+value into `execution-svc` alone - and `tests/security/test_compose_secrets.py`
+checks both the file and what `docker compose config` renders from it. A new
+variable reaches no container until compose names it.
+
+**The pre-commit barrier is the owner's to install** (audit SEC-010): from the
+repository root, `pip install pre-commit && pre-commit install`. It refuses a
+`.env` at any depth, scans for secrets with gitleaks, and runs CI's ruff. It
+cannot be installed for you - it lives in your git directory and your Python.
 
 `make doctor` is the readiness check. It reports which datastore configuration
 source is in effect, whether the broker SDK supports `market_protection` and
@@ -314,11 +343,11 @@ Verified on the built image:
 
 | Property | Result |
 |---|---|
-| Size | 920 MB (dominated by pandas, numpy, pyarrow, TA-Lib) |
-| `/app` contents | `src/`, `config/`, `data/` — nothing else |
-| `tests/`, `Documents/`, `.git`, `.venv`, `.env` | all absent |
-| Runs as | uid 1001, non-root |
-| Smoke test | `algotrader` and `talib 0.7.1` both import |
+| Size | 651 MB on 18 Nov 2026, from 920 MB: numpy, pandas, TA-Lib and the planned services' packages left the runtime dependencies (audit ENG-039) - TA-Lib is the tests' reference, never production's |
+| `/app` contents | exactly `config/`, `data/`, `src/` (asserted by CI) |
+| Ownership | `src/` and `config/` root's, not writable by the runtime user; `data/` the runtime user's |
+| Runs as | uid 1001, non-root; compose adds `read_only: true` and a tmpfs `/tmp` |
+| Smoke test | `algotrader` imports; a Parquet file round-trips without numpy |
 
 ### Migrations are deliberately not in the image
 

@@ -409,7 +409,9 @@ pip install -c constraints.txt -e ".[dev]" && pip install --no-deps --upgrade "a
 # migration failed CI's `ruff check .` after a "green" local gate.
 ruff check . && ruff format --check .
 mypy src
-pytest tests/ -q --cov=src/algotrader --cov-report=term   # includes tests/security
+# REQUIRE_DOCKER=1: an unreachable Docker FAILS the run instead of skipping
+# every container-backed test (tests/conftest.py; CI sets it too - ENG-036).
+REQUIRE_DOCKER=1 pytest tests/ -q --cov=src/algotrader --cov-report=term   # includes tests/security
 python scripts/doctor.py                                  # = make doctor; see below
 ```
 

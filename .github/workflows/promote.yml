@@ -11,6 +11,13 @@ name: Promote
 #
 # This workflow refuses to promote a commit whose CI is not green. That check
 # is the entire point; without it, promotion is just a merge button.
+#
+# No input is ever expanded INTO a script (audit SEC-008). `reason` is free
+# text: written as ${{ inputs.reason }} inside a `run:` block, a reason with a
+# backtick or $( ) ran as shell in a job holding a contents:write token, and
+# one with a double quote broke the merge. Every value reaches a script through
+# `env:` and is used as a quoted variable; tests/security/test_workflow_hygiene.py
+# refuses an expansion inside `run:` or `script:`.
 
 on:
   workflow_dispatch:
@@ -40,19 +47,23 @@ jobs:
     name: ${{ inputs.from }} -> ${{ inputs.to }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      FROM: ${{ inputs.from }}
+      TO: ${{ inputs.to }}
+      REASON: ${{ inputs.reason }}
+      ACTOR: ${{ github.actor }}
     steps:
       - name: Reject an invalid promotion path
         # DEV -> PROD would skip validation entirely. QA -> QA is a no-op that
         # probably means someone picked the wrong dropdown.
         run: |
           set -euo pipefail
-          FROM="${{ inputs.from }}"; TO="${{ inputs.to }}"
           if [ "$FROM" = "DEV" ] && [ "$TO" = "QA" ]; then exit 0; fi
           if [ "$FROM" = "QA" ] && [ "$TO" = "PROD" ]; then exit 0; fi
           echo "::error::$FROM -> $TO is not a valid promotion. Allowed: DEV->QA, QA->PROD."
           exit 1
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -61,16 +72,18 @@ jobs:
         id: src
         run: |
           set -euo pipefail
-          SHA=$(git rev-parse "origin/${{ inputs.from }}")
+          SHA=$(git rev-parse "origin/$FROM")
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Promoting $SHA from ${{ inputs.from }}"
+          echo "Promoting $SHA from $FROM"
           git log -1 --format='  %h  %s' "$SHA"
 
       - name: Require green CI on that exact commit
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          SHA: ${{ steps.src.outputs.sha }}
         with:
           script: |
-            const sha = '${{ steps.src.outputs.sha }}';
+            const sha = process.env.SHA;
             const runs = await github.rest.actions.listWorkflowRunsForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -105,29 +118,31 @@ jobs:
           exit 1
 
       - name: Merge
+        env:
+          SHA: ${{ steps.src.outputs.sha }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git checkout "${{ inputs.to }}"
-          git merge --no-ff "${{ steps.src.outputs.sha }}" -m \
-            "Promote ${{ inputs.from }} -> ${{ inputs.to }}: ${{ inputs.reason }}
-
-          Source commit: ${{ steps.src.outputs.sha }}
-          CI: verified green before merge.
-          Promoted by: ${{ github.actor }}"
+          git checkout "$TO"
+          # The message is written to a file, so no character of the reason is
+          # ever parsed by the shell or by git's option handling.
+          printf 'Promote %s -> %s: %s\n\nSource commit: %s\nCI: verified green before merge.\nPromoted by: %s\n' \
+            "$FROM" "$TO" "$REASON" "$SHA" "$ACTOR" > "$RUNNER_TEMP/merge-message"
+          git merge --no-ff "$SHA" -F "$RUNNER_TEMP/merge-message"
 
       - name: Push
-        run: git push origin "${{ inputs.to }}"
+        run: git push origin "$TO"
 
       - name: Summary
+        env:
+          SHA: ${{ steps.src.outputs.sha }}
         run: |
           {
-            echo "### Promoted ${{ inputs.from }} → ${{ inputs.to }}"
-            echo ""
-            echo "- **Commit:** \`${{ steps.src.outputs.sha }}\`"
-            echo "- **Reason:** ${{ inputs.reason }}"
-            echo "- **By:** ${{ github.actor }}"
-            echo "- **CI:** verified green before the merge"
+            printf '### Promoted %s → %s\n\n' "$FROM" "$TO"
+            printf -- '- **Commit:** `%s`\n' "$SHA"
+            printf -- '- **Reason:** %s\n' "$REASON"
+            printf -- '- **By:** %s\n' "$ACTOR"
+            printf -- '- **CI:** verified green before the merge\n'
           } >> "$GITHUB_STEP_SUMMARY"

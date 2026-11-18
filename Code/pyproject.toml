@@ -6,18 +6,24 @@ description = "AI-driven algorithmic trading platform for Indian markets (NSE/BS
 requires-python = ">=3.11"
 readme = "README.md"
 
+# What the deployed code RUNS ON - and nothing else (audit ENG-039, 18 Nov
+# 2026). Every entry is imported by src, or is one of the two it needs without
+# importing: psycopg (SQLAlchemy loads it from the postgresql+psycopg:// URL)
+# and tzdata (zoneinfo's data on a slim image or on Windows).
+# tests/security/test_runtime_dependencies.py holds that both ways.
+#
+# Thirteen packages were declared here for services that do not exist yet -
+# the AI layer, the dashboard, a scheduler - so every image shipped, and every
+# audit had to triage, web frameworks that never ran. They are extras now,
+# named after the service that will import them (`pip install .[api]`), and
+# move back the day that service's code does. Removed outright, with nothing
+# planned to import them: pydantic-settings, python-dateutil (still arrives
+# through kiteconnect), tenacity, uvloop.
 dependencies = [
     # --- Core ---
     "pydantic>=2.9",
-    "pydantic-settings>=2.5",
     "pyyaml>=6.0",
-    "python-dateutil>=2.9",
     "tzdata>=2024.1",
-
-    # --- Async / runtime ---
-    "uvloop>=0.20; sys_platform != 'win32'",
-    "httpx>=0.27",
-    "tenacity>=9.0",
 
     # --- Data fabric ---
     "redis[hiredis]>=5.1",
@@ -27,17 +33,14 @@ dependencies = [
     # market data feed.
     "websockets>=13.0",
     "sqlalchemy>=2.0",
-    "alembic>=1.13",
     "psycopg[binary,pool]>=3.2",
 
     # --- Market analysis ---
-    "numpy>=2.1",
-    "pandas>=2.2",
     # Parquet archive (E01-S06). Large (~100 MB) but it is the standard
     # implementation, preserves types across a round trip, and the archive
-    # job runs in the same deployment as everything else.
+    # job runs in the same deployment as everything else. It needs no numpy:
+    # CI's image job round-trips a file in the image, where numpy is absent.
     "pyarrow>=18.0",
-    "TA-Lib>=0.4.32",          # requires the C library — see README
 
     # --- Broker ---
     # 5.2.1 is a FLOOR, not a preference. 5.1.0 omitted `market_protection`
@@ -75,24 +78,36 @@ dependencies = [
     # tests/security/test_dependency_hygiene.py, which fails on a vulnerable
     # autobahn — the enforcement is the test, not the documentation.
 
-    # --- AI ---
-    "anthropic>=0.40",
+    # --- Ops ---
+    "structlog>=24.4",
+    "prometheus-client>=0.21",
+]
 
-    # --- API / UI ---
+[project.optional-dependencies]
+# One extra per PLANNED service, installed with it and moved into
+# `dependencies` the day its code imports them (ENG-039). constraints.txt keeps
+# their pins, so `pip install -c constraints.txt .[api]` is still reproducible.
+ai = ["anthropic>=0.40"]                    # E10: the Claude client
+api = [                                     # E19: the dashboard and its auth
     "fastapi>=0.115",
     "uvicorn[standard]>=0.31",
     "jinja2>=3.1",
     "python-multipart>=0.0.12",
     "webauthn>=2.2",
-
-    # --- Ops ---
-    "structlog>=24.4",
-    "prometheus-client>=0.21",
-    "apscheduler>=3.10",
 ]
-
-[project.optional-dependencies]
+scheduler = ["apscheduler>=3.10"]           # the orchestrator's daily jobs
+notify = ["httpx>=0.27"]                    # the notifier's Telegram calls
+# Migrations run from the HOST (`make migrate`), never from the image, which
+# carries no migrations/ directory.
+migrate = ["alembic>=1.13"]
 dev = [
+    # The migration tests apply the real migrations.
+    "alembic>=1.13",
+    # The indicator tests' REFERENCE implementation (tests/unit/test_indicators.py):
+    # TA-Lib is what each incremental indicator is verified against, and numpy
+    # is its input. Production computes every indicator itself.
+    "numpy>=2.1",
+    "TA-Lib>=0.4.32",
     "bandit>=1.9",            # SAST, gated at MEDIUM in CI
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -114,9 +129,9 @@ dev = [
     "mypy==2.3.0",
     "pip-audit>=2.7",
     "types-pyyaml",
-    "types-python-dateutil",
 ]
 research = [
+    "pandas>=2.2",
     "pandas-ta>=0.3.14b",      # BACKTEST/RESEARCH ONLY — never in the live hot path
     "scipy>=1.14",
     "scikit-learn>=1.5",

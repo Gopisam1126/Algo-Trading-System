@@ -1,0 +1,71 @@
+# The local barrier before a commit exists. Install once, from the repository
+# root:
+#
+#     pip install pre-commit && pre-commit install
+#
+# It lives HERE, at the git root (audit SEC-010, 18 Nov 2026). It used to sit
+# in Code/, where pre-commit never finds it - so it was never installed - and
+# it was written as if Code/ were the root: its .env rule was anchored at the
+# repository root and could not match Code/.env, its safety-invariants hook
+# pointed at a tests/ directory that does not exist from here, and its ruff
+# was v0.8.4 while CI runs 0.16.2. A barrier nobody could install was a
+# comment. tests/security/test_precommit_config.py holds each of these.
+#
+# The gitleaks hook is the important one. A leaked broker credential in git
+# history is a total-loss event in a PUBLIC repository, and CI's scan runs
+# only after the push - the cheapest place to stop it is before the commit.
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        name: gitleaks (block committed secrets)
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # The constraints pin (Code/constraints.txt ruff==0.16.2): a hook running
+    # another ruff formats differently from CI.
+    rev: v0.16.2
+    hooks:
+      - id: ruff
+        args: [--fix, --config, Code/pyproject.toml]
+        files: ^Code/
+      - id: ruff-format
+        args: [--config, Code/pyproject.toml]
+        files: ^Code/
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: no-env-files
+        name: block .env files from being committed
+        # At ANY depth - Code/.env is the one that exists - and never the
+        # .env.example templates, which are meant to be committed.
+        entry: >-
+          bash -c 'if git diff --cached --name-only --diff-filter=ACMR
+          | grep -E "(^|/)\.env(\.[^/]*)?$" | grep -vE "(^|/)\.env\.example$"; then
+          echo "Refusing to commit a .env file (above). Secrets live outside git."; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: safety-invariants
+        name: safety invariants must hold
+        # Run in Code/, with the project's own interpreter. The container-
+        # backed tests are left to CI: a hook that needs Docker is a hook
+        # people bypass.
+        entry: >-
+          bash -c 'cd Code && py=.venv/bin/python; [ -x "$py" ] || py=.venv/Scripts/python.exe;
+          "$py" -m pytest tests/security -q -m "not integration" -p no:cacheprovider'
+        language: system
+        pass_filenames: false
+        files: ^Code/.*\.py$

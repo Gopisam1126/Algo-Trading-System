@@ -17,8 +17,9 @@ Every async entry point that touches PostgreSQL on Windows must call
 :func:`configure_event_loop_policy` **before** the loop is created — that is,
 before ``asyncio.run()``, not inside the coroutine.
 
-On non-Windows platforms this is a no-op, and the project's ``uvloop``
-dependency (installed only off Windows) is fully compatible with psycopg.
+On non-Windows platforms this is a no-op. (``uvloop``, once declared here as
+"the faster loop", was imported by nothing and is no longer a dependency -
+audit ENG-039; if it returns, it is compatible with psycopg.)
 """
 
 from __future__ import annotations

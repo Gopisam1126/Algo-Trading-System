@@ -610,6 +610,7 @@ Algo-Trading-System/
 ├── README.md                    Repository landing page
 ├── .gitignore                   Root belt-and-braces secret exclusion
 ├── .gitattributes               LF normalization (Windows dev, Linux containers)
+├── .pre-commit-config.yaml      gitleaks, .env refusal, CI's ruff - owner runs `pre-commit install`
 │
 ├── Documents/                   Design specifications — 4,815 lines
 │   ├── MASTER_REFERENCE.md      ← THIS FILE
@@ -628,7 +629,6 @@ Algo-Trading-System/
     ├── README.md                Developer quick start
     ├── CLAUDE.md                Guidance for AI coding sessions
     ├── .env.example             Credential template (no values)
-    ├── .pre-commit-config.yaml  gitleaks, ruff, safety tests
     │
     ├── config/
     │   ├── system.yaml          Main config — version controlled, no secrets

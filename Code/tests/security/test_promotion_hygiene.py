@@ -281,3 +281,100 @@ class TestOnlyACommitCiPassedIsPromoted:
         self._level_repo(module, monkeypatch)
         monkeypatch.setattr(module, "fetch_runs", lambda *a, **k: [self._run("success")])
         assert module.main(["--from", "DEV", "--to", "QA"]) == 0
+
+
+class FakeRepo:
+    """A DEV/QA pair behind a fake ``git``, holding only what main asks of it.
+
+    Every check main makes reads THIS state, so a test can make exactly one of
+    them refuse and know the refusal came from that check (audit ENG-044: the
+    tests above prove the rule by searching promote.py's source for strings,
+    and one of those strings, "REFUSING", also occurs in unrelated code).
+    """
+
+    DEV, QA, TREE, OTHER, MADE = "d" * 40, "q" * 40, "t" * 40, "o" * 40, "c" * 40
+
+    def __init__(self) -> None:
+        self.diverged = ""  # a non-merge commit only QA has
+        self.lands = True  # whether the push moves origin/QA
+        self.tree_after = self.TREE  # QA's tree once the push lands
+        self.pushes: list[tuple[str, ...]] = []
+        self.qa = self.QA
+
+    def git(self, *args: str, check: bool = True) -> str:
+        cmd = args[0]
+        if cmd == "fetch":
+            return ""
+        if cmd == "log":
+            return self.diverged
+        if cmd == "rev-list":
+            return "1"
+        if cmd == "push":
+            self.pushes.append(args)
+            if self.lands:
+                self.qa = self.MADE
+            return ""
+        if cmd == "commit-tree":
+            return self.MADE
+        if cmd == "ls-tree":
+            return ""
+        if cmd == "rev-parse":
+            ref = args[1]
+            if ref == "origin/DEV":
+                return self.DEV
+            if ref == "origin/QA":
+                return self.qa
+            if ref == "origin/QA^{tree}":
+                return self.tree_after if self.qa == self.MADE else self.OTHER
+        raise AssertionError(f"unexpected git call: {args}")
+
+    def install(self, module, monkeypatch) -> None:
+        monkeypatch.setattr(module, "git", self.git)
+        monkeypatch.setattr(module, "filtered_tree", lambda *a, **k: self.TREE)
+        green = {
+            "head_sha": self.DEV,
+            "name": "CI",
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-11-18T05:00:00Z",
+        }
+        monkeypatch.setattr(module, "fetch_runs", lambda *a, **k: [green])
+
+
+class TestThePromotionBehaves:
+    """Behaviour, not source text: with a fake git, each refusal is the only
+    thing that CAN refuse, and the control promotes."""
+
+    def test_a_target_with_commits_the_source_lacks_is_refused_and_never_pushed(
+        self, monkeypatch, capsys
+    ) -> None:
+        module, repo = _promote_module(), FakeRepo()
+        repo.diverged = "abc1234 a hotfix made on QA"
+        repo.install(module, monkeypatch)
+        assert module.main(["--from", "DEV", "--to", "QA"]) == 1
+        assert "the target has commits the source does not" in capsys.readouterr().out
+        assert repo.pushes == [], "a diverged target must never be pushed to"
+
+    def test_a_push_that_did_not_land_is_a_failure(self, monkeypatch, capsys) -> None:
+        module, repo = _promote_module(), FakeRepo()
+        repo.lands = False
+        repo.install(module, monkeypatch)
+        assert module.main(["--from", "DEV", "--to", "QA"]) == 1
+        assert "PUSH DID NOT LAND" in capsys.readouterr().out
+
+    def test_a_tree_that_is_not_the_filtered_source_is_a_failure(self, monkeypatch, capsys) -> None:
+        module, repo = _promote_module(), FakeRepo()
+        repo.tree_after = "x" * 40
+        repo.install(module, monkeypatch)
+        assert module.main(["--from", "DEV", "--to", "QA"]) == 1
+        assert "TREE MISMATCH" in capsys.readouterr().out
+
+    def test_the_control_a_clean_promotion_pushes_once_and_never_forces(self, monkeypatch) -> None:
+        module, repo = _promote_module(), FakeRepo()
+        repo.install(module, monkeypatch)
+        assert module.main(["--from", "DEV", "--to", "QA"]) == 0
+        [push] = repo.pushes
+        refspec = push[-1]
+        assert refspec == f"{FakeRepo.MADE}:refs/heads/QA"
+        assert not refspec.startswith("+"), "a leading + is a force push"
+        assert not any(a in ("--force", "-f", "--force-with-lease") for a in push), push

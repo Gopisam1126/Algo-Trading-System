@@ -899,6 +899,24 @@ E24) records each. The shapes worth remembering, because each passed QA:
   arguments broke the format, and logging's error handler then printed the
   raw arguments to stderr. An in-process migration no longer replaces the
   redacting root handler (SEC-012).
+- **"Only execution-svc holds trading credentials."** The compose header said
+  so, and `env_file: [../.env]` sat in the anchor every service merged - the
+  Kite secret reached every container, Redis and Grafana included (SEC-001).
+  Fixing it found a second defect: a YAML merge is SHALLOW, so each service
+  that set its own `environment:` had silently dropped `DATABASE_URL` and
+  `REDIS_URL` - execution-svc could never have reached its database. Compose
+  now names each variable per service (`<<: *app-env`), and a test checks
+  what `docker compose config` RENDERS, not just the file.
+- **"The grants enforce append-only audit."** They were written to
+  `algotrader_app`, and the services connected as the table OWNER, for whom
+  no grant applies (SEC-002). Services connect as `algotrader_svc` now
+  (`ops/postgres/initdb/10-app-login.sh`), and `open_service_engine` refuses
+  a login that could rewrite the record. Every earlier test proved the grants
+  under `SET ROLE`; `test_service_login.py` connects AS the login.
+- **"The pre-commit hook guards the commit."** It was in Code/, below the git
+  root, where pre-commit never looks - installed nowhere, matching nothing
+  (SEC-010). Now at the root; installing it is the owner's step. *A control
+  in the wrong directory is a comment.*
 - **"A wider pattern is a safer pattern."** The SEC-011 fix let a key begin
   at every word boundary, and inside a dashed run that is every character:
   6 KB of base64url took 0.9 s to scrub and 200 KB would have held the event

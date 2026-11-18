@@ -495,7 +495,7 @@ fails the moment the adapter and its protocol disagree again.
 **Internal design:**
 - `AuthManager` — handles the daily re-auth (constraint C3): TOTP-based login at the configured `daily_reauth_time`, stores the resulting session token in Redis with a TTL ending at the next pre-open. Publishes `auth.refreshed` on success, `auth.failed` on failure (which trips the health gate).
 - **Rate limiting is enforced here, not by callers.** A shared token bucket in Redis wraps `place_order`; a separate bucket wraps data endpoints. This makes constraint C2 structurally impossible to violate regardless of caller behaviour.
-- **Read-only adapter variant.** `market-ingest` receives a `ReadOnlyBrokerAdapter` whose trading methods raise `NotImplementedError` and whose credentials are a data-scoped API key. Defence in depth (§10.3).
+- **Read-only adapter variant.** `market-ingest` receives a `ReadOnlyBrokerAdapter` whose trading methods raise `NotImplementedError` and whose credentials are a data-scoped API key. Defence in depth (§10.3) *(Kite offers no data-scoped key - any access token trades - so with this broker the read-only adapter is the code half and compose's per-service credentials the other; see §10.3 "As built".)*
 
 **Failure modes:**
 | Failure | Handling |
@@ -1513,11 +1513,16 @@ Concretely:
 
 **Consequence:** compromising `signal-engine` (the service with the largest external attack surface, since it processes AI responses) still cannot place a single order.
 
+**As built (18 Nov 2026, audit SEC-001, SEC-002):**
+- **Kite has no data-only scope.** Every Kite access token can place orders, so "a data-only API key where the broker supports scoping" gives `market-ingest` nothing with this broker. The containment is therefore *which container receives the credential*: `ops/docker-compose.yml` names each variable per service, only `execution-svc` receives any `KITE_*` value, and nothing reads `.env` whole. Until 18 Nov 2026 the shared anchor carried `env_file: [../.env]`, so every container - the datastore and monitoring images included - held the Kite key, secret and token while this section said otherwise. How the daily token reaches the feed and the pre-market history job is decided with the process entrypoints (E23-S03); compose grants it to neither by default.
+- **The database enforces it too.** Services connect as `algotrader_svc`, a member of `algotrader_app` that owns nothing; `open_service_engine` refuses a login that can UPDATE or DELETE the audit trail or rewrite a strategy's document. They used to connect as the table owner, for whom every append-only grant was irrelevant.
+- `tests/security/test_compose_secrets.py` and `tests/integration/test_service_login.py` hold both.
+
 ### 10.4 Secrets management (T1, T7)
 
 **Rules, in priority order:**
 
-1. **No secret in source control, ever.** Enforced by a pre-commit hook running `gitleaks`, plus `git-secrets` patterns for broker key formats.
+1. **No secret in source control, ever.** Enforced by a pre-commit hook running `gitleaks`, plus `git-secrets` patterns for broker key formats. *(As built: CI's gitleaks job on every push, and a pre-commit config at the repository root - gitleaks, an any-depth `.env` refusal, CI's ruff - that the owner installs with `pre-commit install`. Until 18 Nov 2026 it sat in Code/, where pre-commit never found it, and was installed nowhere - audit SEC-010. `git-secrets` is not configured.)*
 2. **No secret in a config file.** Config contains a *reference*: `credentials_source: vault://trading/angelone`.
 3. **No secret in logs.** A `RedactingFilter` on the handler `common.logging.configure_logging()` installs on the root logger scrubs any value matching known secret patterns and any value present in the loaded secret set; because every record reaching that handler passes it, third-party library logging is covered too. *(As built. A process that replaces the root handler - running Alembic in-process does - removes it; see audit SEC-012.)*
 4. **No secret in an LLM prompt.** *(Planned, E10 - no prompt builder or LLM call exists yet.)* The prompt builder must assert that no rendered field appears in the secret registry, and fail loudly if one does.
