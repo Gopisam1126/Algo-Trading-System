@@ -647,6 +647,28 @@ class TestStopsAreRealPlaceablePrices:
 
 
 class TestFiringProducesATrigger:
+    def test_a_stop_below_zero_means_fire_returns_nothing(self, document, ctx) -> None:
+        """Through the PUBLIC path (audit ENG-047): the security test drove
+        the private ``_stop_is_on_the_right_side`` helper, so a ``fire()``
+        that stopped consulting it would have passed. The same met context
+        fires; only its ATR differs - large enough that the 1.5x ATR stop of
+        a 1200 price lands below zero."""
+        import dataclasses
+
+        met = ctx()
+        assert StrategyEvaluator(document).fire(met, correlation_id=CID) is not None
+        frame = dict(met.snapshot.per_timeframe[met.timeframe])
+        frame["atr_14"] = 1000.0
+        snapshot = dataclasses.replace(
+            met.snapshot, per_timeframe={**met.snapshot.per_timeframe, met.timeframe: frame}
+        )
+        assert (
+            StrategyEvaluator(document).fire(
+                dataclasses.replace(met, snapshot=snapshot), correlation_id=CID
+            )
+            is None
+        )
+
     def test_a_met_strategy_produces_a_trigger(self, document, ctx) -> None:
         trigger = StrategyEvaluator(document).fire(ctx(), correlation_id=CID)
         assert trigger is not None

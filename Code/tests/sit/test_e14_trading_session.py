@@ -11,20 +11,24 @@ window with no hole in the middle and no leak at either end. Two individually
 correct checks can still leave a gap between them, and the only way to see it
 is to enumerate the day.
 
-Everything here is pure computation over a frozen clock, so it needs no
-container, no credentials and no network. The engine is deliberately built
-with **no sizer**, which is the truth about the system today: ten of the
-fourteen checks are unwritten, so nothing can be approved, and SIT should
-assert that rather than paper over it.
+Everything here runs over a frozen clock with in-memory doubles: no
+container, no credentials, no network. The first scenarios build the engine
+with **no sizer**, so they read "cleared" from ``checks_passed``; the later
+ones add the sizer and the order path - gateway, protective stop, book,
+reconciliation - so approvals, orders and fills do happen. (Until 18 Nov 2026
+this said ten of the fourteen checks were unwritten and nothing could be
+approved; all fourteen exist - audit ENG-033.)
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import io
 import logging
-from collections.abc import Sequence
+import re
+from collections.abc import Iterator, Sequence
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -362,11 +366,12 @@ class TestSit1TheShapeOfTheTradingDay:
         assert cleared[0] == EXPECTED_FIRST_TRADABLE
         assert cleared[-1] == EXPECTED_LAST_TRADABLE
 
-    def test_it_is_339_minutes_and_that_number_is_derived_not_guessed(
+    def test_it_is_340_minutes_and_that_number_is_derived_not_guessed(
         self, session: Session
     ) -> None:
-        """09:20 to 15:00 exclusive. Stated as a count because an off-by-one at
-        either boundary changes it and nothing else would."""
+        """09:20 to 15:00 exclusive: 5 h 40 min. Stated as a count because an
+        off-by-one at either boundary changes it and nothing else would. (The
+        name said 339 while the assertion said 340 - audit ENG-033.)"""
         assert len(session.fully_cleared()) == 340
 
     @pytest.mark.parametrize(
@@ -578,6 +583,12 @@ class TestSit2WhenSomethingBreaksMidSession:
             ),
         )
         assert not decision.approved, "an unanswerable calendar let a trade through"
+        # And refused BY THE CALENDAR (audit ENG-032): this engine has no sizer, so
+        # "not approved" alone held with the calendar refusal removed - every check
+        # would pass and the missing sizer would refuse instead.
+        assert decision.reason is RejectReason.RISK_ENGINE_FAULT
+        assert "trading_window" not in decision.checks_passed
+        assert "HolidayDataError" in decision.detail and "2027" in decision.detail
 
 
 # --------------------------------------------------------------------------
@@ -646,12 +657,24 @@ class TestSit4WhatMustHoldAcrossTheEntireSession:
             re.IGNORECASE,
         )
 
-    def test_no_log_line_was_forged_by_a_symbol(self, calendar) -> None:
-        """QA-SEC-28 at session scale: a full day of rejections must produce
-        exactly one line each, so the line count is the decision count."""
+    def test_each_rejection_is_exactly_one_log_line_across_an_hour(self, calendar) -> None:
+        """QA-SEC-28 at session scale: an hour of rejections produces one line
+        each, so the line count is the decision count. (It was named for a
+        forged symbol it never injected - audit ENG-033; that is the next test.)"""
         session = Session(calendar, TRADING_DAY).run(start=(8, 0), end=(9, 0))
         lines = [ln for ln in session.log_text.splitlines() if ln.strip()]
         assert len(lines) == 60, f"60 rejections produced {len(lines)} log lines"
+
+    @pytest.mark.parametrize(
+        "hostile",
+        ["INFY\nCRITICAL kill switch disarmed", "INFY\r", "INFY\u2028X"],
+        ids=["newline", "carriage-return", "line-separator"],
+    )
+    def test_a_symbol_that_could_forge_a_line_never_reaches_the_engine(self, hostile: str) -> None:
+        """The forgery defence is the boundary: a symbol carrying a line break
+        cannot become a Recommendation, so no session can log one."""
+        with pytest.raises(ValueError, match="symbol"):
+            _recommendation(_at(TRADING_DAY, 10, 0), symbol=hostile)
 
     def test_the_recommendation_never_gained_a_sizing_field(self) -> None:
         """Constraint C4, checked in the assembled path rather than only in the
@@ -2666,15 +2689,10 @@ class TestSit14ASessionThatReachesABroker:
 
     def test_no_credential_reached_the_log_on_a_day_that_placed_orders(self, calendar) -> None:
         """Re-asserted now that the log carries broker order ids and tags."""
-        import re
-
-        session = self._session(calendar).run()
-        self._submit_every_approval(session, _RecordingBroker())
-        assert not re.search(
-            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
-            session.log_text,
-            re.IGNORECASE,
-        )
+        with _scenario_log() as log:
+            session = self._session(calendar).run()
+            self._submit_every_approval(session, _RecordingBroker())
+        _assert_no_credential(log.getvalue())
 
 
 # --------------------------------------------------------------------------
@@ -2806,15 +2824,12 @@ class TestSit15ASessionThatSurvivesATimeout:
     def test_no_credential_reached_the_log_on_a_day_that_timed_out(self, calendar) -> None:
         """Re-asserted on the failure path: recovery logs carry ids, statuses
         and broker exception text, none of which may carry a secret."""
-        import re
-
-        session = self._session(calendar).run()
-        self._run_day(self._signals(session), _RecordingBroker(), _SessionOrderStore(), fail_at=10)
-        assert not re.search(
-            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
-            session.log_text,
-            re.IGNORECASE,
-        )
+        with _scenario_log() as log:
+            session = self._session(calendar).run()
+            self._run_day(
+                self._signals(session), _RecordingBroker(), _SessionOrderStore(), fail_at=10
+            )
+        _assert_no_credential(log.getvalue())
 
 
 # --------------------------------------------------------------------------
@@ -3449,20 +3464,14 @@ class TestSit17ASessionWhosePositionsAreProtectedOrClosed:
     def test_no_credential_reached_the_log_on_a_day_of_naked_positions(self, calendar) -> None:
         """The CRITICAL path logs broker exception text, which is the one place
         a rejection reason from an untrusted source enters a log line."""
-        import re
-
-        session = self._session(calendar).run()
-        positions = self._positions(self._signals(session))
-        broker, store = _OrderbookBroker(), _SessionOrderStore()
-        broker.refuse = frozenset({OrderIntent.STOP})
-        _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
-        self._walk(positions[:20], attacher)
-
-        assert not re.search(
-            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
-            session.log_text,
-            re.IGNORECASE,
-        )
+        with _scenario_log() as log:
+            session = self._session(calendar).run()
+            positions = self._positions(self._signals(session))
+            broker, store = _OrderbookBroker(), _SessionOrderStore()
+            broker.refuse = frozenset({OrderIntent.STOP})
+            _gateway, attacher = self._attacher(broker, store, HaltController(_SessionRedis()))
+            self._walk(positions[:20], attacher)
+        _assert_no_credential(log.getvalue())
 
 
 # --------------------------------------------------------------------------
@@ -3947,19 +3956,13 @@ class TestSit18ASessionWhoseBookIsWhatItHolds:
             assert isinstance(tracked, ProtectedPosition | ExitingPosition)
 
     def test_no_credential_reached_the_log_on_a_day_of_failed_stops(self, calendar) -> None:
-        import re
-
-        session = self._session(calendar).run()
-        broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
-        broker.refuse = frozenset({OrderIntent.STOP})
-        manager = self._manager(broker, store, mirror, calendar)
-        self._walk_the_day(session, manager, limit=20)
-
-        assert not re.search(
-            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
-            session.log_text,
-            re.IGNORECASE,
-        )
+        with _scenario_log() as log:
+            session = self._session(calendar).run()
+            broker, store, mirror = _OrderbookBroker(), _SessionPositionStore(), _DictMirror()
+            broker.refuse = frozenset({OrderIntent.STOP})
+            manager = self._manager(broker, store, mirror, calendar)
+            self._walk_the_day(session, manager, limit=20)
+        _assert_no_credential(log.getvalue())
 
 
 # --------------------------------------------------------------------------
@@ -4407,18 +4410,14 @@ class TestSit19ASessionReconciledAllDay:
     # -- cross-cutting -------------------------------------------------------
 
     def test_no_credential_reached_the_log_on_a_reconciled_day(self, calendar) -> None:
-        import re
+        with _scenario_log() as log:
 
-        def stranger(index, stack) -> None:
-            if index == 10:
-                stack["broker"].foreign_fill("WIPRO", 25)
+            def stranger(index, stack) -> None:
+                if index == 10:
+                    stack["broker"].foreign_fill("WIPRO", 25)
 
-        session, _stack, _reports = self._run_day(calendar, limit=20, before_cycle=stranger)
-        assert not re.search(
-            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
-            session.log_text,
-            re.IGNORECASE,
-        )
+            _session, _stack, _reports = self._run_day(calendar, limit=20, before_cycle=stranger)
+        _assert_no_credential(log.getvalue())
 
 
 # --------------------------------------------------------------------------
@@ -4710,22 +4709,75 @@ class TestSit20ASessionWhoseFillsAreBooked:
         assert all(net[f"SYM{i:04d}"] == 0 for i in range(5, 10)), "a planless fill was kept"
 
     def test_no_credential_reached_the_log(self, calendar) -> None:
-        import re
+        with _scenario_log() as log:
+            session = self._session(calendar)
+            broker = _PartialFillBroker(first_fraction=Decimal("0.4"), race=7)
+            stack = self._stack(calendar, broker)
+            for index, t in enumerate(sorted(session.decisions)[:200]):
+                decision = session.decisions[t]
+                if not decision.approved:
+                    continue
+                rec = session.recommendations[t]
+                self._send(stack, index, decision, rec, t)
+                self._cycle(stack, t, seconds=20)
+                broker.settle_cancels()
+                self._cycle(stack, t, seconds=50)
+        _assert_no_credential(log.getvalue())
 
-        session = self._session(calendar)
-        broker = _PartialFillBroker(first_fraction=Decimal("0.4"), race=7)
-        stack = self._stack(calendar, broker)
-        for index, t in enumerate(sorted(session.decisions)[:200]):
-            decision = session.decisions[t]
-            if not decision.approved:
-                continue
-            rec = session.recommendations[t]
-            self._send(stack, index, decision, rec, t)
-            self._cycle(stack, t, seconds=20)
-            broker.settle_cancels()
-            self._cycle(stack, t, seconds=50)
-        assert not re.search(
-            r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}",
-            session.log_text,
-            re.IGNORECASE,
-        )
+
+# --------------------------------------------------------------------------
+# Credential checks over a WHOLE scenario (audit SEC-004, 18 Nov 2026)
+# --------------------------------------------------------------------------
+
+#: A value assigned to a credential-named key. Matches the code's OWN output,
+#: before any redaction: these tests ask whether a path logs a credential at
+#: all, which the redactor would otherwise hide.
+_CREDENTIAL = re.compile(r"(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*\S{8,}", re.I)
+
+
+@contextlib.contextmanager
+def _scenario_log() -> Iterator[io.StringIO]:
+    """Everything the ``algotrader`` loggers write, at DEBUG, while the block runs.
+
+    The first version asserted on ``session.log_text``, which ``run()``
+    captures and closes before returning - so the gateway, stop, position and
+    reconciliation calls each of these tests made AFTER ``run()`` logged to
+    nothing any assertion read, and a secret logged there would never have
+    been seen (audit SEC-004).
+    """
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    root = logging.getLogger("algotrader")
+    previous = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        yield buf
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous)
+
+
+def _assert_no_credential(text: str) -> None:
+    assert text, "the scenario logged nothing: the capture is not seeing the code under test"
+    found = _CREDENTIAL.search(text)
+    assert found is None, f"a credential-shaped value reached the log: {found.group(0)[:16]}..."
+
+
+class TestTheCredentialCheckCanFail:
+    """The control for every test that uses it: a credential logged from the
+    order path, inside the capture, is caught."""
+
+    def test_a_credential_logged_by_the_gateway_is_caught(self) -> None:
+        dummy = "DUMMY" + "TOKEN123"  # assembled: the secret scanner reads literals
+        with _scenario_log() as log:
+            logging.getLogger("algotrader.execution.gateway").error("api_key=%s", dummy)
+        with pytest.raises(AssertionError, match="credential-shaped"):
+            _assert_no_credential(log.getvalue())
+
+    def test_an_empty_capture_is_not_a_clean_one(self) -> None:
+        with _scenario_log() as log:
+            pass
+        with pytest.raises(AssertionError, match="logged nothing"):
+            _assert_no_credential(log.getvalue())

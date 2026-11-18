@@ -20,6 +20,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 SRC = Path(__file__).resolve().parents[2] / "src" / "algotrader"
 MODE_VALUES = {"paper", "live", "alert_only", "approval"}
 
@@ -31,21 +33,66 @@ ALLOWED: dict[str, set[str]] = {
 }
 
 
+def _mode_aliases(tree: ast.AST) -> set[str]:
+    """Every local name bound to SystemMode: the class itself, an import
+    alias (``SystemMode as SM``) and a plain assignment (``M = SystemMode``)."""
+    names = {"SystemMode"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names.update(a.asname for a in node.names if a.name == "SystemMode" and a.asname)
+    changed = True
+    while changed:  # an alias of an alias is an alias
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _is_mode_class(node.value, names):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in names:
+                        names.add(target.id)
+                        changed = True
+    return names
+
+
+def _is_mode_class(node: ast.AST, aliases: set[str]) -> bool:
+    """``SystemMode``, an alias of it, or any attribute chain ending in it
+    (``enums.SystemMode``, ``algotrader.common.enums.SystemMode``)."""
+    if isinstance(node, ast.Name):
+        return node.id in aliases
+    return isinstance(node, ast.Attribute) and node.attr == "SystemMode"
+
+
 def _mode_references(source: str) -> tuple[set[str], list[str]]:
-    """The SystemMode members a source names, and its comparisons to mode strings."""
+    """The SystemMode members a source names, and its comparisons to mode strings.
+
+    Every spelling counts (audit ENG-045): the first version matched only the
+    literal ``SystemMode.X``, so ``SM.LIVE`` after an import alias,
+    ``enums.SystemMode.LIVE``, ``getattr(SystemMode, "LIVE")`` and a ``case
+    "live":`` arm each named a mode the scan could not see.
+    """
+    tree = ast.parse(source)
+    aliases = _mode_aliases(tree)
     members: set[str] = set()
     compares: list[str] = []
-    for node in ast.walk(ast.parse(source)):
-        if (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "SystemMode"
-        ):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _is_mode_class(node.value, aliases):
             members.add(node.attr)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and _is_mode_class(node.args[0], aliases)
+            and isinstance(node.args[1], ast.Constant)
+        ):
+            members.add(str(node.args[1].value))
+        operands: list[ast.AST] = []
         if isinstance(node, ast.Compare):
-            for operand in [node.left, *node.comparators]:
-                if isinstance(operand, ast.Constant) and str(operand.value).lower() in MODE_VALUES:
-                    compares.append(f"line {node.lineno}: {operand.value!r}")
+            operands = [node.left, *node.comparators]
+        elif isinstance(node, ast.MatchValue):
+            operands = [node.value]
+        for operand in operands:
+            if isinstance(operand, ast.Constant) and str(operand.value).lower() in MODE_VALUES:
+                line = getattr(node, "lineno", None) or getattr(operand, "lineno", 0)
+                compares.append(f"line {line}: {operand.value!r}")
     return members, compares
 
 
@@ -95,6 +142,33 @@ class TestTheScanSeesABranch:
     def test_a_string_branch_is_found(self) -> None:
         _, compares = _mode_references('if config.system.mode.value == "paper":\n    pass\n')
         assert compares == ["line 1: 'paper'"]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from algotrader.common.enums import SystemMode as SM\nif m is SM.LIVE:\n    pass\n",
+            "from algotrader.common.enums import SystemMode\nM = SystemMode\nN = M\nx = N.LIVE\n",
+            "from algotrader.common import enums\nif m is enums.SystemMode.LIVE:\n    pass\n",
+            "import algotrader.common.enums\nx = algotrader.common.enums.SystemMode.LIVE\n",
+            'from algotrader.common.enums import SystemMode\nx = getattr(SystemMode, "LIVE")\n',
+            "match m:\n    case SystemMode.LIVE:\n        pass\n",
+        ],
+        ids=[
+            "import-alias",
+            "assigned-alias",
+            "module-qualified",
+            "fully-qualified",
+            "getattr",
+            "match",
+        ],
+    )
+    def test_every_spelling_of_a_member_is_found(self, source: str) -> None:
+        """The control for ENG-045: each of these named LIVE unseen."""
+        assert "LIVE" in _mode_references(source)[0]
+
+    def test_a_match_on_a_modes_string_is_found(self) -> None:
+        _, compares = _mode_references('match mode:\n    case "live":\n        pass\n')
+        assert compares
 
     def test_an_unrelated_string_is_not(self) -> None:
         _, compares = _mode_references('if name == "papers":\n    pass\n')
