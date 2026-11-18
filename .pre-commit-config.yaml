@@ -1,0 +1,75 @@
+# The local barrier before a commit exists. Install once, from the repository
+# root:
+#
+#     pip install pre-commit && pre-commit install
+#
+# It lives HERE, at the git root (audit SEC-010, 18 Nov 2026). It used to sit
+# in Code/, where pre-commit never finds it - so it was never installed - and
+# it was written as if Code/ were the root: its .env rule was anchored at the
+# repository root and could not match Code/.env, its safety-invariants hook
+# pointed at a tests/ directory that does not exist from here, and its ruff
+# was v0.8.4 while CI runs 0.16.2. A barrier nobody could install was a
+# comment. tests/security/test_precommit_config.py holds each of these.
+#
+# The gitleaks hook is the important one. A leaked broker credential in git
+# history is a total-loss event in a PUBLIC repository, and CI's scan runs
+# only after the push - the cheapest place to stop it is before the commit.
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        name: gitleaks (block committed secrets)
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # The constraints pin (Code/constraints.txt ruff==0.16.2): a hook running
+    # another ruff formats differently from CI.
+    rev: v0.16.2
+    hooks:
+      # CHECK only, as CI does: a hook never rewrites the owner's files. And no
+      # --config: ruff then finds Code/pyproject.toml for each file and
+      # resolves its paths from there. Passed as --config from the repository
+      # root, its per-file rules and first-party package resolved against the
+      # root instead - the first install "fixed" 92 files into an import order
+      # CI rejects (18 Nov 2026).
+      - id: ruff
+        files: ^Code/
+      - id: ruff-format
+        args: [--check]
+        files: ^Code/
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      # Neither hook below uses a shell. On Windows `bash` on the PATH is often
+      # WSL's launcher, and with no Linux installed it fails both hooks with
+      # execvpe(/bin/bash) - the first version did, on the owner's machine.
+
+      - id: no-env-files
+        name: block .env files from being committed
+        # `fail` refuses every staged file the pattern matches: a .env at ANY
+        # depth - Code/.env is the one that exists - never a .env.example.
+        language: fail
+        entry: "Refusing to commit a .env file - secrets live outside git"
+        files: (^|/)\.env(\.[^/]*)?$
+        exclude: (^|/)\.env\.example$
+
+      - id: safety-invariants
+        name: safety invariants must hold
+        # Code/tests/security with the project's own interpreter, in Code/.
+        # The container-backed tests are left to CI: a hook that needs Docker
+        # is a hook people bypass.
+        language: python
+        entry: python scripts/hooks/safety_invariants.py
+        pass_filenames: false
+        files: ^Code/.*\.py$

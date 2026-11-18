@@ -1,0 +1,18 @@
+# Every action in .github/workflows is pinned to a commit SHA (audit SEC-003).
+# A pin that nothing updates goes stale - and a stale pin of a security action
+# is its own risk - so Dependabot proposes each new release as a pull request,
+# with the new SHA and the release in the comment, for review like any change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    # The workflows are developed on DEV; a pin update belongs there, and
+    # reaches QA by promotion like any change. NOTE: GitHub reads this file
+    # only from the DEFAULT branch, which is `main` (the README-only first
+    # commit), so until the owner makes DEV the default branch - or this file
+    # is also placed on main - Dependabot does not run (18 Nov 2026).
+    target-branch: DEV
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"

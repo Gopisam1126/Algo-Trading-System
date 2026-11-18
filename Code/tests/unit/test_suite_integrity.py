@@ -39,6 +39,11 @@ CONTAINER_FIXTURES = (
     "redis_container",
     "redis_url",
     "redis_client",
+    # A module may start its OWN container rather than share the session's -
+    # test_service_login.py does, because it needs the first-init script
+    # mounted (18 Nov 2026). Constructing one needs Docker just the same.
+    "PostgresContainer(",
+    "RedisContainer(",
 )
 
 

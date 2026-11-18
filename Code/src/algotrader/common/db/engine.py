@@ -66,6 +66,31 @@ def create_engine(config: DatabaseConfig, password: str | None = None) -> AsyncE
     )
 
 
+async def open_service_engine(config: DatabaseConfig, password: str | None = None) -> AsyncEngine:
+    """The engine a SERVICE uses: refused unless its login cannot rewrite the record.
+
+    :func:`create_engine` plus :func:`~algotrader.common.db.privilege.require_least_privilege`
+    on a first connection, so a service started with the owner's DSN - the
+    migration user, which can UPDATE and DELETE the audit trail - stops at
+    start instead of running with rights every grant was written to deny
+    (audit SEC-002). The engine is disposed if the check refuses.
+
+    Process entrypoints (E23-S03) build their engine here, not with
+    :func:`create_engine`; ``tests/security/test_service_entrypoints.py``
+    holds every ``__main__`` to that.
+    """
+    from algotrader.common.db.privilege import require_least_privilege
+
+    engine = create_engine(config, password)
+    try:
+        async with engine.connect() as conn:
+            await require_least_privilege(conn)
+    except BaseException:
+        await engine.dispose()
+        raise
+    return engine
+
+
 def create_engine_from_url(
     url: str, *, echo: bool = False, connect_timeout_seconds: int = 10
 ) -> AsyncEngine:

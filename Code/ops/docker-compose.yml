@@ -1,14 +1,27 @@
 # ===========================================================================
 # Docker Compose — nine services on one India-region host.
 #
-# Two security properties are load-bearing here (LOW_LEVEL_ARCHITECTURE.md
-# §10.3, §13.2):
+# Three security properties are load-bearing here (LOW_LEVEL_ARCHITECTURE.md
+# §10.3, §13.2), and tests/security/test_compose_secrets.py holds each one -
+# on this file AND on what `docker compose config` renders from it:
 #
 #   1. The `core` network is `internal: true` — services on it have NO
 #      internet access at all.  A compromised service cannot phone home.
-#   2. Only `execution-svc` receives trading credentials.  Compromising
-#      `signal-engine` (the largest attack surface, since it processes AI
-#      responses) still cannot place an order.
+#   2. Each container receives ONLY the variables its own job uses, by name.
+#      Nothing reads the whole .env: until 18 Nov 2026 `env_file: [../.env]`
+#      sat in the shared anchor, so the Kite key, secret and token reached
+#      every app container and the upstream Redis, TimescaleDB, Prometheus and
+#      Grafana images - while this header said only execution-svc held them
+#      (audit SEC-001).  Now only `execution-svc` receives any KITE_* value.
+#   3. Services connect to the database as `algotrader_svc`, a login that is a
+#      member of `algotrader_app` and owns nothing - so it cannot rewrite the
+#      audit trail or a strategy's document.  The owner's password reaches only
+#      the database container and the host's `make migrate` (audit SEC-002).
+#
+# Kite has NO data-only API scope: any access token places orders.  So the
+# feed (market-ingest) and the pre-market history (premarket-job) receive no
+# Kite credential here, and how the daily token reaches them is decided with
+# the process entrypoints (E23-S03) - not granted here by default.
 #
 # The dashboard binds to 127.0.0.1 only.  Reach it over WireGuard or an SSH
 # tunnel — a dashboard not reachable from the internet cannot be attacked
@@ -19,31 +32,41 @@ name: algotrader
 
 x-common: &common
   restart: unless-stopped
-  env_file: [../.env]
   security_opt: ["no-new-privileges:true"]
   cap_drop: ["ALL"]
   logging:
     driver: json-file
     options: {max-size: "50m", max-file: "5"}
 
+# What EVERY app service receives.  A service adds its own credentials with
+# `environment: {<<: *app-env, NAME: ...}` - never with a bare `environment:`,
+# because a YAML merge is SHALLOW: a service that declared its own mapping used
+# to REPLACE this one, and market-ingest, signal-engine and execution-svc had
+# no DATABASE_URL or REDIS_URL at all (found 18 Nov 2026).
+#
+# The two URLs OVERRIDE config/system.yaml's `database:` and `redis:` sections
+# for containers only, and they must: system.yaml says `localhost`, which is
+# right on the host and, inside a container, is the container itself.
+x-app-env: &app-env
+  ALGOTRADER_ENV: ${ALGOTRADER_ENV:-development}
+  ALGOTRADER_CONFIRM_LIVE: ${ALGOTRADER_CONFIRM_LIVE:-}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  SECRETS_PROVIDER: ${SECRETS_PROVIDER:-env}
+  DATABASE_URL: >-
+    postgresql+psycopg://${ALGOTRADER_APP_DB_USER:-algotrader_svc}:${ALGOTRADER_APP_DB_PASSWORD:?set ALGOTRADER_APP_DB_PASSWORD in .env}@timescaledb:5432/${POSTGRES_DB:-algotrader}
+  REDIS_URL: redis://redis:6379/0
+
 x-app: &app
   <<: *common
   build:
     context: ..
     dockerfile: ops/Dockerfile
-  # These two OVERRIDE config/system.yaml's `database:` and `redis:` sections
-  # for containers only, and they must.  system.yaml says `localhost` because
-  # that is correct when you run the app on the host; inside this network the
-  # datastores are reachable as `timescaledb` and `redis`, and `localhost`
-  # would resolve to the app container itself.
-  #
-  # `environment` beats `env_file`, so these also win over anything in ../.env.
-  # The credential still comes from POSTGRES_PASSWORD — it is interpolated
-  # here, not duplicated.
-  environment:
-    DATABASE_URL: >-
-      postgresql+psycopg://${POSTGRES_USER:-algotrader}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@timescaledb:5432/${POSTGRES_DB:-algotrader}
-    REDIS_URL: redis://redis:6379/0
+  # The application cannot rewrite its own code (audit ENG-031): the root
+  # filesystem is read-only, /tmp is scratch, and /app/data is the one volume
+  # it writes.  The image's src and config are owned by root as well.
+  read_only: true
+  tmpfs: [/tmp]
+  environment: *app-env
   volumes:
     - ../config:/app/config:ro          # config is read-only to the app
     - app-data:/app/data
@@ -71,10 +94,16 @@ services:
     <<: *common
     image: timescale/timescaledb:2.17.2-pg16
     environment:
+      # The OWNER: initialises the database and runs the migrations.
       POSTGRES_DB: ${POSTGRES_DB:-algotrader}
       POSTGRES_USER: ${POSTGRES_USER:-algotrader}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-    volumes: [tsdb-data:/var/lib/postgresql/data]
+      # The SERVICES' login, created on first init by postgres/initdb/10-app-login.sh.
+      ALGOTRADER_APP_DB_USER: ${ALGOTRADER_APP_DB_USER:-algotrader_svc}
+      ALGOTRADER_APP_DB_PASSWORD: ${ALGOTRADER_APP_DB_PASSWORD:?set ALGOTRADER_APP_DB_PASSWORD in .env}
+    volumes:
+      - tsdb-data:/var/lib/postgresql/data
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     networks: [core]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotrader}"]
@@ -98,6 +127,10 @@ services:
     <<: *app
     command: python -m algotrader.notifier
     networks: [core, notify-egress]
+    environment:
+      <<: *app-env
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
 
   # -------------------------------------------------------------- market ---
   market-ingest:
@@ -105,6 +138,7 @@ services:
     command: python -m algotrader.ingest
     networks: [core, broker-egress]
     environment:
+      <<: *app-env
       ALGOTRADER_ROLE: market-ingest
       BROKER_READ_ONLY: "true"           # read-only adapter; cannot trade
 
@@ -117,12 +151,18 @@ services:
     command: python -m algotrader.signals
     networks: [core, ai-egress]
     environment:
+      <<: *app-env
       BROKER_READ_ONLY: "true"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
 
   macro-svc:
     <<: *app
     command: python -m algotrader.macro
     networks: [core, ai-egress, data-egress]
+    environment:
+      <<: *app-env
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NEWS_API_KEY: ${NEWS_API_KEY:-}
 
   # ------------------------------------------------------------ execution ---
   # The ONLY service holding trading credentials.
@@ -131,14 +171,23 @@ services:
     command: python -m algotrader.execution
     networks: [core, broker-egress]
     environment:
+      <<: *app-env
       ALGOTRADER_ROLE: execution
       BROKER_READ_ONLY: "false"
+      KITE_API_KEY: ${KITE_API_KEY:-}
+      KITE_API_SECRET: ${KITE_API_SECRET:-}
+      KITE_USER_ID: ${KITE_USER_ID:-}
+      KITE_REDIRECT_URI: ${KITE_REDIRECT_URI:-}
 
   # ------------------------------------------------------------ scheduled ---
   premarket-job:
     <<: *app
     command: python -m algotrader.premarket
     networks: [core, ai-egress, data-egress, broker-egress]
+    environment:
+      <<: *app-env
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NEWS_API_KEY: ${NEWS_API_KEY:-}
     deploy:
       resources:
         limits: {cpus: "3.0", memory: 6G}   # heaviest compute of the day

@@ -110,6 +110,12 @@ def _docker_available() -> bool:
 
 DOCKER_AVAILABLE = _docker_available()
 
+#: Set to "1" where a run must be COMPLETE - CI and the QA gate. There a
+#: Docker daemon that cannot be reached fails the session instead of skipping
+#: every container-backed test: pytest exits 0 on skips, and on 15 Oct 2026 a
+#: run reported success with 332 of them (audit ENG-036).
+REQUIRE_DOCKER_ENV = "REQUIRE_DOCKER"
+
 _SKIP_REASON = (
     "Docker is not running, so the integration tests cannot start their "
     "containers. Start Docker Desktop and re-run. These tests are skipped, "
@@ -139,10 +145,18 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     """
     if DOCKER_AVAILABLE:
         return
+    gated = [item for item in items if item.get_closest_marker("integration") is not None]
+    if gated and os.environ.get(REQUIRE_DOCKER_ENV) == "1":
+        # CI and the QA gate set this (audit ENG-036): there, a skipped
+        # container suite is a failed run, not a green one with less in it.
+        raise pytest.UsageError(
+            f"{REQUIRE_DOCKER_ENV}=1 and Docker is not reachable: {len(gated)} "
+            f"container-backed test(s) would be skipped. Start Docker, or unset "
+            f"{REQUIRE_DOCKER_ENV} for a run you know is partial."
+        )
     skip = pytest.mark.skip(reason=_SKIP_REASON)
-    for item in items:
-        if item.get_closest_marker("integration") is not None:
-            item.add_marker(skip)
+    for item in gated:
+        item.add_marker(skip)
 
 
 def pytest_report_header(config: pytest.Config) -> list[str]:

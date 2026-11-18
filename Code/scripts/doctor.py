@@ -73,16 +73,22 @@ def check_python(r: Report) -> None:
 
 
 def check_dependencies(r: Report) -> None:
+    # What the deployed code imports (pyproject `dependencies`, ENG-039). The
+    # AI client and the dashboard are EXTRAS for services not built yet, so
+    # their absence is not a failure; TA-Lib is the TEST suite's reference
+    # implementation, never the "indicator hot path" this once called it.
     required = {
         "pydantic": "core validation",
         "yaml": "config loading",
         "redis": "message fabric",
         "sqlalchemy": "persistence",
+        "psycopg": "the PostgreSQL driver",
         "structlog": "logging + redaction",
-        "anthropic": "AI layer",
-        "fastapi": "dashboard",
+        "pyarrow": "the bar archive",
+        "websockets": "the market feed",
+        "kiteconnect": "the broker",
     }
-    optional = {"talib": "indicator hot path", "uvloop": "faster event loop"}
+    optional = {"anthropic": "AI layer (extra: ai)", "fastapi": "dashboard (extra: api)"}
 
     for mod, why in required.items():
         try:
@@ -576,14 +582,42 @@ def check_secrets(r: Report) -> None:
     if fallback_key and fallback_key != primary_key:
         _check(fallback_key, role="fallback", blocks_live=False)
 
-    if Path(".env").exists():
-        import stat
+    check_env_file_permissions(r)
 
-        mode = Path(".env").stat().st_mode
-        if mode & (stat.S_IRGRP | stat.S_IROTH):
-            r.warn(".env is group/world readable", "chmod 600 .env")
-        else:
-            r.ok(".env permissions look sane")
+
+#: The .env this deployment reads - beside this script's project, not in
+#: whatever directory doctor happens to be run from.
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
+
+def check_env_file_permissions(
+    r: Report, path: Path = ENV_FILE, *, posix: bool | None = None
+) -> None:
+    """Whether the credentials file is readable by anyone but its owner.
+
+    It used to look for ``.env`` relative to the CURRENT directory, so run from
+    anywhere but Code/ it checked nothing and said nothing; and it read POSIX
+    mode bits on Windows, which carry no access control there, and advised a
+    ``chmod`` that cannot help (audit ENG-042). Now it checks the project's
+    file, and on Windows says what it cannot check rather than passing.
+    """
+    import os
+    import stat
+
+    if not path.exists():
+        return
+    if not (os.name == "posix" if posix is None else posix):
+        r.warn(
+            ".env permissions not checked on this platform",
+            f"{path} is protected by its ACL, not mode bits: "
+            "icacls .env /inheritance:r /grant:r %USERNAME%:F",
+        )
+        return
+    mode = path.stat().st_mode
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        r.warn(".env is group/world readable", f"chmod 600 {path}")
+    else:
+        r.ok(".env permissions look sane")
 
 
 def main() -> int:

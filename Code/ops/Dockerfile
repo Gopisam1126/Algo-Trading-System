@@ -1,6 +1,8 @@
 # ===========================================================================
-# Multi-stage build.  The runtime image runs as a non-root user with a
-# read-only application directory — see LOW_LEVEL_ARCHITECTURE.md §10.5.
+# Multi-stage build.  The runtime image runs as a non-root user that cannot
+# write its own code — see LOW_LEVEL_ARCHITECTURE.md §10.5.  /app holds
+# exactly config, data and src; only data belongs to the runtime user, and
+# CI's image job asserts both (audit ENG-031, ENG-048).
 # ===========================================================================
 
 # --- Stage 1: build the application venv -----------------------------------
@@ -62,8 +64,12 @@ ENV PATH="/opt/venv/bin:$PATH" \
     TZ=Asia/Kolkata
 
 WORKDIR /app
-COPY --chown=algotrader:algotrader src ./src
-COPY --chown=algotrader:algotrader config ./config
+# Owned by root, so the runtime user can read and not rewrite them. They used
+# to be chowned to that user while this file's header promised a read-only
+# application directory: code execution in a container could persist itself
+# into /app/src (audit ENG-031, 18 Nov 2026).
+COPY src ./src
+COPY config ./config
 
 RUN mkdir -p /app/data && chown -R algotrader:algotrader /app/data
 
