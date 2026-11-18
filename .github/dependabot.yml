@@ -6,6 +6,12 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    # The workflows are developed on DEV; a pin update belongs there, and
+    # reaches QA by promotion like any change. NOTE: GitHub reads this file
+    # only from the DEFAULT branch, which is `main` (the README-only first
+    # commit), so until the owner makes DEV the default branch - or this file
+    # is also placed on main - Dependabot does not run (18 Nov 2026).
+    target-branch: DEV
     schedule:
       interval: weekly
     commit-message:

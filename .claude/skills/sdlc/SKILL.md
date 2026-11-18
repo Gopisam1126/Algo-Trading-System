@@ -444,6 +444,16 @@ distribution appears once and every package matches its `constraints.txt` pin
 orphaned `.dist-info` (or renaming a complete `~name` stash back), never by
 another blind reinstall - each swap is another chance for the lock.
 
+**A change that REMOVES a dependency is verified in a fresh venv, not the dev
+one.** The dev venv keeps every package it ever had, so a test that relies on
+one the change dropped - directly or as somebody's transitive dependency -
+passes there and fails in CI. On 18 Nov 2026 ENG-039 moved `webauthn` to an
+extra, `pyasn1` (which only it pulled in) vanished from CI's install, and a
+hygiene test asserting the fixed `pyasn1` was installed turned CI Run 152 red
+after a fully green local gate. Before pushing a `pyproject.toml` change:
+`py -3.11 -m venv <scratchpad>/civenv`, CI's three install commands into it,
+then the whole suite with that interpreter.
+
 **`doctor.py` on a development machine** fails the *Datastores* section and
 warns under *Secrets*, *SEBI compliance* and *Network*, because the deployment
 secrets are not there — that is expected, and it exits 1 for it. Any FAIL in

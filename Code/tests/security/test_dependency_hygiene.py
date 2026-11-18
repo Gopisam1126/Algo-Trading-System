@@ -342,6 +342,15 @@ FIXED_FLOORS: dict[str, tuple[int, ...]] = {
     "pyasn1": (0, 6, 5),
 }
 
+#: Of FIXED_FLOORS, the packages every install carries - twisted arrives with
+#: kiteconnect, which imports it unconditionally. pyasn1 arrived only with
+#: webauthn, which moved to the `api` extra with ENG-039 (18 Nov 2026): CI's
+#: install no longer has it, and an absent package carries no advisory. It
+#: must still be at the floor WHERE installed, and its constraints pin is
+#: held below for whoever installs `.[api]`. (CI Run 152 failed on asserting
+#: an absent package was installed - found reproducing CI's exact install.)
+ALWAYS_INSTALLED: frozenset[str] = frozenset({"twisted"})
+
 #: The module each subsystem's advisory is actually in — imported by the
 #: control to prove the probe would see it.
 VULNERABLE_MODULES = (
@@ -435,7 +444,11 @@ class TestTheAcceptedTwistedAdvisories:
 
     def test_the_fixed_releases_are_installed(self) -> None:
         for package, floor in FIXED_FLOORS.items():
-            installed = md.version(package)
+            try:
+                installed = md.version(package)
+            except md.PackageNotFoundError:
+                assert package not in ALWAYS_INSTALLED, f"{package} is not installed at all"
+                continue  # absent: no advisory to carry; the pin test covers an install
             assert _version_tuple(installed) >= floor, (
                 f"{package} {installed} is below {'.'.join(map(str, floor))}, the first "
                 f"release fixing the advisories ACCEPTED_ADVISORIES no longer ignores"
