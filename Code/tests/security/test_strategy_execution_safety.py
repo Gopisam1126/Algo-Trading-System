@@ -15,8 +15,10 @@ execution, never a position without a stop, never an unbounded loop.
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 from decimal import Decimal
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -47,6 +49,32 @@ primitive_registry.install()
 NOW = dt.datetime(2026, 8, 20, 5, 0, tzinfo=dt.UTC)
 
 
+STRATEGY_PACKAGE = Path(runtime.__file__).resolve().parent
+
+#: Calls that turn data into code, by the name they are called as.
+_DYNAMIC_CALLS = frozenset({"eval", "exec", "compile", "__import__"})
+
+
+def _dynamic_execution(root: Path) -> list[str]:
+    """Every dynamic-execution site under ``root``, as ``file:line: what``."""
+    found: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            what = None
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                what = node.func.id if node.func.id in _DYNAMIC_CALLS else None
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "import_module":
+                    what = "importlib.import_module"
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [a.name for a in node.names] + [getattr(node, "module", None) or ""]
+                if any(n.split(".")[0] == "importlib" for n in names):
+                    what = "import importlib"
+            if what:
+                found.append(f"{path.name}:{getattr(node, 'lineno', 0)}: {what}")
+    return found
+
+
 def _snapshot() -> MultiTimeframeSnapshot:
     return MultiTimeframeSnapshot(
         symbol="INFY",
@@ -74,13 +102,32 @@ def _ctx(**kw) -> EvalContext:
 class TestNoCodeExecutionPathExists:
     """Invariant 3, probed rather than asserted."""
 
-    def test_the_evaluator_modules_contain_no_dynamic_execution(self) -> None:
-        import inspect
+    def test_no_module_in_the_strategy_package_executes_dynamically(self) -> None:
+        """EVERY module under strategy/, by AST (audit ENG-047): the first
+        version scanned two modules' text, so an ``eval`` in dsl.py or the
+        registry passed - and a text scan cannot tell the builtin ``compile``
+        from ``re.compile``."""
+        offenders = _dynamic_execution(STRATEGY_PACKAGE)
+        assert len(list(STRATEGY_PACKAGE.rglob("*.py"))) >= 6, "the scan is not seeing the package"
+        assert offenders == []
 
-        for module in (runtime, evaluators):
-            source = inspect.getsource(module)
-            for forbidden in ("eval(", "exec(", "__import__", "importlib", "compile("):
-                assert forbidden not in source, f"{module.__name__} contains {forbidden}"
+    def test_the_scan_would_see_each_spelling(self, tmp_path) -> None:
+        """The control - and the case a text scan got wrong: re.compile is fine."""
+        (tmp_path / "a.py").write_text(
+            "import re\nPAT = re.compile('x')\nimport importlib\ndef f(s):\n"
+            "    eval(s)\n    exec(s)\n    compile(s, 'f', 'exec')\n    __import__(s)\n"
+            "    importlib.import_module(s)\n",
+            encoding="utf-8",
+        )
+        found = {line.split(": ", 1)[1] for line in _dynamic_execution(tmp_path)}
+        assert found == {
+            "import importlib",
+            "eval",
+            "exec",
+            "compile",
+            "__import__",
+            "importlib.import_module",
+        }
 
     def test_a_primitive_name_is_a_dict_lookup_not_a_resolution(self) -> None:
         """The whole defence: an unknown name finds nothing rather than
@@ -163,7 +210,9 @@ class TestAdversarialParametersFailClosed:
         ctx = _ctx(last_price=Decimal("1.00"))
         stop = evaluators.atr_stop(ctx, {"multiplier": Decimal("5"), "period": 14})
         assert stop is not None and stop <= 0
-        # The evaluator refuses to fire on it, which is where it matters.
+        # The helper refuses it. That fire() consults the helper - the path
+        # that matters - is tested through fire() itself:
+        # tests/unit/test_strategy_runtime.py::test_a_stop_below_zero_means_fire_returns_nothing
         doc = compile_strategy(load_strategy_yaml(_MINIMAL_STRATEGY))
         assert StrategyEvaluator(doc)._stop_is_on_the_right_side(stop, ctx) is False
 

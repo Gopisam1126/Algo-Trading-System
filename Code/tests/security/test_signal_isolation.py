@@ -96,6 +96,47 @@ class TestTheSignalsPackageCannotReachAnOrder:
         names = _imports("def f():\n    from algotrader.execution.gateway import OrderGateway\n")
         assert any(n.startswith("algotrader.execution") for n in names)
 
+    def test_nothing_it_reaches_transitively_is_the_order_path(self) -> None:
+        """Through strategy, indicators, common - every module the package can
+        reach by importing. The direct scan above promised "cannot reach an
+        order" and checked one hop: signals -> strategy -> execution would have
+        passed it (audit ENG-046, 18 Nov 2026)."""
+        from tests.import_closure import SRC, closure
+
+        start = ["algotrader.signals"] + [
+            f"algotrader.signals.{p.stem}"
+            for p in (SRC / "algotrader" / "signals").glob("*.py")
+            if p.stem != "__init__"
+        ]
+        reached = closure(start)
+        assert len(reached) > 50, "the closure is not following the imports"
+        offenders = sorted(
+            n for n in reached if any(n == f or n.startswith(f + ".") for f in FORBIDDEN)
+        )
+        assert offenders == []
+
+    def test_the_closure_would_see_a_path_two_hops_away(self) -> None:
+        """The control: signals imports strategy, strategy imports the gateway."""
+        from tests.import_closure import closure
+
+        graph = {
+            "algotrader.signals.loop": "from algotrader.strategy import runtime\n",
+            "algotrader.strategy.runtime": "import algotrader.execution.gateway\n",
+            "algotrader.execution.gateway": "",
+        }
+        reached = closure(["algotrader.signals.loop"], read=graph.get)
+        assert "algotrader.execution.gateway" in reached
+
+    def test_a_type_checking_import_reaches_nothing(self) -> None:
+        """It never executes, so it is no path to an order."""
+        from tests.import_closure import imported_names
+
+        source = (
+            "from typing import TYPE_CHECKING\n"
+            "if TYPE_CHECKING:\n    from algotrader.execution.gateway import OrderGateway\n"
+        )
+        assert not any(n.startswith("algotrader.execution") for n in imported_names(source, "x"))
+
 
 class TestAShadowTriggerHasOneDestination:
     def test_the_recorder_holds_a_store_and_nothing_else(self) -> None:
