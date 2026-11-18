@@ -82,9 +82,15 @@ class TestMaxlenIsMandatory:
             await stream.publish(r, STREAM, make_envelope(i), maxlen=50)
         assert await stream.stream_length(r, STREAM) < 500
 
+    async def test_the_audit_stream_cannot_be_published_to(self, r: aioredis.Redis) -> None:
+        """NR-010: nothing drains stream:audit, and a capped stream trims, so an
+        audit entry there would be discarded silently. AuditWriter is the path."""
+        with pytest.raises(stream.StreamError, match="AuditWriter"):
+            await stream.publish(r, "stream:audit", make_envelope(0), maxlen=50_000)
+        assert await stream.stream_length(r, "stream:audit") == 0
+
     def test_documented_caps_match_the_capacity_analysis(self) -> None:
         assert stream.default_maxlen("stream:ticks") == 100_000
-        assert stream.default_maxlen("stream:audit") == 50_000
         assert stream.default_maxlen("stream:bars:5m") == 10_000
         assert stream.default_maxlen("stream:unknown:thing") > 0
 
@@ -124,16 +130,54 @@ class TestEnvelope:
         with pytest.raises(ValueError):
             Envelope.from_fields({"message_id": "not-a-uuid"})
 
-    def test_decimal_survives_as_a_string_not_a_float(self) -> None:
-        """Money must not silently become float across a stream hop."""
+    def test_a_decimal_comes_back_as_its_exact_string_never_a_float(self) -> None:
+        """Money must not silently become float across a stream hop. It used to
+        pass a str in and assert a str came out, proving nothing about the
+        docstring's claim that a Decimal round-trips as a Decimal - which was
+        false: it comes back as a STRING, the documented type now (ENG-012)."""
         env = Envelope(
             correlation_id=uuid.uuid4(),
             emitted_at=dt.datetime.now(dt.UTC),
             emitted_by="t",
-            payload={"price": str(Decimal("1234.5678"))},
+            payload={"price": Decimal("1234.5678"), "at": dt.datetime(2026, 11, 17, tzinfo=dt.UTC)},
         )
         back = Envelope.from_fields(env.to_fields())
+        assert type(back.payload["price"]) is str
         assert Decimal(back.payload["price"]) == Decimal("1234.5678")
+        assert type(back.payload["at"]) is str
+
+    @pytest.mark.parametrize(
+        "bad",
+        [float("nan"), float("inf"), Decimal("NaN"), Decimal("-Infinity"), [1.0, float("nan")]],
+        ids=["nan", "inf", "decimal-nan", "decimal-inf", "nested"],
+    )
+    def test_a_non_finite_number_is_refused_at_construction(self, bad: object) -> None:
+        """Pydantic writes NaN as null: a NaN price arrived as None, 'missing'
+        rather than 'invalid' (ENG-012)."""
+        with pytest.raises(ValueError, match="finite"):
+            Envelope(
+                correlation_id=uuid.uuid4(),
+                emitted_at=dt.datetime.now(dt.UTC),
+                emitted_by="t",
+                payload={"x": {"y": bad}},
+            )
+
+    @pytest.mark.parametrize("version", [0, 2, 99])
+    def test_an_unknown_schema_version_is_refused(self, version: int) -> None:
+        with pytest.raises(ValueError, match="schema_version"):
+            Envelope(
+                correlation_id=uuid.uuid4(),
+                emitted_at=dt.datetime.now(dt.UTC),
+                emitted_by="t",
+                payload={},
+                schema_version=version,
+            )
+
+    def test_a_future_version_off_the_wire_is_refused(self) -> None:
+        fields = make_envelope().to_fields()
+        fields["schema_version"] = "2"
+        with pytest.raises(ValueError, match="schema_version"):
+            Envelope.from_fields(fields)
 
 
 class TestConsumerGroups:
@@ -167,9 +211,26 @@ class TestConsumerGroups:
         await stream.acknowledge(r, STREAM, GROUP, *[d.entry_id for d in got])
         assert await stream.pending_count(r, STREAM, GROUP) == 0
 
-    async def test_each_process_gets_a_distinct_consumer_name(self) -> None:
+    async def test_a_consumer_name_is_the_same_across_restarts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ENG-013: a fresh name per process stranded the predecessor's pending
+        entries. One per service instance, the same every time."""
+        monkeypatch.delenv(stream.INSTANCE_ENV, raising=False)
+        assert stream.consumer_name("svc") == stream.consumer_name("svc") == "svc-1"
+
+    async def test_a_second_instance_gets_its_own_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Sharing a name means sharing a pending list — one can ack the other's work."""
-        assert stream.new_consumer_name("svc") != stream.new_consumer_name("svc")
+        monkeypatch.setenv(stream.INSTANCE_ENV, "2")
+        assert stream.consumer_name("svc") == "svc-2"
+        assert stream.consumer_name("svc", instance="3") == "svc-3"
+
+    @pytest.mark.parametrize("bad", ["", "A", "x y", "a:b", "-1", "x" * 33])
+    async def test_an_unsafe_instance_is_refused(self, bad: str) -> None:
+        with pytest.raises(stream.StreamError):
+            stream.consumer_name("svc", instance=bad)
 
 
 class TestCrashRecovery:

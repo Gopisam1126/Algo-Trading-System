@@ -25,6 +25,8 @@ from typing import ClassVar
 import psycopg
 import pytest
 
+from tests.approvals import approve
+
 pytestmark = [pytest.mark.integration]
 
 _HASH_A = "0" * 64
@@ -319,9 +321,20 @@ class TestStrategyApprovalGate:
             self._insert_strategy(conn, state="ACTIVE")
 
     def test_br5_active_with_approval_is_accepted(self, conn: psycopg.Connection) -> None:
-        self._insert_strategy(
-            conn, state="ACTIVE", approved_by="human", approved_at=datetime.now(UTC)
-        )
+        """An approval of the document by the approver role (RSK-007)."""
+        sid = f"strat-{uuid.uuid4().hex[:8]}"
+        self._insert_strategy(conn, id=sid, state="AWAITING_APPROVAL")
+        approve(conn, sid)
+        conn.execute("UPDATE strategy SET state = 'ACTIVE' WHERE id = %s", (sid,))
+        row = conn.execute("SELECT approved_by FROM strategy WHERE id = %s", (sid,)).fetchone()
+        assert row is not None and row[0] == "operator", "the approver was not copied"
+
+    def test_br5_approval_columns_set_by_hand_do_not_count(self, conn: psycopg.Connection) -> None:
+        """RSK-007: the two columns WERE the gate, and the app could write them."""
+        with pytest.raises(psycopg.errors.CheckViolation, match="no approval of this document"):
+            self._insert_strategy(
+                conn, state="ACTIVE", approved_by="human", approved_at=datetime.now(UTC)
+            )
 
     def test_br5_cannot_be_bypassed_by_update(self, conn: psycopg.Connection) -> None:
         """A CHECK, not an application rule — so a bad UPDATE cannot promote one either."""
@@ -506,9 +519,15 @@ class TestEveryTableHasDeliberateGrants:
             APPEND_ONLY_TABLES,
             LIFECYCLE_COLUMNS,
             MUTABLE_TABLES,
+            READ_ONLY_TABLES,
         )
 
-        categories = [set(MUTABLE_TABLES), set(APPEND_ONLY_TABLES), set(LIFECYCLE_COLUMNS)]
+        categories = [
+            set(MUTABLE_TABLES),
+            set(APPEND_ONLY_TABLES),
+            set(LIFECYCLE_COLUMNS),
+            set(READ_ONLY_TABLES),
+        ]
         assert set.union(*categories) == self._model_tables()
         assert sum(len(c) for c in categories) == len(self._model_tables()), "a table is in two"
 
@@ -532,6 +551,28 @@ class TestEveryTableHasDeliberateGrants:
                 ).fetchall()
             }
             assert updatable == set(columns), table
+
+    def test_read_only_tables_are_select_only_for_the_app(self, conn: psycopg.Connection) -> None:
+        """RSK-007: the approval table's writer is a role the app is not."""
+        from algotrader.common.db.models import READ_ONLY_TABLES
+
+        for table in READ_ONLY_TABLES:
+            assert self._granted(conn, table) == {"SELECT"}, table
+
+    def test_the_approver_can_write_approvals_and_nothing_of_the_apps(
+        self, conn: psycopg.Connection
+    ) -> None:
+        rows = conn.execute(
+            """
+            SELECT table_name, privilege_type FROM information_schema.role_table_grants
+            WHERE grantee = 'algotrader_approver'
+            """
+        ).fetchall()
+        assert set(rows) == {
+            ("strategy_approval", "SELECT"),
+            ("strategy_approval", "INSERT"),
+            ("strategy", "SELECT"),
+        }
 
     def test_append_only_tables_still_refuse_update_and_delete(
         self, conn: psycopg.Connection

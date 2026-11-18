@@ -457,3 +457,191 @@ class TestNoisyLibrariesStayQuietAtDebug:
             root.setLevel(saved_root)
             for name, level in saved.items():
                 std.getLogger(name).setLevel(level)
+
+
+class TestTheBackstopCatchesWhatTheAuditProbedPast:
+    """Audit SEC-011 (17 Nov 2026). Each line below passed through the shipped
+    patterns unchanged: the assignment pattern matched whole words, and ``_``
+    is a word character, so ``request_token`` had no boundary before
+    ``token``; header values with a scheme word, a bot token in a URL PATH,
+    and a quoted passphrase with spaces all had no rule. The fake values are
+    assembled at runtime so the repository's secret scanner does not flag
+    this file (the test_log_redaction convention)."""
+
+    TOKEN = "abcd" + "1234efgh5678"
+    BOT_SECRET = "AAF" + "abcdefghijklmnopqrstuvwxyz0123456"
+    BASIC = "dXNlcjpw" + "YXNzd29yZA=="
+
+    @pytest.mark.parametrize(
+        ("line", "secret"),
+        [
+            ("request_token=" + TOKEN, TOKEN),
+            ("refresh_token=" + TOKEN, TOKEN),
+            ("api_secret=" + TOKEN, TOKEN),
+            ("enctoken=" + TOKEN, TOKEN),
+            ("checksum=" + TOKEN, TOKEN),
+            ("kite_access_token=" + TOKEN, TOKEN),
+            ("KITE_API_SECRET=" + TOKEN, TOKEN),
+            ("ANTHROPIC_API_KEY=sk-" + "ant-abc", "sk-ant-abc"),
+            ("GET /x?request_token=" + TOKEN + "&action=login", TOKEN),
+            ("https://api.telegram.org/bot123456789:" + BOT_SECRET + "/sendMessage", BOT_SECRET),
+            ("Authorization: Basic " + BASIC, BASIC),
+            ('password="my secret pass phrase"', "pass phrase"),
+            ("password='my secret pass phrase'", "pass phrase"),
+        ],
+    )
+    def test_the_secret_is_gone(self, line: str, secret: str) -> None:
+        out = RedactingProcessor()._scrub_text(line)
+        assert secret not in out, out
+        assert "REDACTED" in out
+
+    def test_the_key_is_kept_so_the_line_says_what_was_hidden(self) -> None:
+        out = RedactingProcessor()._scrub_text("request_token=" + self.TOKEN)
+        assert out.startswith("request_token=")
+
+    def test_a_bot_token_keeps_the_route_around_it(self) -> None:
+        url = "https://api.telegram.org/bot123456789:" + self.BOT_SECRET + "/sendMessage"
+        out = RedactingProcessor()._scrub_text(url)
+        assert out.startswith("https://api.telegram.org/bot")
+        assert out.endswith("/sendMessage")
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "instrument_token=408065 exchange_token=1594",
+            '{"instrument_token": 408065, "exchange_token": 1594}',
+            "max_tokens=1024 tokens=[1, 2] input_tokens: 512",
+            "RELIANCE LONG 120 @ 712.40 stop 705.20",
+            "bot_status=ok reboot in 5s",
+        ],
+    )
+    def test_the_control_public_ids_and_counts_survive(self, line: str) -> None:
+        assert RedactingProcessor()._scrub_text(line) == line
+
+    @pytest.mark.parametrize(
+        "key", ["request_token", "api_secret", "KITE_API_SECRET", "enctoken", "checksum"]
+    )
+    def test_a_prefixed_key_name_redacts_its_value(self, key: str) -> None:
+        assert self.TOKEN not in render(RedactingProcessor(), {key: self.TOKEN})
+
+    def test_a_public_id_key_keeps_its_value(self) -> None:
+        out = render(RedactingProcessor(), {"instrument_token": 408065})
+        assert "408065" in out
+
+
+class TestEveryContainerIsScrubbedAndNoneRaises:
+    """SEC-011: a namedtuple value raised TypeError inside the logging
+    pipeline, and sets and bytes were never scrubbed."""
+
+    def test_a_namedtuple_value_is_scrubbed_and_keeps_its_type(self) -> None:
+        from typing import NamedTuple
+
+        class Session(NamedTuple):
+            user: str
+            access_token: str
+
+        out = RedactingProcessor({KNOWN})(None, "", {"s": Session("AB1234", "opaque-value-xyz")})
+        assert isinstance(out["s"], Session)
+        assert out["s"].user == "AB1234"
+        assert "opaque-value-xyz" not in str(out), "the field NAME access_token must redact"
+
+    def test_a_set_and_a_frozenset_are_scrubbed(self) -> None:
+        out = render(RedactingProcessor({KNOWN}), {"a": {KNOWN, "x"}, "b": frozenset({KNOWN})})
+        assert KNOWN not in out
+
+    def test_bytes_are_scrubbed(self) -> None:
+        out = render(RedactingProcessor({KNOWN}), {"body": KNOWN.encode() + b" tail"})
+        assert KNOWN not in out
+        assert "tail" in out
+
+    def test_a_namedtuple_logged_through_the_real_pipeline_does_not_raise(self) -> None:
+        from typing import NamedTuple
+
+        class Point(NamedTuple):
+            x: int
+            y: int
+
+        logger = logging.getLogger("redaction-namedtuple")
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.addFilter(RedactingFilter(RedactingProcessor()))
+        logger.addHandler(handler)
+        try:
+            logger.warning("at %s", Point(1, 2))
+        finally:
+            logger.removeHandler(handler)
+        assert "Point(x=1, y=2)" in stream.getvalue()
+
+
+class TestTheRedactorIsLinearOnHostileText:
+    """QA, 18 Nov 2026: the SEC-011 assignment pattern began its key at every
+    word boundary - after each ``-`` inside a run - and every start re-scanned
+    the rest of the run. 6 KB of base64url took 0.9 s and 6 KB of ``a-a-``
+    2.9 s, so a 200 KB response body echoed into one log line would have held
+    the event loop for minutes. The URI pattern did the same from every scheme
+    candidate, and from every ``://`` with no ``@`` after it. Each input below
+    is 200 KB; at linear cost each takes milliseconds, so the bound is loose
+    enough for a loaded machine and still four orders of magnitude under the
+    quadratic cost."""
+
+    TOKEN = "abcd" + "1234efgh5678"
+
+    #: Scrubs each hostile run in a CHILD process and prints the seconds each
+    #: took. A child, because a quadratic regex cannot be interrupted in-process:
+    #: the old patterns would run this for most of an hour before any assertion
+    #: was reached, so the timeout is the assertion.
+    PROBE = "\n".join(
+        [
+            "import sys, time",
+            "from algotrader.common.logging import RedactingProcessor",
+            "token = sys.argv[1]",
+            "runs = ['a-' * 100_000, 'Ab3_-x' * 33_000, 'a.' * 100_000, 'x://u:' * 33_000]",
+            "for run in runs:",
+            "    line = run + ' api_key=' + token + ' postgresql://app:' + token + '@db'",
+            "    began = time.perf_counter()",
+            "    out = RedactingProcessor()._scrub_text(line)",
+            "    assert token not in out",
+            "    print(round(time.perf_counter() - began, 3))",
+        ]
+    )
+
+    def test_long_runs_are_scrubbed_in_linear_time(self) -> None:
+        """Dashed, base64url-shaped, dotted, and URI candidates with no '@'."""
+        import subprocess
+        import sys
+
+        try:
+            done = subprocess.run(  # this interpreter, a fixed script
+                [sys.executable, "-c", self.PROBE, self.TOKEN],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("scrubbing 200 KB runs took over 60 s: a redaction pattern is quadratic")
+        assert done.returncode == 0, done.stderr[-2000:]
+        seconds = [float(x) for x in done.stdout.split()]
+        assert len(seconds) == 4, done.stdout
+        assert max(seconds) < 2.0, f"seconds per 200 KB run: {seconds}"
+
+    #: Assembled at runtime so the repository's secret scanner does not read
+    #: ``cfg.api_key="...`` as a credential (gitleaks generic-api-key, 18 Nov 2026).
+    KEY = "api_" + "key="
+
+    @pytest.mark.parametrize(
+        ("line", "kept"),
+        [
+            ("foo=password=" + TOKEN, "foo=password="),  # a key after a non-credential key
+            ("--" + KEY + TOKEN, "--" + KEY),  # a run that starts with '-'
+            ("cfg." + KEY + TOKEN, "cfg." + KEY),  # a key after a '.'
+            ("1-redis://:" + TOKEN + "@cache:6379", "1-redis://:"),  # scheme after a digit run
+            ("postgresql://app:" + TOKEN + "/x@db", "postgresql://app:"),  # a '/' in the password
+        ],
+    )
+    def test_anchoring_the_patterns_redacts_no_less(self, line: str, kept: str) -> None:
+        """The control for the change above: every shape the old patterns
+        caught, including those where they began part-way through a run."""
+        out = RedactingProcessor()._scrub_text(line)
+        assert self.TOKEN not in out, out
+        assert out.startswith(kept), out

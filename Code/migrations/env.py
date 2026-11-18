@@ -23,6 +23,7 @@ Two TimescaleDB-specific behaviours are configured here and both matter:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from logging.config import fileConfig
 from typing import Any
@@ -37,21 +38,27 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from algotrader.common.db import models  # noqa: F401  — registers every table
 from algotrader.common.db.base import Base
 from algotrader.common.db.eventloop import configure_event_loop_policy
+from algotrader.common.logging import redacting_filter
 
 config = context.config
 
-if config.config_file_name is not None:
-    # disable_existing_loggers=False is NOT cosmetic. fileConfig defaults to
-    # True, which reaches into every logger that already exists and switches it
-    # off. Alembic runs in-process here — the scaffold helper and the test
-    # suite both call it — so the default would let a migration silently kill
-    # application logging for the rest of the process. A trading system that
-    # stops logging without failing is the worst possible outcome: it keeps
-    # trading and there is no record of what it did.
+if config.config_file_name is not None and not logging.getLogger().handlers:
+    # alembic.ini's logging is applied ONLY when nothing has configured logging
+    # yet - the `alembic upgrade` command line. In-process (the scaffold
+    # helper, the test suite, any service that migrates at start) the host's
+    # logging is left exactly as it was: fileConfig REPLACES the root handler,
+    # so it removed the RedactingFilter and dropped the root level from INFO to
+    # WARNING, and every later stdlib line - a DSN in a driver's traceback
+    # among them - went out unredacted (audit SEC-012, 17 Nov 2026).
     #
-    # Found because it broke pytest's caplog for every test that ran after a
-    # migration, which is the same defect wearing a smaller hat.
+    # disable_existing_loggers=False is NOT cosmetic either. fileConfig
+    # defaults to True, which switches off every logger that already exists:
+    # a trading system that stops logging without failing keeps trading with
+    # no record of what it did. Found when it broke pytest's caplog.
     fileConfig(config.config_file_name, disable_existing_loggers=False)
+    # Even on the command line, a migration's error carries the URL it used.
+    for _handler in logging.getLogger().handlers:
+        _handler.addFilter(redacting_filter())
 
 target_metadata = Base.metadata
 

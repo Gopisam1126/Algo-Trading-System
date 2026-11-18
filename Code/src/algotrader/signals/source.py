@@ -79,18 +79,27 @@ class RedisBarSource:
         consumer: str | None = None,
         count: int = 50,
         block_ms: int = 1_000,
+        reclaim_idle_ms: int = streams.DEFAULT_MIN_IDLE_MS,
     ) -> None:
         if not timeframes:
             raise ValueError("a bar source needs at least one timeframe")
         self._client = client
         self._streams = [keys.stream_bars(tf) for tf in timeframes]
-        self._consumer = consumer or streams.new_consumer_name(GROUP)
+        # The SAME name across restarts (audit ENG-013): with a fresh one, the
+        # bars the dead process held were stranded, never "the normal path".
+        self._consumer = consumer or streams.consumer_name(GROUP)
         self._count = count
         self._block_ms = block_ms
+        self._reclaim_idle_ms = reclaim_idle_ms
 
     async def start(self) -> None:
         for name in self._streams:
             await streams.ensure_group(self._client, name, GROUP)
+            # Anything held under ANOTHER name - an older deployment's, or an
+            # instance that is gone - comes to this consumer's backlog.
+            await streams.reclaim_stalled(
+                self._client, name, GROUP, self._consumer, min_idle_ms=self._reclaim_idle_ms
+            )
 
     async def next_batch(self) -> list[BarDelivery]:
         entries = await streams.consume_many(
@@ -104,10 +113,9 @@ class RedisBarSource:
         out: list[BarDelivery] = []
         for entry in entries:
             if entry.delivery is None:
-                # Not an envelope at all: nothing to dead-letter it as. Acked so
-                # the backlog read does not return it forever; the missing bar
+                # consume_many dead-letters an entry that is not an envelope
+                # (ENG-013) and returns only readable ones; the missing bar
                 # reads as a gap at the next one.
-                await streams.acknowledge(self._client, entry.stream, GROUP, entry.entry_id)
                 continue
             try:
                 bar = _read_bar(entry.stream, entry.delivery.envelope)

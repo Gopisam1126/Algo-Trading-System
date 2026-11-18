@@ -17,7 +17,8 @@ should not be constructible, and here it is not.
 Delivery is **at-least-once** and consumers must be idempotent. That is the
 correct choice rather than a limitation to route around: processing a bar twice
 yields the same indicator state; a duplicate signal is caught by ``lock:symbol``
-and ``uq_open_symbol``; a duplicate audit event is caught by ``message_id``.
+and ``uq_open_symbol``. (Audit entries do not travel by stream at all - see
+:data:`NOT_PUBLISHABLE`.)
 Exactly-once would need distributed transactions across Redis and Postgres for
 no practical gain.
 """
@@ -26,6 +27,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
+import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -47,7 +50,19 @@ DEFAULT_MAXLEN: Final[dict[str, int]] = {
     "stream:snapshots": 10_000,
     "stream:signals": 10_000,
     "stream:orders": 10_000,
-    "stream:audit": 50_000,  # drained to Postgres continuously
+}
+
+#: Streams nothing may publish to, and why. ``stream:audit`` was planned as a
+#: Redis hop drained to Postgres by a ``db-writer``; what was built writes
+#: straight to Postgres through ``AuditWriter``, whose disk buffer survives an
+#: outage. No drainer exists, and a capped stream TRIMS - approximately - so an
+#: audit entry published here would be silently discarded once 50,000 newer
+#: ones arrived (audit NR-010, 17 Nov 2026). Refused rather than capped.
+NOT_PUBLISHABLE: Final[dict[str, str]] = {
+    "stream:audit": (
+        "audit entries go to Postgres through common.audit.AuditWriter, never through "
+        "a capped stream that trims what nothing drains"
+    ),
 }
 
 #: Entries pending longer than this are assumed abandoned and reclaimed.
@@ -98,12 +113,19 @@ async def publish(
     ``maxlen`` is REQUIRED and has no default — see the module docstring. Use
     :func:`default_maxlen` to get the documented cap for a stream rather than
     inventing a number at the call site.
+
+    **One call can append twice.** The client retries a command whose reply was
+    lost (``common/redis/client.py``), so the same envelope can sit under two
+    entry ids. Consumers de-duplicate on the envelope's content - its bar, its
+    correlation id - never on the entry id (audit NR-007).
     """
     if maxlen <= 0:
         raise StreamError(
             f"maxlen must be positive, got {maxlen}. Under noeviction an unbounded "
             f"stream fills memory and Redis then refuses ALL writes, system-wide."
         )
+    if stream in NOT_PUBLISHABLE:
+        raise StreamError(f"{stream} is not publishable: {NOT_PUBLISHABLE[stream]}")
     # cast: redis-py types the field map as accepting bytes|str|int|float keys
     # AND values; dict[str, str] is a valid subset but mypy will not narrow the
     # invariant dict type. The values are all str by construction (to_fields).
@@ -135,6 +157,7 @@ async def consume(
     count: int = 10,
     block_ms: int = 1_000,
     include_backlog: bool = True,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> list[Delivery]:
     """Read entries for this consumer.
 
@@ -148,17 +171,22 @@ async def consume(
     Order matters: backlog first, then new. Processing new messages while older
     unacked ones sit pending reorders the stream from the consumer's point of
     view.
-    """
-    deliveries: list[Delivery] = []
 
+    An entry that is not an Envelope is dead-lettered and acknowledged here,
+    never returned and never left pending (audit ENG-013); so is a backlog
+    entry delivered more than ``max_attempts`` times.
+    """
     if include_backlog:
         pending = await client.xreadgroup(
             groupname=group, consumername=consumer, streams={stream: "0"}, count=count
         )
-        deliveries.extend(_decode(client, stream, pending))
-        if deliveries:
-            # Drain the backlog fully before taking anything new.
-            return deliveries
+        entries = _decode_tagged(pending)
+        if entries:
+            # Drain the backlog fully before taking anything new - even when
+            # every entry in this read was unreadable and is now dead-lettered:
+            # reading '>' next would put new work ahead of older pending work.
+            kept = await _deliverable(client, group, entries, max_attempts=max_attempts)
+            return [e.delivery for e in kept if e.delivery is not None]
 
     fresh = await client.xreadgroup(
         groupname=group,
@@ -167,20 +195,62 @@ async def consume(
         count=count,
         block=block_ms,
     )
-    deliveries.extend(_decode(client, stream, fresh))
-    return deliveries
+    kept = await _deliverable(client, group, _decode_tagged(fresh), max_attempts=None)
+    return [e.delivery for e in kept if e.delivery is not None]
+
+
+async def _deliverable(
+    client: aioredis.Redis,
+    group: str,
+    entries: list[StreamEntry],
+    *,
+    max_attempts: int | None,
+) -> list[StreamEntry]:
+    """The entries worth handing on; the rest dead-lettered on the way.
+
+    Unreadable entries always go. With ``max_attempts`` - a BACKLOG read,
+    i.e. redeliveries - so does an entry delivered more times than that: a
+    message that took its consumer down repeatedly would otherwise be handed
+    back after every restart, forever (ENG-013). A first delivery is never
+    counted, so this costs nothing in normal running, when the backlog is
+    empty.
+    """
+    out: list[StreamEntry] = []
+    for entry in entries:
+        if entry.delivery is None:
+            await _dead_letter_unreadable(client, entry, group)
+            continue
+        if max_attempts is not None:
+            attempts = await delivery_attempts(client, entry.stream, group, entry.entry_id)
+            if attempts > max_attempts:
+                await dead_letter(
+                    client,
+                    entry.stream,
+                    group,
+                    entry.delivery,
+                    f"delivered {attempts} times without being acknowledged",
+                )
+                continue
+        out.append(entry)
+    return out
 
 
 @dataclass(frozen=True, slots=True)
 class StreamEntry:
-    """One entry from :func:`consume_many`: which stream it came from, and
-    what it held. ``delivery`` is ``None`` when the entry is not an Envelope -
-    returned rather than skipped, so the caller can acknowledge it instead of
-    re-reading it from the backlog on every call."""
+    """One entry read from a stream: where it came from, and what it held.
+
+    ``delivery`` is ``None`` when the entry is not an Envelope, and ``fields``
+    is what it held instead (``None`` for an entry trimmed from the stream
+    while pending). Readers dead-letter such an entry where they read it
+    (audit ENG-013): one that is merely skipped stays pending, comes back on
+    every backlog read, and with ``count`` of them at the head of the pending
+    list, nothing behind them is ever returned.
+    """
 
     stream: str
     entry_id: str
     delivery: Delivery | None
+    fields: dict[Any, Any] | None = None
 
 
 async def consume_many(
@@ -191,6 +261,7 @@ async def consume_many(
     *,
     count: int = 10,
     block_ms: int = 1_000,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> list[StreamEntry]:
     """Read several streams in ONE ``XREADGROUP``, backlog first.
 
@@ -199,6 +270,9 @@ async def consume_many(
     producer writing between them is seen by some and not others - which is
     the difference between "every bar that closed at 10:15" and "some of
     them" (E13-S01). ``count`` applies per stream.
+
+    Every returned entry carries a delivery: an unreadable one, or one
+    redelivered more than ``max_attempts`` times, is dead-lettered here.
     """
     names = list(dict.fromkeys(streams))
     if not names:
@@ -208,7 +282,7 @@ async def consume_many(
     )
     entries = _decode_tagged(pending)
     if entries:
-        return entries
+        return await _deliverable(client, group, entries, max_attempts=max_attempts)
     fresh = await client.xreadgroup(
         groupname=group,
         consumername=consumer,
@@ -216,10 +290,12 @@ async def consume_many(
         count=count,
         block=block_ms,
     )
-    return _decode_tagged(fresh)
+    return await _deliverable(client, group, _decode_tagged(fresh), max_attempts=None)
 
 
 def _decode_tagged(raw: Any) -> list[StreamEntry]:
+    """Turn an XREADGROUP reply into entries. Never raises for one bad entry:
+    one malformed message must not stop the stream."""
     out: list[StreamEntry] = []
     for stream_name, entries in raw or []:
         name = stream_name.decode() if isinstance(stream_name, bytes) else str(stream_name)
@@ -231,35 +307,54 @@ def _decode_tagged(raw: Any) -> list[StreamEntry]:
             except (ValueError, TypeError):
                 # TypeError: a pending entry trimmed from the stream comes back
                 # with no fields at all.
-                log.error("unreadable entry %s on %s", entry_id, name, exc_info=True)
                 delivery = None
-            out.append(StreamEntry(stream=name, entry_id=str(entry_id), delivery=delivery))
-    return out
-
-
-def _decode(client: aioredis.Redis, stream: str, raw: Any) -> list[Delivery]:
-    """Turn the raw XREADGROUP reply into deliveries.
-
-    An entry that will not parse is **not** raised here. One malformed message
-    must not stop the stream, so it is logged and skipped; the reclaim path
-    dead-letters it once its attempt count is exhausted.
-    """
-    out: list[Delivery] = []
-    if not raw:
-        return out
-    for _stream_name, entries in raw:
-        for entry_id, fields in entries:
-            try:
-                out.append(Delivery(entry_id=str(entry_id), envelope=Envelope.from_fields(fields)))
-            except ValueError:
-                log.error(
-                    "unparseable entry %s on %s — skipping; it will be dead-lettered "
-                    "once its attempts are exhausted",
-                    entry_id,
-                    stream,
-                    exc_info=True,
+            out.append(
+                StreamEntry(
+                    stream=name,
+                    entry_id=str(entry_id),
+                    delivery=delivery,
+                    fields=None if delivery is not None else fields,
                 )
+            )
     return out
+
+
+#: The correlation id a dead-lettered entry gets when it carried none that reads.
+NO_CORRELATION: Final = uuid.UUID(int=0)
+
+
+async def _dead_letter_unreadable(client: aioredis.Redis, entry: StreamEntry, group: str) -> None:
+    """Dead-letter an entry that is not an Envelope, then acknowledge it.
+
+    No retry can make malformed bytes parse, so it goes at once - not after
+    attempts it would only fail again (audit ENG-013). What it held is kept,
+    bounded, so the DLQ entry is still the record of a bug.
+    """
+    fields = entry.fields
+    if fields is None:
+        reason = "trimmed from the stream before it was processed"
+    else:
+        reason = "not an envelope: it does not parse"
+    held = {str(k)[:64]: str(v)[:512] for k, v in list((fields or {}).items())[:16]}
+    try:
+        correlation = uuid.UUID(str((fields or {}).get("correlation_id")))
+    except ValueError:
+        correlation = NO_CORRELATION
+    dlq = keys.stream_dlq(entry.stream)
+    record = Envelope(
+        correlation_id=correlation,
+        emitted_at=dt.datetime.now(dt.UTC),
+        emitted_by="dlq",
+        payload={
+            "original_stream": entry.stream,
+            "original_entry_id": entry.entry_id,
+            "reason": reason,
+            "fields": held,
+        },
+    )
+    await publish(client, dlq, record, maxlen=default_maxlen(dlq))
+    await acknowledge(client, entry.stream, group, entry.entry_id)
+    log.error("dead-lettered unreadable entry %s from %s: %s", entry.entry_id, entry.stream, reason)
 
 
 async def acknowledge(client: aioredis.Redis, stream: str, group: str, *entry_ids: str) -> int:
@@ -281,28 +376,55 @@ async def reclaim_stalled(
     *,
     min_idle_ms: int = DEFAULT_MIN_IDLE_MS,
     count: int = 50,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_pages: int = 100,
 ) -> list[Delivery]:
-    """Take over entries abandoned by a dead consumer.
+    """Take over entries abandoned by a dead consumer, into ``consumer``'s pending list.
 
     Without this, a consumer that dies holding pending entries strands them: they
     belong to a consumer name that will never return, and no other consumer will
-    ever be offered them.
+    ever be offered them. Consumers call it at ``start()`` (audit ENG-013 - until
+    then nothing did), so a process that comes back under a NEW name, or a
+    consumer renamed by a deployment, still gets the work its predecessor held:
+    the claimed entries are returned AND sit in this consumer's pending list,
+    where its next backlog read finds them.
+
+    Walks every page of the pending list (``count`` per page, at most
+    ``max_pages``). An entry that does not parse, or that has now been
+    delivered more than ``max_attempts`` times - it has killed a consumer
+    before, more than once - is dead-lettered instead of returned.
     """
-    result = await client.xautoclaim(
-        name=stream,
-        groupname=group,
-        consumername=consumer,
-        min_idle_time=min_idle_ms,
-        count=count,
-    )
-    # xautoclaim returns (next_cursor, entries) or (next_cursor, entries, deleted)
-    entries = result[1] if len(result) >= 2 else []
     out: list[Delivery] = []
-    for entry_id, fields in entries:
-        try:
-            out.append(Delivery(entry_id=str(entry_id), envelope=Envelope.from_fields(fields)))
-        except ValueError:
-            log.error("unparseable reclaimed entry %s on %s", entry_id, stream, exc_info=True)
+    cursor = "0-0"
+    for _ in range(max_pages):
+        result = await client.xautoclaim(
+            name=stream,
+            groupname=group,
+            consumername=consumer,
+            min_idle_time=min_idle_ms,
+            start_id=cursor,
+            count=count,
+        )
+        # xautoclaim returns (next_cursor, entries) or (next_cursor, entries, deleted)
+        cursor = str(result[0].decode() if isinstance(result[0], bytes) else result[0])
+        raw = result[1] if len(result) >= 2 else []
+        for entry in _decode_tagged([(stream, raw)]):
+            if entry.delivery is None:
+                await _dead_letter_unreadable(client, entry, group)
+                continue
+            attempts = await delivery_attempts(client, stream, group, entry.entry_id)
+            if attempts > max_attempts:
+                await dead_letter(
+                    client,
+                    stream,
+                    group,
+                    entry.delivery,
+                    f"delivered {attempts} times without being acknowledged",
+                )
+                continue
+            out.append(entry.delivery)
+        if cursor in {"0-0", "0"}:
+            break
     return out
 
 
@@ -371,10 +493,31 @@ async def pending_count(client: aioredis.Redis, stream: str, group: str) -> int:
     return int(summary["pending"]) if summary else 0
 
 
-def new_consumer_name(service: str) -> str:
-    """A unique consumer name per process.
+#: Which instance of a service this process is. One per service is the
+#: deployment (docker-compose runs one container each); a second instance
+#: needs its own value, or the two would share a pending list.
+INSTANCE_ENV: Final = "ALGOTRADER_INSTANCE"
 
-    Two processes sharing a name share a pending list, so one can acknowledge
-    the other's in-flight work. The uuid suffix makes that impossible.
+_SAFE_INSTANCE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+
+
+def consumer_name(service: str, *, instance: str | None = None) -> str:
+    """The consumer name for ``service`` - the SAME across restarts.
+
+    It used to carry a fresh uuid per process (``new_consumer_name``), so a
+    restarted process read an empty pending list of its own and the entries
+    its predecessor held were stranded under a name nobody would use again:
+    at-least-once became at-most-once across exactly the event it exists for.
+    The tests passed because they restarted under the same name by hand
+    (audit ENG-013, 17 Nov 2026). A stable name makes the restart read its
+    predecessor's pending entries first.
+
+    Two LIVE processes must not share a name - one could acknowledge the
+    other's in-flight work - so a second instance sets :data:`INSTANCE_ENV`.
     """
-    return f"{service}-{uuid.uuid4().hex[:8]}"
+    chosen = instance if instance is not None else os.environ.get(INSTANCE_ENV, "1")
+    if _SAFE_INSTANCE.fullmatch(chosen) is None:
+        raise StreamError(
+            f"{INSTANCE_ENV} must be 1-32 of a-z 0-9 -, starting alphanumeric; got {chosen[:40]!r}"
+        )
+    return f"{service}-{chosen}"

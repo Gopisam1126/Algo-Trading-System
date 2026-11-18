@@ -221,14 +221,18 @@ class DatabaseConfig(_Model):
         """SQL echo prints bound parameters, which include order values.
 
         Harmless locally, but it defeats the log redactor if it is ever left on
-        in a deployed environment, so it is refused outside development.
+        in a deployed environment, so it is refused outside development - and
+        development must be SAID. An unset ``ALGOTRADER_ENV`` used to count as
+        development, so a deployment that forgot the variable could echo
+        (audit NR-005/NR-010, 17 Nov 2026).
         """
         import os
 
-        if v and os.environ.get("ALGOTRADER_ENV", "development") != "development":
+        if v and os.environ.get("ALGOTRADER_ENV") != "development":
             raise ValueError(
-                "database.echo_sql may only be true when ALGOTRADER_ENV=development; "
-                "echoed SQL contains bound parameters and bypasses log redaction"
+                "database.echo_sql may only be true when ALGOTRADER_ENV=development is "
+                "set explicitly; echoed SQL contains bound parameters and bypasses log "
+                "redaction"
             )
         return v
 

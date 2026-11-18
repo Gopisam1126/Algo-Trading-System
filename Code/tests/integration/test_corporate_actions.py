@@ -151,7 +151,10 @@ class TestOrderIndependence:
             st.tuples(
                 st.integers(min_value=1, max_value=400),
                 st.integers(min_value=1, max_value=10),
-                st.integers(min_value=2, max_value=10),
+                # A split INCREASES the share count (NR-004), so ratio_to is
+                # ratio_from plus a positive increase: bound the strategy to
+                # the domain rather than generating splits that do not exist.
+                st.integers(min_value=1, max_value=9),
             ),
             min_size=1,
             max_size=6,
@@ -173,10 +176,10 @@ class TestOrderIndependence:
                 factors_for(
                     CorporateActionType.SPLIT,
                     ratio_from=Decimal(a),
-                    ratio_to=Decimal(b),
+                    ratio_to=Decimal(a + increase),
                 ),
             )
-            for offset, a, b in raw
+            for offset, a, increase in raw
         ]
         bar_day = dt.date(2025, 12, 31)
 
@@ -902,3 +905,216 @@ class TestActionTypesNotYetExercised:
 
         factors = await TestAgainstTheDatabase._factors(session, symbol_id)
         assert factors == {(Decimal(1), Decimal(1))}
+
+
+# ---------------------------------------------------------------------------
+# Audit remediation, 17 Nov 2026 (ENG-027, ENG-029, NR-004)
+# ---------------------------------------------------------------------------
+
+
+async def _split_one_for_five(session: AsyncSession, symbol_id: int) -> CorporateActionRepository:
+    actions = CorporateActionRepository(session)
+    await actions.upsert(
+        [
+            {
+                "symbol_id": symbol_id,
+                "action_type": "SPLIT",
+                "ex_date": SPLIT_DATE,
+                "ratio_from": Decimal(1),
+                "ratio_to": Decimal(5),
+                "source": "test",
+            }
+        ]
+    )
+    await session.flush()
+    return actions
+
+
+async def _factor_at(session: AsyncSession, symbol_id: int, ts: dt.datetime) -> Decimal:
+    value = (
+        await session.execute(
+            text("SELECT price_adj_factor FROM ohlcv WHERE symbol_id = :s AND ts = :ts"),
+            {"s": symbol_id, "ts": ts},
+        )
+    ).scalar_one()
+    return Decimal(value)
+
+
+class TestABackfilledBarGetsTheFactorItsNeighboursHave:
+    """ENG-027: a bar inserted before a recorded ex-date kept the column
+    default of 1 until something re-ran recompute_factors - and nothing did."""
+
+    async def test_an_older_bar_inserted_after_the_split_is_adjusted(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        await _seed_daily_bars(session, symbol_id)
+        actions = await _split_one_for_five(session, symbol_id)
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+
+        repo = InstrumentRepository(session)
+        await repo.refresh_cache()
+        older = dt.datetime.combine(
+            SPLIT_DATE - dt.timedelta(days=40), dt.time(3, 45), tzinfo=dt.UTC
+        )
+        await BarRepository(session, repo).bulk_upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "timeframe": "1d",
+                    "ts": older,
+                    "open": Decimal("2500"),
+                    "high": Decimal("2525"),
+                    "low": Decimal("2475"),
+                    "close": Decimal("2500"),
+                    "volume": 1_000,
+                }
+            ]
+        )
+        await session.flush()
+        assert await _factor_at(session, symbol_id, older) == Decimal("0.2")
+
+    async def test_a_bar_after_every_action_keeps_factor_one(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        """The control: nothing follows it, so 1 is right and nothing is recomputed."""
+        await _seed_daily_bars(session, symbol_id)
+        await _split_one_for_five(session, symbol_id)
+        repo = InstrumentRepository(session)
+        await repo.refresh_cache()
+        later = dt.datetime.combine(
+            SPLIT_DATE + dt.timedelta(days=40), dt.time(3, 45), tzinfo=dt.UTC
+        )
+        await BarRepository(session, repo).bulk_upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "timeframe": "1d",
+                    "ts": later,
+                    "open": Decimal("500"),
+                    "high": Decimal("505"),
+                    "low": Decimal("495"),
+                    "close": Decimal("500"),
+                    "volume": 5_000,
+                }
+            ]
+        )
+        await session.flush()
+        assert await _factor_at(session, symbol_id, later) == Decimal(1)
+
+
+class TestTheExDateIsAnIstDayWhateverTheServerTimeZone:
+    """ENG-029: the boundary was a bare DATE, which PostgreSQL turns into
+    midnight in the SESSION time zone.
+
+    Both ends of every window must be the IST midnight. West of IST a local
+    midnight comes later, east of it earlier, so each zone exposes a
+    different end: New York a lower bound that skips the ex-date's opening
+    bar, Kiritimati an upper bound that stops before the day-before's last
+    instant. A SECOND, later split keeps every expected factor away from the
+    column default of 1 - otherwise a bar that no window updated reads as
+    correctly post-ex (QA, 18 Nov 2026: a bare-date upper bound survived
+    mutation, because the only post-ex expectation was 1)."""
+
+    LATER = SPLIT_DATE + dt.timedelta(days=10)
+
+    @pytest.mark.parametrize(
+        "zone", ["America/New_York", "UTC", "Asia/Kolkata", "Pacific/Kiritimati"]
+    )
+    async def test_the_ex_dates_opening_bar_is_post_ex(
+        self, session: AsyncSession, symbol_id: int, zone: str
+    ) -> None:
+        repo = InstrumentRepository(session)
+        await repo.refresh_cache()
+        day_before = SPLIT_DATE - dt.timedelta(days=1)
+        opening = dt.datetime.combine(SPLIT_DATE, dt.time(3, 45), tzinfo=dt.UTC)  # 09:15 IST
+        last_before = dt.datetime.combine(day_before, dt.time(9, 55), tzinfo=dt.UTC)  # 15:25 IST
+        late_before = dt.datetime.combine(day_before, dt.time(18, 25), tzinfo=dt.UTC)  # 23:55 IST
+        await BarRepository(session, repo).bulk_upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "timeframe": "5m",
+                    "ts": ts,
+                    "open": Decimal(p),
+                    "high": Decimal(p),
+                    "low": Decimal(p),
+                    "close": Decimal(p),
+                    "volume": 1,
+                }
+                for ts, p in ((last_before, "2500"), (late_before, "2500"), (opening, "500"))
+            ]
+        )
+        await session.flush()
+        await session.execute(text(f"SET TIME ZONE '{zone}'"))
+        actions = await _split_one_for_five(session, symbol_id)
+        await actions.upsert(
+            [
+                {
+                    "symbol_id": symbol_id,
+                    "action_type": "SPLIT",
+                    "ex_date": self.LATER,
+                    "ratio_from": Decimal(1),
+                    "ratio_to": Decimal(2),
+                    "source": "test",
+                }
+            ]
+        )
+        await session.flush()
+        await actions.recompute_factors(symbol_id)
+        await session.flush()
+        # Between the two splits: only the later one applies.
+        assert await _factor_at(session, symbol_id, opening) == Decimal("0.5"), zone
+        # Before both, to the last instant of the IST day: 1/5 x 1/2.
+        assert await _factor_at(session, symbol_id, last_before) == Decimal("0.1"), zone
+        assert await _factor_at(session, symbol_id, late_before) == Decimal("0.1"), zone
+
+
+class TestARatioMustPointTheRightWay:
+    """NR-004: ratios are old:new share COUNTS, and an Indian bonus is announced
+    as new-for-every-held - so a '1:1 bonus' entered as 1:1 adjusted nothing."""
+
+    def test_a_one_for_one_bonus_is_one_share_becoming_two(self) -> None:
+        assert ca_module.bonus_ratio(new_shares=Decimal(1), for_every_held=Decimal(1)) == (
+            Decimal(1),
+            Decimal(2),
+        )
+        f = factors_for(CorporateActionType.BONUS, ratio_from=Decimal(1), ratio_to=Decimal(2))
+        assert f.price == Decimal("0.5")
+
+    def test_a_three_for_two_bonus(self) -> None:
+        held, after = ca_module.bonus_ratio(new_shares=Decimal(3), for_every_held=Decimal(2))
+        assert (held, after) == (Decimal(2), Decimal(5))
+
+    @pytest.mark.parametrize(
+        ("kind", "ratio_from", "ratio_to"),
+        [
+            (CorporateActionType.BONUS, 1, 1),
+            (CorporateActionType.BONUS, 2, 1),
+            (CorporateActionType.SPLIT, 5, 1),
+            (CorporateActionType.SPLIT, 2, 2),
+            (CorporateActionType.CONSOLIDATION, 1, 5),
+        ],
+    )
+    def test_a_ratio_pointing_the_wrong_way_is_refused(
+        self, kind: CorporateActionType, ratio_from: int, ratio_to: int
+    ) -> None:
+        with pytest.raises(AdjustmentError, match="share count"):
+            factors_for(kind, ratio_from=Decimal(ratio_from), ratio_to=Decimal(ratio_to))
+
+    async def test_the_wrong_way_is_refused_at_write(
+        self, session: AsyncSession, symbol_id: int
+    ) -> None:
+        with pytest.raises(AdjustmentError, match="share count"):
+            await CorporateActionRepository(session).upsert(
+                [
+                    {
+                        "symbol_id": symbol_id,
+                        "action_type": "BONUS",
+                        "ex_date": SPLIT_DATE,
+                        "ratio_from": Decimal(1),
+                        "ratio_to": Decimal(1),
+                        "source": "test",
+                    }
+                ]
+            )

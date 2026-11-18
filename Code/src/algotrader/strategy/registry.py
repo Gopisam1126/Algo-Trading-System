@@ -49,6 +49,7 @@ from typing import Any, Protocol, TypeGuard
 import yaml
 
 from algotrader.common.enums import StrategyState
+from algotrader.common.roles import APPROVER_ROLE
 from algotrader.common.text import one_safe_line
 from algotrader.strategy.dsl import (
     REGISTRY,
@@ -243,11 +244,27 @@ def verify_row(row: Mapping[str, Any], registry: PrimitiveRegistry = REGISTRY) -
             f"strategy state"
         ) from exc
     approved_by, approved_at = row.get("approved_by"), row.get("approved_at")
-    if state.places_live_orders and (approved_by is None or approved_at is None):
-        raise CorruptStrategyRowError(
-            f"strategy {strategy_id!r} is {state.value}, which places live orders, with no "
-            f"recorded human approval (BR-5)"
-        )
+    if state.places_live_orders:
+        # BR-5, held to the approval ROW, not the two columns (audit RSK-007).
+        # The columns were the application's to write; an approval is
+        # strategy_approval's, which only the approver role can write, and it
+        # must name THIS document. The database refuses a live state without
+        # one; this refuses it again if that trigger is ever gone.
+        approval = row.get("approval")
+        if not isinstance(approval, Mapping) or approval.get("dsl_hash") != recomputed:
+            raise CorruptStrategyRowError(
+                f"strategy {strategy_id!r} is {state.value}, which places live orders, with no "
+                f"approval of this document (BR-5)"
+            )
+        if approval.get("approved_as") != APPROVER_ROLE:
+            raise CorruptStrategyRowError(
+                f"strategy {strategy_id!r}: its approval was not written by {APPROVER_ROLE} (BR-5)"
+            )
+        approved_by, approved_at = approval.get("approved_by"), approval.get("approved_at")
+        if not approved_by or approved_at is None:
+            raise CorruptStrategyRowError(
+                f"strategy {strategy_id!r}: its approval names no approver or time (BR-5)"
+            )
 
     registered_at, changed_at = row.get("hypothesis_frozen_at"), row.get("state_changed_at")
     if not (

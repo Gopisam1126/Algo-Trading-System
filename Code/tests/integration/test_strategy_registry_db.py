@@ -32,6 +32,7 @@ from algotrader.common.db import engine as db_engine
 from algotrader.common.db.models import LIFECYCLE_COLUMNS, Strategy
 from algotrader.common.db.repositories import StrategyRepository
 from algotrader.common.enums import StrategyState
+from algotrader.common.roles import APPROVER_ROLE
 from algotrader.strategy.dsl import StrategyDocument, load_strategy_yaml
 from algotrader.strategy.registry import (
     RegistrationOutcome,
@@ -39,6 +40,8 @@ from algotrader.strategy.registry import (
     StrategyRegistry,
     row_for,
 )
+from tests.approvals import approve
+from tests.conftest import CODE_ROOT
 
 pytestmark = [pytest.mark.integration]
 
@@ -75,6 +78,7 @@ def _no_strategies_survive(migrated_database: str) -> Iterator[None]:
 
     def wipe() -> None:
         with psycopg.connect(_owner_dsn(migrated_database), autocommit=True) as conn:
+            conn.execute("DELETE FROM strategy_approval")
             conn.execute("DELETE FROM strategy")
 
     wipe()
@@ -324,10 +328,15 @@ class TestTheTableRefusesWhatTheRegistryWouldNever:
     ) -> None:
         """Holds the migration's frozen list to the enum, in both directions
         with the test below."""
-        approval = (
-            {"approved_by": "operator", "approved_at": T0} if state.places_live_orders else {}
-        )
-        _insert(app, self._row(state=state.value, **approval))
+        if not state.places_live_orders:
+            _insert(app, self._row(state=state.value))
+            return
+        # A live state is reached only through an approval (RSK-007).
+        row = self._row(state="AWAITING_APPROVAL")
+        _insert(app, row)
+        approve(app, row["id"])
+        app.execute("SET ROLE algotrader_app")
+        app.execute("UPDATE strategy SET state = %s WHERE id = %s", (state.value, row["id"]))
 
     @pytest.mark.parametrize("state", ["active", "LIVE", "", "ACTIVE "])
     def test_a_state_that_is_not_one_is_refused(self, app: psycopg.Connection, state: str) -> None:
@@ -362,3 +371,186 @@ class TestTheTableRefusesWhatTheRegistryWouldNever:
         row["parent_id"] = row["id"]
         with pytest.raises(psycopg.errors.CheckViolation, match="not_its_own_parent"):
             _insert(app, row)
+
+
+# ---------------------------------------------------------------------------
+# Audit RSK-007, 17 Nov 2026: approval is a role the application lacks
+# ---------------------------------------------------------------------------
+
+
+class TestAnApprovalIsNotTheApplicationsToWrite:
+    """BR-5 was two columns the application role could UPDATE. Anything holding
+    the app's credentials could put a DRAFT on live capital."""
+
+    @pytest.mark.parametrize("column", ["approved_by", "approved_at"])
+    async def test_the_app_cannot_write_the_approval_columns(
+        self, factory: async_sessionmaker[AsyncSession], app: psycopg.Connection, column: str
+    ) -> None:
+        await _register(factory, _runnable_seed())
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            app.execute(f"UPDATE strategy SET {column} = {column} WHERE id = 'orb_classic'")
+
+    async def test_the_app_cannot_write_an_approval(
+        self, factory: async_sessionmaker[AsyncSession], app: psycopg.Connection
+    ) -> None:
+        await _register(factory, _runnable_seed())
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            app.execute(
+                "INSERT INTO strategy_approval (strategy_id, dsl_hash, approved_by) "
+                "SELECT id, dsl_hash, 'mallory' FROM strategy WHERE id = 'orb_classic'"
+            )
+
+    async def test_a_draft_cannot_be_approved(
+        self, factory: async_sessionmaker[AsyncSession], owner: psycopg.Connection
+    ) -> None:
+        """Approval is for a strategy that has passed validation, shadow and paper."""
+        await _register(factory, _runnable_seed())
+        owner.execute(f"SET ROLE {APPROVER_ROLE}")
+        try:
+            with pytest.raises(psycopg.errors.CheckViolation, match="not AWAITING_APPROVAL"):
+                owner.execute(
+                    "INSERT INTO strategy_approval (strategy_id, dsl_hash, approved_by) "
+                    "SELECT id, dsl_hash, 'operator' FROM strategy WHERE id = 'orb_classic'"
+                )
+        finally:
+            owner.execute("RESET ROLE")
+
+    async def test_an_approval_must_name_the_document_it_approves(
+        self, factory: async_sessionmaker[AsyncSession], owner: psycopg.Connection
+    ) -> None:
+        await _register(factory, _runnable_seed())
+        owner.execute("UPDATE strategy SET state = 'AWAITING_APPROVAL' WHERE id = 'orb_classic'")
+        owner.execute(f"SET ROLE {APPROVER_ROLE}")
+        try:
+            with pytest.raises(psycopg.errors.CheckViolation, match="does not hold"):
+                owner.execute(
+                    "INSERT INTO strategy_approval (strategy_id, dsl_hash, approved_by) "
+                    "VALUES ('orb_classic', %s, 'operator')",
+                    ("e" * 64,),
+                )
+        finally:
+            owner.execute("RESET ROLE")
+
+    async def test_the_writer_cannot_choose_who_it_was_or_when(
+        self, factory: async_sessionmaker[AsyncSession], owner: psycopg.Connection
+    ) -> None:
+        await _register(factory, _runnable_seed())
+        owner.execute("UPDATE strategy SET state = 'AWAITING_APPROVAL' WHERE id = 'orb_classic'")
+        login = owner.execute("SELECT session_user").fetchone()
+        assert login is not None
+        owner.execute(f"SET ROLE {APPROVER_ROLE}")
+        try:
+            owner.execute(
+                "INSERT INTO strategy_approval "
+                "(strategy_id, dsl_hash, approved_by, approved_at, approved_as, approved_login) "
+                "SELECT id, dsl_hash, 'operator', '2020-01-01T00:00Z', 'someone_else', 'nobody' "
+                "FROM strategy WHERE id = 'orb_classic'"
+            )
+        finally:
+            owner.execute("RESET ROLE")
+        row = owner.execute(
+            "SELECT approved_as, approved_login, approved_at > now() - interval '1 hour' "
+            "FROM strategy_approval"
+        ).fetchone()
+        # The role, the login that TOOK the role, and now - none of them the writer's.
+        assert row == (APPROVER_ROLE, login[0], True)
+
+    async def test_a_member_of_the_role_writing_under_its_own_name_is_refused(
+        self, factory: async_sessionmaker[AsyncSession], owner: psycopg.Connection
+    ) -> None:
+        """The operator grants a human's login MEMBERSHIP in the approver role.
+        Written under that login's own name, the approval would read
+        ``approved_as = <login>``, which the registry refuses at load - so the
+        database refuses it first, and the two agree on what an approval is
+        (QA, 18 Nov 2026: the trigger accepted any member)."""
+        await _register(factory, _runnable_seed())
+        owner.execute("UPDATE strategy SET state = 'AWAITING_APPROVAL' WHERE id = 'orb_classic'")
+        owner.execute("DROP ROLE IF EXISTS qa_approver_member")
+        owner.execute(f"CREATE ROLE qa_approver_member NOLOGIN IN ROLE {APPROVER_ROLE}")
+        try:
+            owner.execute("SET ROLE qa_approver_member")
+            try:
+                with pytest.raises(
+                    psycopg.errors.InsufficientPrivilege, match="SET ROLE algotrader_approver"
+                ):
+                    owner.execute(
+                        "INSERT INTO strategy_approval (strategy_id, dsl_hash, approved_by) "
+                        "SELECT id, dsl_hash, 'operator' FROM strategy WHERE id = 'orb_classic'"
+                    )
+            finally:
+                owner.execute("RESET ROLE")
+            # The control: the same member, having taken the role, is accepted.
+            owner.execute("SET ROLE qa_approver_member")
+            try:
+                owner.execute(f"SET ROLE {APPROVER_ROLE}")
+                owner.execute(
+                    "INSERT INTO strategy_approval (strategy_id, dsl_hash, approved_by) "
+                    "SELECT id, dsl_hash, 'operator' FROM strategy WHERE id = 'orb_classic'"
+                )
+            finally:
+                owner.execute("RESET ROLE")
+            row = owner.execute("SELECT approved_as FROM strategy_approval").fetchone()
+            assert row == (APPROVER_ROLE,)
+        finally:
+            owner.execute("DROP ROLE qa_approver_member")
+
+    async def test_a_draft_set_active_by_hand_is_refused_by_the_database(
+        self, factory: async_sessionmaker[AsyncSession], owner: psycopg.Connection
+    ) -> None:
+        """The audit's own attack, as the OWNER - who can write any column."""
+        await _register(factory, _runnable_seed())
+        with pytest.raises(psycopg.errors.CheckViolation, match="no approval of this document"):
+            owner.execute(
+                "UPDATE strategy SET state = 'ACTIVE', approved_by = 'anyone', "
+                "approved_at = now() WHERE id = 'orb_classic'"
+            )
+
+    async def test_and_by_the_registry_if_the_trigger_is_gone(
+        self, factory: async_sessionmaker[AsyncSession], owner: psycopg.Connection
+    ) -> None:
+        """The load stands behind the trigger, as it stands behind the grants."""
+        await _register(factory, _runnable_seed())
+        owner.execute("ALTER TABLE strategy DISABLE TRIGGER strategy_live_needs_approval")
+        try:
+            owner.execute(
+                "UPDATE strategy SET state = 'ACTIVE', approved_by = 'anyone', "
+                "approved_at = now() WHERE id = 'orb_classic'"
+            )
+        finally:
+            owner.execute("ALTER TABLE strategy ENABLE TRIGGER strategy_live_needs_approval")
+        loaded = await _load(factory)
+        assert "no approval of this document" in loaded.rejected["orb_classic"]
+        assert not loaded.runnable
+
+    async def test_the_approved_path_runs_and_names_the_approver(
+        self, factory: async_sessionmaker[AsyncSession], owner: psycopg.Connection
+    ) -> None:
+        """The control: register, await approval, approve, go live."""
+        await _register(factory, _runnable_seed())
+        approve(owner, "orb_classic", approved_by="the owner")
+        owner.execute("SET ROLE algotrader_app")
+        try:
+            owner.execute("UPDATE strategy SET state = 'ACTIVE' WHERE id = 'orb_classic'")
+        finally:
+            owner.execute("RESET ROLE")
+        loaded = await _load(factory)
+        [runnable] = loaded.runnable
+        assert runnable.record.state is StrategyState.ACTIVE
+        assert runnable.record.approved_by == "the owner"
+
+    async def test_an_approval_does_not_carry_to_another_version(
+        self, factory: async_sessionmaker[AsyncSession], owner: psycopg.Connection
+    ) -> None:
+        """Approval is of ONE document; a new version is a new strategy."""
+        doc = _runnable_seed()
+        await _register(factory, doc)
+        await _register(factory, _variant(doc, "orb_other_v1", 1.8), T0 + dt.timedelta(minutes=1))
+        approve(owner, "orb_classic")
+        with pytest.raises(psycopg.errors.CheckViolation, match="no approval of this document"):
+            owner.execute("UPDATE strategy SET state = 'ACTIVE' WHERE id = 'orb_other_v1'")
+
+    def test_the_role_names_agree_with_the_migration(self) -> None:
+        source = next((CODE_ROOT / "migrations" / "versions").glob("*7f3e9b2c4d10*.py")).read_text(
+            encoding="utf-8"
+        )
+        assert f'_APPROVER = "{APPROVER_ROLE}"' in source

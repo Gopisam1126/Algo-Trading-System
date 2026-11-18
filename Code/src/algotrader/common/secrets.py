@@ -89,10 +89,13 @@ class SecretString:
     def __eq__(self, other: object) -> bool:
         import hmac
 
+        # Compared as UTF-8 BYTES: compare_digest accepts only ASCII str, so a
+        # non-ASCII character on either side raised TypeError instead of
+        # answering (audit ENG-040).
         if isinstance(other, SecretString):
-            return hmac.compare_digest(self._value, other._value)
+            return hmac.compare_digest(self._value.encode("utf-8"), other._value.encode("utf-8"))
         if isinstance(other, str):
-            return hmac.compare_digest(self._value, other)
+            return hmac.compare_digest(self._value.encode("utf-8"), other.encode("utf-8"))
         return NotImplemented
 
     def __hash__(self) -> int:

@@ -28,6 +28,7 @@ from sqlalchemy import CursorResult, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from algotrader.common.calendar import IST
 from algotrader.common.db.models import CorporateAction
 from algotrader.common.enums import CorporateActionType
 
@@ -50,6 +51,47 @@ _RATIO_ACTIONS = frozenset(
 
 class AdjustmentError(ValueError):
     """Raised when an action cannot produce a meaningful factor."""
+
+
+def bonus_ratio(*, new_shares: Decimal, for_every_held: Decimal) -> tuple[Decimal, Decimal]:
+    """``(ratio_from, ratio_to)`` for a bonus announced as "new for every held".
+
+    **The convention this table uses is share COUNTS, old to new** - a 1:5
+    split is from=1, to=5: one share becomes five. An Indian bonus is
+    announced the other way, as new shares granted per shares held: "a 1:1
+    bonus" is one new share for every one held, so ONE share becomes TWO and
+    is stored from=1, to=2. Entered as from=1, to=1 it computed a factor of 1
+    and adjusted nothing (audit NR-004, 17 Nov 2026). A producer converts here,
+    by name, rather than at the call site from a pair of bare numbers.
+    """
+    if new_shares <= 0 or for_every_held <= 0:
+        raise AdjustmentError("a bonus grants a positive number of shares per a positive holding")
+    return for_every_held, for_every_held + new_shares
+
+
+def check_ratio(kind: CorporateActionType, ratio_from: Decimal, ratio_to: Decimal) -> None:
+    """Refuse a ratio pointing the wrong way for its action.
+
+    A split or a bonus always ends with MORE shares than it started with, a
+    consolidation with fewer. A ratio that says otherwise - a bonus written
+    1:1 straight from its announcement, a consolidation entered as a split -
+    is a data error with a plausible-looking factor, refused at write and
+    again at recompute (NR-004).
+    """
+    if ratio_from <= 0 or ratio_to <= 0:
+        raise AdjustmentError(f"{kind.value} ratios must be positive")
+    grows = kind in (CorporateActionType.SPLIT, CorporateActionType.BONUS)
+    if grows and ratio_to <= ratio_from:
+        raise AdjustmentError(
+            f"{kind.value} {ratio_from}:{ratio_to} does not increase the share count. Ratios "
+            f"are old:new share COUNTS (a 1:5 split is 1:5; a 1-for-1 bonus is 1:2 - see "
+            f"bonus_ratio)"
+        )
+    if kind is CorporateActionType.CONSOLIDATION and ratio_to >= ratio_from:
+        raise AdjustmentError(
+            f"CONSOLIDATION {ratio_from}:{ratio_to} does not reduce the share count. Ratios "
+            f"are old:new share COUNTS (a 5-into-1 consolidation is 5:1)"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +142,7 @@ def factors_for(
     if kind in _RATIO_ACTIONS:
         if ratio_from is None or ratio_to is None:
             raise AdjustmentError(f"{kind.value} needs ratio_from and ratio_to")
-        if ratio_from <= 0 or ratio_to <= 0:
-            raise AdjustmentError(f"{kind.value} ratios must be positive")
+        check_ratio(kind, ratio_from, ratio_to)
         # 1:5 split -> one share becomes five -> price x 1/5, volume x 5.
         return ActionFactors(
             price_num=ratio_from,
@@ -167,6 +208,11 @@ class CorporateActionRepository:
         """
         if not actions:
             return 0
+        for action in actions:
+            kind = CorporateActionType(action["action_type"])
+            low, high = action.get("ratio_from"), action.get("ratio_to")
+            if kind in _RATIO_ACTIONS and low is not None and high is not None:
+                check_ratio(kind, Decimal(low), Decimal(high))
         stmt = pg_insert(CorporateAction).values(list(actions))
         stmt = stmt.on_conflict_do_update(
             constraint="uq_action",
@@ -259,26 +305,54 @@ class CorporateActionRepository:
         for boundary in [*boundaries, None]:
             reference = boundary - dt.timedelta(days=1) if boundary else dt.date.max
             combined = cumulative_factors(resolved, reference)
+            # Each boundary is the ex-date's MIDNIGHT IN IST, bound as an
+            # instant. `ts < CAST(:hi AS date)` compared a timestamptz with a
+            # bare date, which PostgreSQL turns into midnight in the SESSION's
+            # TimeZone: on a server west of UTC-03:45 the ex-date's first bars
+            # kept the pre-ex factor (audit ENG-029, 17 Nov 2026).
             sql = (
                 "UPDATE ohlcv SET price_adj_factor = :p, volume_adj_factor = :v "
-                "WHERE symbol_id = :sid AND ts >= CAST(:lo AS date) "
+                "WHERE symbol_id = :sid"
             )
-            params: dict[str, Any] = {
-                "sid": symbol_id,
-                "p": combined.price,
-                "v": combined.volume,
-                "lo": lower or dt.date.min,
-            }
+            params: dict[str, Any] = {"sid": symbol_id, "p": combined.price, "v": combined.volume}
+            if lower is not None:
+                sql += " AND ts >= :lo"
+                params["lo"] = ist_midnight(lower)
             if boundary is not None:
-                sql += "AND ts < CAST(:hi AS date)"
-                params["hi"] = boundary
+                sql += " AND ts < :hi"
+                params["hi"] = ist_midnight(boundary)
             result = await self._session.execute(text(sql), params)
             updated += int(cast("CursorResult[Any]", result).rowcount or 0)
             lower = boundary
         return updated
+
+    async def symbols_needing_recompute(self, earliest: dict[int, dt.date]) -> list[int]:
+        """The symbols, of ``{symbol_id: earliest bar date}``, with an action AFTER it.
+
+        A bar inserted before a recorded ex-date gets the column default factor
+        of 1 - correct only if no action follows it. These are the symbols for
+        which that default is wrong.
+        """
+        if not earliest:
+            return []
+        rows = (
+            await self._session.execute(
+                text(
+                    "SELECT symbol_id, max(ex_date) FROM corporate_action "
+                    "WHERE symbol_id = ANY(:sids) GROUP BY symbol_id"
+                ),
+                {"sids": list(earliest)},
+            )
+        ).all()
+        return sorted(int(sid) for sid, newest in rows if newest > earliest[int(sid)])
 
     async def recompute_all(self, symbol_ids: Sequence[int]) -> int:
         total = 0
         for symbol_id in symbol_ids:
             total += await self.recompute_factors(symbol_id)
         return total
+
+
+def ist_midnight(day: dt.date) -> dt.datetime:
+    """The instant an IST trading day begins, in UTC - what an ex-date means."""
+    return dt.datetime.combine(day, dt.time(0), tzinfo=IST).astimezone(dt.UTC)

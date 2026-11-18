@@ -31,12 +31,13 @@ from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol, cast, runtime_checkable
 
-from sqlalchemy import CursorResult, func, select
+from sqlalchemy import CursorResult, and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from algotrader.common.calendar import IST as _IST
 from algotrader.common.db.models import (
+    REJECTION_OUTCOMES,
     DailyPlan,
     DecisionLog,
     Instrument,
@@ -47,6 +48,7 @@ from algotrader.common.db.models import (
     Position,
     ShadowSignal,
     Strategy,
+    StrategyApproval,
 )
 from algotrader.common.enums import PositionStatus, Timeframe
 
@@ -68,6 +70,17 @@ _PG_MAX_BIND_PARAMS = 65535
 #: Batches at or above this size go through COPY into a temp table instead of a
 #: multi-row INSERT. Below it, COPY's setup cost exceeds what it saves.
 _COPY_THRESHOLD = 5_000
+
+#: The COPY path's conflict guard (ENG-027): the stored bar's raw prices change
+#: only when it is synthetic or when the incoming prices are the same.
+_KEEP_RAW_PRICES = (
+    " WHERE ohlcv.synthetic OR (ohlcv.open = EXCLUDED.open AND ohlcv.high = EXCLUDED.high"
+    " AND ohlcv.low = EXCLUDED.low AND ohlcv.close = EXCLUDED.close)"
+)
+
+
+def _distinct_keys(bars: Sequence[dict[str, Any]]) -> int:
+    return len({(b["symbol_id"], str(b["timeframe"]), b["ts"]) for b in bars})
 
 
 class UnknownSymbolError(KeyError):
@@ -297,7 +310,7 @@ class BarRepository:
         self._session = session
         self._instruments = instruments
 
-    async def bulk_upsert(self, bars: Sequence[dict[str, Any]]) -> int:
+    async def bulk_upsert(self, bars: Sequence[dict[str, Any]], *, revise: bool = False) -> int:
         """Insert or update bars. Idempotent on ``(symbol_id, timeframe, ts)``.
 
         Idempotent because ingestion is at-least-once: a reconnect replays
@@ -305,10 +318,23 @@ class BarRepository:
         ``ON CONFLICT`` every reconnect would fail the whole batch on a
         duplicate-key error.
 
-        ``ON CONFLICT DO UPDATE`` rather than ``DO NOTHING``: a bar can be
-        legitimately revised — a late trade report changes volume and vwap, and
-        a corporate action re-adjusts prices. Keeping the first version would
-        silently pin stale data.
+        **The raw OHLC of a stored bar is not changed (BR-15).** On a conflict
+        the volume, trade count and vwap are updated - a late trade report
+        changes those - but only when the open, high, low and close AGREE with
+        the stored bar; or when the stored bar is synthetic, which a real one
+        replaces. A conflicting bar whose prices differ is NOT applied: it is
+        counted and logged, and the stored bar stands. ``revise=True`` is the
+        deliberate correction - an operator replacing bars from a source known
+        to be right - and overwrites them. The first version overwrote every
+        price on every conflict, and its docstring said a corporate action
+        "re-adjusts prices" here, which is what the factor columns exist so
+        that nothing ever does (audit ENG-027, 17 Nov 2026).
+
+        **Factors are made right in the same transaction.** A new bar gets the
+        column default of 1; for a symbol with an ex-date after the bar that is
+        wrong, so those symbols are recomputed before this returns.
+
+        Returns the number of bars written - inserted or updated.
 
         **Chunking is internal and mandatory, not the caller's problem.**
         PostgreSQL's wire protocol allows at most 65535 bound parameters per
@@ -327,7 +353,33 @@ class BarRepository:
         # chunked INSERTs and comfortably under the 10 s budget via COPY. Below
         # it, COPY's temp-table setup costs more than it saves.
         if len(bars) >= _COPY_THRESHOLD:
-            return await self._bulk_upsert_via_copy(bars)
+            written = await self._bulk_upsert_via_copy(bars, revise=revise)
+        else:
+            written = await self._bulk_upsert_rows(bars, revise=revise)
+        refused = _distinct_keys(bars) - written
+        if refused > 0:
+            log.error(
+                "%d bar(s) conflict with a stored bar whose raw OHLC differ and were NOT "
+                "applied (BR-15); the stored bars stand. Use revise=True for a correction.",
+                refused,
+            )
+        await self._factors_after(bars)
+        return written
+
+    async def _factors_after(self, bars: Sequence[dict[str, Any]]) -> None:
+        from algotrader.common.db.corporate_actions import CorporateActionRepository
+
+        earliest: dict[int, dt.date] = {}
+        for bar in bars:
+            day = bar["ts"].astimezone(_IST).date()
+            sid = int(bar["symbol_id"])
+            if sid not in earliest or day < earliest[sid]:
+                earliest[sid] = day
+        actions = CorporateActionRepository(self._session)
+        for sid in await actions.symbols_needing_recompute(earliest):
+            await actions.recompute_factors(sid)
+
+    async def _bulk_upsert_rows(self, bars: Sequence[dict[str, Any]], *, revise: bool) -> int:
 
         # Width is taken from the widest row: callers may omit optional columns,
         # and sizing off the first row alone would under-count and still overflow.
@@ -338,7 +390,14 @@ class BarRepository:
         for start in range(0, len(bars), rows_per_statement):
             chunk = list(bars[start : start + rows_per_statement])
             stmt = pg_insert(Ohlcv).values(chunk)
-            stmt = stmt.on_conflict_do_update(
+            stored = Ohlcv.__table__.c
+            same_prices = and_(
+                stored.open == stmt.excluded.open,
+                stored.high == stmt.excluded.high,
+                stored.low == stmt.excluded.low,
+                stored.close == stmt.excluded.close,
+            )
+            upsert = stmt.on_conflict_do_update(
                 index_elements=["symbol_id", "timeframe", "ts"],
                 set_={
                     "open": stmt.excluded.open,
@@ -350,12 +409,18 @@ class BarRepository:
                     "vwap": stmt.excluded.vwap,
                     "synthetic": stmt.excluded.synthetic,
                 },
-            )
-            result = await self._session.execute(stmt)
-            total += int(cast("CursorResult[Any]", result).rowcount or 0)
+                where=None if revise else or_(stored.synthetic.is_(True), same_prices),
+            ).returning(stored.symbol_id)
+            # RETURNING, not rowcount: through the ORM session an INSERT of many
+            # VALUES reports rowcount -1. A row the WHERE above skipped is not
+            # returned, which is exactly what makes the refusal countable.
+            result = await self._session.execute(upsert)
+            total += len(result.all())
         return total
 
-    async def _bulk_upsert_via_copy(self, bars: Sequence[dict[str, Any]]) -> int:
+    async def _bulk_upsert_via_copy(
+        self, bars: Sequence[dict[str, Any]], *, revise: bool = False
+    ) -> int:
         """The backfill path: ``COPY`` into a temp table, then upsert from it.
 
         ``COPY`` is the only way to load 24 million historical bars in
@@ -438,12 +503,15 @@ class BarRepository:
 
             updatable = [c for c in columns if c not in ("symbol_id", "timeframe", "ts")]
             assignments = ", ".join(f"{c} = EXCLUDED.{c}" for c in updatable)
+            # BR-15, as on the small path: a stored bar's raw prices change only
+            # over a synthetic bar, or under revise=True. A fixed string.
+            guard = "" if revise else _KEEP_RAW_PRICES
             await cur.execute(
                 f"INSERT INTO ohlcv ({col_list}) "  # noqa: S608  # nosec B608 - see _SAFE_IDENTIFIER
                 f"SELECT DISTINCT ON (symbol_id, timeframe, ts) {col_list} "
                 f"FROM _bar_load "
                 f"ORDER BY symbol_id, timeframe, ts, ctid DESC "
-                f"ON CONFLICT (symbol_id, timeframe, ts) DO UPDATE SET {assignments}"
+                f"ON CONFLICT (symbol_id, timeframe, ts) DO UPDATE SET {assignments}{guard}"
             )
             return int(cur.rowcount or 0)
 
@@ -1208,12 +1276,17 @@ class DecisionLogRepository:
         return [_decision_to_dict(r) for r in rows]
 
     async def recent_rejections(self, limit: int = 100) -> list[dict[str, Any]]:
-        """ "Why isn't it trading?" — the highest-value debugging query."""
+        """ "Why isn't it trading?" — the highest-value debugging query.
+
+        Every spelling a producer writes for "did not trade"
+        (:data:`models.REJECTION_OUTCOMES`) - the predicate ``ix_audit_reason``
+        covers. It filtered on ``'REJECT'``, which nothing writes (ENG-026).
+        """
         rows = (
             (
                 await self._session.execute(
                     select(DecisionLog)
-                    .where(DecisionLog.outcome == "REJECT")
+                    .where(DecisionLog.outcome.in_(REJECTION_OUTCOMES))
                     .order_by(DecisionLog.ts.desc())
                     .limit(limit)
                 )
@@ -1286,13 +1359,32 @@ class StrategyRepository:
         row = (
             await self._session.execute(select(Strategy).where(Strategy.id == strategy_id))
         ).scalar_one_or_none()
-        return None if row is None else _strategy_to_dict(row)
+        return None if row is None else _strategy_to_dict(row, await self._approvals([row.id]))
 
     async def strategy_by_hash(self, dsl_hash: str) -> dict[str, Any] | None:
         row = (
             await self._session.execute(select(Strategy).where(Strategy.dsl_hash == dsl_hash))
         ).scalar_one_or_none()
-        return None if row is None else _strategy_to_dict(row)
+        return None if row is None else _strategy_to_dict(row, await self._approvals([row.id]))
+
+    async def _approvals(self, ids: Sequence[str] | None = None) -> dict[str, dict[str, Any]]:
+        """``strategy_approval`` rows by strategy id (RSK-007). Every read of a
+        strategy carries its approval, so the registry can hold a live state
+        to one without asking separately."""
+        query = select(StrategyApproval)
+        if ids is not None:
+            query = query.where(StrategyApproval.strategy_id.in_(list(ids)))
+        rows = (await self._session.execute(query)).scalars().all()
+        return {
+            a.strategy_id: {
+                "dsl_hash": a.dsl_hash,
+                "approved_by": a.approved_by,
+                "approved_at": a.approved_at,
+                "approved_as": a.approved_as,
+                "approved_login": a.approved_login,
+            }
+            for a in rows
+        }
 
     async def all_strategies(self) -> list[dict[str, Any]]:
         """Every row, in registration order. Dozens, never thousands: the
@@ -1307,10 +1399,32 @@ class StrategyRepository:
             .scalars()
             .all()
         )
-        return [_strategy_to_dict(r) for r in rows]
+        approvals = await self._approvals()
+        return [_strategy_to_dict(r, approvals) for r in rows]
 
 
-def _strategy_to_dict(row: Strategy) -> dict[str, Any]:
+class StrategyApprovalRepository:
+    """Writes ``strategy_approval`` - and only works for ``common.roles.APPROVER_ROLE``.
+
+    The session must have run ``SET ROLE algotrader_approver``: the
+    application role has SELECT on the table and no more, which is the point
+    (RSK-007), and a member of the approver role writing under its own name
+    is refused. The database records the role, the login and the time; the
+    caller names the human and the document.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def approve(self, strategy_id: str, *, dsl_hash: str, approved_by: str) -> None:
+        await self._session.execute(
+            pg_insert(StrategyApproval).values(
+                strategy_id=strategy_id, dsl_hash=dsl_hash, approved_by=approved_by
+            )
+        )
+
+
+def _strategy_to_dict(row: Strategy, approvals: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {
         "id": row.id,
         "name": row.name,
@@ -1329,6 +1443,7 @@ def _strategy_to_dict(row: Strategy) -> dict[str, Any]:
         "approved_at": row.approved_at,
         "state_changed_at": row.state_changed_at,
         "retirement_reason": row.retirement_reason,
+        "approval": approvals.get(row.id),
     }
 
 
