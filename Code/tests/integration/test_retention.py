@@ -337,3 +337,165 @@ class TestCompressionPolicyHealth:
         assert status.total_chunks == 0
         assert status.compressed_chunks == 0
         assert status.healthy
+
+
+# ---------------------------------------------------------------------------
+# Audit remediation, 17 Nov 2026 (ENG-006, ENG-030)
+# ---------------------------------------------------------------------------
+
+
+async def ohlcv_count(session: AsyncSession) -> int:
+    return int((await session.execute(text("SELECT count(*) FROM ohlcv"))).scalar_one())
+
+
+class TestAnArchiveIsNeverOverwrittenWithLess:
+    """ENG-006: archives were named by DATE and overwritten in place, so a
+    later range on the same dates destroyed the only copy of purged bars."""
+
+    async def test_two_ranges_on_the_same_dates_are_two_files(self, tmp_path: Path) -> None:
+        day = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        week = day + dt.timedelta(days=7)
+        assert retention.archive_path(tmp_path, day, week) != retention.archive_path(
+            tmp_path, day, week + dt.timedelta(hours=12)
+        )
+
+    async def test_the_audit_scenario_keeps_the_purged_bars(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        """Archive and purge a range, then archive one ending later on the same
+        date: the first archive must still hold every purged bar."""
+        first_end = BASE + dt.timedelta(minutes=50)  # bars 0..9
+        first = await retention.archive_bars(session, tmp_path, start=BASE, end=first_end)
+        await retention.purge_archived_bars(session, tmp_path, start=BASE, end=first_end)
+        await session.flush()
+
+        await retention.archive_bars(
+            session, tmp_path, start=BASE, end=first_end + dt.timedelta(hours=2)
+        )
+        assert len(retention.read_archive(first.path)) == 10, "the purged bars' only copy was lost"
+
+    async def test_re_archiving_a_purged_range_is_refused_and_keeps_the_file(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        first = await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        await session.execute(
+            text("DELETE FROM ohlcv WHERE ts < :t"), {"t": BASE + dt.timedelta(minutes=25)}
+        )
+        await session.flush()
+        with pytest.raises(retention.RetentionError, match="only copy"):
+            await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        assert len(retention.read_archive(first.path)) == 20
+
+    async def test_a_re_run_that_finds_more_bars_replaces_the_archive(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        """The control: growing an archive is safe and allowed."""
+        await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        await session.execute(
+            text(
+                "INSERT INTO ohlcv (symbol_id, timeframe, ts, open, high, low, close, volume) "
+                "VALUES (:s, '5m', :ts, 1, 1, 1, 1, 1)"
+            ),
+            {"s": seeded, "ts": BASE + dt.timedelta(days=1)},
+        )
+        await session.flush()
+        grown = await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        assert len(retention.read_archive(grown.path)) == 21
+
+    async def test_a_crash_mid_write_leaves_the_previous_archive_whole(
+        self, session: AsyncSession, seeded: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first = await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        await session.execute(
+            text(
+                "INSERT INTO ohlcv (symbol_id, timeframe, ts, open, high, low, close, volume) "
+                "VALUES (:s, '5m', :ts, 1, 1, 1, 1, 1)"
+            ),
+            {"s": seeded, "ts": BASE + dt.timedelta(days=1)},
+        )
+        await session.flush()
+
+        def half_a_file(table: object, where: object, **_: object) -> None:
+            Path(str(where)).write_bytes(b"PAR1 truncated")
+            raise OSError("disk full")
+
+        monkeypatch.setattr(retention.pq, "write_table", half_a_file)
+        with pytest.raises(OSError):
+            await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        assert len(retention.read_archive(first.path)) == 20, "the previous archive was damaged"
+
+    async def test_a_naive_range_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(retention.RetentionError, match="timezone-aware"):
+            retention.archive_path(tmp_path, dt.datetime(2026, 1, 1), LATER)
+
+
+class TestAPurgeDeletesOnlyWhatTheArchiveHolds:
+    """ENG-006: a purge was authorised by row COUNT alone."""
+
+    async def test_a_purge_wider_than_the_archive_is_refused(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        with pytest.raises(retention.RetentionError, match="no archive"):
+            await retention.purge_archived_bars(
+                session, tmp_path, start=BASE, end=LATER + dt.timedelta(hours=1)
+            )
+        assert await ohlcv_count(session) == 20
+
+    async def test_an_archive_renamed_onto_another_range_is_refused(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        result = await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        wider = LATER + dt.timedelta(days=1)
+        result.path.rename(retention.archive_path(tmp_path, BASE, wider))
+        with pytest.raises(retention.RetentionError, match="does not record the range"):
+            await retention.purge_archived_bars(session, tmp_path, start=BASE, end=wider)
+        assert await ohlcv_count(session) == 20
+
+    async def test_a_bar_revised_after_the_archive_is_not_purged(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        """Same COUNT, different content: the revision exists nowhere else."""
+        await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        await session.execute(text("UPDATE ohlcv SET volume = 999999 WHERE ts = :t"), {"t": BASE})
+        await session.flush()
+        with pytest.raises(retention.RetentionError, match="Nothing was deleted"):
+            await retention.purge_archived_bars(session, tmp_path, start=BASE, end=LATER)
+        assert await ohlcv_count(session) == 20
+
+    async def test_a_damaged_archive_is_refused(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        import pyarrow.parquet as pq
+
+        result = await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        table = pq.read_table(result.path)
+        pq.write_table(table.slice(0, 19), result.path)  # same name, a row short, metadata kept
+        with pytest.raises(retention.RetentionError, match="no longer hashes"):
+            await retention.purge_archived_bars(session, tmp_path, start=BASE, end=LATER)
+        assert await ohlcv_count(session) == 20
+
+
+class TestARestoreCountsWhatItInserted:
+    """ENG-030: a restore reported the file's row count, so one that inserted
+    nothing read as full success."""
+
+    async def test_restoring_the_same_archive_twice_reports_zero_the_second_time(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        result = await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        await session.execute(text("DELETE FROM ohlcv"))
+        await session.flush()
+        assert await retention.restore_bars(session, result.path) == 20
+        assert await retention.restore_bars(session, result.path) == 0
+
+    async def test_a_partial_restore_counts_only_the_missing_bars(
+        self, session: AsyncSession, seeded: int, tmp_path: Path
+    ) -> None:
+        result = await retention.archive_bars(session, tmp_path, start=BASE, end=LATER)
+        await session.execute(
+            text("DELETE FROM ohlcv WHERE ts < :t"), {"t": BASE + dt.timedelta(minutes=15)}
+        )
+        await session.flush()
+        assert await retention.restore_bars(session, result.path) == 3
+        assert await ohlcv_count(session) == 20

@@ -871,6 +871,42 @@ E24) records each. The shapes worth remembering, because each passed QA:
 - **"The trigger is the price."** Nothing compared it with the market, and
   every cap divides by it. The sizer now requires a fresh live price and
   refuses a trigger more than 1% away.
+- **"Human approval only."** It was two columns the application role could
+  write. An approval is a `strategy_approval` row now, written only by
+  `algotrader_approver` (`common.roles`), naming the document and refused
+  outside AWAITING_APPROVAL; a trigger and the registry both refuse a live
+  state without one (RSK-007). Tests reach a live state through
+  `tests/approvals.py`, the one real path. QA then found the trigger and the
+  registry disagreeing: the trigger took any MEMBER of the role, the registry
+  only `approved_as = algotrader_approver`, and every test used `SET ROLE`, so
+  a human approving under their own login would have been accepted by the
+  database and refused at load. The trigger now requires the role itself and
+  records the login (`approved_login`). *Two guards on one rule must agree;
+  test the path the operator will take, not only the one the helper takes.*
+- **"A buffered audit entry is safe."** A replay read the day file, awaited
+  the database and deleted it - with whatever a concurrent failed write had
+  appended; one poisoned line (a NaN) blocked every entry behind it; and a
+  chain missing its first or last rows verified. Replay and buffering share
+  one lock with durable progress, only an OUTAGE buffers, and the chain is
+  anchored to genesis and to a head recorded off-host (ENG-010/011, SEC-005).
+- **"A restarted consumer picks up where it left off."** Not under a fresh
+  uuid name: its predecessor's pending entries were stranded. Consumer names
+  are stable per instance (`stream.consumer_name`), `start()` reclaims, and
+  an unreadable or repeatedly-fatal entry is dead-lettered (ENG-013).
+- **"The redactor matches `token=`."** As a whole word only, and `_` is a
+  word character, so `request_token=` passed in clear (SEC-011). The filter
+  now renders the message first: scrubbing the template apart from its
+  arguments broke the format, and logging's error handler then printed the
+  raw arguments to stderr. An in-process migration no longer replaces the
+  redacting root handler (SEC-012).
+- **"A wider pattern is a safer pattern."** The SEC-011 fix let a key begin
+  at every word boundary, and inside a dashed run that is every character:
+  6 KB of base64url took 0.9 s to scrub and 200 KB would have held the event
+  loop for most of an hour - one log line of an SDK's response body. Found by
+  timing it in QA, not by any test. Patterns now start where a run starts
+  (and URIs at `://`), and a child-process test with a timeout holds them
+  linear. *A regex in the logging path is code on every request; time it on
+  hostile input of realistic size.*
 
 ### What the whole-system audit checked and did not break
 

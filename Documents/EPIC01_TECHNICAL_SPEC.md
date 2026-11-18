@@ -358,7 +358,9 @@ cheaper than exact and is entirely adequate here.
 | `stream:bars:*` | 10,000 | Several sessions of context |
 | `stream:signals` | 10,000 | Low volume, keep generously |
 | `stream:orders` | 10,000 | Low volume |
-| `stream:audit` | 50,000 | Drained to Postgres continuously |
+| `stream:audit` | — | Not built; see the note below |
+
+**Not built as a stream (audit NR-010, 17 Nov 2026).** Audit entries go to Postgres directly through `common.audit.AuditWriter`, whose disk buffer survives an outage; no `db-writer` exists, and a capped stream TRIMS, so an entry nothing drained would be discarded silently. `stream.publish` refuses `stream:audit`.
 
 **Action:** make `maxlen` a required argument in the `EventStream.publish`
 signature (E01-S04). A stream that can be published to without a bound should
@@ -985,7 +987,7 @@ returned partially parsed, because half-valid trading state is worse than none.
 | `stream:snapshots` | — (unused: the indicator engine runs inside `signal-engine`, which publishes `state:indicator:*`) | — | 10,000 |
 | `stream:signals` | signal-engine | `execution` | 10,000 |
 | `stream:orders` | execution | `notifier`, `api` | 10,000 |
-| `stream:audit` | all | `db-writer` | 50,000 |
+| `stream:audit` | — | — | not built (audit NR-010; `AuditWriter` writes Postgres directly) |
 
 ### 10.2 Envelope
 

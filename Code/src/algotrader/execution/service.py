@@ -1008,7 +1008,12 @@ class RedisSignalSource:
 
     At-least-once: an entry is acknowledged only after its outcome is
     recorded, so a crash mid-signal redelivers it - and the duplicate check
-    is what makes the redelivery harmless.
+    is what makes the redelivery harmless. The consumer name is the SAME
+    across restarts (:func:`~algotrader.common.events.stream.consumer_name`),
+    so the restarted process reads what its predecessor held; ``start()``
+    also reclaims anything idle under another name (audit ENG-013). A
+    reclaimed signal older than ``execution.max_signal_age_seconds`` is
+    refused as stale, not traded.
     """
 
     def __init__(
@@ -1018,15 +1023,20 @@ class RedisSignalSource:
         consumer: str | None = None,
         block_ms: int = 1_000,
         count: int = 10,
+        reclaim_idle_ms: int = streams.DEFAULT_MIN_IDLE_MS,
     ) -> None:
         self._client = client
         self._stream = keys.stream_signals()
-        self._consumer = consumer or streams.new_consumer_name(GROUP)
+        self._consumer = consumer or streams.consumer_name(GROUP)
         self._block_ms = block_ms
         self._count = count
+        self._reclaim_idle_ms = reclaim_idle_ms
 
     async def start(self) -> None:
         await streams.ensure_group(self._client, self._stream, GROUP)
+        await streams.reclaim_stalled(
+            self._client, self._stream, GROUP, self._consumer, min_idle_ms=self._reclaim_idle_ms
+        )
 
     async def next_batch(self) -> list[Delivery]:
         return await streams.consume(

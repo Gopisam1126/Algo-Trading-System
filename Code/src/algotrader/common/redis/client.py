@@ -31,6 +31,15 @@ log = logging.getLogger(__name__)
 #: Retried on connection-level failures only. A command that fails for a
 #: semantic reason (wrong type, bad script) is a bug and must surface, not be
 #: retried into a slower bug.
+#:
+#: **A retried write can land twice** (audit NR-007): an XADD whose reply was
+#: lost is sent again, and the stream then holds the same envelope under two
+#: entry ids. That is accepted, not prevented, because every consumer
+#: de-duplicates on CONTENT, not on the entry id: the strategy loop refuses a
+#: bar not newer than the last it folded (``test_a_redelivered_bar_is_not_
+#: folded_again_or_evaluated``) and the execution service refuses a signal
+#: whose correlation id already has an order (``test_a_redelivered_signal_is_
+#: not_sent_twice``). A new consumer must do the same - see ``stream.publish``.
 _RETRY_ON = (RedisConnectionError, RedisTimeoutError)
 
 

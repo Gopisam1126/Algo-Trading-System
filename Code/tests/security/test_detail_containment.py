@@ -35,6 +35,7 @@ import datetime as dt
 import decimal
 import io
 import logging
+import unicodedata
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from types import MappingProxyType
@@ -158,13 +159,22 @@ class TestTheTypeItselfRefusesToCarryAForgedLine:
             "blocked\x7fdel",
             "blocked\tTAB",
             "blocked\x0bvertical\x0ctab",
+            # SEC-013: the C1 controls and the Unicode separators, which
+            # str.splitlines - and any Unicode-aware reader - also breaks at.
+            "blocked\x85NEL CRITICAL forged",
+            "blocked\u2028LINE SEPARATOR forged",
+            "blocked\u2029PARAGRAPH SEPARATOR forged",
+            "blocked\x9b31mC1 CSI",
         ],
     )
     def test_no_control_character_survives_construction(self, hostile: str) -> None:
         outcome = CheckOutcome.fail(RejectReason.SYMBOL_NOT_TRADABLE, hostile)
         assert "\n" not in outcome.detail
         assert "\r" not in outcome.detail
-        assert not any(ord(c) < 0x20 or ord(c) == 0x7F for c in outcome.detail)
+        assert len(outcome.detail.splitlines()) == 1, outcome.detail
+        assert not any(unicodedata.category(c) in {"Cc", "Zl", "Zp"} for c in outcome.detail), (
+            outcome.detail
+        )
 
     def test_the_direct_constructor_is_covered_too(self) -> None:
         """Not only ``fail``. A check constructing ``CheckOutcome(...)`` by

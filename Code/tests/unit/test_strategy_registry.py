@@ -22,6 +22,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from algotrader.common.enums import StrategyState, Timeframe
+from algotrader.common.roles import APPROVER_ROLE
 from algotrader.strategy.dsl import (
     REGISTRY,
     ParamSpec,
@@ -148,7 +149,17 @@ class MemoryStore:
         row = self.rows[strategy_id]
         row["state"] = state.value
         if approved:
-            row["approved_by"], row["approved_at"] = "operator", T0 + dt.timedelta(days=1)
+            # An approval ROW, written by the approver role, naming this
+            # document - what the repository reads from strategy_approval
+            # (RSK-007); the trigger copies it onto the two columns.
+            at = T0 + dt.timedelta(days=1)
+            row["approved_by"], row["approved_at"] = "operator", at
+            row["approval"] = {
+                "dsl_hash": row["dsl_hash"],
+                "approved_by": "operator",
+                "approved_at": at,
+                "approved_as": APPROVER_ROLE,
+            }
 
     def force(self, row: dict[str, Any]) -> None:
         """Write a row past every guarantee, as a hand-run SQL statement would."""
@@ -704,6 +715,42 @@ class TestTheStartupLoad:
         loaded = await registry.load()
         assert [r.strategy_id for r in loaded.runnable] == ["orb_test_v1"]
         assert loaded.runnable[0].state is StrategyState.DEGRADED
+
+    @pytest.mark.parametrize(
+        ("tamper", "reason"),
+        [
+            pytest.param(lambda r: r.pop("approval"), "no approval of this document", id="none"),
+            pytest.param(
+                lambda r: r["approval"].update(dsl_hash="f" * 64),
+                "no approval of this document",
+                id="another-document",
+            ),
+            pytest.param(
+                lambda r: r["approval"].update(approved_as="algotrader_app"),
+                "not written by algotrader_approver",
+                id="written-by-the-app",
+            ),
+            pytest.param(
+                lambda r: r["approval"].update(approved_by=""), "names no approver", id="nameless"
+            ),
+        ],
+    )
+    async def test_a_live_state_is_held_to_its_approval_row(
+        self,
+        registry: StrategyRegistry,
+        store: MemoryStore,
+        tamper: Callable[[dict[str, Any]], None],
+        reason: str,
+    ) -> None:
+        """RSK-007: the two columns used to be the gate, and the application
+        could write them. The approval row is the gate now; the columns, even
+        filled in, are not."""
+        await registry.register(_base(), now=T0)
+        store.set_state("orb_test_v1", StrategyState.ACTIVE, approved=True)
+        tamper(store.rows["orb_test_v1"])
+        loaded = await registry.load()
+        assert reason in loaded.rejected["orb_test_v1"]
+        assert not loaded.runnable
 
     async def test_a_primitive_rebounded_since_registration_is_caught_at_load(
         self, store: MemoryStore

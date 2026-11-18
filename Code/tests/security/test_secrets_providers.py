@@ -250,15 +250,44 @@ class TestSecretStringCannotEscapeItsWrapper:
         """Needed so a caller can verify a value without calling reveal()."""
         assert SecretString("s3cret-value-x", name="A") == "s3cret-value-x"
 
-    def test_comparison_is_constant_time(self) -> None:
-        """Not a timing measurement — a structural assertion that the
-        implementation routes through hmac.compare_digest. A plain ``==``
-        returns early on the first differing byte, which leaks the length of
-        the matching prefix to anything that can time it."""
-        import inspect
+    def test_comparison_is_constant_time(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Not a timing measurement — an assertion that every comparison is
+        ANSWERED by hmac.compare_digest. A plain ``==`` returns early on the
+        first differing byte, which leaks the length of the matching prefix to
+        anything that can time it. This used to grep the source for the name,
+        which a comment containing it would satisfy (audit ENG-040)."""
+        import hmac
 
-        source = inspect.getsource(SecretString.__eq__)
-        assert "compare_digest" in source
+        answers: list[tuple[object, object]] = []
+        real = hmac.compare_digest
+
+        def spy(a: bytes, b: bytes) -> bool:
+            answers.append((a, b))
+            return real(a, b)
+
+        monkeypatch.setattr(hmac, "compare_digest", spy)
+        secret = SecretString("s3cret-value-x", name="A")
+        assert secret == "s3cret-value-x"
+        assert secret != SecretString("s3cret-value-y", name="B")
+        assert len(answers) == 2, "a comparison was answered without compare_digest"
+
+    @pytest.mark.parametrize(
+        ("held", "probe", "equal"),
+        [
+            ("pässword12345", "pässword12345", True),
+            ("pässword12345", "x", False),
+            ("plainascii123", "pässword12345", False),
+            ("₹-secret-value", "₹-secret-value", True),
+        ],
+    )
+    def test_a_non_ascii_value_compares_instead_of_raising(
+        self, held: str, probe: str, equal: bool
+    ) -> None:
+        """compare_digest takes only ASCII str; a non-ASCII side raised
+        TypeError (ENG-040)."""
+        secret = SecretString(held, name="A")
+        assert (secret == probe) is equal
+        assert (secret == SecretString(probe, name="B")) is equal
 
     def test_comparison_to_an_unrelated_type_is_not_an_error(self) -> None:
         assert SecretString("aaaaaaaaaaaa", name="A") != 42

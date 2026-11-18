@@ -18,7 +18,19 @@ chain, and the verifier names the first divergent row.
 **3. It survives the database being down.** Entries are buffered to disk and
 replayed on recovery. A failed attempt is often exactly what you need to
 investigate later, and "the database was down" is precisely when interesting
-failures happen.
+failures happen. Only an OUTAGE is buffered: an entry that is wrong is
+refused before the database is asked (it raises ``AuditError`` to the
+caller - a programming error), and one the database refuses on its merits is
+quarantined, never left to wedge the replay of everything behind it. A
+buffer directory belongs to ONE writer: replay and buffering are serialised
+by that writer's lock, which another process does not hold.
+
+**What the chain does NOT prove on its own.** The hash is unkeyed, so an
+actor who can rewrite rows can recompute every later hash, and a chain cut
+short at either end is still a chain. :func:`verify_chain` anchors the first
+row to :data:`GENESIS_HASH`, and detects a truncated or rewritten tail only
+against a head (:func:`chain_head`) recorded somewhere the database's writers
+cannot reach (audit SEC-005).
 
 **The writer owns its own session and refuses a caller's.** That is deliberate
 and is the reason :class:`AuditWriter` takes a session *factory*, never a
@@ -41,12 +53,14 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final
 
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -80,16 +94,35 @@ class AuditError(RuntimeError):
     """Raised when the audit layer is used incorrectly."""
 
 
-def _reject_non_string_keys(value: Any, path: str = "payload") -> None:
-    """Refuse payloads whose keys are not strings, at any depth.
+#: At and above this magnitude Python spells a float with an exponent
+#: (``1e+16``) while PostgreSQL's ``numeric`` - which is what JSONB stores a
+#: number as - spells it as an integer (``10000000000000000``), which
+#: ``json.loads`` then reads back as an ``int``. Every float this large is
+#: integral, so it is written as the int it equals and both sides agree.
+_FLOAT_SPELLED_WITH_EXPONENT: Final = 1e16
 
-    ``json.dumps`` coerces non-string keys, so ``{1: "a"}`` and ``{"1": "a"}``
-    serialise identically — two different payloads with one hash. Worse,
-    ``{1: "a", "1": "b"}`` emits a duplicate key. Both are canonicalisation
-    defects in a structure whose entire purpose is to be canonical, so they are
-    rejected at the boundary rather than papered over.
+
+def _canonical_value(value: Any, path: str) -> Any:
+    """The payload as JSON can hold it AND as JSONB will hand it back.
+
+    The chain is verified by re-hashing what the database returns, so any
+    value whose spelling JSONB changes would fail verification of a chain
+    nobody touched (audit NR-008). Three cases, each refused or normalised
+    here rather than discovered by a false tamper alarm:
+
+    - **Non-string keys are refused.** ``json.dumps`` coerces them, so
+      ``{1: "a"}`` and ``{"1": "a"}`` serialise identically - two payloads,
+      one hash - and ``{1: "a", "1": "b"}`` emits a duplicate key.
+    - **Non-finite floats are refused.** ``json.dumps`` writes ``NaN`` and
+      ``Infinity``, which are not JSON; JSONB rejects them, so an entry
+      carrying one could never be inserted (audit ENG-011).
+    - **Two floats are respelled**: ``-0.0`` (``numeric`` has no negative
+      zero, so it comes back ``0.0``) and anything at or above 1e16 (see
+      :data:`_FLOAT_SPELLED_WITH_EXPONENT`). Both are respelled as the value
+      they equal, so nothing is lost.
     """
     if isinstance(value, dict):
+        out: dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise AuditError(
@@ -97,10 +130,21 @@ def _reject_non_string_keys(value: Any, path: str = "payload") -> None:
                     f"JSON coerces it to a string, so {{1: 'a'}} and {{'1': 'a'}} would "
                     f"hash identically — an ambiguity the audit chain must not have."
                 )
-            _reject_non_string_keys(item, f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _reject_non_string_keys(item, f"{path}[{index}]")
+            out[key] = _canonical_value(item, f"{path}.{key}")
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item, f"{path}[{i}]") for i, item in enumerate(value)]
+    if isinstance(value, float) and not isinstance(value, bool):
+        if not math.isfinite(value):
+            raise AuditError(
+                f"{path} is {value!r}: JSON has no non-finite numbers and JSONB refuses "
+                f"them, so this entry could never be written"
+            )
+        if value == 0.0:
+            return 0.0  # -0.0 included: numeric has no negative zero
+        if abs(value) >= _FLOAT_SPELLED_WITH_EXPONENT:
+            return int(value)
+    return value
 
 
 def canonical_json(payload: dict[str, Any]) -> str:
@@ -113,10 +157,36 @@ def canonical_json(payload: dict[str, Any]) -> str:
     ``Decimal``, ``datetime`` and ``UUID`` serialisable without silently
     converting money to float.
 
-    Non-string keys are refused — see :func:`_reject_non_string_keys`.
+    Refuses what the chain could not hold — see :func:`_canonical_value`.
+    It is idempotent over its own output: ``canonical_json(json.loads(s)) ==
+    s``, which is the property verification depends on.
     """
-    _reject_non_string_keys(payload)
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(
+        _canonical_value(payload, "payload"),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+        allow_nan=False,
+    )
+
+
+def _is_outage(exc: BaseException) -> bool:
+    """True when the database could not be REACHED, not when it refused the entry.
+
+    Only an outage is buffered (audit ENG-011). An entry the database refuses
+    on its merits - a constraint, a bad value - would be refused again on
+    every replay, so buffering it would wedge the replay of everything behind
+    it; it is quarantined instead, and the writer is not "degraded", because
+    the database is up.
+    """
+    if isinstance(exc, (sa_exc.OperationalError, sa_exc.InterfaceError, sa_exc.TimeoutError)):
+        return True
+    if isinstance(exc, sa_exc.DisconnectionError):
+        return True
+    if isinstance(exc, sa_exc.DBAPIError) and exc.connection_invalidated:
+        return True
+    # OSError covers ConnectionError; TimeoutError is asyncio's too on 3.11.
+    return isinstance(exc, (OSError, TimeoutError))
 
 
 def _length_prefixed(*fields: str) -> str:
@@ -241,9 +311,15 @@ class AuditWriter:
         self._factory = session_factory
         self._buffer_dir = Path(buffer_dir)
         self._degraded = False
-        # Serialises this process's writers before they reach the database.
-        # The advisory lock is what makes the chain safe ACROSS processes; this
-        # avoids pointless contention on it within one.
+        # True until a replay has completed in THIS process, so entries a
+        # crashed predecessor left on disk drain on the first good write
+        # rather than waiting for a later outage (audit ENG-010).
+        self._replay_due = True
+        # Serialises this process's writes, buffering AND replay. The advisory
+        # lock is what makes the chain safe across processes; this lock is what
+        # makes the buffer safe: a replay that read a file and awaited the
+        # database while another write appended to it then deleted the file,
+        # and the appended entry with it (audit ENG-010).
         self._local_lock = asyncio.Lock()
 
     @property
@@ -252,31 +328,53 @@ class AuditWriter:
         return self._degraded
 
     async def write(self, entry: AuditEntry) -> str | None:
-        """Append one entry. Returns its ``row_hash``, or ``None`` if buffered.
+        """Append one entry. Returns its ``row_hash``, or ``None`` if it did not land.
 
         **Never raises on a database failure.** An audit write that brought down
         the caller would mean a database blip stops trading *and* loses the
-        record of why. Instead the entry goes to disk, a degraded flag is set,
-        and the failure is logged loudly.
+        record of why. An outage buffers the entry to disk and sets
+        :attr:`degraded`; an entry the database refuses on its merits is
+        quarantined (:meth:`quarantined_count`). Both are logged loudly, and
+        differently, because they mean different things.
+
+        **Does raise ``AuditError`` for an entry that is wrong** - a non-string
+        key, a non-finite float, a naive timestamp. That is a caller's bug, it
+        is refused before the database is asked, and it is never buffered: a
+        buffered entry that can never be inserted only postpones the error to a
+        replay, where it used to block every entry behind it (audit ENG-011).
         """
-        stamped = entry if entry.ts is not None else _with_now(entry)
-        try:
-            async with self._local_lock:
+        stamped = _prepared(entry if entry.ts is not None else _with_now(entry))
+        async with self._local_lock:
+            if self._replay_due:
+                _, complete = await self._replay_locked()
+                if not complete:
+                    # The database is still unreachable (the replay logged
+                    # why). Go straight to disk - behind the entries already
+                    # there, so order is kept - without a second attempt.
+                    self._buffer_outage(stamped, cause=None)
+                    return None
+            try:
                 row_hash = await self._insert(stamped)
+            except Exception as exc:
+                if not _is_outage(exc):
+                    self._quarantine(stamped.as_buffer_line(), exc)
+                    return None
+                self._buffer_outage(stamped, cause=exc)
+                return None
             if self._degraded:
-                log.warning("audit database recovered; replaying buffered entries")
+                log.warning("audit database recovered; buffered entries replayed")
                 self._degraded = False
-                await self.replay_buffer()
             return row_hash
-        except Exception:
-            log.error(
-                "AUDIT WRITE FAILED — buffering to disk. The system is running "
-                "without a live audit trail.",
-                exc_info=True,
-            )
-            self._degraded = True
-            self._buffer(stamped)
-            return None
+
+    def _buffer_outage(self, entry: AuditEntry, *, cause: BaseException | None) -> None:
+        log.error(
+            "AUDIT WRITE FAILED — the database is unreachable; buffering to disk. "
+            "The system is running without a live audit trail.",
+            exc_info=cause,
+        )
+        self._degraded = True
+        self._replay_due = True
+        self._buffer(entry)
 
     async def _insert(self, entry: AuditEntry) -> str:
         """One entry, one transaction, holding the chain lock.
@@ -352,6 +450,15 @@ class AuditWriter:
         day = (when or dt.datetime.now(dt.UTC)).astimezone(dt.UTC).date()
         return self._buffer_dir / f"{day.isoformat()}.jsonl"
 
+    @staticmethod
+    def _progress_path(path: Path) -> Path:
+        return path.with_name(path.name + ".progress")
+
+    @property
+    def _quarantine_path(self) -> Path:
+        # A subdirectory, so the replay's non-recursive glob never reads it.
+        return self._buffer_dir / "quarantine" / "refused.jsonl"
+
     def _buffer(self, entry: AuditEntry) -> None:
         """Append to the disk buffer, fsynced per line.
 
@@ -364,51 +471,165 @@ class AuditWriter:
         """
         self._buffer_dir.mkdir(parents=True, exist_ok=True)
         path = self._buffer_path(entry.ts)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(entry.as_buffer_line() + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        progress = self._progress_path(path)
+        if not path.exists() and progress.exists():
+            # A replay finished this day's file and stopped before removing
+            # its marker. Left in place it would skip this new file's lines.
+            progress.unlink()
+        _append_durably(path, entry.as_buffer_line())
+
+    def _quarantine(self, line: str, exc: BaseException) -> None:
+        """Keep an entry the database refused, verbatim, for an operator.
+
+        Only the exception's TYPE is recorded: a driver's message can carry a
+        DSN or the offending value, and this file is read by people.
+        """
+        self._quarantine_path.parent.mkdir(parents=True, exist_ok=True)
+        record = json.dumps(
+            {
+                "refused_at": dt.datetime.now(dt.UTC).isoformat(),
+                "error": type(exc).__name__,
+                "line": line,
+            }
+        )
+        _append_durably(self._quarantine_path, record)
+        log.error(
+            "AUDIT ENTRY REFUSED — the database is up and refused this entry (%s); "
+            "it is quarantined in %s and will not be retried",
+            type(exc).__name__,
+            self._quarantine_path,
+        )
 
     async def replay_buffer(self) -> int:
         """Replay buffered entries into the chain, in order. Returns how many.
 
-        A buffer file is deleted only after **every** line in it has been
-        committed. If replay fails partway, the file stays and replay is
-        retried — at worst producing duplicate entries, which is recoverable.
-        Deleting first and failing after would lose them permanently, which is
-        not.
+        Never raises for an outage: a replay the database interrupts stops,
+        keeps what is left, and reports what it did manage.
+        """
+        async with self._local_lock:
+            replayed, _ = await self._replay_locked()
+            return replayed
+
+    async def _replay_locked(self) -> tuple[int, bool]:
+        """Replay every buffer file in order. Returns (replayed, complete).
+
+        Caller holds :attr:`_local_lock`, so no write appends to a file while
+        it is read.
+
+        **Progress is durable.** After each line is committed (or
+        quarantined) the count of lines done is written beside the file, so a
+        replay the database interrupts - or a crash - resumes at the next
+        line instead of inserting the earlier ones twice (audit ENG-010). The
+        one window left is a commit whose acknowledgement was lost, which no
+        client can tell from a failure.
+
+        **A file is deleted only once every line in it is handled.** Deleting
+        first and failing after would lose them; a line the database refuses
+        on its merits is quarantined and the replay goes on (audit ENG-011).
         """
         if not self._buffer_dir.exists():
-            return 0
+            self._replay_due = False
+            return 0, True
+        for orphan in self._buffer_dir.glob("*.jsonl.progress"):
+            if not orphan.with_name(orphan.name.removesuffix(".progress")).exists():
+                orphan.unlink()
 
         replayed = 0
         for path in sorted(self._buffer_dir.glob("*.jsonl")):
-            lines = path.read_text(encoding="utf-8").splitlines()
-            try:
-                for line in lines:
-                    if line.strip():
-                        await self._insert(AuditEntry.from_buffer_line(line))
+            lines = _buffered_lines(path)
+            progress = self._progress_path(path)
+            done = _read_progress(progress)
+            for index in range(done, len(lines)):
+                line = lines[index]
+                try:
+                    entry = _prepared(AuditEntry.from_buffer_line(line))
+                except (ValueError, KeyError, TypeError, AuditError) as exc:
+                    self._quarantine(line, exc)
+                else:
+                    try:
+                        await self._insert(entry)
+                    except Exception as exc:
+                        if _is_outage(exc):
+                            log.error(
+                                "replay of %s stopped at line %d — the database is "
+                                "unreachable; the rest stays buffered",
+                                path,
+                                index + 1,
+                                exc_info=True,
+                            )
+                            return replayed, False
+                        self._quarantine(line, exc)
+                    else:
                         replayed += 1
-            except Exception:
-                log.error("replay of %s failed — keeping the file for retry", path, exc_info=True)
-                return replayed
+                _write_progress(progress, index + 1)
             path.unlink()
-        return replayed
+            progress.unlink(missing_ok=True)
+        self._replay_due = False
+        return replayed, True
 
     def buffered_count(self) -> int:
         """How many entries are sitting on disk unreplayed."""
         if not self._buffer_dir.exists():
             return 0
         return sum(
-            len([ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()])
+            max(0, len(_buffered_lines(p)) - _read_progress(self._progress_path(p)))
             for p in self._buffer_dir.glob("*.jsonl")
         )
 
+    def quarantined_count(self) -> int:
+        """How many entries the database refused. Non-zero needs an operator."""
+        if not self._quarantine_path.exists():
+            return 0
+        return len(_buffered_lines(self._quarantine_path))
+
 
 def _with_now(entry: AuditEntry) -> AuditEntry:
-    from dataclasses import replace
-
     return replace(entry, ts=dt.datetime.now(dt.UTC))
+
+
+def _prepared(entry: AuditEntry) -> AuditEntry:
+    """The entry as it will be hashed, inserted AND buffered - or ``AuditError``.
+
+    The payload becomes the JSON-native value :func:`canonical_json` writes,
+    so the bytes hashed now, the line buffered, and the JSONB the database
+    hands back to the verifier are one value (audit ENG-011, NR-008).
+    """
+    if entry.ts is None or entry.ts.tzinfo is None:
+        raise AuditError("an audit entry needs a timezone-aware timestamp")
+    return replace(entry, payload=json.loads(canonical_json(entry.payload)))
+
+
+def _append_durably(path: Path, line: str) -> None:
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _buffered_lines(path: Path) -> list[str]:
+    return [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def _read_progress(path: Path) -> int:
+    """Lines of the buffer file already handled. A marker that will not read is 0.
+
+    Reading 0 re-replays the file: duplicates, which are visible and
+    recoverable. Guessing high would skip entries, which is neither.
+    """
+    try:
+        return max(0, int(path.read_text(encoding="utf-8").strip()))
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def _write_progress(path: Path, done: int) -> None:
+    """Atomically: a torn marker must never read as a larger number."""
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(str(done))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -430,11 +651,50 @@ class VerificationResult:
         return self.verified
 
 
+@dataclass(frozen=True, slots=True)
+class ChainPoint:
+    """One row's place in the chain: its ``seq`` and ``row_hash``.
+
+    Recorded somewhere the database's writers cannot reach, it is what turns
+    "the chain is internally consistent" into "the chain is the one we wrote"
+    (audit SEC-005).
+    """
+
+    seq: int
+    row_hash: str
+
+
+#: The point before the first row: seq 0, the genesis hash.
+GENESIS: Final = ChainPoint(seq=0, row_hash=GENESIS_HASH)
+
+
+async def chain_head(session: AsyncSession) -> ChainPoint | None:
+    """The newest row's place in the chain, or ``None`` for an empty chain.
+
+    Record it OFF this host, periodically. A head kept in the same database
+    proves nothing: whoever can truncate the chain can rewrite the record.
+    """
+    row = (
+        await session.execute(
+            text("SELECT seq, row_hash FROM decision_log ORDER BY seq DESC LIMIT 1")
+        )
+    ).first()
+    return None if row is None else ChainPoint(seq=int(row[0]), row_hash=str(row[1]))
+
+
+def _failed(rows: int, seq: int | None, ts: dt.datetime | None, detail: str) -> VerificationResult:
+    return VerificationResult(
+        verified=False, rows_checked=rows, first_bad_seq=seq, first_bad_ts=ts, detail=detail
+    )
+
+
 async def verify_chain(
     session: AsyncSession,
     *,
     start: dt.datetime | None = None,
     end: dt.datetime | None = None,
+    after: ChainPoint | None = None,
+    head: ChainPoint | None = None,
 ) -> VerificationResult:
     """Recompute every hash and report the first divergence.
 
@@ -444,10 +704,35 @@ async def verify_chain(
     - **A deleted row** — the chain is intact either side but ``prev_hash`` does
       not match its predecessor's ``row_hash``, or ``seq`` skips.
 
+    **Both ends are anchored** (audit SEC-005; before it, deleting the first
+    or last rows verified):
+
+    - **The first row** must follow ``after``. With no window that is
+      :data:`GENESIS` - seq 1, ``prev_hash`` all zeroes - so a deleted
+      beginning is a failure. A window that begins mid-chain cannot vouch for
+      its own first link, so it needs ``after`` from a trusted record, and
+      FAILS without one rather than verifying half a chain.
+    - **The last row** is checked against ``head``, a :func:`chain_head`
+      recorded earlier and kept off this host: the chain must still contain
+      that row, unchanged. Without one, a truncated tail is undetectable by
+      construction - nothing in the remaining rows refers to the missing
+      ones - and the result says so. ``head`` is refused with ``end``: a
+      window that ends early has no way to tell truncation from its own end.
+
     A per-``correlation_id`` chain would be simpler and lock-free but could not
-    detect the second case, and deleting an entire trade's worth of entries is
+    detect deletions, and deleting an entire trade's worth of entries is
     exactly the tampering worth defending against.
     """
+    if head is not None and end is not None:
+        raise AuditError("verify_chain: `head` checks the tail, which a window with `end` excludes")
+    if head is not None and after is not None and head.seq <= after.seq:
+        # The head would lie before the window: never compared, while the
+        # result said "tail checked against the recorded head" - or, with no
+        # rows since, a truncation that did not happen (QA, 18 Nov 2026).
+        raise AuditError(
+            f"verify_chain: the head (seq {head.seq}) is not after the anchor (seq "
+            f"{after.seq}), so the window cannot contain it"
+        )
     # The four possible queries are written out in full rather than assembled by
     # string interpolation. There are only four, and a lookup table has no SQL
     # injection surface at all — which is a better answer than interpolating and
@@ -463,29 +748,43 @@ async def verify_chain(
     rows = (await session.execute(text(sql), params)).all()
 
     if not rows:
+        if head is not None:
+            return _failed(
+                0, head.seq, None, f"chain is empty but seq {head.seq} was recorded — truncated"
+            )
         return VerificationResult(verified=True, rows_checked=0, detail="chain is empty")
 
-    expected_prev = None
-    expected_seq = None
+    n = len(rows)
+    first_seq = int(rows[0][0])
+    anchor = after if after is not None else (GENESIS if first_seq == 1 or start is None else None)
+    if anchor is None:
+        return _failed(
+            n,
+            first_seq,
+            rows[0][1],
+            f"the window begins at seq {first_seq} with no anchor: pass after= the trusted "
+            f"ChainPoint of seq {first_seq - 1}",
+        )
+
+    expected_prev = anchor.row_hash
+    expected_seq = anchor.seq + 1
     for row in rows:
         seq, ts, correlation_id, stage, outcome, payload, prev_hash, row_hash = row
 
-        if expected_seq is not None and seq != expected_seq:
-            return VerificationResult(
-                verified=False,
-                rows_checked=len(rows),
-                first_bad_seq=int(seq),
-                first_bad_ts=ts,
-                detail=f"sequence gap: expected seq {expected_seq}, found {seq} — rows deleted",
+        if seq != expected_seq:
+            return _failed(
+                n,
+                int(seq),
+                ts,
+                f"sequence gap: expected seq {expected_seq}, found {seq} — rows deleted",
             )
 
-        if expected_prev is not None and prev_hash != expected_prev:
-            return VerificationResult(
-                verified=False,
-                rows_checked=len(rows),
-                first_bad_seq=int(seq),
-                first_bad_ts=ts,
-                detail=f"broken link at seq {seq}: prev_hash does not match the previous row",
+        if prev_hash != expected_prev:
+            return _failed(
+                n,
+                int(seq),
+                ts,
+                f"broken link at seq {seq}: prev_hash does not match the previous row",
             )
 
         recomputed = compute_row_hash(
@@ -498,17 +797,31 @@ async def verify_chain(
             payload=payload,
         )
         if recomputed != row_hash:
-            return VerificationResult(
-                verified=False,
-                rows_checked=len(rows),
-                first_bad_seq=int(seq),
-                first_bad_ts=ts,
-                detail=f"row {seq} has been modified: stored hash does not match its contents",
+            return _failed(
+                n,
+                int(seq),
+                ts,
+                f"row {seq} has been modified: stored hash does not match its contents",
+            )
+        if head is not None and int(seq) == head.seq and row_hash != head.row_hash:
+            return _failed(
+                n, int(seq), ts, f"row {seq} is not the row recorded as the head — rewritten"
             )
 
         expected_prev = row_hash
         expected_seq = int(seq) + 1
 
-    return VerificationResult(
-        verified=True, rows_checked=len(rows), detail=f"{len(rows)} rows verified"
+    last_seq = expected_seq - 1
+    if head is not None and last_seq < head.seq:
+        return _failed(
+            n,
+            last_seq + 1,
+            None,
+            f"the chain ends at seq {last_seq} but seq {head.seq} was recorded — truncated",
+        )
+    tail = (
+        f"; tail checked against the recorded head (seq {head.seq})"
+        if head is not None
+        else "; tail NOT checked: no recorded head was given"
     )
+    return VerificationResult(verified=True, rows_checked=n, detail=f"{n} rows verified{tail}")

@@ -309,7 +309,9 @@ class CorporateAction(Base):
     #: are the ones needing adjustment.
     ex_date: Mapped[dt.date] = mapped_column(Date, nullable=False)
 
-    #: A 1:5 split is from=1, to=5. Required for SPLIT/BONUS/CONSOLIDATION.
+    #: Old:new share COUNTS - a 1:5 split is from=1, to=5; a bonus of one new
+    #: share for each held is from=1, to=2 (corporate_actions.bonus_ratio).
+    #: Required for SPLIT/BONUS/CONSOLIDATION.
     ratio_from: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     ratio_to: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     #: Per-share amount. Required for DIVIDEND.
@@ -661,11 +663,19 @@ class DecisionLog(Base):
 # 'rejected'. It did not exist and would have indexed nothing if it had.
 # tests/integration/test_schema_matches_models.py now fails on any Index the
 # metadata does not carry.
+#: Every ``decision_log.outcome`` that means "this signal did not trade" -
+#: one list, read by ``recent_rejections`` AND by the index below, so the two
+#: cannot disagree again. ``rejected`` is the risk engine's row; ``REJECTED``
+#: and ``REFUSED`` are the execution service's (``execution.service.Outcome``).
+#: The reader filtered on ``'REJECT'``, which nothing writes, so "why isn't it
+#: trading?" always answered "no rejections" (audit ENG-026, 17 Nov 2026).
+REJECTION_OUTCOMES: tuple[str, ...] = ("rejected", "REJECTED", "REFUSED")
+
 Index(
     "ix_audit_reason",
-    DecisionLog.reason_code,
     DecisionLog.ts.desc(),
-    postgresql_where=text("outcome = 'rejected'"),
+    DecisionLog.reason_code,
+    postgresql_where=text("outcome IN (" + ", ".join(f"'{o}'" for o in REJECTION_OUTCOMES) + ")"),
 )
 
 
@@ -737,6 +747,51 @@ Index(
     Strategy.state,
     postgresql_where=text("state IN ('ACTIVE', 'DEGRADED', 'SHADOW', 'PAPER')"),
 )
+
+
+class StrategyApproval(Base):
+    """A human's approval of ONE strategy document (BR-5). Append-only, and not the app's.
+
+    ``approved_by`` / ``approved_at`` on ``strategy`` used to be the whole
+    gate: two columns the application role could itself write, so any holder
+    of the app's credentials - every service, and one day an AI proposer -
+    could promote a DRAFT straight to ACTIVE (audit RSK-007, 17 Nov 2026). An
+    approval is now a row here, which:
+
+    - only ``common.roles.APPROVER_ROLE`` can INSERT - the application has SELECT -
+      and only AS that role (``SET ROLE``): a member writing under its own
+      name is refused, because the registry would refuse what it wrote;
+    - names the document approved (``dsl_hash``), so an approval does not
+      carry over to another version;
+    - can only be written while the strategy is ``AWAITING_APPROVAL``;
+    - records the role that wrote it (``approved_as``) and the login that
+      took that role (``approved_login``), both set by the trigger, not by
+      the writer - ``approved_by`` is only the name the writer typed.
+
+    ``strategy`` refuses ACTIVE or DEGRADED without one (a trigger, so it
+    holds for every writer), and copies the approver onto the row; the
+    registry refuses to load a live strategy without one too.
+    """
+
+    __tablename__ = "strategy_approval"
+
+    strategy_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("strategy.id"), primary_key=True
+    )
+    dsl_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    approved_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    approved_at: Mapped[dt.datetime] = mapped_column(Ts, nullable=False, server_default=func.now())
+    approved_as: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default=text("CURRENT_USER")
+    )
+    approved_login: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default=text("SESSION_USER")
+    )
+
+    __table_args__ = (
+        CheckConstraint("dsl_hash ~ '^[0-9a-f]{64}$'", name="approved_hash_is_sha256"),
+        CheckConstraint("length(btrim(approved_by)) >= 2", name="approver_is_named"),
+    )
 
 
 class StrategyTrial(Base):
@@ -885,18 +940,24 @@ MUTABLE_TABLES: tuple[str, ...] = (
 #: Append-only tables: SELECT and INSERT only, no UPDATE, no DELETE.
 APPEND_ONLY_TABLES: tuple[str, ...] = ("decision_log", "strategy_trial")
 
+#: Tables the application may READ and nothing else: their writer is another
+#: role. ``strategy_approval`` is written by :data:`APPROVER_ROLE` (RSK-007).
+READ_ONLY_TABLES: tuple[str, ...] = ("strategy_approval",)
+
 #: Tables whose rows are permanent records with a lifecycle: SELECT and INSERT,
 #: UPDATE on exactly these columns, and no DELETE (E12-S01). A strategy's
 #: document - its DSL, hash, hypothesis and lineage - is what its validation,
 #: shadow history and approval were granted to; an UPDATE that changed it
 #: would keep all three for a strategy nobody validated. A rejected or retired
 #: strategy is archived, never deleted (STRATEGY_ENGINE.md §5).
+#:
+#: ``approved_by`` and ``approved_at`` are NOT among them since RSK-007: the
+#: approval is a ``strategy_approval`` row the app cannot write, copied onto
+#: the strategy by a trigger when it moves to ACTIVE or DEGRADED.
 LIFECYCLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "strategy": (
         "state",
         "state_changed_at",
-        "approved_by",
-        "approved_at",
         "retirement_reason",
     ),
 }

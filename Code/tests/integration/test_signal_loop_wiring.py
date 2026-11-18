@@ -66,6 +66,7 @@ from algotrader.signals.source import (
 )
 from algotrader.strategy.dsl import load_strategy_yaml
 from algotrader.strategy.registry import RunnableStrategy, StrategyRegistry
+from tests.approvals import approve
 
 pytestmark = [pytest.mark.integration]
 
@@ -150,6 +151,7 @@ def _wipe(conn: psycopg.Connection) -> None:
     )
     conn.execute("DELETE FROM plan_candidate")
     conn.execute("DELETE FROM daily_plan")
+    conn.execute("DELETE FROM strategy_approval")
     conn.execute("DELETE FROM strategy")
     conn.execute("DELETE FROM instruments WHERE tradingsymbol = ANY(%s)", (list(SYMBOLS),))
 
@@ -663,8 +665,9 @@ async def _registered(
         await StrategyRegistry(StrategyRepository(await _as_app(session))).register(
             doc, now=ist(YESTERDAY, 9, 0)
         )
-    approval = ", approved_by = 'operator', approved_at = now()" if state.places_live_orders else ""
-    owner.execute(f"UPDATE strategy SET state = %s{approval} WHERE id = %s", (state.value, doc.id))
+    if state.places_live_orders:
+        approve(owner, doc.id)  # the only way to a live state (RSK-007)
+    owner.execute("UPDATE strategy SET state = %s WHERE id = %s", (state.value, doc.id))
     async with db_engine.read_only(factory) as session:
         loaded = await StrategyRegistry(StrategyRepository(await _as_app(session))).load()
     [runnable] = [s for s in loaded.runnable if s.strategy_id == doc.id]

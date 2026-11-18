@@ -127,6 +127,7 @@ def _wipe(conn: psycopg.Connection) -> None:
     conn.execute("DELETE FROM shadow_signal")
     conn.execute("DELETE FROM plan_candidate")
     conn.execute("DELETE FROM daily_plan")
+    conn.execute("DELETE FROM strategy_approval")
     conn.execute("DELETE FROM strategy")
     symbols = [*PLANNED, VETOED]
     conn.execute(

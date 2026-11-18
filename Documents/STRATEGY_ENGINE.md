@@ -249,7 +249,7 @@ The last row matters practically: SEBI's framework treats transparent, rule-base
 | `VALIDATING → REJECTED` | Any check fails. Recorded in the trial registry regardless |
 | `SHADOW → PAPER` | ≥ 20 shadow sessions; live-vs-backtest signal agreement ≥ 80%; no execution-feasibility problems (signals at untradeable prices, etc.) |
 | `PAPER → AWAITING_APPROVAL` | ≥ 30 paper trades; positive expectancy after realistic costs; max drawdown within limits |
-| `AWAITING_APPROVAL → ACTIVE` | **Human approval only.** Never automatic, at any autonomy level |
+| `AWAITING_APPROVAL → ACTIVE` | **Human approval only.** Never automatic, at any autonomy level. Enforced by the database since 17 Nov 2026 (audit RSK-007): an approval is a `strategy_approval` row only the `algotrader_approver` role can write, naming the document's `dsl_hash`, writable only while the strategy is `AWAITING_APPROVAL`; a trigger refuses ACTIVE or DEGRADED without one, and the registry refuses to load it |
 | `ACTIVE → DEGRADED` | Automatic on degradation triggers (§8) |
 | `DEGRADED → RETIRED` | Automatic on continued degradation, or human decision |
 | `* → QUARANTINED` | Emergency: anomalous behaviour, suspected data issue, or kill-switch event |
@@ -680,7 +680,7 @@ Four tabs: **Definition** (the DSL, human-readable, with a diff against the pare
 
 ### 12.3 Approval screen
 
-When a strategy reaches `AWAITING_APPROVAL`, the notification and screen present: the hypothesis in plain language, the validation summary with DSR and PBO stated explicitly, the shadow and paper records, correlation to existing active strategies, and the proposed initial allocation. Approval requires re-authentication (MVP doc §11) and typing the strategy name — deliberately more friction than a single tap, because this is the gate between the AI's proposals and your money.
+When a strategy reaches `AWAITING_APPROVAL`, the notification and screen present: the hypothesis in plain language, the validation summary with DSR and PBO stated explicitly, the shadow and paper records, correlation to existing active strategies, and the proposed initial allocation. Approval requires re-authentication (MVP doc §11) and typing the strategy name — deliberately more friction than a single tap, because this is the gate between the AI's proposals and your money. **Built so far (17 Nov 2026):** the database half — the approval is written by a role the application lacks (`algotrader_approver`, migration `7f3e9b2c4d10`), so no service, and no future AI proposer holding the app's credentials, can approve anything. Until the screen exists an approval is an INSERT by a human's own database login that the operator has made a member of `algotrader_approver`, run after `SET ROLE algotrader_approver` — membership alone is refused (18 Nov 2026), because the registry accepts only an approval whose `approved_as` is that role. The database records the role, the login that took it (`approved_login`) and the time; the writer chooses none of them. The screen, the re-authentication and the typed name are not built (E12-S02, E19).
 
 ### 12.4 Trial log
 

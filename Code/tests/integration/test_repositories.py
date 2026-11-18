@@ -185,14 +185,51 @@ class TestBarUpsert:
         await session.flush()
         assert await bars.count("INFY", Timeframe.M5) == 1
 
-    async def test_a_revised_bar_overwrites_rather_than_being_ignored(
+    async def test_a_late_trade_report_updates_volume(
         self, session: AsyncSession, instruments: InstrumentRepository
     ) -> None:
-        """A late trade report changes volume and vwap; DO NOTHING would pin stale data."""
+        """Same prices, more volume: DO NOTHING would pin stale data."""
+        bars = BarRepository(session, instruments)
+        sid = await instruments.symbol_id("INFY")
+        await bars.bulk_upsert([_bar(sid, 0)])
+        await bars.bulk_upsert([{**_bar(sid, 0), "volume": 1500}])
+        await session.flush()
+        [row] = await bars.latest_n("INFY", Timeframe.M5, 1)
+        assert row["volume"] == 1500
+
+    async def test_a_conflicting_price_does_not_rewrite_the_raw_bar(
+        self, session: AsyncSession, instruments: InstrumentRepository
+    ) -> None:
+        """ENG-027 / BR-15: the raw OHLC are never mutated. This test used to
+        assert the opposite - that a second close overwrote the first - which
+        is how a backfill of split-adjusted prices becomes 'raw' with no error."""
         bars = BarRepository(session, instruments)
         sid = await instruments.symbol_id("INFY")
         await bars.bulk_upsert([_bar(sid, 0, close="100")])
-        await bars.bulk_upsert([_bar(sid, 0, close="107")])
+        assert await bars.bulk_upsert([_bar(sid, 0, close="107")]) == 0
+        await session.flush()
+        [row] = await bars.latest_n("INFY", Timeframe.M5, 1)
+        assert row["close"] == Decimal("100")
+
+    async def test_revise_is_the_deliberate_correction(
+        self, session: AsyncSession, instruments: InstrumentRepository
+    ) -> None:
+        bars = BarRepository(session, instruments)
+        sid = await instruments.symbol_id("INFY")
+        await bars.bulk_upsert([_bar(sid, 0, close="100")])
+        assert await bars.bulk_upsert([_bar(sid, 0, close="107")], revise=True) == 1
+        await session.flush()
+        [row] = await bars.latest_n("INFY", Timeframe.M5, 1)
+        assert row["close"] == Decimal("107")
+
+    async def test_a_real_bar_replaces_a_synthetic_one(
+        self, session: AsyncSession, instruments: InstrumentRepository
+    ) -> None:
+        """A synthetic bar is a placeholder, not raw data: the real one wins."""
+        bars = BarRepository(session, instruments)
+        sid = await instruments.symbol_id("INFY")
+        await bars.bulk_upsert([{**_bar(sid, 0, close="100"), "synthetic": True}])
+        assert await bars.bulk_upsert([_bar(sid, 0, close="107")]) == 1
         await session.flush()
         [row] = await bars.latest_n("INFY", Timeframe.M5, 1)
         assert row["close"] == Decimal("107")
@@ -312,6 +349,23 @@ class TestCopyPath:
         assert await bars.count("INFY", Timeframe.M5) == 6_000
         first = await bars.range("INFY", Timeframe.M5, BASE_TS, BASE_TS + dt.timedelta(minutes=1))
         assert first[0]["close"] == Decimal("109"), "last occurrence did not win"
+
+    async def test_copy_path_does_not_rewrite_raw_prices_either(
+        self, session: AsyncSession, instruments: InstrumentRepository
+    ) -> None:
+        """ENG-027 on the backfill path - the one that would meet adjusted data."""
+        bars = BarRepository(session, instruments)
+        sid = await instruments.symbol_id("INFY")
+        await bars.bulk_upsert([_bar(sid, m) for m in range(6_000)])
+        changed = [_bar(sid, 0, close="107"), *(_bar(sid, m) for m in range(1, 6_000))]
+        assert await bars.bulk_upsert(changed) == 5_999
+        await session.flush()
+        first = await bars.range("INFY", Timeframe.M5, BASE_TS, BASE_TS + dt.timedelta(minutes=1))
+        assert first[0]["close"] == Decimal("100")
+        assert await bars.bulk_upsert(changed, revise=True) == 6_000
+        await session.flush()
+        first = await bars.range("INFY", Timeframe.M5, BASE_TS, BASE_TS + dt.timedelta(minutes=1))
+        assert first[0]["close"] == Decimal("107")
 
     async def test_copy_path_is_idempotent_across_calls(
         self, session: AsyncSession, instruments: InstrumentRepository

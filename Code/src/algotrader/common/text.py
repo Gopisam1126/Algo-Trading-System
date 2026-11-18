@@ -28,10 +28,23 @@ from __future__ import annotations
 #: next one.
 MAX_DETAIL = 512
 
-#: Control characters that must never survive into a detail. C0 plus DEL.
-_CONTROL = {c: f"\\x{c:02x}" for c in [*range(0x20), 0x7F]}
-_CONTROL.update({0x0A: "\\n", 0x0D: "\\r", 0x09: "\\t"})
+#: Characters that must never survive into a line of text: every Unicode
+#: control (category Cc: C0, DEL and C1) and the line and paragraph separators
+#: (Zl, Zp). The first version stopped at C0 and DEL, and ``str.splitlines``
+#: - like any reader that honours Unicode - also breaks a line at U+0085,
+#: U+2028 and U+2029 (audit SEC-013, 17 Nov 2026).
+_CONTROL = {c: f"\\x{c:02x}" for c in [*range(0x20), *range(0x7F, 0xA0)]}
+_CONTROL.update({0x0A: "\\n", 0x0D: "\\r", 0x09: "\\t", 0x2028: "\\u2028", 0x2029: "\\u2029"})
 _CONTROL_TABLE = str.maketrans({chr(k): v for k, v in _CONTROL.items()})
+
+
+def escape_controls(text: str) -> str:
+    """Make ``text`` one line: every character that could end a line, escaped.
+
+    No length bound - for fields that carry their own (an AI rationale of
+    2,000 characters is legitimate). Use :func:`one_safe_line` for a detail.
+    """
+    return text.translate(_CONTROL_TABLE)
 
 
 def one_safe_line(detail: str) -> str:
@@ -45,7 +58,7 @@ def one_safe_line(detail: str) -> str:
     The escape is visible on purpose — an investigator should be able to see
     that a newline was attempted, not merely that the text looks odd.
     """
-    escaped = detail.translate(_CONTROL_TABLE)
+    escaped = escape_controls(detail)
     if len(escaped) > MAX_DETAIL:
         keep = MAX_DETAIL - 24
         escaped = f"{escaped[:keep]}... [{len(escaped) - keep} more chars]"

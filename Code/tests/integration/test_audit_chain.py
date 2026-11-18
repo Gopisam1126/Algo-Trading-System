@@ -16,7 +16,7 @@ import asyncio
 import datetime as dt
 import itertools
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from decimal import Decimal
 from pathlib import Path
 
@@ -24,14 +24,18 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from algotrader.common.audit import (
+    GENESIS,
     GENESIS_HASH,
     AuditEntry,
     AuditError,
     AuditWriter,
+    ChainPoint,
     canonical_json,
+    chain_head,
     compute_row_hash,
     verify_chain,
 )
@@ -520,3 +524,327 @@ class TestVerificationRange:
             await writer.write(entry(i))
         result = await verify_chain(session, start=dt.datetime(2020, 1, 1, tzinfo=dt.UTC))
         assert result.rows_checked == 5
+
+
+# ---------------------------------------------------------------------------
+# Audit remediation, 17 Nov 2026 (ENG-010, ENG-011, SEC-005, NR-008)
+# ---------------------------------------------------------------------------
+
+
+class Flaky:
+    """The real session factory, with the database made to go away on demand.
+
+    ``fail_calls`` names the factory calls (1-based) that see an outage;
+    ``failing_tasks`` fails the next call made from a given task; ``on_call``
+    runs once, inside the next call - which is how a test lands a second
+    write in the middle of a replay.
+    """
+
+    def __init__(self, real: object) -> None:
+        self.real = real
+        self.calls = 0
+        self.fail_calls: set[int] = set()
+        self.failing_tasks: set[object] = set()
+        self.on_call: Callable[[], None] | None = None
+
+    def __call__(self) -> object:
+        self.calls += 1
+        hook, self.on_call = self.on_call, None
+        if hook is not None:
+            hook()
+        task = asyncio.current_task()
+        if self.calls in self.fail_calls or task in self.failing_tasks:
+            self.failing_tasks.discard(task)
+            raise OperationalError("SELECT 1", None, ConnectionRefusedError("simulated outage"))
+        return self.real()  # type: ignore[operator]
+
+
+async def payload_ns(session: AsyncSession) -> list[int]:
+    rows = await session.execute(text("SELECT payload FROM decision_log ORDER BY seq"))
+    return [r[0]["n"] for r in rows.all()]
+
+
+class TestTheBufferLosesNothing:
+    """ENG-010: a replay used to read a day file, await the inserts, then unlink
+    it - deleting whatever a concurrent failed write had appended meanwhile."""
+
+    async def test_a_write_landing_mid_replay_is_neither_lost_nor_doubled(
+        self, factory: object, session: AsyncSession, tmp_path: Path
+    ) -> None:
+        flaky = Flaky(factory)
+        w = AuditWriter(flaky, buffer_dir=tmp_path / "buf")  # type: ignore[arg-type]
+        flaky.fail_calls = {1, 2}
+        await w.write(entry(0))
+        await w.write(entry(1))
+        assert w.buffered_count() == 2
+        assert w.degraded
+
+        spawned: list[asyncio.Future[str | None]] = []
+
+        def a_second_write_whose_database_is_down() -> None:
+            task = asyncio.ensure_future(w.write(entry(2)))
+            flaky.failing_tasks.add(task)
+            spawned.append(task)
+
+        flaky.on_call = a_second_write_whose_database_is_down
+        assert await w.write(entry(99)) is not None
+        await spawned[0]
+
+        assert w.buffered_count() == 1, "the mid-replay write was lost with the replayed file"
+        assert await w.replay_buffer() == 1
+        assert w.buffered_count() == 0
+        assert await payload_ns(session) == [0, 1, 99, 2]
+        assert await verify_chain(session)
+
+    async def test_an_interrupted_replay_resumes_without_duplicates(
+        self, factory: object, session: AsyncSession, tmp_path: Path
+    ) -> None:
+        flaky = Flaky(factory)
+        w = AuditWriter(flaky, buffer_dir=tmp_path / "buf")  # type: ignore[arg-type]
+        flaky.fail_calls = {1, 2, 3}
+        for n in range(3):
+            await w.write(entry(n))
+        assert w.buffered_count() == 3
+
+        flaky.fail_calls = {5}  # call 4 replays entry 0; call 5 - entry 1 - finds it down
+        assert await w.replay_buffer() == 1
+        assert w.buffered_count() == 2, "progress was not kept"
+
+        flaky.fail_calls = set()
+        assert await w.replay_buffer() == 2
+        assert await payload_ns(session) == [0, 1, 2], "a resumed replay re-inserted entry 0"
+        assert await verify_chain(session)
+
+    async def test_a_dead_predecessors_buffer_drains_on_the_first_good_write(
+        self, factory: object, session: AsyncSession, tmp_path: Path
+    ) -> None:
+        """Nothing calls replay at startup; the first write that lands does."""
+        buf = tmp_path / "buf"
+        flaky = Flaky(factory)
+        flaky.fail_calls = {1, 2}
+        crashed = AuditWriter(flaky, buffer_dir=buf)  # type: ignore[arg-type]
+        await crashed.write(entry(0))
+        await crashed.write(entry(1))
+
+        restarted = AuditWriter(factory, buffer_dir=buf)  # type: ignore[arg-type]
+        assert await restarted.write(entry(7)) is not None
+        assert restarted.buffered_count() == 0
+        assert await payload_ns(session) == [0, 1, 7], "buffered entries must land first"
+
+    async def test_while_down_each_write_tries_the_database_once(
+        self, factory: object, tmp_path: Path
+    ) -> None:
+        flaky = Flaky(factory)
+        w = AuditWriter(flaky, buffer_dir=tmp_path / "buf")  # type: ignore[arg-type]
+        flaky.fail_calls = set(range(1, 100))
+        for n in range(5):
+            await w.write(entry(n))
+        assert flaky.calls == 5, "an outage doubled every write's connection attempts"
+        assert w.buffered_count() == 5
+
+
+class TestARefusedEntryIsQuarantinedNotBuffered:
+    """ENG-011: every exception used to count as an outage, so an entry the
+    database refuses sat in the buffer and blocked every entry behind it."""
+
+    async def test_the_database_refusing_an_entry_quarantines_it(
+        self, writer: AuditWriter, session: AsyncSession
+    ) -> None:
+        assert await writer.write(entry(1, stage="S" * 40)) is None  # stage is String(28)
+        assert writer.quarantined_count() == 1
+        assert writer.buffered_count() == 0, "a refused entry was buffered as an outage"
+        assert writer.degraded is False, "the database is up"
+
+        assert await writer.write(entry(2)) is not None
+        assert await payload_ns(session) == [2]
+        assert await verify_chain(session)
+
+    async def test_a_poisoned_buffer_line_does_not_stop_the_rest(
+        self, writer: AuditWriter, session: AsyncSession, tmp_path: Path
+    ) -> None:
+        stamp = dt.datetime(2026, 11, 17, 4, tzinfo=dt.UTC)
+        buf = tmp_path / "audit_buffer"
+        buf.mkdir()
+        lines = [
+            entry(0, ts=stamp).as_buffer_line(),
+            "not json at all",
+            entry(1, ts=stamp, stage="S" * 40).as_buffer_line(),
+            entry(2, ts=stamp).as_buffer_line(),
+        ]
+        (buf / "2026-11-17.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        assert await writer.replay_buffer() == 2
+        assert writer.quarantined_count() == 2
+        assert writer.buffered_count() == 0
+        assert await writer.replay_buffer() == 0, "the replay ran twice"
+        assert await payload_ns(session) == [0, 2]
+        assert writer.quarantined_count() == 2
+
+
+class TestBothEndsOfTheChainAreAnchored:
+    """SEC-005: deleting the first or last rows used to verify."""
+
+    async def test_deleting_the_first_rows_is_detected(
+        self, writer: AuditWriter, session: AsyncSession
+    ) -> None:
+        for n in range(6):
+            await writer.write(entry(n))
+        await session.execute(text("DELETE FROM decision_log WHERE seq IN (1, 2)"))
+        await session.commit()
+        result = await verify_chain(session)
+        assert not result
+        assert result.first_bad_seq == 3
+        assert "gap" in result.detail
+
+    async def test_a_truncated_tail_is_detected_against_a_recorded_head(
+        self, writer: AuditWriter, session: AsyncSession
+    ) -> None:
+        for n in range(6):
+            await writer.write(entry(n))
+        recorded = await chain_head(session)
+        assert recorded is not None
+        assert recorded.seq == 6
+        await session.execute(text("DELETE FROM decision_log WHERE seq >= 5"))
+        await session.commit()
+
+        blind = await verify_chain(session)
+        assert blind, "the remaining rows are consistent; without a head this is undetectable"
+        assert "NOT checked" in blind.detail, "the result must say the tail was not checked"
+
+        result = await verify_chain(session, head=recorded)
+        assert not result
+        assert "truncated" in result.detail
+
+    async def test_a_rehashed_last_row_is_detected_against_a_recorded_head(
+        self, writer: AuditWriter, session: AsyncSession
+    ) -> None:
+        """The last row has no successor to break, so only the head catches it."""
+        for n in range(4):
+            await writer.write(entry(n))
+        recorded = await chain_head(session)
+        row = (
+            await session.execute(
+                text("SELECT prev_hash, ts, correlation_id, stage FROM decision_log WHERE seq = 4")
+            )
+        ).one()
+        forged = compute_row_hash(
+            prev_hash=row[0],
+            seq=4,
+            ts=row[1],
+            correlation_id=row[2],
+            stage=row[3],
+            outcome="ALLOW",
+            payload={"n": 999},
+        )
+        await session.execute(
+            text(
+                "UPDATE decision_log SET payload = '{\"n\": 999}'::jsonb, row_hash = :h "
+                "WHERE seq = 4"
+            ),
+            {"h": forged},
+        )
+        await session.commit()
+        assert await verify_chain(session), "control: consistent without the head"
+        result = await verify_chain(session, head=recorded)
+        assert not result
+        assert "rewritten" in result.detail
+
+    async def test_the_untampered_chain_verifies_against_its_head(
+        self, writer: AuditWriter, session: AsyncSession
+    ) -> None:
+        for n in range(4):
+            await writer.write(entry(n))
+        head = await chain_head(session)
+        for n in range(4, 6):  # the chain grows past a head recorded earlier
+            await writer.write(entry(n))
+        result = await verify_chain(session, head=head)
+        assert result, result.detail
+        assert "checked against the recorded head" in result.detail
+
+    async def test_an_empty_chain_with_a_recorded_head_was_truncated(
+        self, session: AsyncSession
+    ) -> None:
+        result = await verify_chain(session, head=ChainPoint(seq=3, row_hash="a" * 64))
+        assert not result
+        assert "truncated" in result.detail
+
+    async def test_a_window_mid_chain_needs_its_anchor(
+        self, writer: AuditWriter, session: AsyncSession
+    ) -> None:
+        base = dt.datetime(2026, 11, 17, 4, tzinfo=dt.UTC)
+        for n in range(6):
+            await writer.write(entry(n, ts=base + dt.timedelta(minutes=n)))
+        predecessor = (
+            await session.execute(text("SELECT row_hash FROM decision_log WHERE seq = 3"))
+        ).one()
+        start = base + dt.timedelta(minutes=3)
+
+        unanchored = await verify_chain(session, start=start)
+        assert not unanchored
+        assert "no anchor" in unanchored.detail
+
+        anchored = await verify_chain(
+            session, start=start, after=ChainPoint(seq=3, row_hash=predecessor[0])
+        )
+        assert anchored, anchored.detail
+        assert anchored.rows_checked == 3
+
+        wrong = ChainPoint(seq=3, row_hash="f" * 64)
+        assert not await verify_chain(session, start=start, after=wrong)
+
+    async def test_a_head_with_an_end_is_refused(self, session: AsyncSession) -> None:
+        with pytest.raises(AuditError):
+            await verify_chain(session, end=dt.datetime(2030, 1, 1, tzinfo=dt.UTC), head=GENESIS)
+
+    async def test_a_head_before_the_window_is_refused_not_claimed_checked(
+        self, writer: AuditWriter, session: AsyncSession
+    ) -> None:
+        """A head at or before the anchor is outside the window, so it can
+        never be compared - and the result used to say the tail had been
+        checked against it (QA, 18 Nov 2026)."""
+        base = dt.datetime(2026, 11, 17, 4, tzinfo=dt.UTC)
+        for n in range(6):
+            await writer.write(entry(n, ts=base + dt.timedelta(minutes=n)))
+        rows = (
+            await session.execute(text("SELECT seq, row_hash FROM decision_log ORDER BY seq"))
+        ).all()
+        point = {int(seq): ChainPoint(seq=int(seq), row_hash=h) for seq, h in rows}
+        start = base + dt.timedelta(minutes=3)
+        for stale in (point[2], point[3]):  # before the anchor, and the anchor itself
+            with pytest.raises(AuditError, match="cannot contain it"):
+                await verify_chain(session, start=start, after=point[3], head=stale)
+        # The control: a head inside the window is checked.
+        result = await verify_chain(session, start=start, after=point[3], head=point[5])
+        assert result, result.detail
+        assert "checked against the recorded head (seq 5)" in result.detail
+
+
+class TestFloatsSurviveJsonb:
+    """NR-008: JSONB stores numbers as numeric and hands some floats back in a
+    different spelling; re-hashing that spelling failed verification of a
+    chain nobody had touched."""
+
+    async def test_every_respelled_float_round_trips_through_the_chain(
+        self, writer: AuditWriter, session: AsyncSession
+    ) -> None:
+        awkward = {
+            "big": 1e16,
+            "bigger": 1.5e17,
+            "huge": 1.7976931348623157e308,
+            "negative_zero": -0.0,
+            "tiny": 5e-324,
+            "small": 1e-7,
+            "inexact": 0.1 + 0.2,
+            "plain": 123.456,
+            "nested": [1e20, {"z": -0.0}],
+        }
+        assert await writer.write(entry(0, payload=awkward)) is not None
+        result = await verify_chain(session)
+        assert result, f"an untouched chain failed verification: {result.detail}"
+
+    async def test_without_the_respelling_jsonb_would_break_it(self, session: AsyncSession) -> None:
+        """The control: prove JSONB really does respell these, so the test above
+        tests something."""
+        for literal in ("1e+16", "-0.0"):
+            back = (await session.execute(text(f"SELECT '{literal}'::jsonb::text"))).scalar_one()
+            assert back != literal, f"JSONB kept {literal!r}; the respelling is unneeded"

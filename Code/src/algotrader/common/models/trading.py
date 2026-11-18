@@ -37,7 +37,7 @@ from algotrader.common.enums import (
     Side,
 )
 from algotrader.common.models.market import Price
-from algotrader.common.text import one_safe_line
+from algotrader.common.text import escape_controls, one_safe_line
 
 Confidence = Annotated[Decimal, Field(ge=0, le=1, decimal_places=3)]
 
@@ -78,6 +78,31 @@ def _validate_symbol(value: str) -> str:
     return value
 
 
+#: A strategy id reaches the same log lines as a symbol, and the AI layer will
+#: one day propose strategies - so it is held to the same kind of allowlist
+#: (audit SEC-013). The DSL is stricter still (``^[a-z0-9_]{3,64}$``); this is
+#: the floor every model carrying an id shares.
+_SAFE_STRATEGY_ID = re.compile(r"[A-Za-z0-9_\-.]{1,64}")
+
+
+def _validate_strategy_id(value: str) -> str:
+    if _SAFE_STRATEGY_ID.fullmatch(value) is None:
+        raise ValueError(
+            f"strategy_id {escape_controls(value[:32])!r} is not a valid id. Allowed: "
+            f"letters, digits and _ - . (1-64 chars)."
+        )
+    return value
+
+
+def _one_line(value: str) -> str:
+    """Free text from the AI is untrusted: it may not end a log line (SEC-013)."""
+    return escape_controls(value)
+
+
+def _one_line_each(values: list[str]) -> list[str]:
+    return [escape_controls(v) for v in values]
+
+
 class Trigger(_Frozen):
     """A deterministic strategy firing.  No AI involvement at this point."""
 
@@ -92,6 +117,7 @@ class Trigger(_Frozen):
 
     _utc = field_validator("fired_at")(_require_utc)
     _symbol = field_validator("symbol")(_validate_symbol)
+    _strategy = field_validator("strategy_id")(_validate_strategy_id)
 
     @model_validator(mode="after")
     def _stop_on_correct_side(self) -> Trigger:
@@ -127,6 +153,9 @@ class AIReview(_Frozen):
     output_tokens: int = Field(default=0, ge=0)
     cache_read_tokens: int = Field(default=0, ge=0)
 
+    _text = field_validator("thesis_alignment", "rationale", "model_used")(_one_line)
+    _factors = field_validator("supporting_factors", "risk_factors")(_one_line_each)
+
 
 class Recommendation(_Frozen):
     """The AI / deterministic boundary.
@@ -160,6 +189,8 @@ class Recommendation(_Frozen):
 
     _utc = field_validator("emitted_at")(_require_utc)
     _symbol = field_validator("symbol")(_validate_symbol)
+    _strategy = field_validator("strategy_id")(_validate_strategy_id)
+    _rationale = field_validator("ai_rationale")(_one_line)
 
     @classmethod
     def build(

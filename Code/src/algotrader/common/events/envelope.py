@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import uuid
+from decimal import Decimal
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -24,12 +26,41 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 #: a version they do not understand rather than guess at the payload shape.
 CURRENT_SCHEMA_VERSION = 1
 
+#: The versions this code can read - exactly these, not "at least 1". The
+#: validator was named for refusing unknown versions and refused only those
+#: below 1, so a v99 message was accepted by a v1 consumer (audit ENG-012).
+SUPPORTED_SCHEMA_VERSIONS: frozenset[int] = frozenset({CURRENT_SCHEMA_VERSION})
+
+
+def _refuse_non_finite(value: Any, path: str) -> None:
+    """NaN and infinity are not JSON. Pydantic writes them as ``null``, so a NaN
+    price published on a stream arrived as None - read downstream as "missing",
+    not "invalid" (ENG-012)."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _refuse_non_finite(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _refuse_non_finite(item, f"{path}[{index}]")
+    elif (isinstance(value, float) and not math.isfinite(value)) or (
+        isinstance(value, Decimal) and not value.is_finite()
+    ):
+        raise ValueError(f"{path} is {value!r}: a stream payload carries finite numbers only")
+
 
 class Envelope(BaseModel):
     """A single stream message.
 
     Frozen because a message is a record of something that happened. Mutating
     one after publication would make the audit trail a work of fiction.
+
+    **The payload is JSON, and comes back as JSON.** A ``Decimal`` or a
+    ``datetime`` put in is written as a string and READ BACK AS A STRING; it
+    does not round-trip as its type, whatever this docstring once said
+    (audit ENG-012). A consumer re-validates the payload with the typed model
+    it expects (``Bar.model_validate``, ``Recommendation.model_validate``),
+    which is where a string becomes a ``Decimal`` again - exactly, because it
+    was never a float. Non-finite numbers are refused at construction.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -51,10 +82,19 @@ class Envelope(BaseModel):
             raise ValueError("emitted_at must be timezone-aware")
         return v
 
+    @field_validator("payload")
+    @classmethod
+    def _payload_is_finite(cls, v: dict[str, Any]) -> dict[str, Any]:
+        _refuse_non_finite(v, "payload")
+        return v
+
     @model_validator(mode="after")
     def _version_must_be_known(self) -> Self:
-        if self.schema_version < 1:
-            raise ValueError(f"schema_version must be >= 1, got {self.schema_version}")
+        if self.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+            raise ValueError(
+                f"schema_version {self.schema_version} is not one this code reads "
+                f"({sorted(SUPPORTED_SCHEMA_VERSIONS)}); refused rather than guessed at"
+            )
         return self
 
     def to_fields(self) -> dict[str, str]:
@@ -62,8 +102,8 @@ class Envelope(BaseModel):
 
         The payload is nested JSON in a single field rather than spread across
         stream fields. Redis stream fields are a flat string map, so a nested
-        payload would need flattening and re-inflating — losing type information
-        (every value becomes a string) exactly where ``Decimal`` matters most.
+        payload would need flattening and re-inflating — and every number would
+        come back a string, not only the ``Decimal`` ones.
         """
         return {
             "message_id": str(self.message_id),
@@ -86,9 +126,10 @@ class Envelope(BaseModel):
         """
         try:
             # to_fields() writes model_dump_json(include={"payload"}), which is
-            # {"payload": {...}} — so unwrap one level here. Going through
-            # Pydantic's encoder both ways is what keeps Decimal and datetime
-            # round-tripping exactly rather than degrading to float/str.
+            # {"payload": {...}} — so unwrap one level here. What comes back is
+            # JSON-native: a Decimal written as "1234.50" is the STRING
+            # "1234.50" here, never a float, and the consumer's typed model
+            # turns it back into a Decimal (see the class docstring).
             wrapper = json.loads(fields["payload"])
             payload = (
                 wrapper["payload"]

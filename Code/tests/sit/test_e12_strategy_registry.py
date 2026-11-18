@@ -66,6 +66,7 @@ def _owner_dsn(url: str) -> str:
 def _empty_registry(migrated_database: str) -> Iterator[None]:
     def wipe() -> None:
         with psycopg.connect(_owner_dsn(migrated_database), autocommit=True) as conn:
+            conn.execute("DELETE FROM strategy_approval")
             conn.execute("DELETE FROM strategy")
 
     wipe()

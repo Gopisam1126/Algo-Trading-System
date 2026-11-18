@@ -406,7 +406,7 @@ stream:ticks                              → XADD, consumer group "archiver"
 stream:bars:{timeframe}                   → XADD, consumer group "signal-engine"
 stream:signals                            → XADD, consumer group "execution-svc"
 stream:orders                             → XADD, consumer group "notifier","api-server"
-stream:audit                              → XADD, consumer group "db-writer"
+stream:audit                              → NOT BUILT: AuditWriter writes Postgres directly (audit NR-010); publish() refuses it
 
 # ---- Control (String) ----
 control:killswitch                        → STRING  "ACTIVE" | "INACTIVE"
