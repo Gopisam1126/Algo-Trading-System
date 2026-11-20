@@ -44,7 +44,17 @@ MARKET_CLOSE = time(15, 30)
 CAS_CONTINUOUS_END = time(15, 15)
 CAS_END = time(15, 35)
 
-#: Broker auto square-off times — per-stock.  We always exit BEFORE these.
+#: The square-off times every deadline is computed back from - per stock class,
+#: and at or before the BROKER's auto square-off, which is the property that
+#: matters: we exit before we are force-closed. They were Zerodha's own times
+#: when written. Zerodha has since moved its MIS square-off LATER (support FAQ
+#: "intraday auto square-off timings", read 20 Nov 2026: CAS stocks 3:12 PM,
+#: non-CAS 3:25 PM, F&O contracts 3:26 PM - Z-Connect 26 Dec 2025 and
+#: 10 Aug 2026), so each now precedes it by 2, 5 and 1 minutes and they are
+#: kept: later times are a choice to trade longer, not a correction (audit
+#: ENG-020). ``tests/unit/test_calendar.py`` holds them below Zerodha's published
+#: times as independent literals. Zerodha says it may change them at short
+#: notice; NSE moves CAS stocks' continuous session to 15:30 on 7 Dec 2026.
 SQUAREOFF_CAS_STOCKS = time(15, 10)
 SQUAREOFF_NON_CAS = time(15, 20)
 SQUAREOFF_FNO = time(15, 25)
@@ -246,10 +256,19 @@ class MarketCalendar:
     # -- Square-off deadlines (constraint C5) -------------------------------
 
     def broker_squareoff_time(self, *, is_cas_stock: bool, is_fno: bool = False) -> time:
-        """The time the BROKER will force-close an intraday position."""
-        if is_fno:
-            return SQUAREOFF_FNO
-        return SQUAREOFF_CAS_STOCKS if is_cas_stock else SQUAREOFF_NON_CAS
+        """The time the BROKER will force-close an intraday position.
+
+        A CAS-scope instrument gets the CAS time whatever else it is - the
+        earliest that could apply. Until 20 Nov 2026 ``is_fno`` was checked
+        first, so a CAS stock flagged F&O got 15:25: thirteen minutes after
+        Zerodha force-closes CAS stocks (15:12) and a deadline the broker would
+        always beat. Nothing sets ``is_fno`` yet - the system trades cash
+        equity - so it was latent; found by testing the deadline against
+        Zerodha's published times instead of these constants (audit ENG-020).
+        """
+        if is_cas_stock:
+            return SQUAREOFF_CAS_STOCKS
+        return SQUAREOFF_FNO if is_fno else SQUAREOFF_NON_CAS
 
     def squareoff_deadline(
         self,

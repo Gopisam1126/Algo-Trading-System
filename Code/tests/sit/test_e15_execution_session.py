@@ -18,19 +18,24 @@ closes in Postgres.
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import math
 import random
+import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
+from kiteconnect import KiteConnect
+from kiteconnect import exceptions as kx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from algotrader.broker.adapter import Venue
 from algotrader.broker.kite.trading import KiteTradingAdapter
 from algotrader.broker.paper import PaperConfig, PaperKite
 from algotrader.common.audit import AuditWriter
@@ -80,7 +85,13 @@ from algotrader.indicators.engine import IndicatorSet
 from algotrader.indicators.publish import publish_indicator_state
 from algotrader.ingest.quotes import QuoteState
 from algotrader.strategy.dsl import load_strategy_yaml
-from tests.doubles import CountingLimiter, MarketAt, RegisteredStrategies
+from tests.doubles import (
+    CountingLimiter,
+    MarketAt,
+    RegisteredStrategies,
+    nse_equity_tick,
+    on_venue,
+)
 
 pytestmark = [pytest.mark.integration]
 
@@ -97,6 +108,11 @@ def _ist(hour: int, minute: int) -> dt.datetime:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+#: Where every fixture instrument closed last month - the price level its
+#: fills are at - which sets its NSE tick (audit NR-006).
+FIXTURE_CLOSE = Decimal("1200")
 
 
 @pytest.fixture
@@ -135,7 +151,9 @@ async def instruments(session: AsyncSession) -> InstrumentRepository:
                 "tradingsymbol": symbol,
                 "exchange": "NSE",
                 "broker_token": f"sit21-tok-{i}",
-                "tick_size": Decimal("0.05"),
+                # Audit NR-006: NSE's tick for the fixture's price level, not a
+                # flat 0.05 (0.10 for a Rs 1,200 stock since 15 Apr 2025).
+                "tick_size": nse_equity_tick(FIXTURE_CLOSE),
                 "lot_size": 1,
                 "sector": sector,
             }
@@ -184,28 +202,126 @@ def calendar() -> MarketCalendar:
 
 
 class SettlingAccount:
-    """Kite's payloads; a MARKET order fills in full at the next settle()."""
+    """Kite's payloads, and the order rules Kite and the exchange apply (audit ENG-008).
 
-    def __init__(self) -> None:
+    Until 20 Nov 2026 this accepted anything: any price grid, any keyword, any
+    tag, and filled every MARKET order in full at one constant price, so a
+    regression in tick snapping or order shape on the money path passed every
+    SIT that used it. It now refuses what the venue refuses, each rule with its
+    source:
+
+    * **Tick** - a trigger or price off the instrument's grid. The exchange's
+      rule (NSE/CMTR/67133 sets the grid by price band); the grid is the
+      instrument master's, the same resolver the adapter snaps to.
+    * **Lot** - a quantity that is not a positive whole number of lots (one
+      share for NSE equity).
+    * **Tag** - "alphanumeric, max 20 chars" (kite.trade/docs/connect/v3/orders,
+      read 20 Nov 2026).
+    * **Market protection** - "-1 (auto protection)" or "greater than 0 and up
+      to 100" for MARKET and SL-M (same page). The page does not say it is
+      mandatory; requiring it is THIS system's rule (the gateway refuses 0 and
+      always sends it), held here so that dropping it fails a SIT.
+    * **Order types** - the system sends MARKET and SL-M only; LIMIT and SL are
+      refused as unmodelled, never mis-filled (PaperKite's rule too).
+
+    A refusal at placement raises ``InputException``, Kite's type for "bad
+    values for parameters" (kite.trade/docs/connect/v3/exceptions). Whether
+    Kite refuses an off-tick order synchronously or lists it REJECTED is not
+    documented; both reach the gateway as a refusal.
+
+    And tests can configure what a real session does: a fill price per symbol
+    that is not the trigger, a partial fill per settle, an order the RMS
+    rejects AFTER accepting it (as the documented "Insufficient funds" example
+    does - the order exists, then reads REJECTED with a status_message), and a
+    stop that triggers when the price crosses it.
+    """
+
+    #: The keywords the INSTALLED SDK's ``KiteConnect.place_order`` takes - read
+    #: from it, not listed by hand (a hand list here once named ``autoslice``,
+    #: which 5.2.1 does not accept). A keyword outside it is a TypeError there.
+    PLACE_ORDER_KEYWORDS = frozenset(inspect.signature(KiteConnect.place_order).parameters) - {
+        "self"
+    }
+    MODELLED_ORDER_TYPES = frozenset({"MARKET", "SL-M"})
+    TAG = re.compile(r"[A-Za-z0-9]{1,20}")
+
+    def __init__(
+        self,
+        *,
+        tick_size: Callable[[str], Decimal],
+        lot_size: Callable[[str], int] = lambda _symbol: 1,
+        fill_price: Decimal = Decimal("1200.50"),
+    ) -> None:
         self.book: list[dict[str, Any]] = []
         self.net: dict[str, dict[str, Any]] = {}
         self.placed: list[dict[str, Any]] = []
+        self.refused: list[tuple[dict[str, Any], str]] = []
+        self._tick = tick_size
+        self._lot = lot_size
+        #: Where each symbol's MARKET orders fill; ``fill_price`` otherwise.
+        self.fill_prices: dict[str, Decimal] = {}
+        self._fill_price = fill_price
+        #: (symbol, transaction_type, order_type) the RMS rejects after
+        #: accepting, with the status_message it gives.
+        self.rejects: dict[tuple[str, str, str], str] = {}
+        #: The most of a symbol's MARKET order that fills per settle.
+        self.fill_at_most: dict[str, int] = {}
+
+    # -- placement -----------------------------------------------------------
+
+    def _refuse(self, params: dict[str, Any], why: str) -> None:
+        self.refused.append((params, why))
+        raise kx.InputException(why, code=400)
+
+    def _on_grid(self, symbol: str, value: Any) -> bool:
+        tick = self._tick(symbol)
+        return Decimal(str(value)) % tick == 0
 
     def place_order(self, **params: Any) -> str:
+        unknown = set(params) - self.PLACE_ORDER_KEYWORDS
+        if unknown:
+            self._refuse(params, f"place_order() got unexpected keywords {sorted(unknown)}")
+        symbol, order_type = params["tradingsymbol"], params["order_type"]
+        if order_type not in self.MODELLED_ORDER_TYPES:
+            self._refuse(params, f"{order_type} orders are not modelled")
+        tag = params.get("tag")
+        if tag is not None and not self.TAG.fullmatch(str(tag)):
+            self._refuse(params, "tag must be alphanumeric, at most 20 characters")
+        quantity = params["quantity"]
+        lot = self._lot(symbol)
+        if not isinstance(quantity, int) or quantity <= 0 or quantity % lot:
+            self._refuse(params, f"quantity {quantity!r} is not a whole number of {lot}-lots")
+        protection = params.get("market_protection")
+        if protection is None:
+            self._refuse(params, f"a {order_type} order without market_protection")
+        if not (Decimal(str(protection)) == -1 or 0 < Decimal(str(protection)) <= 100):
+            self._refuse(params, f"market_protection {protection!r} is not -1 or in (0, 100]")
+        if order_type == "SL-M":
+            trigger = params.get("trigger_price")
+            if trigger is None or Decimal(str(trigger)) <= 0:
+                self._refuse(params, "an SL-M order needs a positive trigger_price")
+            if not self._on_grid(symbol, trigger):
+                self._refuse(
+                    params,
+                    f"trigger_price {trigger} is not a multiple of tick {self._tick(symbol)}",
+                )
+        if params.get("price") not in (None, 0) and not self._on_grid(symbol, params["price"]):
+            self._refuse(params, f"price {params['price']} is off the {self._tick(symbol)} grid")
         self.placed.append(params)
         order_id = f"26082500{len(self.placed):04d}"
         self.book.append(
             {
                 "order_id": order_id,
                 "tag": params.get("tag"),
-                "status": "OPEN" if params["order_type"] == "MARKET" else "TRIGGER PENDING",
-                "tradingsymbol": params["tradingsymbol"],
+                "status": "OPEN" if order_type == "MARKET" else "TRIGGER PENDING",
+                "tradingsymbol": symbol,
                 "exchange": params.get("exchange", "NSE"),
                 "transaction_type": params["transaction_type"],
-                "order_type": params["order_type"],
+                "order_type": order_type,
                 "product": params["product"],
-                "quantity": params["quantity"],
+                "quantity": quantity,
                 "filled_quantity": 0,
+                "trigger_price": params.get("trigger_price"),
                 "order_timestamp": "2026-08-25 10:00:00",
             }
         )
@@ -229,30 +345,60 @@ class SettlingAccount:
             "utilised": {"debits": 0.0},
         }
 
+    # -- what happens between reads -----------------------------------------
+
+    def trigger(self, symbol: str, ltp: Decimal) -> None:
+        """The price reaches ``ltp``: every working stop it crosses fills there."""
+        for row in self.book:
+            if row["tradingsymbol"] != symbol or row["status"] != "TRIGGER PENDING":
+                continue
+            stop = Decimal(str(row["trigger_price"]))
+            crossed = ltp <= stop if row["transaction_type"] == "SELL" else ltp >= stop
+            if crossed:
+                self._fill(row, row["quantity"], ltp)
+
     def settle(self) -> None:
         for row in self.book:
+            key = (row["tradingsymbol"], row["transaction_type"], row["order_type"])
+            if row["status"] in ("OPEN", "TRIGGER PENDING") and key in self.rejects:
+                if row["filled_quantity"] == 0:
+                    row.update(status="REJECTED", status_message=self.rejects[key])
+                    continue
             if row["order_type"] != "MARKET" or row["status"] != "OPEN":
                 continue
-            row.update(status="COMPLETE", filled_quantity=row["quantity"], average_price="1200.50")
-            held = self.net.setdefault(
-                row["tradingsymbol"],
-                {
-                    "tradingsymbol": row["tradingsymbol"],
-                    "exchange": "NSE",
-                    "product": "MIS",
-                    "quantity": 0,
-                    "day_buy_quantity": 0,
-                    "day_sell_quantity": 0,
-                    "average_price": 1200.5,
-                    "pnl": 0,
-                },
-            )
-            if row["transaction_type"] == "BUY":
-                held["quantity"] += row["quantity"]
-                held["day_buy_quantity"] += row["quantity"]
-            else:
-                held["quantity"] -= row["quantity"]
-                held["day_sell_quantity"] += row["quantity"]
+            remaining = row["quantity"] - row["filled_quantity"]
+            now = min(remaining, self.fill_at_most.get(row["tradingsymbol"], remaining))
+            price = self.fill_prices.get(row["tradingsymbol"], self._fill_price)
+            self._fill(row, now, price)
+
+    def _fill(self, row: dict[str, Any], quantity: int, price: Decimal) -> None:
+        if quantity <= 0:
+            return
+        before = row["filled_quantity"]
+        row["filled_quantity"] = before + quantity
+        previous = Decimal(str(row.get("average_price") or 0))
+        row["average_price"] = str((previous * before + price * quantity) / row["filled_quantity"])
+        if row["filled_quantity"] == row["quantity"]:
+            row["status"] = "COMPLETE"
+        held = self.net.setdefault(
+            row["tradingsymbol"],
+            {
+                "tradingsymbol": row["tradingsymbol"],
+                "exchange": "NSE",
+                "product": "MIS",
+                "quantity": 0,
+                "day_buy_quantity": 0,
+                "day_sell_quantity": 0,
+                "average_price": float(price),
+                "pnl": 0,
+            },
+        )
+        if row["transaction_type"] == "BUY":
+            held["quantity"] += quantity
+            held["day_buy_quantity"] += quantity
+        else:
+            held["quantity"] -= quantity
+            held["day_sell_quantity"] += quantity
 
 
 class Facts:
@@ -296,7 +442,9 @@ class Day:
         clock=None,
         facts=None,
     ) -> None:
-        self.account = account or SettlingAccount()
+        self.account = account or SettlingAccount(tick_size=instruments.tick_size)
+        # Audit NR-002: the service runs in PAPER, so its account must say it is one.
+        on_venue(Venue.PAPER, self.account)
         self.clock = clock or Clock(_ist(9, 10))
         self.redis = redis
         adapter = KiteTradingAdapter(
@@ -446,6 +594,29 @@ def _stops(account: SettlingAccount) -> dict[str, int]:
     return {p["tradingsymbol"]: p["quantity"] for p in account.placed if p["order_type"] == "SL-M"}
 
 
+def _stop_triggers(account: SettlingAccount) -> dict[str, Decimal]:
+    """Each stop's trigger price as the BROKER received it (audit ENG-008:
+    the SITs compared stop quantities only, so a stop at the wrong price -
+    off the grid, on the wrong side, unanchored - passed)."""
+    return {
+        p["tradingsymbol"]: Decimal(str(p["trigger_price"]))
+        for p in account.placed
+        if p["order_type"] == "SL-M"
+    }
+
+
+def _assert_long_stops_protect(account: SettlingAccount, instruments: InstrumentRepository) -> None:
+    """Every stop is on its instrument's grid and below its long entry's fill."""
+    fills = {
+        r["tradingsymbol"]: Decimal(str(r["average_price"]))
+        for r in account.book
+        if r["transaction_type"] == "BUY" and r["filled_quantity"]
+    }
+    for symbol, trigger in _stop_triggers(account).items():
+        assert trigger % instruments.tick_size(symbol) == 0, (symbol, trigger)
+        assert trigger < fills[symbol], (symbol, trigger, fills[symbol])
+
+
 # ---------------------------------------------------------------------------
 # SIT-21
 # ---------------------------------------------------------------------------
@@ -510,6 +681,17 @@ class TestSit21ASessionDrivenByTheExecutionService:
         entries = [p for p in day.account.placed if p["transaction_type"] == "BUY"]
         assert sorted(p["tradingsymbol"] for p in entries) == ["INFY", "TCS"]
         assert _stops(day.account) == {p["tradingsymbol"]: p["quantity"] for p in entries}
+        # And at the right PRICE (audit ENG-008), worked by hand: the sizer's
+        # distance is ATR 12.5 x 1.5 = 18.75 from the 1200.00 trigger; the
+        # entry filled at 1200.50, so the stop anchors at 1200.50 - 18.75 =
+        # 1181.75 (RSK-013); a long's SELL stop rounds UP to the 0.10 tick:
+        # 1181.80. On the old flat 0.05 grid 1181.75 was already valid, which
+        # is why an unsnapped stop could not fail this test before.
+        assert _stop_triggers(day.account) == {
+            "INFY": Decimal("1181.80"),
+            "TCS": Decimal("1181.80"),
+        }
+        assert day.account.refused == [], "the broker refused an order the system sent"
         exits = [
             p
             for p in day.account.placed
@@ -744,6 +926,47 @@ class TestSit22NoPositionSurvivesItsDeadline:
 
 
 # ---------------------------------------------------------------------------
+# SIT-26 - an exit the broker refuses (audit ENG-008)
+# ---------------------------------------------------------------------------
+
+
+class TestSit26AnExitTheBrokerRefuses:
+    """The account accepts the entry and the stop, and its RMS rejects every
+    MARKET sell of INFY - the exits. At the deadline the stop is cancelled
+    and the exit refused, attempt after attempt: the position must end
+    ESCALATED (a NAKED_POSITION halt), never booked as CLOSED, because the
+    shares are still held."""
+
+    async def test_a_refused_exit_halts_rather_than_closing_the_book(
+        self, session, instruments, redis, audit, calendar
+    ) -> None:
+        day = Day(session, instruments, redis, audit, calendar)
+        day.account.rejects[("INFY", "SELL", "MARKET")] = "RMS:Rule: exit refused (SIT-26)"
+        await day.service.start()
+        entry = _rec("INFY", _ist(10, 0))
+        late = _rec("TCS", _ist(15, 25))
+        await day.walk(_ist(15, 30), {_ist(10, 0): [entry], _ist(15, 25): [late]})
+
+        sells = [
+            r
+            for r in day.account.book
+            if r["tradingsymbol"] == "INFY" and r["order_type"] == "MARKET"
+        ]
+        sells = [r for r in sells if r["transaction_type"] == "SELL"]
+        assert sells, "no exit was attempted"
+        assert all(r["status"] == "REJECTED" for r in sells), sells
+        assert day.account.net["INFY"]["quantity"] > 0, "the shares are still held"
+
+        state = await day.halts.state()
+        assert state.any_halted
+        reasons = {record.reason for record in state.records.values() if record is not None}
+        assert HaltReason.NAKED_POSITION in reasons, reasons
+        # INFY is the only position all day: TCS at 15:25 is in the closing blackout.
+        status = (await session.execute(text("SELECT status FROM positions"))).scalar_one()
+        assert status != "CLOSED", "the book closed a position the broker still holds"
+
+
+# ---------------------------------------------------------------------------
 # SIT-23 - a session sized from the live inputs (E15-S14)
 # ---------------------------------------------------------------------------
 
@@ -875,7 +1098,7 @@ class TestSit23ASessionSizedFromTheLiveInputs:
                 prices=MarketAt(Decimal("1200.00")),
             )
 
-        account = SettlingAccount()
+        account = SettlingAccount(tick_size=instruments.tick_size)
         account.order_margins = desk.order_margins  # type: ignore[attr-defined]
         day = Day(session, instruments, redis, audit, calendar, account=account, facts=live)
         await day.service.start()
@@ -931,6 +1154,7 @@ class TestSit23ASessionSizedFromTheLiveInputs:
         # Nothing a refusal touched reached the broker; everything that did was
         # protected, then left at its own deadline, once.
         assert _stops(day.account) == {s: p["quantity"] for s, p in entries.items()}
+        _assert_long_stops_protect(day.account, instruments)
         exits = {
             p["tradingsymbol"]: p["quantity"]
             for p in day.account.placed
@@ -998,7 +1222,7 @@ class TestSit24TheHealthGateThroughASession:
                 prices=MarketAt(Decimal("1200.00")),
             )
 
-        account = SettlingAccount()
+        account = SettlingAccount(tick_size=instruments.tick_size)
         account.order_margins = desk.order_margins  # type: ignore[attr-defined]
         day = Day(session, instruments, redis, audit, calendar, account=account, facts=live)
         await day.service.start()
@@ -1052,6 +1276,7 @@ class TestSit24TheHealthGateThroughASession:
         }
         assert sorted(entries) == ["INFY", "TCS"]
         assert _stops(day.account) == {s: p["quantity"] for s, p in entries.items()}
+        _assert_long_stops_protect(day.account, instruments)
         exits = {
             p["tradingsymbol"]: p["quantity"]
             for p in day.account.placed
@@ -1093,11 +1318,14 @@ class _Prices:
 
     def at(self, symbol: str, ltp: str, **depth: Any) -> None:
         price = Decimal(ltp)
+        # One tick either side - NSE's tick for the fixture, so the touch is
+        # on the exchange's grid (audit NR-006; it was a flat 0.05).
+        tick = nse_equity_tick(FIXTURE_CLOSE)
         self.quotes[symbol] = QuoteState(
             symbol=symbol,
             ltp=price,
-            bid=price - Decimal("0.05"),
-            ask=price + Decimal("0.05"),
+            bid=price - tick,
+            ask=price + tick,
             as_of=self._clock.now,
             **depth,
         )
@@ -1118,7 +1346,9 @@ class TestSit25ADayOnThePaperBroker:
     ) -> None:
         clock = Clock(_ist(9, 10))
         prices = _Prices(clock)
-        desk = PaperDesk(quotes=prices, clock=clock, config=PaperConfig())
+        desk = PaperDesk(
+            quotes=prices, clock=clock, tick_size=instruments.tick_size, config=PaperConfig()
+        )
         day = Day(session, instruments, redis, audit, calendar, account=desk, clock=clock)
         await day.service.start()
 
@@ -1191,7 +1421,9 @@ class TestSit25ADayOnThePaperBroker:
         clock = Clock(_ist(9, 10))
         prices = _Prices(clock)
         saved: dict[str, Any] = {}
-        desk = PaperDesk(quotes=prices, clock=clock, on_change=saved.update)
+        desk = PaperDesk(
+            quotes=prices, clock=clock, tick_size=instruments.tick_size, on_change=saved.update
+        )
         day = Day(session, instruments, redis, audit, calendar, account=desk, clock=clock)
         await day.service.start()
         signals = {_ist(10, 1): [_rec("INFY", _ist(10, 1))]}
@@ -1202,7 +1434,7 @@ class TestSit25ADayOnThePaperBroker:
         await day.walk(_ist(10, 10), signals, at_each_minute=each_minute)
         assert isinstance(day.manager.tracked("INFY"), ProtectedPosition)
 
-        revived = PaperDesk(quotes=prices, clock=clock)
+        revived = PaperDesk(quotes=prices, clock=clock, tick_size=instruments.tick_size)
         revived.restore(saved)
         after = Day(session, instruments, redis, audit, calendar, account=revived, clock=clock)
         report = await after.service.start()

@@ -55,6 +55,7 @@ from algotrader.strategy.runtime import (
     load_evaluators,
     verify_condition,
 )
+from tests.doubles import nse_equity_tick
 
 primitive_registry.install()
 
@@ -111,6 +112,8 @@ def ctx(snapshot: MultiTimeframeSnapshot, opening_range: OpeningRange):
             "timeframe": Timeframe.M5,
             "direction": Direction.LONG,
             "last_price": Decimal("1200.00"),
+            # INFY's NSE tick at this price level (audit NR-006).
+            "tick_size": nse_equity_tick(Decimal("1200")),
             # The previous bar closed INSIDE the 1140-1150 range, so a close of
             # 1200 is a break - a crossing, not merely a price above the level
             # (audit TRD-017). Tests about the crossing override it.
@@ -379,6 +382,7 @@ class TestTrendPrimitives:
                 timeframe=Timeframe.M5,
                 direction=Direction.LONG,
                 last_price=Decimal("1000"),
+                tick_size=nse_equity_tick(Decimal("1000")),
                 snapshot=snap,
             ),
         )
@@ -798,6 +802,7 @@ class TestTheContextRefusesIncoherentInput:
                 timeframe=Timeframe.M5,
                 direction=Direction.LONG,
                 last_price=Decimal("100"),
+                tick_size=nse_equity_tick(Decimal("100")),
                 snapshot=snapshot,
             )
 
@@ -809,6 +814,7 @@ class TestTheContextRefusesIncoherentInput:
                 timeframe=Timeframe.M5,
                 direction=Direction.LONG,
                 last_price=Decimal("100"),
+                tick_size=nse_equity_tick(Decimal("100")),
                 snapshot=snapshot,
             )
 
@@ -820,6 +826,7 @@ class TestTheContextRefusesIncoherentInput:
                 timeframe=Timeframe.M5,
                 direction=Direction.LONG,
                 last_price=Decimal("0"),
+                tick_size=Decimal("0.01"),  # any valid tick: the price is what is refused
                 snapshot=snapshot,
             )
 

@@ -13,8 +13,62 @@ from typing import Any
 
 import pytest
 
+from algotrader.broker.adapter import Venue
 from algotrader.broker.ratelimit import RateLimitConfig
 from algotrader.common.config import CONFIRM_LIVE_VARIABLE, LIVE_ENVIRONMENT, AppConfig
+
+
+def on_venue(venue: Venue, *doubles: Any) -> None:
+    """Declare that each double stands for an account on ``venue`` (audit NR-002).
+
+    The execution service refuses collaborators whose venue is not its mode's,
+    and an object that declares none counts as LIVE. A double is a simulation,
+    but which ACCOUNT it stands for is the test's statement, so it is set
+    here, explicitly, rather than defaulted on the class.
+    """
+    for double in doubles:
+        double.venue = venue
+
+
+#: NSE's capital-market tick by price band (audit NR-006), effective from the
+#: trade date of 15 Apr 2025 - NSE circular NSE/CMTR/67133, as published in
+#: Zerodha's bulletin 408151 of 17 Mar 2025 (read 20 Nov 2026; NSE's own PDF
+#: does not load from this host, B8). The upper bound of each band, inclusive,
+#: and its tick; above the last bound the tick is NSE_TOP_TICK. NSE reviews it
+#: monthly on the close of the month's last trading day, so an instrument's
+#: tick is fixed for the month whatever its price does intraday. The tests
+#: hard-coded 0.05 for Rs 1,200 stocks, whose tick has been 0.10 since then.
+NSE_EQUITY_TICK_BANDS: tuple[tuple[Decimal, Decimal], ...] = (
+    (Decimal("250"), Decimal("0.01")),  # "Below 250": the bound is EXCLUSIVE here
+    (Decimal("1000"), Decimal("0.05")),  # ">= 250 to 1000"
+    (Decimal("5000"), Decimal("0.10")),  # "> 1000 to 5000"
+    (Decimal("10000"), Decimal("0.50")),  # "> 5000 to 10000"
+    (Decimal("20000"), Decimal("1")),  # "> 10000 to 20000"
+)
+NSE_TOP_TICK = Decimal("5")  # "> 20000"
+
+
+def nse_equity_tick(reference_close: Decimal) -> Decimal:
+    """The tick NSE assigns a stock whose last month-end close was ``reference_close``."""
+    if reference_close <= 0:
+        raise ValueError(f"a close is positive, not {reference_close}")
+    (below, lowest), *rest = NSE_EQUITY_TICK_BANDS
+    if reference_close < below:
+        return lowest
+    for upper, tick in rest:
+        if reference_close <= upper:
+            return tick
+    return NSE_TOP_TICK
+
+
+class Unreachable:
+    """A collaborator a test never calls, which still has to declare a venue."""
+
+    def __init__(self, venue: Venue) -> None:
+        self.venue = venue
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"this test was not meant to reach .{name}")
 
 
 class CountingLimiter:

@@ -16,13 +16,19 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from kiteconnect import KiteConnect
 
 from algotrader.broker.adapter import (
     AmbiguousOrderError,
     MarginSnapshot,
     OrderRejectedError,
     RateLimitError,
+    Venue,
+    venue_of,
+    venue_of_all,
 )
+from algotrader.broker.kite.trading import KiteTradingAdapter
+from algotrader.broker.paper import PaperKite, trading_client, venue_for
 from algotrader.common.audit import AuditEntry
 from algotrader.common.calendar import MarketCalendar, load_holidays_with_status
 from algotrader.common.config import AppConfig
@@ -42,13 +48,16 @@ from algotrader.execution import reconciliation as rec_mod
 from algotrader.execution.gateway import GatewayPolicy, OrderGateway, client_order_id
 from algotrader.execution.halt import HaltController, HaltReason
 from algotrader.execution.positions import PositionManager, UnverifiedPosition
+from algotrader.execution.protective_stop import ProtectiveStop
 from algotrader.execution.risk.checks import all_check_ids
-from algotrader.execution.service import ExecutionService, Outcome
+from algotrader.execution.service import ExecutionService, Outcome, VenueMismatchError
 from algotrader.execution.session_context import NoProducerYet
-from tests.doubles import live_config
+from tests.doubles import CountingLimiter, Unreachable, live_config, nse_equity_tick, on_venue
 
 # 10:30 IST on an ordinary Tuesday.
 NOW = dt.datetime(2026, 8, 25, 5, 0, tzinfo=dt.UTC)
+#: INFY around Rs 1,200: NSE tick 0.10 (audit NR-006).
+TICK = nse_equity_tick(Decimal("1200"))
 TRADE_DATE = dt.date(2026, 8, 25)
 CLEAN = {"is_t2t": False, "is_asm": False, "is_gsm": False, "is_fno_ban": False}
 
@@ -350,8 +359,10 @@ class Harness:
             policy=GatewayPolicy(algo_id=None, market_protection=Decimal("-1")),
             store=self.orders,
         )
+        venue = venue_for(mode)
+        self.margins = Margins()
         self.manager = PositionManager(
-            protector=None,  # type: ignore[arg-type]
+            protector=Unreachable(venue),  # type: ignore[arg-type]
             store=self.store,
             mirror=Mirror(),
             calendar=_calendar(),
@@ -359,6 +370,8 @@ class Harness:
         self.reconciler = Reconciler(self.ref)
         self.holdings = Holdings()
         self.emergency = Emergency()
+        # Audit NR-002: each double stands for this mode's account.
+        on_venue(venue, self.placer, self.reconciler, self.holdings, self.emergency, self.margins)
         self.clock = Clock()
         self.audit: list[AuditEntry] = []
         self.service = ExecutionService(
@@ -370,7 +383,7 @@ class Harness:
             protector=self.emergency,
             broker=self.holdings,
             halts=self.halts,
-            margins=Margins(),
+            margins=self.margins,
             store=self.store,
             orders=self.orders,
             redis=self.redis,  # type: ignore[arg-type]
@@ -1010,7 +1023,7 @@ class TestTheSignalAgeLimit:
             protector=h.emergency,
             broker=h.holdings,
             halts=h.halts,
-            margins=Margins(),
+            margins=h.margins,
             store=h.store,
             orders=h.orders,
             redis=h.redis,  # type: ignore[arg-type]
@@ -1626,3 +1639,189 @@ class TestTheLoopsOutliveATransientFailure:
         h.service._sleep = no_wait
         await asyncio.wait_for(h.service._squareoff_until(stop), timeout=5)
         assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Audit NR-002: the service is built only over its mode's venue
+# ---------------------------------------------------------------------------
+
+#: Every collaborator through which the service reads the account or acts on it.
+VENUE_BOUND = ("gateway", "manager", "reconciler", "protector", "broker", "margins")
+
+
+def _build(h: Harness, **swap: Any) -> ExecutionService:
+    """The harness's service again, with some collaborators replaced."""
+    parts: dict[str, Any] = {
+        "gateway": h.gateway,
+        "manager": h.manager,
+        "reconciler": h.reconciler,
+        "protector": h.emergency,
+        "broker": h.holdings,
+        "margins": h.margins,
+    }
+    parts.update(swap)
+    return ExecutionService(
+        config=h.config,
+        calendar=_calendar(),
+        halts=h.halts,
+        store=h.store,
+        orders=h.orders,
+        redis=h.redis,  # type: ignore[arg-type]
+        facts=Facts(),
+        clock=h.clock,
+        **parts,
+    )
+
+
+def _kite_gateway(client: Any, h: Harness) -> OrderGateway:
+    """The REAL order path: a gateway over the Kite adapter over ``client``."""
+    adapter = KiteTradingAdapter(
+        auth=None,  # type: ignore[arg-type]
+        client=client,
+        limiter=CountingLimiter(),
+        tick_size_for=lambda _s: TICK,
+    )
+    return OrderGateway(
+        adapter,
+        policy=GatewayPolicy(algo_id=None, market_protection=Decimal("-1")),
+        store=h.orders,
+    )
+
+
+class TestTheVenueMatchesTheMode:
+    """A PAPER service could be handed a live Kite client and would have sent
+    real orders through it with every paper control in force (NR-002)."""
+
+    def test_a_paper_service_over_a_real_kite_client_is_refused(self) -> None:
+        """The probe: the actual SDK class behind the actual adapter and gateway."""
+        h = Harness()
+        live = _kite_gateway(KiteConnect(api_key="probe"), h)
+        with pytest.raises(VenueMismatchError, match=r"paper venue, and gateway does not"):
+            _build(h, gateway=live)
+
+    def test_the_same_stack_over_the_paper_client_is_built(self) -> None:
+        """The control: only the client differs, and the service builds."""
+        h = Harness()
+        paper = PaperKite(quotes=lambda _s: None, clock=lambda: NOW, tick_size=lambda _s: TICK)
+        assert _build(h, gateway=_kite_gateway(paper, h)) is not None
+
+    def test_a_kite_client_that_claims_to_be_paper_is_still_live(self) -> None:
+        class Disguised(KiteConnect):
+            venue = Venue.PAPER
+
+        h = Harness()
+        with pytest.raises(VenueMismatchError, match="gateway"):
+            _build(h, gateway=_kite_gateway(Disguised(api_key="probe"), h))
+
+    @pytest.mark.parametrize("name", VENUE_BOUND)
+    def test_any_live_collaborator_refuses_a_paper_service(self, name: str) -> None:
+        h = Harness()
+        with pytest.raises(VenueMismatchError) as caught:
+            _build(h, **{name: Unreachable(Venue.LIVE)})
+        # The ONLY one named: the check reads each collaborator, not the first.
+        named = str(caught.value).split("and ", 1)[1].split(" do")[0]
+        assert named == name
+
+    @pytest.mark.parametrize("name", VENUE_BOUND)
+    def test_an_undeclared_collaborator_counts_as_live(self, name: str) -> None:
+        """Fail closed: forgetting the declaration refuses, it does not pass."""
+        h = Harness()
+        with pytest.raises(VenueMismatchError, match=name):
+            _build(h, **{name: object()})
+
+    @pytest.mark.parametrize("name", VENUE_BOUND)
+    def test_any_paper_collaborator_refuses_a_live_service(
+        self, name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A live service reading a simulated book - or exiting through one -
+        compares one account's positions with another's orders."""
+        h = Harness(mode=SystemMode.LIVE, autonomy="L2", monkeypatch=monkeypatch)
+        with pytest.raises(VenueMismatchError, match=rf"live venue, and {name} does not"):
+            _build(h, **{name: Unreachable(Venue.PAPER)})
+
+    def test_a_live_service_over_live_collaborators_is_built(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h = Harness(mode=SystemMode.LIVE, autonomy="L2", monkeypatch=monkeypatch)
+        assert h.service is not None
+
+    @pytest.mark.parametrize("mode", list(SystemMode))
+    def test_the_client_chosen_is_the_venue_required(self, mode: SystemMode) -> None:
+        """trading_client and the service's check are one decision, for every mode."""
+        client = trading_client(
+            mode,
+            live=lambda: KiteConnect(api_key="probe"),
+            paper=lambda: PaperKite(
+                quotes=lambda _s: None, clock=lambda: NOW, tick_size=lambda _s: TICK
+            ),
+        )
+        h = Harness()
+        assert venue_of(_kite_gateway(client, h)) is venue_for(mode)
+
+
+class TestVenueOf:
+    def test_a_string_is_not_a_declaration(self) -> None:
+        class Says:
+            venue = "paper"
+
+        assert venue_of(Says()) is Venue.LIVE
+
+    def test_one_live_part_makes_the_whole_live(self) -> None:
+        assert venue_of_all(Unreachable(Venue.PAPER), object()) is Venue.LIVE
+        assert venue_of_all(Unreachable(Venue.PAPER), Unreachable(Venue.PAPER)) is Venue.PAPER
+
+    def test_nothing_is_not_a_simulation(self) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            venue_of_all()
+
+
+class TestEachLayerReportsWhatItIsBuiltOver:
+    """The service reads ``venue`` off six objects; each must derive it from
+    everything beneath it that reaches the account, or a live part hides."""
+
+    PAPER, LIVE = Unreachable(Venue.PAPER), Unreachable(Venue.LIVE)
+
+    def test_the_gateway_is_its_placer(self) -> None:
+        policy = GatewayPolicy(algo_id=None, market_protection=Decimal("-1"))
+        assert OrderGateway(self.LIVE, policy=policy, store=Orders()).venue is Venue.LIVE
+        assert OrderGateway(self.PAPER, policy=policy, store=Orders()).venue is Venue.PAPER
+
+    def test_the_protector_is_its_gateway(self) -> None:
+        halts = HaltController(FakeRedis())  # type: ignore[arg-type]
+        assert ProtectiveStop(self.LIVE, halter=halts).venue is Venue.LIVE  # type: ignore[arg-type]
+        assert ProtectiveStop(self.PAPER, halter=halts).venue is Venue.PAPER  # type: ignore[arg-type]
+
+    def test_the_manager_is_its_protector(self) -> None:
+        def manager(protector: Any) -> PositionManager:
+            return PositionManager(
+                protector=protector, store=Store(), mirror=Mirror(), calendar=_calendar()
+            )
+
+        assert manager(self.LIVE).venue is Venue.LIVE
+        assert manager(self.PAPER).venue is Venue.PAPER
+
+    @pytest.mark.parametrize("live", ["broker", "protector", "canceller"])
+    def test_the_reconciler_is_live_if_any_part_is(self, live: str) -> None:
+        parts: dict[str, Any] = {
+            "broker": self.PAPER,
+            "protector": self.PAPER,
+            "canceller": self.PAPER,
+        }
+        parts[live] = self.LIVE
+        reconciler = rec_mod.Reconciler(
+            ledger=Orders(),  # type: ignore[arg-type]
+            manager=None,  # type: ignore[arg-type]
+            halter=HaltController(FakeRedis()),  # type: ignore[arg-type]
+            **parts,
+        )
+        assert reconciler.venue is Venue.LIVE
+        parts[live] = self.PAPER
+        assert (
+            rec_mod.Reconciler(
+                ledger=Orders(),  # type: ignore[arg-type]
+                manager=None,  # type: ignore[arg-type]
+                halter=HaltController(FakeRedis()),  # type: ignore[arg-type]
+                **parts,
+            ).venue
+            is Venue.PAPER
+        )

@@ -28,11 +28,15 @@ from collections.abc import AsyncIterator
 from decimal import Decimal
 from typing import Any
 
+from kiteconnect import KiteConnect
+
 from algotrader.broker.adapter import (
     AuthenticationError,
     BrokerSession,
     RateLimitError,
     ReadOnlyGuard,
+    Venue,
+    venue_of,
 )
 from algotrader.broker.kite import mapping
 from algotrader.broker.kite.auth import KiteAuthManager
@@ -78,6 +82,19 @@ class KiteReads:
         self._auth = auth
         self._client = client
         self._limiter = limiter
+
+    @property
+    def venue(self) -> Venue:
+        """Where this adapter's calls land (audit NR-002).
+
+        A real ``kiteconnect.KiteConnect`` - or any subclass of it - is LIVE
+        whatever it declares. Any other client is what it declares
+        (:class:`~algotrader.broker.paper.PaperKite` says PAPER), and LIVE if
+        it declares nothing.
+        """
+        if isinstance(self._client, KiteConnect):
+            return Venue.LIVE
+        return venue_of(self._client)
 
     # -- session -------------------------------------------------------------
 

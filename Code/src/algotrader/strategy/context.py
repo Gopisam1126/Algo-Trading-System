@@ -81,11 +81,12 @@ class EvalContext:
     #: The instrument's tick size. A stop is a price that must be PLACEABLE:
     #: NSE rejects anything off the tick grid, so an unsnapped stop is not a
     #: slightly-imprecise stop, it is a rejected order and therefore a position
-    #: with no protection at all. Defaults to the same 0.05 as
-    #: ``Instrument.tick_size``; callers holding a real instrument must pass
-    #: its own value, because the default is right for most NSE equities and
-    #: wrong for the ones that matter.
-    tick_size: Decimal = Decimal("0.05")
+    #: with no protection at all. REQUIRED (audit NR-006): it defaulted to
+    #: 0.05, described as "right for most NSE equities" - and since 15 Apr 2025
+    #: NSE sets the tick by price band (NSE/CMTR/67133: 0.10 from Rs 1,000 to
+    #: 5,000, 0.50 to 10,000, ...), so 0.05 is off the grid for every stock
+    #: above Rs 1,000. The instrument master's value is the only right one.
+    tick_size: Decimal
 
     bar: Bar | None = None
     #: Today's opening print. Needed by ``gap_from_prev_close``, which is a

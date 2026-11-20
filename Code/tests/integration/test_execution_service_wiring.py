@@ -31,6 +31,7 @@ import redis.asyncio as aioredis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from algotrader.broker.adapter import Venue
 from algotrader.broker.kite.trading import KiteTradingAdapter
 from algotrader.broker.paper import PaperConfig, PaperKite
 from algotrader.common.audit import AuditWriter
@@ -86,13 +87,24 @@ from algotrader.indicators.engine import IndicatorSet
 from algotrader.indicators.publish import publish_indicator_state
 from algotrader.ingest.quotes import QuoteState
 from algotrader.strategy.dsl import load_strategy_yaml
-from tests.doubles import CountingLimiter, MarketAt, RegisteredStrategies
+from tests.doubles import (
+    CountingLimiter,
+    MarketAt,
+    RegisteredStrategies,
+    nse_equity_tick,
+    on_venue,
+)
 
 pytestmark = [pytest.mark.integration]
 
 TRADE_DATE = dt.date(2026, 8, 25)
 NOW = dt.datetime(2026, 8, 25, 5, 0, tzinfo=dt.UTC)  # 10:30 IST
 INSTRUMENTS = {"INFY": "IT", "TCS": "IT", "SBIN": "BANKS"}
+
+
+#: Where every fixture instrument closed last month - the price level its
+#: fills are at - which sets its NSE tick (audit NR-006).
+FIXTURE_CLOSE = Decimal("1200")
 
 
 @pytest.fixture
@@ -133,7 +145,9 @@ async def instruments(session: AsyncSession) -> InstrumentRepository:
                 "tradingsymbol": symbol,
                 "exchange": "NSE",
                 "broker_token": f"svc-tok-{i}",
-                "tick_size": Decimal("0.05"),
+                # Audit NR-006: NSE's tick for the fixture's price level, not a
+                # flat 0.05 (0.10 for a Rs 1,200 stock since 15 Apr 2025).
+                "tick_size": nse_equity_tick(FIXTURE_CLOSE),
                 "lot_size": 1,
                 "sector": sector,
             }
@@ -286,6 +300,8 @@ class Stack:
         self.clock = clock or (lambda: NOW)
         self.redis = redis
         self.account = account or KiteAccount()
+        # Audit NR-002: the service runs in PAPER, so its account must say it is one.
+        on_venue(Venue.PAPER, self.account)
         self.adapter = KiteTradingAdapter(
             limiter=CountingLimiter(),
             auth=None,
@@ -1144,6 +1160,8 @@ def _paper_stack(session, instruments, redis, audit, calendar, **config: Any):
     paper = PaperKite(
         quotes=tape,
         clock=lambda: clock["now"],
+        # The instrument master's tick, as the adapter over it snaps to.
+        tick_size=instruments.tick_size,
         config=PaperConfig(**({"slippage_bps": Decimal("0")} | config)),
     )
     stack = Stack(

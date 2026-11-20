@@ -92,7 +92,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Final, Protocol, assert_never
 
-from algotrader.broker.adapter import BrokerPosition
+from algotrader.broker.adapter import BrokerPosition, Venue, venue_of_all
 from algotrader.common.audit import AuditEntry
 from algotrader.common.calendar import IST
 from algotrader.common.db.models import DecisionLog
@@ -623,6 +623,16 @@ class Reconciler:
         #: has changed size (SIT-005). The first version alerted 30 times for
         #: one position, and a counter documented as counting positions read 30.
         self._reported_unknown: dict[tuple[str, str], tuple[int, int]] = {}
+
+    @property
+    def venue(self) -> Venue:
+        """PAPER only if what it reads AND what it acts through are (audit NR-002).
+
+        A cycle reading a simulated account while exiting through a live one -
+        or the reverse - compares one account's positions with another's
+        orders, and every conclusion it draws from that is wrong.
+        """
+        return venue_of_all(self._broker, self._protector, self._canceller)
 
     async def run_cycle(self, *, now: dt.datetime) -> CycleReport:
         """Read, then act. Raises :class:`ReconciliationReadError` having done

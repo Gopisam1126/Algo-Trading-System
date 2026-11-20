@@ -8,7 +8,9 @@ is found in the source by AST and held to an allowlist:
 * ``common/config.py`` - the field's default, and LIVE's static-IP validation;
 * ``execution/service.py`` - TRADING_MODES, the refusal of modes that place
   no orders;
-* ``broker/paper.py`` - :func:`trading_client`, the one injection.
+* ``broker/paper.py`` - :func:`venue_for`, the one decision, which
+  :func:`trading_client` injects by and the execution service checks
+  its collaborators against (audit NR-002).
 
 A new branch anywhere else - the risk engine sizing differently on paper, the
 gateway skipping a check - fails here, naming the file. And the paper client

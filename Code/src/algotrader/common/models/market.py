@@ -48,7 +48,10 @@ class Instrument(_Frozen):
     broker_token: str
     isin: str | None = None
     lot_size: int = Field(default=1, ge=1)
-    tick_size: Decimal = Field(default=Decimal("0.05"), gt=0)
+    #: REQUIRED (audit NR-006): there is no market-wide default. NSE sets the
+    #: tick by price band (NSE/CMTR/67133, from 15 Apr 2025), so the broker's
+    #: instrument dump is the only source - see ``KiteReads.instruments``.
+    tick_size: Decimal = Field(gt=0)
     sector: str | None = None
 
     def round_to_tick(self, price: Decimal) -> Decimal:

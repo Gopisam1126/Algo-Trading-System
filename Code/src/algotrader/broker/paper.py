@@ -81,10 +81,11 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
-from typing import Any, Final, Protocol
+from typing import Any, ClassVar, Final, Protocol
 
 from kiteconnect import exceptions as kx
 
+from algotrader.broker.adapter import Venue
 from algotrader.common.calendar import IST
 from algotrader.common.enums import SystemMode
 
@@ -96,6 +97,7 @@ __all__ = [
     "PaperConfig",
     "PaperKite",
     "trading_client",
+    "venue_for",
 ]
 
 _BUY: Final = "BUY"
@@ -115,6 +117,17 @@ _PAISE: Final = Decimal("0.01")
 # ---------------------------------------------------------------------------
 
 
+def venue_for(mode: SystemMode) -> Venue:
+    """The venue a process in ``mode`` must be built over (audit NR-002).
+
+    LIVE for LIVE, PAPER for every other mode. :func:`trading_client` chooses
+    the client by this, and the execution service refuses any collaborator
+    whose :func:`~algotrader.broker.adapter.venue_of` differs - so the choice
+    is made once and checked where the orders are sent.
+    """
+    return Venue.LIVE if mode is SystemMode.LIVE else Venue.PAPER
+
+
 def trading_client(mode: SystemMode, *, live: Callable[[], Any], paper: Callable[[], Any]) -> Any:
     """The Kite client the trading adapter is built over (E15-S10 AC1).
 
@@ -124,7 +137,7 @@ def trading_client(mode: SystemMode, *, live: Callable[[], Any], paper: Callable
     orders (the execution service refuses them), so the paper client is the
     safe thing for anything they might read.
     """
-    if mode is SystemMode.LIVE:
+    if venue_for(mode) is Venue.LIVE:
         return live()
     return paper()
 
@@ -327,19 +340,30 @@ class PaperKite:
     broker.
     """
 
+    #: Audit NR-002: what :func:`~algotrader.broker.adapter.venue_of` reads.
+    #: The adapter over this client, and everything over the adapter, is PAPER.
+    venue: ClassVar[Venue] = Venue.PAPER
+
     def __init__(
         self,
         *,
         quotes: Callable[[str], Quote | None],
         clock: Callable[[], dt.datetime],
+        tick_size: Callable[[str], Decimal],
         config: PaperConfig | None = None,
-        tick_size: Callable[[str], Decimal] | None = None,
         on_change: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._quotes = quotes
         self._clock = clock
         self._config = config or PaperConfig()
-        self._tick = tick_size or (lambda _symbol: Decimal("0.05"))
+        # REQUIRED (audit NR-006). It defaulted to a flat 0.05, and NSE's tick
+        # has been set by price band since 15 Apr 2025 - 0.10 from Rs 1,000 to
+        # 5,000 - so a defaulted paper fill landed off the exchange's grid. The
+        # instrument master's tick (InstrumentRepository.tick_size) is the one
+        # the live adapter snaps to; paper takes the same resolver.
+        if tick_size is None:
+            raise TypeError("PaperKite needs the instrument master's tick_size resolver")
+        self._tick = tick_size
         self._on_change = on_change
         self._lock = threading.Lock()
         self._account = _Account()

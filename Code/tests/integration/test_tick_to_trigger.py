@@ -66,6 +66,7 @@ from algotrader.strategy.context import EvalContext
 from algotrader.strategy.dsl import compile_strategy, load_strategy_yaml
 from algotrader.strategy.primitives import registry as primitive_registry
 from algotrader.strategy.runtime import StrategyEvaluator
+from tests.doubles import nse_equity_tick
 
 
 #: What system.yaml configures.
@@ -132,6 +133,13 @@ exit:
   stop: {primitive: atr_stop, params: {multiplier: 1.5, period: 14}}
   time: {primitive: squareoff_deadline}
 """
+
+
+#: The session opens near Rs 1,000 and rallies; the stock closed LAST month at
+#: Rs 1,050, so NSE's tick for it this month is 0.10 (audit NR-006: this was a
+#: flat 0.05, which NSE has not used above Rs 1,000 since 15 Apr 2025). The
+#: monthly review fixes it whatever the price does intraday.
+TICK = nse_equity_tick(Decimal("1050"))
 
 
 def _tick(price: str, *, offset_s: int, volume: int, token: int = TOKEN) -> RawTick:
@@ -317,6 +325,7 @@ class Pipeline:
             "timeframe": Timeframe.M5,
             "direction": Direction.LONG,
             "last_price": view.last_price,
+            "tick_size": TICK,
             "previous_bar_close": view.previous_bar_close,
             "snapshot": view.snapshot,
             "opening_range": self.opening_range,
@@ -382,7 +391,9 @@ class TestATriggerComesOutOfTheOtherEnd:
         from cleaned ticks rather than from a fixture."""
         trigger = evaluator.fire(run.context(), correlation_id=CID)
         assert trigger is not None
-        assert trigger.suggested_stop % Decimal("0.05") == 0
+        assert trigger.suggested_stop % TICK == 0, (
+            f"{trigger.suggested_stop} is off the {TICK} grid"
+        )
         assert -trigger.suggested_stop.as_tuple().exponent <= 4
 
     def test_the_stop_is_below_the_entry(self, run: Pipeline, evaluator: StrategyEvaluator) -> None:

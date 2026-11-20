@@ -62,6 +62,10 @@ SEBI's retail algo trading framework (circular dated 4 Feb 2025) became **fully 
 | MIS auto square-off (non-CAS stocks) | 15:20 | Standard. |
 | F&O auto square-off | 15:25 | If trading derivatives. |
 
+**Re-read 20 Nov 2026 (audit ENG-020).** Zerodha has since moved its MIS square-off **later**: CAS stocks **15:12**, non-CAS **15:25**, F&O contracts **15:26** (support FAQ "intraday auto square-off timings"; Z-Connect 26 Dec 2025 and 10 Aug 2026). The system's 15:10 / 15:20 / 15:25 are kept: each still precedes the broker's, which is the property that matters, and trading later is a choice rather than a correction. `tests/unit/test_calendar.py` holds them below Zerodha's published times as literals. **From 7 Dec 2026** NSE ends CAS stocks' continuous session at 15:30 with a 10-minute CAS (Z-Connect 16 Oct 2026) - `CAS_CONTINUOUS_END` (15:15) and Zerodha's new CAS square-off need re-reading then.
+
+**Tick size (audit NR-006).** Since 15 Apr 2025 NSE sets the equity tick by price band, reviewed monthly on the last trading day's close (NSE/CMTR/67133, via Zerodha bulletin 408151): below Rs 250 **0.01**; Rs 250-1,000 **0.05**; Rs 1,000-5,000 **0.10**; Rs 5,000-10,000 **0.50**; Rs 10,000-20,000 **1**; above **5**. There is no market-wide default - the instrument master's `tick_size` is the only source, and `Instrument`, `EvalContext` and `PaperKite` now require it.
+
 **Design implication:** square-off timing is **per-stock, not global.** The system needs a `is_cas_stock` flag per symbol and must compute each position's own hard-exit deadline. Getting this wrong means the broker force-closes positions at market price at a moment the algo didn't choose — a silent, recurring source of slippage. The system should always exit on its *own* terms, several minutes before the broker's deadline (see `risk.exit_buffer_minutes` in §7).
 
 ⚠️ **Verify current timings against NSE circulars at implementation time.** NSE has extended F&O timings and introduced CAS within the last few months; this area is actively changing.

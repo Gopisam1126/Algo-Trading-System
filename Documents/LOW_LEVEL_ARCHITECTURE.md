@@ -1414,7 +1414,12 @@ from a caller — and for an approval claims a slot, registers the `EntryPlan`
   paper=)` is the one injection - LIVE gets the Kite client, every other mode
   the paper one, and the live factory is never called otherwise - and a
   structural test confines every `SystemMode` branch to config, the service's
-  mode refusal and that function. Fills come on the next read from the
+  mode refusal and that function. **The choice is checked, not trusted (audit
+  NR-002):** every object on the order path reports a `broker.adapter.Venue`
+  (a real `KiteConnect` is always LIVE; an object that declares nothing counts
+  as LIVE), and `ExecutionService` refuses to be built over a gateway, book,
+  reconciler, protector, positions reader or margin source whose venue is not
+  `paper.venue_for(mode)` - in either direction. Fills come on the next read from the
   published quote: far side of the spread, slippage against the order, tick
   rounding against it; partial to the visible depth, each quote's depth taken
   once; SL-M triggers on the LTP crossing; an entry the paper margin cannot

@@ -15,6 +15,7 @@ returned a number.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import uuid
 from collections.abc import AsyncIterator
@@ -41,7 +42,8 @@ pytestmark = [pytest.mark.integration]
 
 #: Two instruments with DIFFERENT tick sizes. One tick size would let a
 #: hardcoded constant pass every assertion here.
-TICKS = {"INFY": Decimal("0.05"), "PENNYCO": Decimal("0.01")}
+#: INFY trades near Rs 1,200: NSE tick 0.10 since 15 Apr 2025 (audit NR-006; was 0.05).
+TICKS = {"INFY": Decimal("0.10"), "PENNYCO": Decimal("0.01")}
 
 
 @pytest.fixture
@@ -118,7 +120,7 @@ class TestTheRepositoryHoldsTheTickSize:
     async def test_refresh_cache_loads_it(self, instruments: InstrumentRepository) -> None:
         """The column has been populated by the instrument sync since E02-S06
         and nothing ever read it — the cache held only id <-> symbol."""
-        assert instruments.tick_size("INFY") == Decimal("0.05")
+        assert instruments.tick_size("INFY") == Decimal("0.10")
         assert instruments.tick_size("PENNYCO") == Decimal("0.01")
 
     async def test_an_unknown_symbol_raises_rather_than_defaulting(
@@ -355,27 +357,46 @@ class TestTheGatewayAndTheRealOrderStoreAgree:
         self, instruments: InstrumentRepository, session: AsyncSession
     ) -> None:
         """AC1 against the real store: at the moment the adapter is invoked,
-        the row must already be there and must still say SUBMITTING."""
-        seen: list[dict | None] = []
+        the row must already be there and must still say SUBMITTING.
+
+        Audit ENG-020: this read the row AFTER submit_entry returned, when it
+        says SUBMITTED, so a gateway that recorded the order only after the
+        broker call passed. The double now reads the store DURING the call.
+        The adapter calls it in a worker thread, so the read is handed back to
+        the event loop - which is idle, awaiting that very thread."""
         repo = OrderRepository(session, instruments)
+        loop = asyncio.get_running_loop()
+        decision, rec = self._decision_and_rec()
+        key = (
+            OrderGateway(
+                _adapter(instruments, _RecordingKite()),
+                policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
+                store=repo,
+            )
+            .build_entry(decision, rec, trade_date=dt.date(2026, 8, 25))
+            .client_order_id
+        )
+        seen: list[dict | None] = []
 
         class _ObservingKite(_RecordingKite):
             def place_order(self, **params):
-                seen.append(params)
+                read = asyncio.run_coroutine_threadsafe(repo.find_by_client_order_id(key), loop)
+                seen.append(read.result(timeout=10))
                 return "260825000999"
 
-        client = _ObservingKite()
-        decision, rec = self._decision_and_rec()
         gateway = OrderGateway(
-            _adapter(instruments, client),
+            _adapter(instruments, _ObservingKite()),
             policy=GatewayPolicy(algo_id="ALGO12345", market_protection=Decimal("-1")),
             store=repo,
         )
-        cid = gateway.build_entry(decision, rec, trade_date=dt.date(2026, 8, 25))
         await gateway.submit_entry(decision, rec, trade_date=dt.date(2026, 8, 25))
-        assert seen, "the broker was never called"
-        stored = await repo.find_by_client_order_id(cid.client_order_id)
-        assert stored is not None
+        assert len(seen) == 1, "the broker was called once, or not at all"
+        at_the_call = seen[0]
+        assert at_the_call is not None, "no row existed when the broker was called"
+        assert at_the_call["status"] == "SUBMITTING"
+        assert at_the_call["broker_order_id"] is None
+        after = await repo.find_by_client_order_id(key)
+        assert after is not None and after["status"] == "SUBMITTED"
 
     async def test_the_unique_constraint_is_real(
         self, instruments: InstrumentRepository, session: AsyncSession

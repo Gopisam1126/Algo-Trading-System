@@ -97,6 +97,8 @@ from algotrader.broker.adapter import (
     BrokerError,
     OrderRejectedError,
     RateLimitError,
+    Venue,
+    venue_of,
 )
 from algotrader.common.enums import (
     Direction,
@@ -411,6 +413,11 @@ class OrderGateway:
         #: cannot be constructed, so there is no configuration in which orders
         #: are placed untracked.
         self._store = store
+
+    @property
+    def venue(self) -> Venue:
+        """Where this gateway's orders land: its placer's venue (audit NR-002)."""
+        return venue_of(self._placer)
 
     async def submit_entry(
         self,

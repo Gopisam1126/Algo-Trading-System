@@ -1,9 +1,12 @@
 """The order state machine (E15-S03), organised one class per acceptance criterion.
 
 The state space is small — eleven states, 121 ordered pairs — so this suite
-tests it EXHAUSTIVELY rather than by sampling. A property-based generator would
-be strictly weaker here: it would explore the same 121 pairs at random and
-report a subset of them.
+tests it EXHAUSTIVELY rather than by sampling: ``TestTheWholeMatrix`` pins all
+121 as a literal grid (audit ENG-020 - until 20 Nov 2026 this paragraph said
+so while the suite tested the diagram's edges, nine listed refusals and the
+terminal rows, so adding OPEN -> SUBMITTING passed). A property-based
+generator would be strictly weaker here: it would explore the same 121 pairs
+at random and report a subset of them.
 
 What the exhaustive pass can prove that spot-checks cannot is the two graph
 properties at the bottom: no state is orphaned, and no non-terminal state is a
@@ -14,6 +17,7 @@ plausible malformed versions of it.
 from __future__ import annotations
 
 import itertools
+from typing import ClassVar
 
 import pytest
 
@@ -316,3 +320,61 @@ def test_a_recovered_submission_may_be_found_part_filled() -> None:
     from algotrader.execution.order_state import assert_legal
 
     assert_legal(OrderStatus.SUBMITTING, OrderStatus.PARTIAL)
+
+
+class TestTheWholeMatrix:
+    """All 121 ordered pairs, as data (audit ENG-020).
+
+    Rows are the current state, columns the target, both in the order below;
+    ``x`` is a transition the table allows, ``.`` one it refuses. The diagonal
+    is ``.`` because the TABLE lists no self-edge - re-observation is allowed
+    by ``is_legal`` and asserted on its own below. This grid is the reviewed
+    statement of the state machine: a change to ``order_state._TABLE`` is a
+    change to this grid, read in the same diff.
+    """
+
+    ORDER = (
+        OrderStatus.PENDING_RISK,
+        OrderStatus.APPROVED,
+        OrderStatus.SUBMITTING,
+        OrderStatus.SUBMITTED,
+        OrderStatus.OPEN,
+        OrderStatus.PARTIAL,
+        OrderStatus.FILLED,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+        OrderStatus.SUBMIT_FAILED,
+        OrderStatus.RECONCILE_REQUIRED,
+    )
+    #            to: PR AP SG SD OP PA FI CA RJ SF RR
+    GRID: ClassVar[dict[OrderStatus, str]] = {
+        OrderStatus.PENDING_RISK: ". x . . . . . . x . .",
+        OrderStatus.APPROVED: ". . x . . . . . x . .",
+        OrderStatus.SUBMITTING: ". . . x x x x x x x x",
+        OrderStatus.SUBMITTED: ". . . . x x x x x . x",
+        OrderStatus.OPEN: ". . . . . x x x x . x",
+        OrderStatus.PARTIAL: ". . . . . . x x . . x",
+        OrderStatus.FILLED: ". . . . . . . . . . .",
+        OrderStatus.CANCELLED: ". . . . . . . . . . .",
+        OrderStatus.REJECTED: ". . . . . . . . . . .",
+        OrderStatus.SUBMIT_FAILED: ". . . . . . . . . . x",
+        OrderStatus.RECONCILE_REQUIRED: ". . . . x x x x x . .",
+    }
+
+    def test_the_grid_covers_every_state_once(self) -> None:
+        assert set(self.ORDER) == set(OrderStatus) and len(self.ORDER) == len(OrderStatus)
+        assert set(self.GRID) == set(OrderStatus)
+        assert all(len(row.split()) == len(self.ORDER) for row in self.GRID.values())
+
+    @pytest.mark.parametrize("current", list(OrderStatus))
+    def test_each_row_is_exactly_the_table(self, current: OrderStatus) -> None:
+        cells = self.GRID[current].split()
+        pinned = {t for t, cell in zip(self.ORDER, cells, strict=True) if cell == "x"}
+        assert ALLOWED_TRANSITIONS[current] == pinned, current
+
+    @pytest.mark.parametrize(("current", "target"), list(itertools.product(OrderStatus, repeat=2)))
+    def test_is_legal_is_the_grid_plus_re_observation(
+        self, current: OrderStatus, target: OrderStatus
+    ) -> None:
+        cell = self.GRID[current].split()[self.ORDER.index(target)]
+        assert is_legal(current, target) is (cell == "x" or current is target)

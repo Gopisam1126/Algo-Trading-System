@@ -397,8 +397,12 @@ class TestAc1OurDeadlinePrecedesTheBrokers:
         ours = calendar.squareoff_deadline(
             day, is_cas_stock=is_cas, is_fno=is_fno, buffer_minutes=buffer
         )
-        broker_time = calendar.broker_squareoff_time(is_cas_stock=is_cas, is_fno=is_fno)
-        broker = dt.datetime.combine(day, broker_time, tzinfo=IST)
+        # Zerodha's PUBLISHED times, not the calendar's own constant (audit
+        # ENG-020): support FAQ, read 20 Nov 2026 - CAS 15:12, non-CAS 15:25,
+        # F&O contracts 15:26. An F&O stock's CASH position squares off on the
+        # cash row, so the earliest that could apply bounds it.
+        published = dt.time(15, 12) if is_cas else dt.time(15, 25)
+        broker = dt.datetime.combine(day, published, tzinfo=IST)
         assert ours < broker
         assert ours.tzinfo is not None and ours.astimezone(IST).date() == day
 
