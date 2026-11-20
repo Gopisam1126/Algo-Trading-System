@@ -42,7 +42,8 @@ from tests.doubles import CountingLimiter
 pytestmark = [pytest.mark.integration]
 
 #: Two instruments with DIFFERENT tick sizes, so a hardcoded 0.05 fails.
-TICKS = {"INFY": Decimal("0.05"), "PENNYCO": Decimal("0.01")}
+#: INFY trades near Rs 1,200: NSE tick 0.10 since 15 Apr 2025 (audit NR-006; was 0.05).
+TICKS = {"INFY": Decimal("0.10"), "PENNYCO": Decimal("0.01")}
 TRADE_DATE = dt.date(2026, 8, 25)
 NOW = dt.datetime(2026, 8, 25, 6, 30, tzinfo=dt.UTC)
 
@@ -153,14 +154,16 @@ class TestTheStopReachesTheBrokerCorrectly:
     async def test_the_trigger_price_lands_on_the_instruments_grid(
         self, instruments: InstrumentRepository, session: AsyncSession
     ) -> None:
-        """A stop derived from ATR is essentially never on a 0.05 grid by
+        """A stop derived from ATR is essentially never on the grid by
         accident, and the exchange rejects off-grid prices — so without the
-        resolver every computed stop would be refused."""
+        resolver every computed stop would be refused. INFY's grid is 0.10
+        (NSE's tick for Rs 1,000-5,000 since 15 Apr 2025, audit NR-006); a
+        long's SELL stop rounds UP, toward the price."""
         client = _RecordingKite()
         await _gateway(instruments, session, client).submit_stop(
             _position(stop="1179.73"), trade_date=TRADE_DATE
         )
-        assert Decimal(str(client.calls[0]["trigger_price"])) == Decimal("1179.75")
+        assert Decimal(str(client.calls[0]["trigger_price"])) == Decimal("1179.80")
 
     async def test_a_different_instrument_uses_its_own_tick(
         self, instruments: InstrumentRepository, session: AsyncSession

@@ -619,7 +619,11 @@ Recorded because each was believed, written down, and wrong.
   the modes differ (only LIVE ever gets the Kite client).
   `tests/security/test_paper_isolation.py` fails on any other `SystemMode`
   branch. Quotes come through `ingest.quotes.quote_reader` (a SYNC Redis
-  read - the client runs in the adapter's worker threads).
+  read - the client runs in the adapter's worker threads). The choice is
+  CHECKED (audit NR-002): `ExecutionService` refuses collaborators whose
+  `broker.adapter.venue_of` is not `paper.venue_for(mode)`; an undeclared
+  object is LIVE, a `KiteConnect` always is. Test doubles declare theirs
+  with `tests.doubles.on_venue`.
 
 - **"Paper needs a broker sandbox."** Kite now has one, and it cannot run
   this system: its docs say LIMIT only, no MARKET, no `order_margins`. A
@@ -925,6 +929,32 @@ E24) records each. The shapes worth remembering, because each passed QA:
   (and URIs at `://`), and a child-process test with a timeout holds them
   linear. *A regex in the logging path is code on every request; time it on
   hostile input of realistic size.*
+
+- **"Paper mode is the paper client."** Only if the composition remembered
+  to call `trading_client`. The execution service sent through whatever
+  gateway it was handed, so a PAPER process over a live Kite client would
+  have placed real orders under paper controls (NR-002). Every order-path
+  object now reports its venue and the service refuses a mismatch at
+  construction - in both directions, because a live service reading a
+  simulated book compares one account's positions with another's orders.
+- **"0.05 is the NSE tick."** Not above Rs 1,000 since 15 Apr 2025: NSE sets
+  it by price band (0.10 to Rs 5,000, then 0.50, 1, 5). The tests gave Rs
+  1,200 stocks 0.05, and `Instrument`, `EvalContext` and `PaperKite`
+  defaulted to it - so an unsnapped ATR stop (1181.75) was "on the grid" and
+  a snapping regression could not fail a SIT (NR-006, ENG-008). The ticks are
+  required now, the fixtures use `tests.doubles.nse_equity_tick`, and the SIT
+  account refuses an off-grid trigger.
+- **"The deadline test checks the deadline."** Every one compared the
+  calendar with the calendar's own constants. Against Zerodha's published
+  times (15:12 / 15:25 / 15:26, read 20 Nov 2026) one combination was wrong:
+  a CAS stock flagged F&O got 15:25, after the broker's 15:12 force-close -
+  latent, since nothing sets `is_fno` (ENG-020). *Test a market constant
+  against the market's own publication, written by hand.*
+- **"A fake account is a neutral stand-in."** It filled everything in full at
+  one price and accepted any grid, keyword and tag, so it proved a system more
+  capable than the venue allows (ENG-008). The E15 SIT account now refuses
+  what Kite and the exchange refuse, and SIT-26 shows a refused exit ends in a
+  NAKED_POSITION halt, not a closed book.
 
 ### What the whole-system audit checked and did not break
 

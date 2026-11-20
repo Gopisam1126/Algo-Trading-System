@@ -89,6 +89,7 @@ import logging
 from dataclasses import dataclass
 from typing import Protocol
 
+from algotrader.broker.adapter import Venue, venue_of
 from algotrader.common.enums import OrderIntent, OrderStatus
 from algotrader.common.models.trading import Order, Position
 from algotrader.common.text import one_safe_line
@@ -262,6 +263,11 @@ class ProtectiveStop:
         #: silently in exactly the case that matters most.
         self._halter = halter
         self._metrics = metrics
+
+    @property
+    def venue(self) -> Venue:
+        """Where its stops and exits land: its gateway's venue (audit NR-002)."""
+        return venue_of(self._gateway)
 
     async def attach(
         self, position: Position, *, trade_date: dt.date, now: dt.datetime

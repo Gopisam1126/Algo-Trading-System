@@ -26,9 +26,12 @@ from hypothesis import strategies as st
 from algotrader.common.enums import Direction
 from algotrader.strategy.primitives.evaluators import snap_stop, snap_target
 from algotrader.strategy.runtime import _all_of, _any_of, _none_of
+from tests.doubles import NSE_EQUITY_TICK_BANDS, NSE_TOP_TICK
 
-#: Real NSE tick sizes. 0.01 for sub-250 scrips, 0.05 for most equities.
-TICKS = st.sampled_from([Decimal("0.01"), Decimal("0.05"), Decimal("0.10"), Decimal("0.25")])
+#: Every tick NSE's equity schedule uses (audit NR-006): by price band since
+#: 15 Apr 2025 (NSE/CMTR/67133), 0.01 below Rs 250 up to 5 above Rs 20,000.
+#: The old comment called 0.05 "most equities"; above Rs 1,000 it is none.
+TICKS = st.sampled_from([band[1] for band in NSE_EQUITY_TICK_BANDS] + [NSE_TOP_TICK])
 
 PRICES = st.decimals(
     min_value=Decimal("0.01"),

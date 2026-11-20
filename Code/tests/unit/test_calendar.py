@@ -551,3 +551,54 @@ class TestASpecialSessionFlagCannotLieAboutItsOwnEffect:
         muhurat = date(2026, 11, 8)
         assert muhurat.strftime("%A") == "Sunday"
         assert calendar.is_trading_day(muhurat) is False
+
+
+#: Zerodha's published MIS auto square-off times - written here by hand from
+#: support.zerodha.com/category/trading-and-markets/trading-faqs/market-sessions/
+#: articles/intraday-auto-square-off-timings (read 20 Nov 2026), NOT from the
+#: calendar's constants: "CAS stocks 3:12 PM", "Non-CAS stocks 3:25 PM",
+#: "F&O contracts 3:26 PM". Re-read the page when it changes; Zerodha "may
+#: adjust these timings based on market volatility".
+ZERODHA_MIS_SQUAREOFF = {
+    (True, False): time(15, 12),
+    (False, False): time(15, 25),
+    (False, True): time(15, 26),
+}
+
+
+class TestTheDeadlinesAgainstTheBrokersPublishedTimes:
+    """Audit ENG-020: every deadline test compared the calendar with the
+    calendar's own constants, so moving SQUAREOFF_NON_CAS to 15:25 - Zerodha's
+    own time, a deadline ON the force-close - passed all of them."""
+
+    @pytest.mark.parametrize(("is_cas", "is_fno"), list(ZERODHA_MIS_SQUAREOFF))
+    def test_our_square_off_time_is_before_zerodhas(
+        self, cal: MarketCalendar, is_cas: bool, is_fno: bool
+    ) -> None:
+        ours = cal.broker_squareoff_time(is_cas_stock=is_cas, is_fno=is_fno)
+        assert ours < ZERODHA_MIS_SQUAREOFF[(is_cas, is_fno)]
+
+    def test_a_cas_stock_flagged_fno_gets_the_earliest_time(self, cal: MarketCalendar) -> None:
+        """Found by the test above's sibling in test_squareoff: is_fno was
+        checked first, so CAS + F&O read 15:25 - after Zerodha's 15:12."""
+        got = cal.broker_squareoff_time(is_cas_stock=True, is_fno=True)
+        assert got == time(15, 10) and got < ZERODHA_MIS_SQUAREOFF[(True, False)]
+
+    @pytest.mark.parametrize(
+        ("is_cas", "is_fno", "deadline"),
+        [
+            (True, False, time(15, 5)),
+            (True, True, time(15, 5)),
+            (False, False, time(15, 15)),
+            (False, True, time(15, 20)),
+        ],
+    )
+    def test_the_deadline_with_the_default_buffer_is_pinned(
+        self, cal: MarketCalendar, is_cas: bool, is_fno: bool, deadline: time
+    ) -> None:
+        """Literals for what the book stores: our time minus the 5-minute buffer."""
+        got = cal.squareoff_deadline(date(2026, 8, 25), is_cas_stock=is_cas, is_fno=is_fno)
+        assert got == datetime.combine(date(2026, 8, 25), deadline, tzinfo=IST)
+        # A CAS-scope instrument is bounded by the CAS row whatever else it is.
+        published = ZERODHA_MIS_SQUAREOFF[(True, False) if is_cas else (False, is_fno)]
+        assert got.astimezone(IST).time() < published

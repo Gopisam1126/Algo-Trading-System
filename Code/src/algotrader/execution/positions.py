@@ -62,6 +62,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from algotrader.broker.adapter import Venue, venue_of
 from algotrader.common.config import MIN_EXIT_BUFFER_MINUTES
 from algotrader.common.enums import Direction, ExitReason, PositionStatus
 from algotrader.common.models.trading import Order, Position, SizingResult
@@ -606,6 +607,11 @@ class PositionManager:
         self._plans: dict[str, EntryPlan] = {}
 
     # -- reading ------------------------------------------------------------
+
+    @property
+    def venue(self) -> Venue:
+        """Where the stops it attaches land: its protector's venue (audit NR-002)."""
+        return venue_of(self._protector)
 
     def tracked(self, symbol: str) -> TrackedPosition | None:
         return self._book.get(symbol)

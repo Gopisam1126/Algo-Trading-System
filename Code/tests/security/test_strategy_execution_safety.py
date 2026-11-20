@@ -43,6 +43,7 @@ from algotrader.strategy.runtime import (
     evaluate_condition,
     evaluate_group,
 )
+from tests.doubles import nse_equity_tick
 
 primitive_registry.install()
 
@@ -92,6 +93,7 @@ def _ctx(**kw) -> EvalContext:
         "timeframe": Timeframe.M5,
         "direction": Direction.LONG,
         "last_price": Decimal("100"),
+        "tick_size": nse_equity_tick(Decimal("100")),
         "snapshot": _snapshot(),
         "entries_today": 0,
     }

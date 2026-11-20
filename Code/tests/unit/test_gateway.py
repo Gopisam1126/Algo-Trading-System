@@ -33,6 +33,7 @@ from algotrader.broker.adapter import (
     OrderRejectedError,
     RateLimitError,
 )
+from algotrader.common.calendar import IST
 from algotrader.common.enums import (
     AIVerdict,
     Direction,
@@ -42,7 +43,9 @@ from algotrader.common.enums import (
     Product,
     RejectReason,
     Side,
+    Timeframe,
 )
+from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import (
     Order,
     OrderRequest,
@@ -67,12 +70,27 @@ from algotrader.execution.gateway import (
     protective_keys,
 )
 from algotrader.execution.order_state import IllegalTransitionError
+from algotrader.signals.loop import signal_id
 
 _ASYNC = pytest.mark.asyncio
 
 NOW = dt.datetime(2026, 8, 25, 6, 30, tzinfo=dt.UTC)
 TRADE_DATE = dt.date(2026, 8, 25)
 CID = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+
+def _bar(*, minute: int) -> Bar:
+    """A sealed 5-minute INFY bar opening at 09:{minute} IST on TRADE_DATE."""
+    return Bar(
+        symbol="INFY",
+        timeframe=Timeframe.M5,
+        open_ts=dt.datetime.combine(TRADE_DATE, dt.time(9, minute), tzinfo=IST),
+        open=Decimal("1200"),
+        high=Decimal("1201"),
+        low=Decimal("1199"),
+        close=Decimal("1200"),
+        volume=1,
+    )
 
 
 class RecordingPlacer:
@@ -378,7 +396,9 @@ class TestAc2TheIdempotencyKey:
         value = self._id()
         assert len(value) == CLIENT_ORDER_ID_LENGTH
         assert value.isalnum()
-        assert value.islower() or value.isdigit() or True  # hex is lowercase
+        # Lowercase hex and nothing else (audit ENG-020: this line ended in
+        # `or True`, so it asserted nothing).
+        assert set(value) <= set("0123456789abcdef"), value
 
     @pytest.mark.parametrize(
         "change",
@@ -396,12 +416,26 @@ class TestAc2TheIdempotencyKey:
         assert self._id(**change) != self._id()
 
     async def test_two_signals_on_one_symbol_and_day_do_not_collide(self) -> None:
-        """E15-S02's build concern, answered. Two entries into the same symbol,
-        same side, same day are two SIGNALS with two correlation ids — so a
-        deliberate re-entry is not suppressed as a duplicate."""
-        first = self._id(correlation_id=uuid4())
-        second = self._id(correlation_id=uuid4())
+        """E15-S02's build concern, answered AT THE PRODUCER (audit ENG-020).
+
+        Two entries into the same symbol, same side, same day are two SIGNALS
+        with two correlation ids - so a deliberate re-entry is not suppressed
+        as a duplicate. This hashed two fresh ``uuid4()``s, which cannot fail:
+        a producer that reused one id per symbol-day would have passed. The
+        ids are now the ones production mints, ``signals.loop.signal_id``, for
+        one strategy firing on two bars of one symbol on one day."""
+        first = self._id(correlation_id=signal_id("orb_long_v1", _bar(minute=45)))
+        second = self._id(correlation_id=signal_id("orb_long_v1", _bar(minute=50)))
         assert first != second
+
+    async def test_a_redelivered_bar_is_the_same_signal_and_the_same_order(self) -> None:
+        """The other half at the producer: the SAME firing, re-evaluated after
+        a redelivery or a restart, must reuse its id, or the key would let it
+        place a second order."""
+        bar = _bar(minute=45)
+        assert self._id(correlation_id=signal_id("orb_long_v1", bar)) == self._id(
+            correlation_id=signal_id("orb_long_v1", bar.model_copy())
+        )
 
     async def test_a_retry_of_one_decision_does_collide(self) -> None:
         """The other half, and the point of the key. Re-submitting the SAME

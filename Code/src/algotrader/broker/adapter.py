@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,6 +29,40 @@ from pydantic import BaseModel, ConfigDict, Field
 from algotrader.common.enums import Timeframe
 from algotrader.common.models.market import Bar, Instrument, Tick
 from algotrader.common.models.trading import Order, OrderRequest
+
+
+class Venue(StrEnum):
+    """Where an object's broker calls land: a simulation, or a real account.
+
+    Audit NR-002: paper and live differed only in the client handed to the
+    trading adapter (``broker.paper.trading_client``), and nothing downstream
+    could tell which it had been given - the execution service in PAPER mode
+    sent through whatever gateway it was handed. Every object on the order and
+    position path now answers :func:`venue_of`, and the service refuses to be
+    built over one whose venue is not its mode's.
+    """
+
+    PAPER = "paper"
+    LIVE = "live"
+
+
+def venue_of(obj: object) -> Venue:
+    """The venue ``obj`` declares - and LIVE when it declares none.
+
+    Fail closed: an object is a simulation only if it SAYS so, with a
+    :class:`Venue` on its ``venue`` attribute. Anything else - a real SDK
+    client, an object that forgot, an attribute holding the string
+    ``"paper"`` - may reach a real account, and is treated as one that does.
+    """
+    declared = getattr(obj, "venue", None)
+    return declared if isinstance(declared, Venue) else Venue.LIVE
+
+
+def venue_of_all(*objs: object) -> Venue:
+    """PAPER only if every one of ``objs`` is; one live part makes the whole live."""
+    if not objs:
+        raise ValueError("venue_of_all needs at least one object: nothing is not a simulation")
+    return Venue.PAPER if all(venue_of(o) is Venue.PAPER for o in objs) else Venue.LIVE
 
 
 class BrokerSession(BaseModel):

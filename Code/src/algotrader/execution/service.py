@@ -85,7 +85,8 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from pydantic import ValidationError
 
-from algotrader.broker.adapter import OrderRejectedError
+from algotrader.broker.adapter import OrderRejectedError, venue_of
+from algotrader.broker.paper import venue_for
 from algotrader.common.audit import AuditEntry
 from algotrader.common.calendar import IST
 from algotrader.common.db.models import DecisionLog
@@ -144,6 +145,7 @@ __all__ = [
     "Outcome",
     "RedisSignalSource",
     "SignalResult",
+    "VenueMismatchError",
 ]
 
 #: Every row this service writes to ``decision_log`` carries this stage. The
@@ -155,8 +157,9 @@ GROUP: Final = "execution-svc"
 #: How far in the FUTURE a signal's timestamp may be. The producer and this
 #: service share a host clock, so anything beyond this is not skew.
 MAX_CLOCK_SKEW: Final = dt.timedelta(seconds=5)
-#: The modes in which this service sends orders. PAPER relies on the process
-#: entrypoint handing the gateway a paper placer - see the story's notes.
+#: The modes in which this service sends orders. That a PAPER service sends
+#: them to a simulation is checked when it is built, not trusted to the
+#: composition (audit NR-002) - see :class:`VenueMismatchError`.
 TRADING_MODES: Final = frozenset({SystemMode.PAPER, SystemMode.LIVE})
 #: The strategy states whose signals this service sends, by mode (RSK-006).
 #: LIVE takes only the states that place live orders; PAPER also takes the
@@ -179,6 +182,37 @@ REDUCED_SIZE_FACTOR: Final = Decimal("0.5")
 #: than this many of the three timeframes agreeing - a majority disagreeing.
 #: The same majority ``autonomy.min_timeframe_agreement`` ships with.
 MIN_TIMEFRAMES_AGREEING: Final = 2
+
+
+class VenueMismatchError(ValueError):
+    """A collaborator reads or trades an account that is not this mode's (audit NR-002).
+
+    The service sent through whatever gateway it was handed, and the one thing
+    choosing paper or live was ``broker.paper.trading_client`` - which a
+    composition root (none exists yet, E23-S03) had to remember to call. A
+    PAPER process built over a live Kite client would have placed real orders
+    with every paper control in force, and nothing would have said so.
+
+    So construction refuses it - the strongest rung short of making it
+    unrepresentable. Every object the service reads the account through or acts
+    on it through must report :func:`~algotrader.broker.paper.venue_for` its
+    mode: PAPER for every mode but LIVE. An object that does not declare a
+    venue counts as LIVE, so a forgotten declaration refuses a paper service
+    rather than passing it. LIVE is held to it too: a live service reading a
+    simulated book, or exiting through one, would compare one account's
+    positions with another's orders.
+    """
+
+
+def _refuse_mixed_venues(mode: SystemMode, parts: dict[str, object]) -> None:
+    expected = venue_for(mode)
+    wrong = sorted(name for name, part in parts.items() if venue_of(part) is not expected)
+    if wrong:
+        raise VenueMismatchError(
+            f"system mode {mode.value} trades on the {expected.value} venue, and "
+            f"{', '.join(wrong)} {'does' if len(wrong) == 1 else 'do'} not: refusing to "
+            f"build an execution service whose orders could land on another account"
+        )
 
 
 class Outcome(StrEnum):
@@ -320,6 +354,18 @@ class ExecutionService:
         heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._mode = config.system.mode
+        # Audit NR-002: before anything else is built over them.
+        _refuse_mixed_venues(
+            self._mode,
+            {
+                "gateway": gateway,
+                "manager": manager,
+                "reconciler": reconciler,
+                "protector": protector,
+                "broker": broker,
+                "margins": margins,
+            },
+        )
         self._autonomy = config.autonomy.level
         self._approval_required = config.notifications.require_approval_before_entry
         self._confidence = config.ai.confidence

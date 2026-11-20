@@ -30,9 +30,15 @@ from algotrader.broker.paper import (
 from algotrader.common.enums import OrderIntent, OrderStatus, OrderType, Product, Side, SystemMode
 from algotrader.common.models.trading import OrderRequest
 from algotrader.ingest.quotes import QuoteState, quote_reader
-from tests.doubles import CountingLimiter
+from tests.doubles import CountingLimiter, nse_equity_tick
 
 NOW = dt.datetime(2026, 8, 25, 5, 0, tzinfo=dt.UTC)  # 10:30 IST
+#: INFY trades around Rs 1,200 here, so its NSE tick is 0.10 (audit NR-006).
+TICK = nse_equity_tick(Decimal("1200"))
+
+
+def _tick(_symbol: str) -> Decimal:
+    return TICK
 
 
 class Clock:
@@ -58,12 +64,12 @@ class Tape:
 
 def _paper(**config: Any) -> tuple[PaperKite, Tape, Clock, KiteTradingAdapter]:
     tape, clock = Tape({}), Clock()
-    client = PaperKite(quotes=tape, clock=clock, config=PaperConfig(**config))
+    client = PaperKite(quotes=tape, clock=clock, tick_size=_tick, config=PaperConfig(**config))
     adapter = KiteTradingAdapter(
         limiter=CountingLimiter(),
         auth=None,  # type: ignore[arg-type]
         client=client,
-        tick_size_for=lambda _s: Decimal("0.05"),
+        tick_size_for=_tick,
     )
     return client, tape, clock, adapter
 
@@ -141,8 +147,8 @@ class TestMarketOrders:
         assert order_id.startswith("PAPER-")
         order = await _only(adapter)
         assert order.status is OrderStatus.FILLED and order.filled_quantity == 50
-        # 1200.10 x 1.001 = 1201.3001 -> rounded UP to the tick: 1201.35
-        assert order.average_price == Decimal("1201.35")
+        # 1200.10 x 1.001 = 1201.3001 -> rounded UP to the 0.10 tick: 1201.40
+        assert order.average_price == Decimal("1201.40")
 
     async def test_a_sell_fills_at_the_bid_minus_slippage(self) -> None:
         _client, tape, _, adapter = _paper(slippage_bps=Decimal("10"))
@@ -223,18 +229,21 @@ class TestStops:
         await adapter.place_order(_request(Side.SELL, order_type=OrderType.SLM, trigger="1186.45"))
         waiting = await _only(adapter)
         assert waiting.status is OrderStatus.OPEN and waiting.filled_quantity == 0
-        assert waiting.trigger_price == Decimal("1186.45")  # snapped by the adapter: SELL rounds up
-        tape.set("INFY", "1186.50")
+        # Snapped by the adapter to the 0.10 tick: a SELL stop rounds UP, tighter.
+        assert waiting.trigger_price == Decimal("1186.50")
+        tape.set("INFY", "1186.60")
         assert (await _only(adapter)).filled_quantity == 0, "not yet crossed"
-        tape.set("INFY", "1186.45")
+        tape.set("INFY", "1186.50")
         filled = await _only(adapter)
-        assert filled.status is OrderStatus.FILLED and filled.average_price == Decimal("1186.45")
+        assert filled.status is OrderStatus.FILLED and filled.average_price == Decimal("1186.50")
 
     async def test_a_buy_stop_triggers_at_or_above(self) -> None:
         _client, tape, _, adapter = _paper(slippage_bps=Decimal("0"))
         tape.set("INFY", "1200.00")
         await adapter.place_order(_request(Side.BUY, order_type=OrderType.SLM, trigger="1213.55"))
-        tape.set("INFY", "1213.50")
+        # A BUY stop rounds DOWN to the 0.10 tick, tighter: 1213.50.
+        assert (await _only(adapter)).trigger_price == Decimal("1213.50")
+        tape.set("INFY", "1213.40")
         assert (await _only(adapter)).filled_quantity == 0
         tape.set("INFY", "1214.00")
         assert (await _only(adapter)).status is OrderStatus.FILLED
@@ -450,7 +459,7 @@ class TestPersistence:
             _request(Side.SELL, order_type=OrderType.SLM, trigger="1186.45", key="g" * 64)
         )
         await adapter.fetch_orderbook()
-        restored = PaperKite(quotes=tape, clock=clock)
+        restored = PaperKite(quotes=tape, clock=clock, tick_size=_tick)
         restored.restore(client.snapshot())
         assert restored.orders() == client.orders()
         assert restored.positions() == client.positions()
@@ -459,7 +468,7 @@ class TestPersistence:
     def test_every_change_is_offered_for_persistence(self) -> None:
         seen: list[dict[str, Any]] = []
         tape, clock = Tape({}), Clock()
-        client = PaperKite(quotes=tape, clock=clock, on_change=seen.append)
+        client = PaperKite(quotes=tape, clock=clock, tick_size=_tick, on_change=seen.append)
         client.place_order(
             "regular", "NSE", "INFY", "BUY", 1, "MIS", "MARKET", tag="abc", market_protection=-1
         )

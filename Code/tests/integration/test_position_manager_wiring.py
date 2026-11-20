@@ -37,7 +37,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from algotrader.broker.kite.trading import KiteTradingAdapter
-from algotrader.common.calendar import MarketCalendar, load_holidays_with_status
+from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_status
 from algotrader.common.db import engine as db_engine
 from algotrader.common.db.repositories import (
     InstrumentRepository,
@@ -63,7 +63,8 @@ pytestmark = [pytest.mark.integration]
 
 TRADE_DATE = dt.date(2026, 8, 25)
 NOW = dt.datetime(2026, 8, 25, 6, 30, tzinfo=dt.UTC)
-TICKS = {"INFY": Decimal("0.05")}
+#: INFY trades near Rs 1,200: NSE tick 0.10 since 15 Apr 2025 (audit NR-006; was 0.05).
+TICKS = {"INFY": Decimal("0.10")}
 
 
 @pytest.fixture
@@ -476,9 +477,14 @@ class TestTheHealthyPath:
         self, instruments, session, redis, calendar
     ) -> None:
         """The real calendar, not a stub: a per-stock deadline computed wrong is
-        a position the broker force-closes at an arbitrary price."""
+        a position the broker force-closes at an arbitrary price.
+
+        Audit ENG-020: the expected value was the calendar's own answer, so a
+        wrong calendar agreed with itself. It is a literal now - a non-CAS
+        stock's 15:20 less the 5-minute buffer - and it is before Zerodha's
+        published 15:25 MIS square-off (support FAQ, read 20 Nov 2026)."""
         manager, _repo = _manager(instruments, session, redis, calendar, _RecordingKite())
         tracked = await _open(manager, _entry(), _sizing())
-        assert tracked.position.squareoff_deadline == calendar.squareoff_deadline(
-            TRADE_DATE, is_cas_stock=False, is_fno=False, buffer_minutes=5
-        )
+        expected = dt.datetime.combine(TRADE_DATE, dt.time(15, 15), tzinfo=IST)
+        assert tracked.position.squareoff_deadline == expected
+        assert expected < dt.datetime.combine(TRADE_DATE, dt.time(15, 25), tzinfo=IST)

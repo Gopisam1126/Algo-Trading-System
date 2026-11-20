@@ -59,7 +59,8 @@ pytestmark = [pytest.mark.integration]
 
 TRADE_DATE = dt.date(2026, 8, 25)
 NOW = dt.datetime(2026, 8, 25, 5, 0, tzinfo=dt.UTC)  # 10:30 IST
-TICKS = {"INFY": Decimal("0.05"), "TCS": Decimal("0.05")}
+#: NSE ticks for ~Rs 1,200 stocks since 15 Apr 2025 (audit NR-006; were 0.05).
+TICKS = {"INFY": Decimal("0.10"), "TCS": Decimal("0.10")}
 
 
 @pytest.fixture

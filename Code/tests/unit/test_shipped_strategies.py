@@ -23,6 +23,7 @@ from algotrader.strategy import primitives  # noqa: F401 - populates REGISTRY
 from algotrader.strategy.context import EvalContext
 from algotrader.strategy.dsl import compile_strategy, load_strategy_yaml
 from algotrader.strategy.runtime import StrategyEvaluator
+from tests.doubles import nse_equity_tick
 
 CODE = Path(__file__).resolve().parents[2]
 STRATEGIES = CODE / "config" / "strategies"
@@ -85,6 +86,7 @@ def _ctx(hours_since_material_news: float | None) -> EvalContext:
         timeframe=Timeframe.M5,
         direction=Direction.LONG,
         last_price=Decimal("1160"),
+        tick_size=nse_equity_tick(Decimal("1160")),
         previous_bar_close=Decimal("1148"),
         snapshot=snapshot,
         opening_range=OpeningRange(
