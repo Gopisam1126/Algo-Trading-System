@@ -447,6 +447,23 @@ class TestAC6ATRMustBeKnownAndPositive:
             _ctx(atr=Decimal("0"))
         assert "infinite quantity" in str(excinfo.value)
 
+
+class TestTheLivePriceMustBePositive:
+    """RSK-002 gave the context a fresh traded price, which the sizer compares
+    with the trigger and divides the caps by. Its refusal of a non-positive
+    price had no test until the coverage gate found the line unrun (E22-S07)."""
+
+    @pytest.mark.parametrize("bad", [Decimal("0"), Decimal("-1"), Decimal("-1181.80")])
+    def test_a_non_positive_last_price_is_refused_at_construction(self, bad: Decimal) -> None:
+        with pytest.raises(RiskContextError, match="last_price"):
+            _ctx(last_price=bad)
+
+    def test_a_positive_price_and_an_unknown_one_construct(self) -> None:
+        """Control: a real price is accepted, and None stays 'not known' - for
+        the sizer to refuse with its own reason, not this one."""
+        assert _ctx(last_price=Decimal("1181.80")).last_price == Decimal("1181.80")
+        assert _ctx(last_price=None).last_price is None
+
     @pytest.mark.parametrize("bad", [0, -1])
     def test_a_nonsensical_lot_size_is_refused_at_construction(self, bad: int) -> None:
         with pytest.raises(RiskContextError, match="lot_size"):

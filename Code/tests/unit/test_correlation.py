@@ -374,3 +374,18 @@ class TestTheDenominatorCannotUnderflowToZero:
 
         rho = pearson(xs, ys)  # must NOT raise
         assert rho == pytest.approx(1.0, abs=1e-5)
+
+
+def test_the_underflow_guard_is_unreachable() -> None:
+    """The proof behind correlation.py's ``# pragma: no cover`` (E22-S07).
+
+    ``pearson`` refuses a series whose variance is not above zero before it
+    divides, and takes each root separately (CORR-001). The smallest variance
+    above zero is the smallest positive float, and the product of two of its
+    roots is that float again - still above zero - so ``denominator <= 0``
+    cannot be reached. If this ever fails, the guard is live and must be
+    covered, not excluded."""
+    tiny = math.ulp(0.0)  # 5e-324, the smallest positive float
+    assert tiny > 0
+    assert math.sqrt(tiny) * math.sqrt(tiny) > 0
+    assert math.sqrt(tiny) * math.sqrt(1.0) > 0

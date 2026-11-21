@@ -103,7 +103,7 @@ src/algotrader/
   signals/               Strategy evaluation loop (AI review: planned)
   strategy/              DSL, primitives, registry (gauntlet: planned)
   ai/                    Anthropic client, prompts, budget     [empty - planned]
-  execution/             Risk engine, sizing, orders, positions  ← 100% coverage is the TARGET (LLA §15)
+  execution/             Risk engine, sizing, orders, positions  ← risk/ and sizer.py: 100% lines, gated in CI (scripts/coverage_gate.py)
   orchestrator/          Lifecycle and scheduling              [empty - planned]
   api/                   FastAPI dashboard (localhost only)    [empty - planned]
   notifier/              Telegram alerts (single recipient)    [empty - planned]
