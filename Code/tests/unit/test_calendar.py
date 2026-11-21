@@ -16,12 +16,16 @@ import pytest
 from pydantic import ValidationError
 
 from algotrader.common.calendar import (
+    CAS_SCHEDULE,
     IST,
     SQUAREOFF_CAS_STOCKS,
     SQUAREOFF_FNO,
     SQUAREOFF_NON_CAS,
+    CasSession,
     HolidayDataError,
     MarketCalendar,
+    _check_cas_schedule,
+    cas_session_on,
     load_holidays_with_status,
 )
 
@@ -33,8 +37,8 @@ def cal() -> MarketCalendar:
     )  # Independence Day
 
 
-def ist_at(y: int, m: int, d: int, hh: int, mm: int) -> datetime:
-    return datetime(y, m, d, hh, mm, tzinfo=IST)
+def ist_at(y: int, m: int, d: int, hh: int, mm: int, ss: int = 0) -> datetime:
+    return datetime(y, m, d, hh, mm, ss, tzinfo=IST)
 
 
 class TestTradingDays:
@@ -62,10 +66,97 @@ class TestSessionState:
         assert not cal.is_market_open(ist_at(2026, 8, 4, 16, 0))
 
     def test_cas_stock_continuous_ends_earlier(self, cal: MarketCalendar) -> None:
-        """CAS-scope stocks stop continuous trading at 15:15, not 15:30."""
+        """From 3 Aug to 4 Dec 2026 CAS-scope stocks stopped continuous trading
+        at 15:15, not 15:30."""
         at_1520 = ist_at(2026, 8, 4, 15, 20)
         assert not cal.is_continuous_for(at_1520, is_cas_stock=True)
         assert cal.is_continuous_for(at_1520, is_cas_stock=False)
+
+
+class TestTheCasScheduleChangesOn7Dec2026:
+    """E04-S08. NSE's circulars of 6 Nov 2026: from 7 Dec 2026 a CAS stock trades
+    continuously to 15:30 and the auction runs 15:30-15:40. The times below are
+    NSE's published ones, written by hand - never read from the calendar's own
+    constants, which would let a wrong constant agree with itself (ENG-020)."""
+
+    @pytest.mark.parametrize(
+        ("day", "last_continuous", "first_auction"),
+        [
+            # 4 Dec 2026, the last Friday under the August rules: 15:15.
+            ((2026, 12, 4), (15, 14, 59), (15, 15, 0)),
+            # 7 Dec 2026, the first day under the new rules: 15:30.
+            ((2026, 12, 7), (15, 29, 59), (15, 30, 0)),
+            # A later day keeps the new rules.
+            ((2026, 12, 24), (15, 29, 59), (15, 30, 0)),
+            # The first CAS day, 3 Aug 2026: 15:15.
+            ((2026, 8, 3), (15, 14, 59), (15, 15, 0)),
+        ],
+    )
+    def test_a_cas_stock_trades_continuously_until_that_days_cutoff(
+        self,
+        cal: MarketCalendar,
+        day: tuple[int, int, int],
+        last_continuous: tuple[int, int, int],
+        first_auction: tuple[int, int, int],
+    ) -> None:
+        assert cal.is_continuous_for(ist_at(*day, *last_continuous), is_cas_stock=True)
+        assert not cal.is_continuous_for(ist_at(*day, *first_auction), is_cas_stock=True)
+
+    def test_before_cas_existed_a_cas_stock_traded_to_15_30(self, cal: MarketCalendar) -> None:
+        """31 Jul 2026, the Friday before CAS went live: no auction carve-out."""
+        assert cal.is_continuous_for(ist_at(2026, 7, 31, 15, 20), is_cas_stock=True)
+
+    @pytest.mark.parametrize("day", [(2026, 7, 31), (2026, 8, 4), (2026, 12, 4), (2026, 12, 7)])
+    def test_a_non_cas_stock_trades_to_15_30_on_every_date(
+        self, cal: MarketCalendar, day: tuple[int, int, int]
+    ) -> None:
+        """Control: the change is for CAS-scope stocks only."""
+        assert cal.is_continuous_for(ist_at(*day, 15, 29, 59), is_cas_stock=False)
+        assert not cal.is_continuous_for(ist_at(*day, 15, 30), is_cas_stock=False)
+
+    def test_the_schedule_in_force_is_the_latest_entry_on_or_before_the_day(self) -> None:
+        assert cas_session_on(date(2026, 8, 2)) is None
+        assert cas_session_on(date(2026, 12, 6)) == CasSession(
+            effective=date(2026, 8, 3), continuous_end=time(15, 15), auction_end=time(15, 35)
+        )
+        assert cas_session_on(date(2026, 12, 7)) == CasSession(
+            effective=date(2026, 12, 7), continuous_end=time(15, 30), auction_end=time(15, 40)
+        )
+
+    def test_the_cas_square_off_precedes_every_continuous_end(self) -> None:
+        """15:10 is before 15:15 and 15:30: the change gives a CAS position no
+        later exit - Zerodha's post-change CAS square-off is unpublished, and its
+        current one (15:12, read 20 Nov 2026) is after ours."""
+        for entry in CAS_SCHEDULE:
+            assert time(15, 10) < entry.continuous_end
+
+    @pytest.mark.parametrize(
+        ("schedule", "match"),
+        [
+            (
+                (
+                    CasSession(date(2026, 12, 7), time(15, 30), time(15, 40)),
+                    CasSession(date(2026, 8, 3), time(15, 15), time(15, 35)),
+                ),
+                "increasing date order",
+            ),
+            ((CasSession(date(2026, 12, 7), time(15, 45), time(15, 50)),), "by 15:30"),
+            (
+                (CasSession(date(2026, 12, 7), time(15, 5), time(15, 40)),),
+                "after the CAS square-off",
+            ),
+            ((CasSession(date(2026, 12, 7), time(15, 30), time(15, 30)),), "ends before it starts"),
+        ],
+    )
+    def test_an_impossible_schedule_does_not_load(
+        self, schedule: tuple[CasSession, ...], match: str
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            _check_cas_schedule(schedule)
+
+    def test_the_shipped_schedule_passes_its_own_check(self) -> None:
+        """Control for the refusals above."""
+        _check_cas_schedule(CAS_SCHEDULE)
 
     def test_naive_datetime_rejected(self, cal: MarketCalendar) -> None:
         with pytest.raises(ValueError, match="timezone-aware"):

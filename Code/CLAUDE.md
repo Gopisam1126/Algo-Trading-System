@@ -52,6 +52,11 @@ found a design conflict rather than an obstacle.
   15-minute bar runs 09:15–09:30. Use `MarketCalendar.bar_open_time()`.
 - **Square-off deadlines are per-stock**, not global — 15:10 CAS / 15:20
   non-CAS / 15:25 F&O, minus a buffer. Use `MarketCalendar.squareoff_deadline()`.
+- **Session rules are dated.** NSE changed the closing auction on 7 Dec 2026
+  (CAS stocks now trade continuously to 15:30; auction 15:30-15:40). Ask
+  `MarketCalendar.is_continuous_for(moment, ...)` - it reads `CAS_SCHEDULE`
+  for the moment's own IST day - never a fixed cutoff, or a replay of an
+  earlier day is judged by today's rules (E04-S08).
 - Pydantic models are `frozen=True, extra="forbid"` unless there is a reason.
 - Strategies are pure functions over a `MultiTimeframeSnapshot` — no I/O, no
   randomness. This is what makes them backtestable by replay.
@@ -152,7 +157,8 @@ sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
 order, because that needs credentials (B5), a static IP (B6) and two written
 answers - B1, the Algo-ID tagging (closed 9 Sep 2026 as not applicable,
-REOPENED 16 Nov 2026 by audit LEG-001), and B10, hosting (HAL-001) - and because the pieces around
+REOPENED 16 Nov 2026 by audit LEG-001), and B10, hosting (HAL-001); research
+on 21 Nov 2026 expects both to come back in this system's favour - and because the pieces around
 the gateway are unbuilt: no process entrypoint
 (`python -m algotrader.execution`, which docker-compose runs, has no
 `__main__` - no service does yet). Every live risk input now has a producer -
@@ -1016,8 +1022,8 @@ else was examined. Verified sound, with probes rather than by reading:
 | B4 historical data pricing | ✅ Closed — Connect ₹500/mo bundles WebSocket + historical |
 | B7 `autobahn` CVE-2020-35678 | ✅ Closed 24 Aug 2026 — upgraded to 26.7.1; 26.10.2 since 29 Oct 2026 (CVE-2026-116579) |
 | B3 NSE holiday list | ✅ Closed 24 Aug 2026 — 2026 verified, 245 sessions. **Renew each December** |
-| B1 Algo-ID tagging | ❌ **Reopened 16 Nov 2026 (audit LEG-001).** Closed 9 Sep 2026 as not applicable on the SEBI text alone; the NSE standard tags sub-threshold API algo orders with a generic algo ID and who sends it is unconfirmed. Live mode refuses to load without `broker.algo_tagging_confirmation` (Zerodha's written answer) |
-| B10 hosting | ❌ **Open (HAL-001).** NSE standard I(h): retail algos "should be hosted on brokers' cloud servers" - does it apply here? India-region hosting is this system's own rule, not a cited regulation |
+| B1 Algo-ID tagging | ❌ **Reopened 16 Nov 2026 (audit LEG-001).** Closed 9 Sep 2026 as not applicable on the SEBI text alone; the NSE standard tags sub-threshold API algo orders with a generic algo ID and who sends it is unconfirmed. Live mode refuses to load without `broker.algo_tagging_confirmation` (Zerodha's written answer). **Researched 21 Nov 2026** (`Documents/RESEARCH_ALGO_TAGGING_AND_HOSTING.md`): the broker sends the generic ID (`"99999"`, NSE/INVG/69255 8.2.4) and Zerodha staff say the client passes none - keep `algo_id` unset; only the written answer is missing |
+| B10 hosting | ⚠️ **Open (HAL-001); researched 21 Nov 2026 - self-hosting supported.** NSE standard I(h) ("hosted on brokers' cloud servers") is a broker obligation; NSE's FAQ (3 Nov 2025, Q5) has a tech-savvy client host "at their end", Zerodha staff allow any cloud from the registered IP, and no text puts a client's server in India. Residual: NSE/INVG/73992 restates I(h) without Q5. India-region hosting is this system's own rule. Needs Zerodha in writing; B6 need not wait |
 | B5 daily login | ⚠️ Needs real credentials |
 | B6 static IP | 🔍 **Order endpoints only** — does not block development |
 | B8 NSE data access | 🔍 Same fix as B6; `scripts/check_data_reachability.py` answers it in one command |

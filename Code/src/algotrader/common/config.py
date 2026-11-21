@@ -154,9 +154,13 @@ class SystemConfig(_Model):
         reports a different and potentially material standard - that retail
         algos "should be hosted on brokers' cloud servers" - whose application
         to a client's own sub-threshold algo is an open question for Zerodha
-        and counsel (PRE_LIVE_CHECKLIST.md, owner action). The India-region
-        check stays because it costs nothing and keeps data and latency local;
-        it is not evidence of compliance with any hosting rule.
+        and counsel (PRE_LIVE_CHECKLIST.md B10, owner action). Researched 21 Nov
+        2026: NSE's FAQ of 3 Nov 2025 (Q5) has a tech-savvy client host the
+        algo "using a static IP at their end", and no text requires a client's
+        server to be in India - the India rules bind the broker's routing
+        server. The India-region check stays because it costs nothing and keeps
+        data and latency local; it is not evidence of compliance with any
+        hosting rule.
         """
         india_regions = {
             "ap-south-1",
@@ -349,10 +353,12 @@ class BrokerConfig(_Model):
     #: The broker's WRITTEN answer to "what must a client-developed,
     #: sub-threshold algo send on an API order?" - a support ticket number, an
     #: email date, or a documentation URL with its retrieval date (audit
-    #: LEG-001). The exchanges tag such orders with a generic algo ID; whether
-    #: Kite applies it server-side or expects the client to send something is
-    #: not confirmed. Live mode refuses to load while this is empty: the
-    #: question has a cheap answer and an expensive wrong guess.
+    #: LEG-001). The exchanges tag such orders with a generic algo ID. Research
+    #: on 21 Nov 2026 found the BROKER applies it (NSE/INVG/69255 para 8.2.4:
+    #: members send "99999") and Zerodha staff saying the client passes none -
+    #: but a forum reply is not a written answer attributable to Zerodha. Live
+    #: mode refuses to load while this is empty: the question has a cheap
+    #: answer and an expensive wrong guess.
     algo_tagging_confirmation: str = ""
     auth: BrokerAuthConfig = Field(default_factory=BrokerAuthConfig)
 
