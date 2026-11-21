@@ -92,6 +92,22 @@ def test_ruff_only_checks_and_finds_the_projects_config_itself() -> None:
     assert "--check" in hooks["ruff-format"].get("args", [])
 
 
+def test_the_doc_claims_hook_checks_the_pre_live_checklist() -> None:
+    """E24-S09: the design documents are checked only by this hook (QA does not
+    carry them), so its absence - or a list that dropped the checklist, which
+    called B1 closed five days after the audit reopened it - checks nothing."""
+    hook = _hooks()["doc-claims"]
+    assert hook["entry"] == "python scripts/hooks/doc_claims.py"
+    assert all(re.search(hook["files"], p) for p in ("README.md", "Code/CLAUDE.md"))
+    assert re.search(hook["files"], "Code/tests/unit/test_doc_claims.py")
+    text = (REPO / "scripts" / "hooks" / "doc_claims.py").read_text(encoding="utf-8")
+    assert '"PRE_LIVE_CHECKLIST"' in text and '"MASTER_REFERENCE"' in text
+    assert "DOC_CLAIMS_EXTRA" in text
+    assert "DOC_CLAIMS_EXTRA" in (
+        REPO / "Code" / "tests" / "unit" / "test_doc_claims.py"
+    ).read_text(encoding="utf-8")
+
+
 def test_the_safety_hook_runs_the_projects_tests_in_code() -> None:
     hook = _hooks()["safety-invariants"]
     script = REPO / "scripts" / "hooks" / "safety_invariants.py"

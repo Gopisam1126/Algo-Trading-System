@@ -55,10 +55,12 @@ decision was made, what exists today, what does not, and what to do next.
 An algorithmic trading platform for **Indian equities (NSE/BSE)**, built for
 **personal use with the owner's own capital**.
 
-It ingests real-time market data, cleans it, computes technical indicators across
-multiple timeframes, monitors news and macro conditions, uses AI to synthesize
-patterns and produce reasoned trade recommendations, and executes risk-gated
-trades across multiple stocks concurrently.
+**As designed** - §2 says what is built - it ingests real-time market data,
+cleans it, computes technical indicators across multiple timeframes, monitors
+news and macro conditions, uses AI to review rule-based candidates and produce
+reasoned trade recommendations, and executes risk-gated trades across multiple
+stocks concurrently. **As built**, the signals are deterministic rules and no AI
+or news component exists (audit AI-003, AI-004).
 
 ### 1.1 What makes it different from a typical retail bot
 
@@ -96,7 +98,7 @@ resolve to "no trade" rather than a forced decision.
 | Concurrent positions | 5 slots |
 | Capital | ₹5,00,000 (configurable) |
 | Decision interval | 5 minutes (adaptive, derived from measured latency) |
-| Order rate | 3/sec (SEBI allows 10; deliberately conservative) |
+| Order rate | 3/sec configured, 5/sec hard cap (the exchanges' registration threshold is 10; deliberately conservative) |
 | Daily AI cost | Bounded by token budget, ~₹150/day expected |
 
 ---
@@ -154,10 +156,10 @@ integration tests; none of them runs as a process yet.
 
 The AI review and the Recommendation emitter (E13-S03/S04, which need the
 Anthropic client, E10-S01); a market context with a regime (E09); the day's
-locked plan (E11-S08); a strategy this engine can evaluate (the shipped
-`orb_classic` asks for daily and weekly bars the engine does not carry); daily
-and intraday bars (E03 - E03-S01 is blocked by B8); and the entrypoints
-(E23-S03). The backlog tracker is the authority on each item's state.
+locked plan (E11-S08); a news source (the shipped `orb_classic`, which now
+asks only for 15m/1h agreement - audit TRD-014 - enters only when no material
+news landed, and nothing reports news yet); daily and intraday bars (E03 -
+E03-S01 is blocked by B8); and the entrypoints (E23-S03). The backlog tracker is the authority on each item's state.
 
 ### 2.4 The gap that had been invisible
 
@@ -233,7 +235,7 @@ has no way to say it.
 
 | # | Constraint | Source | Enforced in |
 |---|---|---|---|
-| C1 | India-hosted server, static broker-whitelisted IP | SEBI | Infrastructure + config validation |
+| C1 | Static broker-whitelisted IP; India-region host | SEBI (static IP); **this system's own rule** (India region - no cited regulation requires it, audit HAL-001) | Infrastructure + config validation |
 | C2 | Order rate below 10/sec; system runs at 3 | SEBI + Zerodha | `common/redis/primitives.py` token bucket (atomic Lua), capped by `config.py` hard bounds |
 | C3 | Daily re-auth before pre-open | SEBI | `AuthManager` scheduled job |
 | C4 | LLM never sizes/orders | Design | `Recommendation` type |
@@ -621,9 +623,11 @@ Algo-Trading-System/
 │   ├── STRATEGY_ENGINE.md            Strategy lifecycle (706)
 │   ├── VERIFICATION_REPORT.md        Audit trail (234)
 │   ├── PRE_LIVE_CHECKLIST.md         The gate before capital (133)
-│   └── *.png                         Architecture diagrams
+│   └── *.png                         Diagrams of the DESIGN - they draw the AI
+│                                     layer and an Angel One broker, neither
+│                                     built (audit ENG-049); §2 is what exists
 │
-└── Code/                        The application — 4,577 lines Python
+└── Code/                        The application (§2 for its state)
     ├── pyproject.toml           Dependencies, ruff, mypy, pytest config
     ├── Makefile                 All common commands
     ├── README.md                Developer quick start
@@ -1079,22 +1083,37 @@ asserting it is true.
 | **Whose money** | Your own account, plus immediate family with permission | Managing others' money without registration is a serious offence |
 | **Whose advice** | Your own signals only — not published, sold, or shared | Publishing can trigger Research Analyst regulations |
 | **How fast** | Below 10 orders/sec per segment | Above requires exchange registration |
-| **How connected** | Via a registered broker, static whitelisted IP, India-hosted | Non-compliance means the broker cuts API access |
+| **How connected** | Via a registered broker, from a static whitelisted IP (where the algo must be HOSTED is open - §15.2) | Non-compliance means the broker cuts API access |
 
 ### 15.2 SEBI retail algo framework (mandatory since 1 April 2026)
 
 - **Self-developed algos for personal use are permitted** without registering the
   algorithm, provided the order-rate threshold isn't breached.
-- Below 10 OPS the algo is **unregistered** and the order is tagged with a
-  **generic** ID applied on the broker/exchange side — there is no registered
-  Algo-ID for the developer to obtain or attach. Registration is conditional on
-  *crossing* the threshold (SEBI circular 4 Feb 2025, clause I(c)); brokers
-  categorise as algo orders only those **above** it (I(d)). Confirmed 9 Sep 2026.
+- Below the threshold the algo is **unregistered**, so there is no registered
+  Algo-ID to obtain. **But its orders are still tagged** - **OPEN (B1, reopened
+  16 Nov 2026, audit LEG-001).** The 9 Sep 2026 conclusion ("not applicable")
+  read the SEBI circular alone. The exchanges' implementation standard
+  (NSE/INVG/67858, 5 May 2025, Annexure B.3, as read by the audit) requires
+  every API algo order below the threshold to carry an exchange-provided
+  **generic** algo ID, and whether Kite applies it server-side or expects the
+  client to send it is unconfirmed. Live mode refuses to load until
+  `broker.algo_tagging_confirmation` records Zerodha's written answer.
+- **Where the 10 comes from (audit HAL-002).** The SEBI circular sets no number:
+  it speaks of "the specified order per second threshold" and leaves the figure
+  to the Brokers' Industry Standards Forum. The 10 OPS (per exchange and
+  segment) is the exchanges' standard (NSE/INVG/67858 Annexures B.2/F); the
+  exchanges may revise it and a broker may set a lower client limit, so it is
+  re-checked every year with the holiday file (PRE_LIVE_CHECKLIST §1).
 - **Static IP whitelisting** — at `developers.kite.trade` → profile → IP
   Whitelist. Applies to **order endpoints only**; quotes, WebSocket, orderbook
   and positions remain reachable from any IP.
-- **India-hosted servers**, **OAuth + 2FA**, **daily session logout before
-  pre-open**.
+- **Hosting - OPEN (audit HAL-001).** Neither the SEBI circular nor the
+  exchange standards, as read, require *Indian* servers; the India-region check
+  in `config.py` is this system's own rule (data and latency stay local).
+  NSE's standard I(h) says instead that retail algorithms "should be hosted on
+  brokers' cloud servers", and whether that applies to a client's own
+  sub-threshold algo on its own static IP is a question for Zerodha and counsel
+  (B10). **OAuth + 2FA** and **daily session logout before pre-open** stand.
 - Brokers retain API/algo logs for a minimum of 5 years.
 
 ### 15.3 The advisory boundary — easy to cross accidentally
@@ -1281,15 +1300,19 @@ for Phase 0.
 
 ### 21.1 Immediate — the critical path
 
-**Procure the static IP.** That is now the whole of the critical path. B1 and B4
-were both resolved by research rather than correspondence, which leaves one item
-that genuinely needs procurement and one that needs a decision:
+**Procure the static IP, and get two written answers.** B4 was resolved by
+research; B1 was too, and was reopened by the 16 Nov 2026 audit, because research
+on the SEBI text alone was not enough:
 
-1. ~~**Algo-ID mechanic**~~ — ✅ **closed 9 Sep 2026, not applicable.** Below
-   10 OPS the algo is unregistered and the broker tags it generically. No email
-   required.
-2. **Static IP whitelisting** — process and lead time. **The one real SEBI
-   obligation left, and it applies at every order rate.**
+1. **Algo-ID tagging (B1, reopened, audit LEG-001)** — Zerodha's written answer
+   on what a client-developed, sub-threshold algo must send on an API order
+   under NSE/INVG/67858 B.3. Live mode will not load without it
+   (`broker.algo_tagging_confirmation`).
+2. **Static IP whitelisting** — process and lead time. A SEBI obligation at
+   every order rate.
+2a. **Hosting (B10, audit HAL-001)** — Zerodha's and counsel's written answer
+   on whether NSE standard I(h) ("hosted on brokers' cloud servers") applies to
+   this system.
 3. ~~**Historical data**~~ — ✅ closed: Connect ₹500/mo bundles WebSocket and
    historical.
 4. **Daily login** — what is permitted for an unattended personal algo. Worth
@@ -1337,7 +1360,8 @@ passing tests. Cheap now, annoying to retrofit.
 
 | # | Item | Status | Blocks |
 |---|---|---|---|
-| B1 | **Algo-ID attachment mechanic** | ✅ **Closed 9 Sep 2026 — not applicable.** Unregistered below 10 OPS; broker tags generically. `config.py` no longer demands one in LIVE mode | — |
+| B1 | **Algo-ID tagging for a sub-threshold client algo** | ❌ **Reopened 16 Nov 2026 (audit LEG-001)** - closed 9 Sep 2026 on the SEBI text alone; the NSE standard tags such orders with a generic algo ID, and who sends it is unconfirmed. Needs Zerodha's written answer | Live mode (`broker.algo_tagging_confirmation`) |
+| B10 | **Hosting: does NSE standard I(h) apply?** | ❌ **Open (audit HAL-001, recorded 21 Nov 2026)** - I(h) says retail algos "should be hosted on brokers' cloud servers"; this system plans its own India-region VPS. Needs Zerodha's and counsel's written answer | Live trading; the choice of host (B6) |
 | B2 | `kiteconnect` lacks `market_protection` | ✅ **Closed** — present in 5.2.1 | — |
 | B3 | NSE holiday list incomplete | ✅ **Closed 24 Aug 2026** | — |
 | B4 | Historical data pricing | ✅ **Closed** — Connect ₹500/mo bundles WebSocket + historical | — |
@@ -1377,8 +1401,9 @@ picking a side.**
 
 What NSE blocks is **overseas** access, not programmatic access as such. SEBI
 already requires the order path to originate from a single static,
-broker-whitelisted, India-hosted IP — so one host answers both the compliance
-requirement and the data-reachability question. `scripts/check_data_reachability.py`
+broker-whitelisted IP, and this system's own rule puts it in an India region —
+so one host answers both the compliance requirement and the data-reachability
+question (unless B10 moves the algo onto the broker's cloud). `scripts/check_data_reachability.py`
 makes that a one-command check on the day there is a host.
 
 Confirmed from Zerodha's developer forum, and it unblocks a great deal:

@@ -225,7 +225,10 @@ added to LOW_LEVEL_ARCHITECTURE.md §1.1.
   Below the 10 OPS threshold the algo is unregistered, no ID is issued, and the
   broker tags the order generically (SEBI circular 4 Feb 2025, I(c) and I(d);
   Zerodha's own guidance; `kiteconnect`'s `algo_id` is optional, default
-  `None`). No Zerodha correspondence was needed.
+  `None`). No Zerodha correspondence was needed. **REOPENED 16 Nov 2026
+  (audit LEG-001):** the exchanges' standard (NSE/INVG/67858 B.3) tags
+  sub-threshold API algo orders with a generic algo ID, and who sends it is
+  unconfirmed - correspondence IS needed. Open as B1 in PRE_LIVE_CHECKLIST.md.
 - **`pykiteconnect` 5.1.0 lacks `market_protection`.** A plain
   `pip install kiteconnect` yields a version that cannot place compliant market
   orders. Verify the installed version before live trading.

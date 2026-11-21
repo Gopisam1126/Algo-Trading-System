@@ -73,3 +73,12 @@ repos:
         entry: python scripts/hooks/safety_invariants.py
         pass_filenames: false
         files: ^Code/.*\.py$
+
+      - id: doc-claims
+        name: documents make no claim the tree has falsified
+        # The audit W8 checks over the design documents too - which QA does not
+        # carry, so the suite under Code/ cannot read them (E24-S09).
+        language: python
+        entry: python scripts/hooks/doc_claims.py
+        pass_filenames: false
+        files: (\.md$|^Code/tests/unit/test_doc_claims\.py$|^Code/src/algotrader/)

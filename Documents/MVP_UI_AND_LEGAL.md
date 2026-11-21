@@ -2,7 +2,7 @@
 ## AI-Driven Algorithmic Trading Platform — Personal Use, Indian Markets
 
 **Document type:** Product specification — scope, interface design, regulatory framing
-**Status:** Design complete, pre-implementation
+**Status:** The design. What is built is [MASTER_REFERENCE.md §2](MASTER_REFERENCE.md#2-current-status--what-exists-what-doesnt); the compliance features (§2.5) carry their own built/planned state (audit ENG-016, 21 Nov 2026)
 **Version:** 1.0 — 2026-08-04
 
 > 📘 **New here? Start with [MASTER_REFERENCE.md](MASTER_REFERENCE.md)** — the single onboarding document covering the whole system.
@@ -124,7 +124,7 @@ GIFT Nifty · India VIX · FII/DII flows · sector rotation · economic calendar
 | **Whose money** | Your own account, and (with permission) immediate family — spouse, dependent children, dependent parents | Managing others' money without registration is a serious offence |
 | **Whose advice** | You act on your own signals only. You do not publish, sell, or share them | Publishing recommendations can trigger Research Analyst regulations |
 | **How fast** | Below the exchange order-rate threshold (10 orders/sec per segment) | Above it, the algo requires exchange registration |
-| **How connected** | Through a registered broker, never direct to exchange, on a static whitelisted IP, from Indian servers | Non-compliance means the broker cuts API access |
+| **How connected** | Through a registered broker, never direct to exchange, on a static whitelisted IP (where the algo must be hosted is open - B10) | Non-compliance means the broker cuts API access |
 
 ### 2.2 SEBI retail algo framework — what applies to you
 
@@ -132,7 +132,8 @@ Fully mandatory since 1 April 2026. Recapping the operational requirements (full
 
 - **Self-developed algos for personal use are explicitly permitted** without registering the algorithm, as long as the order-rate threshold isn't breached.
 - Below 10 orders/second there is **no registration and no Algo-ID to obtain** — the order is tagged with a generic identifier on the broker/exchange side. *(Corrected 9 Sep 2026: this line previously said you still needed to obtain a Generic Algo-ID via your broker. SEBI's circular of 4 Feb 2025 makes registration conditional on crossing the threshold, clause I(c), and Zerodha asks the developer only for a static IP.)*
-- **Static IP whitelisting**, **India-hosted servers**, **OAuth + 2FA**, and **daily session logout before pre-open** are all mandatory. These are architectural constraints, not paperwork (LLD §1.1, C1–C3).
+- **Static IP whitelisting**, **OAuth + 2FA**, and **daily session logout before pre-open** are mandatory. These are architectural constraints, not paperwork (LLD §1.1, C1–C3). **Hosting is open (B10, audit HAL-001):** the India-region check is this system's own rule, and NSE's standard I(h) ("hosted on brokers' cloud servers") needs a written answer.
+- **Algo-ID tagging is open (B1, reopened 16 Nov 2026, audit LEG-001):** sub-threshold API algo orders carry an exchange-provided generic algo ID, and whether Kite or the client applies it is unconfirmed. Live mode refuses to load without `broker.algo_tagging_confirmation`.
 - The broker is the *principal* — legally responsible for every algo on their platform. This means their terms of service matter as much as SEBI's rules. **Read them.**
 
 ### 2.3 The line you must not cross: advisory regulations
@@ -150,7 +151,7 @@ This is the most commonly misunderstood boundary, and it's easy to cross acciden
 - Managing anyone else's account, even informally, even for free
 - Publishing the AI's trade rationales publicly in a way that reads as recommendations
 
-**The system design implication:** the alert/notification layer must be **single-recipient by construction**. No broadcast channels, no group chats, no public webhooks. This is enforced in config validation (§9.5) — the notifier refuses to start if more than one recipient is configured, unless an explicit `family_accounts` block with a compliance acknowledgement is present.
+**The system design implication:** the alert/notification layer must be **single-recipient by construction**. No broadcast channels, no group chats, no public webhooks. This is enforced in config validation (§9.5): `notifications.recipients` holds at most one entry (`max_length=1`), so a configuration naming two does not load. *(Corrected 21 Nov 2026, audit ENG-016: this said the notifier refuses to start unless a `family_accounts` block is present. No such exception exists, and the notifier itself is not built.)*
 
 **A subtle trap:** Research Analyst regulations impose personal trading restrictions on registered analysts — no trading in a recommended security for 30 days before and 5 days after publishing. If you ever *do* register or publish, your own algo becomes entangled in those windows. Staying purely personal keeps this entirely out of scope.
 
@@ -181,17 +182,19 @@ Brokerage, STT, GST on brokerage, exchange transaction charges, SEBI turnover fe
 
 ### 2.5 Compliance features (MVP)
 
-| ID | Feature | Why |
-|---|---|---|
-| ~~L-1~~ | ~~Algo-ID attached to every order~~ — **withdrawn 9 Sep 2026** | Not applicable below the 10 OPS registration threshold; the broker tags generically. The adapter still sends one when configured, so this costs nothing if the profile ever changes |
-| L-2 | Order-rate limiter (hard cap 5/sec) | Keeps you under the 10 OPS registration threshold |
-| L-3 | Static IP verification at startup — refuse to start if the egress IP doesn't match config | Prevents accidental non-compliant operation after an infra change |
-| L-4 | Daily re-auth with audit trail | SEBI session rule |
-| L-5 | Immutable decision log with hash chaining | Regulatory record-keeping + tax substantiation |
-| L-6 | Single-recipient notification enforcement | Prevents accidental drift into advisory territory |
-| L-7 | Charge-level fill accounting | Tax computation accuracy |
-| L-8 | Tax report generator (speculative turnover, P&L, expenses, carry-forward) | ITR-3 preparation |
-| L-9 | Compliance self-check panel in admin UI | One screen showing every constraint's live status |
+**State as of 21 Nov 2026** (audit ENG-016: this table listed every row as MVP scope with no word on which exist). "Built" means built and tested as a component; nothing runs as a process yet (no entrypoint, E23-S03).
+
+| ID | Feature | Why | State |
+|---|---|---|---|
+| L-1 | Algo-ID tagging as the broker requires | The exchanges tag sub-threshold API algo orders with a generic algo ID | **Open (B1, reopened 16 Nov 2026, audit LEG-001)** - withdrawn on 9 Sep 2026 as not applicable; who sends the generic ID is unconfirmed. Live mode refuses to load without `broker.algo_tagging_confirmation`; the adapter sends an `algo_id` only when one is configured |
+| L-2 | Order-rate limiter (hard cap 5/sec) | Keeps you under the 10 OPS registration threshold | **Built** - required by the Kite trading adapter, refused above `MAX_ORDERS_PER_SECOND` |
+| L-3 | Static IP verification at startup — refuse to start if the egress IP doesn't match config | Prevents accidental non-compliant operation after an infra change | **Partial** - live mode refuses to load without `system.static_ip`, and `doctor` compares the actual egress IP; refusing to START on a mismatch needs an entrypoint (E21-S02 remainder, E23-S03) |
+| L-4 | Daily re-auth with audit trail | SEBI session rule | **Built, unexercised** - the re-auth schedule exists (E02-S02); a real login needs credentials (B5) |
+| L-5 | Immutable decision log with hash chaining | Regulatory record-keeping + tax substantiation | **Built** - hash-chained `decision_log`, anchored to genesis and an off-host head, append-only for the service login |
+| L-6 | Single-recipient notification enforcement | Prevents accidental drift into advisory territory | **Built in config** (`recipients` at most one); the notifier is planned |
+| L-7 | Charge-level fill accounting | Tax computation accuracy | **Partial** - `execution/charges.py` computes Zerodha's charges for the day's loss figure; per-fill accounting against a contract note is planned |
+| L-8 | Tax report generator (speculative turnover, P&L, expenses, carry-forward) | ITR-3 preparation | **Planned** - not built |
+| L-9 | Compliance self-check panel in admin UI | One screen showing every constraint's live status | **Planned** - `api/` is empty; `doctor` reports the same constraints from the command line |
 
 ---
 
@@ -1025,8 +1028,8 @@ The system is MVP-complete when **all** of these hold:
 
 **Compliance**
 - [ ] Static IP verified and broker-whitelisted; startup check active
-- [ ] Deployed in an India region
-- [x] ~~Algo-ID attached to every order~~ — N/A below the registration threshold (B1 closed)
+- [ ] Hosting answered in writing (B10); if self-hosted, in an India region (this system's own rule, audit HAL-001)
+- [ ] Algo-ID tagging answered in writing and recorded (B1, reopened - audit LEG-001)
 - [ ] Order rate demonstrably capped at 5/sec under a flood test
 - [ ] Daily re-auth working for 20 consecutive sessions
 - [ ] Single-recipient notification enforced

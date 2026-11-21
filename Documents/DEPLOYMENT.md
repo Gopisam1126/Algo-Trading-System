@@ -164,9 +164,9 @@ The workflow then:
 **PROD promotion is blocked by a deliberate speed bump.** The workflow fails
 with a message pointing at `PRE_LIVE_CHECKLIST.md`. That step is meant to be
 removed only by someone who has actually read the file and can say the static
-IP is whitelisted — which is now the *only* outstanding SEBI item, B1 having
-closed as not-applicable on 9 Sep 2026 — and paper trading has a record across
-more than one market regime.
+IP is whitelisted, the two written answers are in (B1 Algo-ID tagging -
+closed on 9 Sep 2026 and reopened by audit LEG-001 - and B10 hosting), and
+paper trading has a record across more than one market regime.
 
 ---
 
@@ -188,10 +188,21 @@ this document** — everything else is automation that a direct push walks aroun
 
 ## 6. Running the QA environment
 
-There is **no QA server yet.** Blocker **B6** — an India-hosted static IP — is
-open, and SEBI requires order endpoints to originate from a whitelisted address.
+There is **no QA server yet.** Blocker **B6** — a static IP — is open (and B10,
+whether the algo must be hosted on the broker's cloud, decides where it goes),
+and SEBI requires order endpoints to originate from a whitelisted address.
 So today "the QA environment" is the container stack, run wherever you are
 running it.
+
+> **The stack does not run the system yet (audit ENG-015, ARC-001).** No
+> package has a `__main__`, so the nine application containers - and the image's
+> own `CMD`, `python -m algotrader.orchestrator` - exit at start, and
+> `strategy-svc` names a module that does not exist (`algotrader.strategy.service`).
+> The image `HEALTHCHECK` only imports the package, so it cannot tell. What the
+> commands below give you is Redis, TimescaleDB, Prometheus and Grafana, a
+> migrated schema and a doctor report. The entrypoints are E23-S03;
+> `tests/unit/test_service_commands.py` lists the commands that cannot start
+> yet and fails when one can, so this paragraph is updated in the same change.
 
 ```bash
 cd Code

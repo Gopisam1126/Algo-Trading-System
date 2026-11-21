@@ -1461,7 +1461,10 @@ Not a coding task, but it gates all live trading, so here is the sequence:
    - An Indian VPS provider with a dedicated IPv4 included (simplest, cheapest)
    - AWS `ap-south-1` EC2 with an **Elastic IP** attached
    - Any provider offering a static/reserved IP in an India region
-   Requirement is only that the IP is **static and India-hosted** (SEBI).
+   The SEBI requirement is that the IP is **static** and whitelisted. India
+   hosting is this system's own rule (audit HAL-001, 21 Nov 2026), and NSE's
+   standard I(h) - retail algos "should be hosted on brokers' cloud servers" -
+   may change the choice of host entirely: answer B10 before procuring.
 
 2. **Provision and note the IP.** After allocation, confirm the actual egress IP
    from the box itself — the assigned IP and the egress IP can differ behind
