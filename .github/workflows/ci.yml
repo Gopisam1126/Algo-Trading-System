@@ -134,7 +134,14 @@ jobs:
           docker pull "$(python -c "import yaml;print(yaml.safe_load(open('ops/docker-compose.yml'))['services']['redis']['image'])")"
 
       - name: pytest
-        run: pytest -q --junitxml=test-results.xml
+        # Measured here so the gate below has a report (E22-S07): until 21 Nov
+        # 2026 CI ran the suite without coverage, so nothing held it anywhere.
+        run: pytest -q --junitxml=test-results.xml --cov=src/algotrader --cov-report=term --cov-report=json:coverage.json
+
+      - name: Coverage gate
+        # The risk engine and the sizer fully covered; the package total at or
+        # above its floor. scripts/coverage_gate.py says what and why.
+        run: python scripts/coverage_gate.py coverage.json
 
       - name: Publish results
         if: always()

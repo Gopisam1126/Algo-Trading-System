@@ -95,6 +95,8 @@ Prefer a failing test over a comment asserting correctness.
 ruff check . && ruff format --check .       # = make lint - CI's exact commands
 mypy src                                    # = make types
 pytest tests/ -q                            # = make test; Docker up, 0 skipped
+# make cov = the suite with --cov-report=json:coverage.json, then
+python scripts/coverage_gate.py coverage.json   # risk/ + sizer.py fully covered (CI runs it)
 python scripts/doctor.py                    # = make doctor; Datastores FAIL is expected without secrets
 ```
 

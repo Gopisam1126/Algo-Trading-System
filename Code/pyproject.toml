@@ -228,6 +228,8 @@ branch = true
 [tool.coverage.report]
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
 
-# Safety-critical modules must be fully covered — see LOW_LEVEL_ARCHITECTURE.md §12.1
-[tool.coverage.paths]
-risk = ["src/algotrader/execution/risk_engine.py", "src/algotrader/execution/sizer.py"]
+# Safety-critical modules must be fully covered — see LOW_LEVEL_ARCHITECTURE.md §12.1.
+# Enforced by scripts/coverage_gate.py, which CI runs after the suite (E22-S07). Until
+# 21 Nov 2026 a [tool.coverage.paths] entry stood here naming execution/risk_engine.py,
+# which does not exist - and [paths] maps source locations when combining data files,
+# so it enforced nothing even when it named real files.

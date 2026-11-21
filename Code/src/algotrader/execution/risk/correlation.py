@@ -148,8 +148,10 @@ def pearson(left: Sequence[float], right: Sequence[float]) -> float:
     # is the smallest positive float itself (4.94e-324), so no input can reach
     # it. It is defence in depth against exactly one future edit — someone
     # folding the two roots back into `sqrt(var_l * var_r)` for tidiness, which
-    # is the spelling that caused CORR-001.
-    if denominator <= 0:
+    # is the spelling that caused CORR-001. Excluded from the coverage gate
+    # (scripts/coverage_gate.py) on that proof, which a test executes:
+    # test_correlation.py::test_the_underflow_guard_is_unreachable.
+    if denominator <= 0:  # pragma: no cover - unreachable; proven by a test
         raise CorrelationError(
             "the correlation denominator underflowed to zero despite both "
             "series having variance, so no correlation can be reported. "

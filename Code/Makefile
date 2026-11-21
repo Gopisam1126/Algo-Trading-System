@@ -76,8 +76,9 @@ test-safety:  ## Verify the architecture's safety invariants still hold
 	pytest tests/security -v
 
 .PHONY: cov
-cov:  ## Test with coverage; risk modules must be at 100%
-	pytest --cov --cov-report=term-missing --cov-report=html
+cov:  ## Test with coverage, then the gate CI runs (risk engine + sizer fully covered)
+	pytest --cov=src/algotrader --cov-report=term-missing --cov-report=html --cov-report=json:coverage.json
+	python scripts/coverage_gate.py coverage.json
 
 .PHONY: check
 check: lint types test  ## CI's quality and test jobs (security: `make security`; the image build and secret scan run in CI)

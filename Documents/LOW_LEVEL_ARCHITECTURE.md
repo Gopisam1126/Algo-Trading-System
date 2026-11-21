@@ -1711,7 +1711,7 @@ All logs are JSON (`structlog`), always carrying `correlation_id`, `service`, `s
 
 | Level | Scope | Tooling | Gate |
 |---|---|---|---|
-| **Unit** | Pure functions: strategies, sizing, filters, scoring | pytest | 100% coverage required on `risk/` and `execution/` |
+| **Unit** | Pure functions: strategies, sizing, filters, scoring | pytest | 100% line coverage on `execution/risk/` and `execution/sizer.py`, **enforced** in CI by `scripts/coverage_gate.py` with a floor on the package total (E22-S07, 21 Nov 2026). The rest of `execution/` (gateway, stops, book, reconciliation) is not gated at 100%: it is held by that floor and by mutation testing, which says more than a line count does |
 | **Property** | Invariants over generated inputs | Hypothesis | Risk engine invariants (§12.2) |
 | **Integration** | Service + Redis + Postgres | pytest + testcontainers | All inter-service contracts |
 | **Contract** | Broker/AI API shapes | pytest + recorded fixtures | Detects upstream API drift |
