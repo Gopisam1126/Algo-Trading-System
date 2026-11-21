@@ -122,8 +122,14 @@ Never commit a `.env`, a credential, or anything under `data/`.
 
 ## AI layer specifics
 
-- Model tiers: `claude-opus-5` (pre-market deep synthesis, once daily),
-  `claude-sonnet-5` (in-session confirmation), `claude-haiku-4-5` (news triage).
+**The AI layer is designed, not built** - no code calls a model, `ai/` is
+empty and the `anthropic` SDK is an optional extra (audit AI-003, HAL-003).
+These are the rules for building it (E10, E13-S03).
+
+- Model tiers, as configured and **unverified** (HAL-003 - check them against
+  the `claude-api` skill before E10-S01 uses them): `claude-opus-5`
+  (pre-market deep synthesis, once daily), `claude-sonnet-5` (in-session
+  confirmation), `claude-haiku-4-5` (news triage).
 - Always use structured outputs (`messages.parse()` with a Pydantic model).
   Free-text responses have no place in a system that acts on them.
 - Check `stop_reason` **before** reading `content` — a refusal has empty or
@@ -144,8 +150,9 @@ do not). It carries no test counts (ENG-037): the latest CI run is the count.
 through `execution/gateway.py` to a submitted broker order.** The keystone
 sentence that led this file for months — *"nothing turns that decision into an
 order"* — is no longer true. What is still true: nothing has ever placed a real
-order, because that needs credentials (B5) and a static IP (B6) — B1, the
-Algo-ID, closed on 9 Sep 2026 as not applicable — and because the pieces around
+order, because that needs credentials (B5), a static IP (B6) and two written
+answers - B1, the Algo-ID tagging (closed 9 Sep 2026 as not applicable,
+REOPENED 16 Nov 2026 by audit LEG-001), and B10, hosting (HAL-001) - and because the pieces around
 the gateway are unbuilt: no process entrypoint
 (`python -m algotrader.execution`, which docker-compose runs, has no
 `__main__` - no service does yet). Every live risk input now has a producer -
@@ -234,8 +241,8 @@ Built and tested as components (counts: the latest CI run; it must say
 - **E15-S01 the order gateway** — `execution/gateway.py`, the only path from a
   decision to a broker. Generates §8.2's deterministic `client_order_id`, which
   was *consumed* in three places and *generated* nowhere; attaches market
-  protection (and an `algo_id` only if one is configured — none is, and that is
-  correct below the registration threshold); refuses anything the risk engine did not
+  protection (and an `algo_id` only if one is configured — none is; whether a
+  sub-threshold client must send a generic one is B1, reopened by audit LEG-001); refuses anything the risk engine did not
   approve; takes a rate-limiter token only after the order is known to be
   valid, so a rejected decision never spends one. **The tick resolver is wired**
   — E02 left the adapter refusing every priced order with `NO_TICK_RESOLVER`,
@@ -959,6 +966,16 @@ E24) records each. The shapes worth remembering, because each passed QA:
   adapter-level brokers report orders through `KiteTradingAdapter._to_order`
   (tag as the id, no intent), because Kite stores nothing else (E24-S08). A
   new double either reuses these or calls `check_place_order`.
+- **"The code is corrected, so the record is."** Batch A made live mode refuse
+  to load without the broker's written answer on Algo-ID tagging (LEG-001) -
+  and left `PRE_LIVE_CHECKLIST.md`, the gate before capital, showing B1 - which
+  the audit had reopened - as CLOSED with its box ticked, beside seven other
+  documents saying the same, and nine
+  calling India hosting a SEBI rule. A correction lands where the claim is
+  READ, not only where it is enforced. `tests/unit/test_doc_claims.py` holds
+  the documents every branch carries; the design documents, which QA does not
+  carry and nothing running there may read, are held by the same tests from
+  the pre-commit hook `scripts/hooks/doc_claims.py` (E24-S09).
 
 ### What the whole-system audit checked and did not break
 
@@ -999,7 +1016,8 @@ else was examined. Verified sound, with probes rather than by reading:
 | B4 historical data pricing | ✅ Closed — Connect ₹500/mo bundles WebSocket + historical |
 | B7 `autobahn` CVE-2020-35678 | ✅ Closed 24 Aug 2026 — upgraded to 26.7.1; 26.10.2 since 29 Oct 2026 (CVE-2026-116579) |
 | B3 NSE holiday list | ✅ Closed 24 Aug 2026 — 2026 verified, 245 sessions. **Renew each December** |
-| B1 Algo-ID | ✅ Closed 9 Sep 2026 — **not applicable.** Unregistered below 10 OPS; the broker tags generically and there is no ID to obtain. `config.py` requires one only at or above `SEBI_ALGO_REGISTRATION_OPS` |
+| B1 Algo-ID tagging | ❌ **Reopened 16 Nov 2026 (audit LEG-001).** Closed 9 Sep 2026 as not applicable on the SEBI text alone; the NSE standard tags sub-threshold API algo orders with a generic algo ID and who sends it is unconfirmed. Live mode refuses to load without `broker.algo_tagging_confirmation` (Zerodha's written answer) |
+| B10 hosting | ❌ **Open (HAL-001).** NSE standard I(h): retail algos "should be hosted on brokers' cloud servers" - does it apply here? India-region hosting is this system's own rule, not a cited regulation |
 | B5 daily login | ⚠️ Needs real credentials |
 | B6 static IP | 🔍 **Order endpoints only** — does not block development |
 | B8 NSE data access | 🔍 Same fix as B6; `scripts/check_data_reachability.py` answers it in one command |

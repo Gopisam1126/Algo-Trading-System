@@ -19,10 +19,13 @@
 # finds no data, and either fails loudly (best case) or computes indicators
 # across a phantom session (worse). `doctor.py` warns while it is unverified.
 #
-# Weekends are handled in code and do NOT need listing here. The four
-# weekend-falling holidays are listed anyway, commented, so that a future
-# reader comparing this file against the circular finds every line accounted
-# for rather than wondering what was dropped.
+# Weekends are handled in code and do NOT need listing here. The circular's
+# four weekend-falling holidays are accounted for anyway, so that a future
+# reader comparing this file against it finds every line: three are ordinary
+# entries at the end of `holidays` (harmless - a weekend is closed either way),
+# and the fourth, Diwali Laxmi Pujan on Sunday 8 Nov, is under
+# `special_sessions`, because it carries the Muhurat session. (Until 21 Nov
+# 2026 this said all four were listed "commented"; none was - audit ENG-051.)
 #
 # Source: https://www.nseindia.com/resources/exchange-communication-holidays
 # ===========================================================================

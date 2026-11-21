@@ -100,10 +100,17 @@ Full instructions in [Code/README.md](Code/README.md).
 
 SEBI's retail algo framework has been mandatory since 1 April 2026. Personal-use
 self-developed algorithms are permitted, inside a specific lane: own capital,
-own signals only (not shared), under 10 orders/second, through a registered
-broker, on a static whitelisted IP, hosted in India. The system is designed to
-stay inside that lane deliberately — several of those constraints are enforced
-by config validation rather than left to discipline.
+own signals only (not shared), under the exchanges' 10 orders/second threshold,
+through a registered broker, on a static whitelisted IP. The system is designed
+to stay inside that lane deliberately — several of those constraints are
+enforced by config validation rather than left to discipline.
+
+Two questions about the lane are **open** and need written answers before any
+live order ([PRE_LIVE_CHECKLIST.md](Documents/PRE_LIVE_CHECKLIST.md)): how a
+sub-threshold algo's orders are tagged (B1, reopened by the 10 Nov 2026 audit,
+LEG-001), and whether NSE's standard that retail algos be hosted on the
+broker's cloud applies (B10, HAL-001). Running in an India region is this
+system's own rule, not a cited regulation.
 
 See [MVP_UI_AND_LEGAL.md §2](Documents/MVP_UI_AND_LEGAL.md) for the full
 treatment including taxation. Not legal or tax advice.

@@ -189,7 +189,7 @@ cd Code
 .venv/Scripts/activate          # Windows;  source .venv/bin/activate elsewhere
 
 make doctor                     # config + datastore posture
-make test                       # 118 tests
+make test                       # Docker up: 0 skipped, or it is not green
 ```
 
 `make doctor` now has a **Datastores** section that answers "which database am
@@ -265,7 +265,8 @@ mention ruff or PATH at all.
 
 **Versions installed are newer majors than the design docs assume** — alembic
 1.19 (docs assume 1.13), pytest 9.1, pytest-asyncio 1.4 (docs assume 0.24),
-SQLAlchemy 2.0.51, psycopg 3.3.4, pydantic 2.13.4. All 118 tests pass on them.
+SQLAlchemy 2.0.51, psycopg 3.3.4, pydantic 2.13.4. The suite passed on them when
+this was written (constraints.txt now pins what CI installs).
 `asyncio_default_fixture_loop_scope` had to be added to `pyproject.toml` for
 pytest-asyncio 1.x.
 
@@ -358,7 +359,16 @@ positive percentage, `0` rejected — so the model and the broker already agree
 with no change needed. `pyproject.toml` now floors the dependency at `>=5.2.1`
 so a downgrade cannot silently reintroduce the gap.
 
-**B1 — Algo-ID — CLOSED 9 Sep 2026. There is nothing to send.** `place_order()`
+**B1 — Algo-ID — REOPENED 16 Nov 2026 (audit LEG-001).** What follows is the
+9 Sep 2026 reasoning that closed it, kept because the SEBI reading in it is
+right as far as it goes. What it missed: the exchanges' implementation standard
+(NSE/INVG/67858, 5 May 2025, Annexure B.3, as read by the audit) requires every
+API algo order BELOW the threshold to carry an exchange-provided generic algo
+ID, and whether Kite applies it server-side or expects the client to send it is
+unconfirmed. Live mode now refuses to load until `broker.algo_tagging_confirmation`
+records Zerodha's written answer; until then `doctor` warns (paper) or fails (live).
+
+*The 9 Sep 2026 reasoning:* `place_order()`
 takes an `algo_id` parameter documented as *"an **optional** algo ID to associate
 with the order"*, defaulting to `None` — and *optional* is the answer, not an
 aside. SEBI requires a self-developed algo to be registered with the exchange
@@ -368,8 +378,9 @@ the threshold. Zerodha's own guidance describes sub-threshold client algos as
 *"tagged with generic ID (unregistered, ≤10 OPS)"* and asks the developer for
 exactly one thing: a static IP dedicated to the API key.
 
-So there is no paperwork question left. `broker.algo_id` stays empty, the
-adapter omits the parameter, and `make doctor` reports that as OK.
+So, it concluded, there was no paperwork question left - which LEG-001
+reopened. `broker.algo_id` stays empty and the adapter omits the parameter
+until the broker's answer says otherwise.
 
 **What changed in the code as a result.** `common/config.py` used to refuse to
 load in LIVE mode without an `algo_id` — a fail-closed gate on a requirement
@@ -386,7 +397,7 @@ outright.
 
 ### Verified as safe
 
-- **The four safety invariants still hold** — 50 security tests pass.
+- **The four safety invariants still hold** — the security tests pass.
 - **The password does not leak through any config surface**: `model_dump()`,
   `repr()`, `str()` and `config_hash()` were each probed with a known canary
   and none contained it. `config_hash()` is password-independent by

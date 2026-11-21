@@ -32,10 +32,8 @@ Read these before changing anything. They are in [`../Documents/`](../Documents/
 
 ## Quick start
 
-> **Setting up for the first time, or picking up Sprint 1?** Read
-> **[SETUP.md](SETUP.md)** instead — it covers what is already built, the one
-> decision still outstanding (the TimescaleDB pin), and the datastore
-> gotchas that will otherwise cost you an afternoon.
+> **Setting up for the first time?** Read **[SETUP.md](SETUP.md)** too — it
+> covers the datastore gotchas that will otherwise cost you an afternoon.
 
 ```bash
 cd Code
@@ -53,8 +51,9 @@ tells you exactly what is missing.
 
 > **TA-Lib needs a C library** before the Python package will install. On
 > Debian/Ubuntu build it from source (see `ops/Dockerfile`); on macOS
-> `brew install ta-lib`; on Windows use a prebuilt wheel. It is optional for
-> Phase 0 — nothing in the current scaffold requires it.
+> `brew install ta-lib`; on Windows use a prebuilt wheel. Production never
+> imports it; the `dev` extra needs it, because the indicator tests verify
+> every incremental indicator against TA-Lib.
 
 ---
 
@@ -129,26 +128,35 @@ scripts/
 | `make test-safety` | Verify the four invariants above still hold |
 | `make check` | Lint + types + tests (what CI runs) |
 | `make security` | Secret scan + dependency audit + safety tests |
-| `make up` / `make down` | Start / stop all services |
+| `make up` / `make down` | Start / stop the compose stack - **only Redis, TimescaleDB, Prometheus and Grafana stay up today**: no application service has an entrypoint yet, so its nine containers exit at start (audit ARC-001, ENG-015; E23-S03) |
 
 ---
 
 ## Compliance — read before going live
 
-SEBI's retail algo framework has been mandatory since 1 April 2026. Four
-requirements are architectural, not paperwork:
+SEBI's retail algo framework has been mandatory since 1 April 2026. What is
+required, and what is still open, is kept in
+[`PRE_LIVE_CHECKLIST.md`](../Documents/PRE_LIVE_CHECKLIST.md); in short:
 
 - **Static, broker-whitelisted IP.** Rules out autoscaling deployments where the
-  egress IP changes. `make doctor` verifies the actual egress IP matches config.
-- **India-hosted servers.** Enforced by config validation — a non-India
-  `deployment_region` fails to load.
+  egress IP changes. Live mode refuses to load without `system.static_ip`;
+  `make doctor` compares the actual egress IP with `EXPECTED_EGRESS_IP`.
 - **Daily re-authentication** before pre-open; sessions must not persist overnight.
-- **Algo-ID on every order.** Required for live mode.
+- **Algo-ID tagging - OPEN (B1, audit LEG-001).** Below the registration
+  threshold there is no registered Algo-ID, but the exchanges tag such orders
+  with a generic one, and who sends it is unconfirmed. Live mode refuses to
+  load until `broker.algo_tagging_confirmation` records Zerodha's written answer.
+- **Hosting - OPEN (B10, audit HAL-001).** The India-region check
+  (`deployment_region`) is this system's own rule; no cited regulation
+  requires Indian servers. NSE's standard I(h) says retail algos "should be
+  hosted on brokers' cloud servers", and whether that applies here needs a
+  written answer.
 
 Two further boundaries matter:
 
-- **Order rate stays under 10/sec.** The system caps at 5, enforced in the broker
-  adapter's token bucket rather than left to callers.
+- **Order rate stays under the exchanges' 10/sec threshold.** The system caps
+  at 5 (`MAX_ORDERS_PER_SECOND`), enforced in the broker adapter's token bucket
+  rather than left to callers.
 - **Single notification recipient.** Sharing trade signals with others can trigger
   SEBI Research Analyst obligations. Configuring a second recipient fails validation.
 
@@ -161,9 +169,13 @@ subscriptions are deductible business expenses — track them from day one. See
 
 ## Build sequence
 
+The original plan, kept for its ordering. **It is not a status** — what is
+built is [`MASTER_REFERENCE.md` §2](../Documents/MASTER_REFERENCE.md#2-current-status--what-exists-what-doesnt);
+the backlog tracker has each story's state.
+
 | Phase | Weeks | Deliverable |
 |---|---|---|
-| **0** | 1–2 | **Foundation — this scaffold** ✅ |
+| 0 | 1–2 | Foundation |
 | 1 | 3–4 | Broker auth, WebSocket ingest, cleaning, historical sync |
 | 2 | 5–6 | Indicator engine, filters, Tradeability scoring |
 | 3 | 7–8 | **Pre-market AI plan by 09:15 — first genuinely useful milestone** |

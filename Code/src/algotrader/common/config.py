@@ -337,13 +337,14 @@ class BrokerConfig(_Model):
     primary: str = "angelone"
     fallback: str | None = "fyers"
 
-    #: The registered Algo-ID, and empty is the CORRECT value at this
-    #: system's operating profile. A self-developed algo below
-    #: :data:`SEBI_ALGO_REGISTRATION_OPS` is not registered, so no such id
-    #: exists to put here; the broker tags the order generically. Set it only
-    #: if registration is ever obtained -- see
-    #: ``_live_mode_requires_compliance``, which requires it above the
-    #: threshold and nowhere else.
+    #: The REGISTERED Algo-ID. A self-developed algo below
+    #: :data:`SEBI_ALGO_REGISTRATION_OPS` is not registered, so it has none,
+    #: and ``_live_mode_requires_compliance`` requires one only at or above the
+    #: threshold. Its orders are still tagged with a GENERIC algo ID, and who
+    #: sends that is the open question ``algo_tagging_confirmation`` records
+    #: (audit LEG-001; until 21 Nov 2026 this comment called empty "the
+    #: CORRECT value", which nothing had confirmed). If the broker's answer
+    #: says the client sends a value, it is encoded then - not guessed now.
     algo_id: str = ""
     #: The broker's WRITTEN answer to "what must a client-developed,
     #: sub-threshold algo send on an API order?" - a support ticket number, an
@@ -711,6 +712,14 @@ class ExecutionConfig(_Model):
 
 
 class AIModels(_Model):
+    """Model IDs for the PLANNED AI layer - read by nothing yet (E10-S01).
+
+    Unverified (audit HAL-003): no one has checked these names against
+    Anthropic's published model list, and nothing rejects a wrong one. E10-S01,
+    which builds the client, verifies each on its build date and validates the
+    IDs at load; the ``anthropic`` SDK stays an optional extra until then.
+    """
+
     deep_synthesis: str = "claude-opus-5"
     session_reasoning: str = "claude-sonnet-5"
     news_triage: str = "claude-haiku-4-5"

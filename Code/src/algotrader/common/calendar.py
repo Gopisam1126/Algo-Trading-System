@@ -7,13 +7,18 @@ This module encodes constraint C5 from LOW_LEVEL_ARCHITECTURE.md §1.1:
 
 The subtlety that makes this non-trivial: since NSE's Closing Auction Session
 went live on 2026-08-03, **the square-off deadline is per-stock, not global**.
-F&O stocks in CAS scope square off at 15:10; everything else at 15:20; F&O
-positions at 15:25.  A system with one global exit time will have positions
-force-closed by the broker at whatever price happens to be there — a silent,
-recurring source of slippage.
+This system squares off CAS stocks at 15:10, everything else at 15:20 and F&O
+at 15:25 - each earlier than Zerodha's published MIS times (15:12 / 15:25 /
+15:26, read 20 Nov 2026; see ``SQUAREOFF_*``).  A system with one global exit
+time will have positions force-closed by the broker at whatever price happens
+to be there — a silent, recurring source of slippage.
 
-⚠️  The holiday list below MUST be verified against NSE's official circular
-    before live trading.  It is a placeholder, not an authority.
+Holidays are not in this module: they are loaded from
+``config/nse_holidays.yaml`` (:func:`load_holidays_with_status`), which records
+whether it was checked against NSE's circular and which years it covers.  The
+2026 file was verified on 24 Aug 2026 (blocker B3); ``doctor`` warns while a
+file is unverified and fails once today is past the last covered year, so the
+file must be renewed each December, when NSE publishes the next year's list.
 """
 
 from __future__ import annotations
