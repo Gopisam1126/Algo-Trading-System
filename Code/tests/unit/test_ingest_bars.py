@@ -307,6 +307,28 @@ class TestTheClosingAuctionIsNotContinuousTrading:
         assert sealed is not None and sealed.high == Decimal("140")
         assert b.out_of_session_ticks == 0
 
+    @pytest.mark.parametrize(
+        ("day", "kept"),
+        [
+            (dt.date(2026, 12, 4), False),  # the auction still started at 15:15
+            (dt.date(2026, 12, 7), True),  # E04-S08: continuous to 15:30 from today
+        ],
+    )
+    def test_a_cas_stocks_15_16_trade_is_a_bar_from_7_dec_2026(
+        self, calendar: MarketCalendar, day: dt.date, kept: bool
+    ) -> None:
+        """NSE's 6 Nov 2026 circulars move CAS to 15:30-15:40. From 7 Dec a CAS
+        stock's 15:16 print is continuous trading and shapes its bar; on 4 Dec
+        it was an auction print and must not."""
+        b = BarBuilder(symbol="INFY", timeframe=Timeframe.M5, calendar=calendar)
+        at = dt.datetime.combine(day, dt.time(15, 12), tzinfo=IST)
+        b.add(_tick(at, "100", volume=1_000), is_cas_stock=True)
+        b.add(_tick(at + dt.timedelta(minutes=4), "140", volume=9_000), is_cas_stock=True)
+        sealed = b.force_seal()
+        assert sealed is not None
+        assert (sealed.high == Decimal("140")) is kept
+        assert b.out_of_session_ticks == (0 if kept else 1)
+
     def test_earlier_bars_are_unaffected(self, calendar: MarketCalendar) -> None:
         b = BarBuilder(symbol="INFY", timeframe=Timeframe.M5, calendar=calendar)
         b.add(_tick(_at(11, 0), "100"), is_cas_stock=True)

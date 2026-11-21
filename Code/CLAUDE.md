@@ -52,6 +52,11 @@ found a design conflict rather than an obstacle.
   15-minute bar runs 09:15–09:30. Use `MarketCalendar.bar_open_time()`.
 - **Square-off deadlines are per-stock**, not global — 15:10 CAS / 15:20
   non-CAS / 15:25 F&O, minus a buffer. Use `MarketCalendar.squareoff_deadline()`.
+- **Session rules are dated.** NSE changed the closing auction on 7 Dec 2026
+  (CAS stocks now trade continuously to 15:30; auction 15:30-15:40). Ask
+  `MarketCalendar.is_continuous_for(moment, ...)` - it reads `CAS_SCHEDULE`
+  for the moment's own IST day - never a fixed cutoff, or a replay of an
+  earlier day is judged by today's rules (E04-S08).
 - Pydantic models are `frozen=True, extra="forbid"` unless there is a reason.
 - Strategies are pure functions over a `MultiTimeframeSnapshot` — no I/O, no
   randomness. This is what makes them backtestable by replay.

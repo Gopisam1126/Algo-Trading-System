@@ -23,6 +23,7 @@ file must be renewed each December, when NSE publishes the next year's list.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -45,9 +46,48 @@ PRE_OPEN_END = time(9, 15)
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
-#: Continuous trading ends earlier for CAS-scope stocks (live 2026-08-03).
-CAS_CONTINUOUS_END = time(15, 15)
-CAS_END = time(15, 35)
+
+@dataclass(frozen=True, slots=True)
+class CasSession:
+    """NSE's closing-auction schedule for CAS-scope stocks, from ``effective``
+    until the next entry of :data:`CAS_SCHEDULE` takes over."""
+
+    effective: date
+    continuous_end: time  # a CAS stock's continuous trading ends here
+    auction_end: time
+
+
+#: The closing-auction schedule, oldest first. **Dated, not a constant**
+#: (E04-S08): NSE changed it on 7 Dec 2026, and a replay of an earlier day must
+#: use that day's rules - a bar built from 4 Dec's 15:16 auction print is as
+#: wrong as one that drops 7 Dec's 15:16 trade.
+#:
+#: - Before 3 Aug 2026 there was no CAS: every stock traded to 15:30.
+#: - From 3 Aug 2026 CAS-scope stocks stopped continuous trading at 15:15, and
+#:   the auction ran to 15:35.
+#: - From 7 Dec 2026 (NSE's two circulars of 6 Nov 2026; BSE notice
+#:   20261117-35) they trade continuously to 15:30, and the auction runs
+#:   15:30-15:40; its reference price is the 15:15-15:30 VWAP. Read 21 Nov 2026
+#:   from broker and press summaries - the circular PDFs were not readable from
+#:   this host, so re-read them on the rendered page.
+#:
+#: Checked at import (below): an entry out of date order, or one whose session
+#: could not be real, does not load. The square-off deadlines do not depend on
+#: it - 15:10 precedes every continuous end here.
+CAS_SCHEDULE: tuple[CasSession, ...] = (
+    CasSession(effective=date(2026, 8, 3), continuous_end=time(15, 15), auction_end=time(15, 35)),
+    CasSession(effective=date(2026, 12, 7), continuous_end=time(15, 30), auction_end=time(15, 40)),
+)
+
+
+def cas_session_on(day: date) -> CasSession | None:
+    """The CAS schedule in force on the IST date ``day``; ``None`` before CAS."""
+    current: CasSession | None = None
+    for entry in CAS_SCHEDULE:
+        if entry.effective <= day:
+            current = entry
+    return current
+
 
 #: The square-off times every deadline is computed back from - per stock class,
 #: and at or before the BROKER's auto square-off, which is the property that
@@ -63,6 +103,27 @@ CAS_END = time(15, 35)
 SQUAREOFF_CAS_STOCKS = time(15, 10)
 SQUAREOFF_NON_CAS = time(15, 20)
 SQUAREOFF_FNO = time(15, 25)
+
+
+def _check_cas_schedule(schedule: tuple[CasSession, ...]) -> None:
+    """Refuse a schedule that cannot be NSE's - at import, not at 15:15."""
+    days = [entry.effective for entry in schedule]
+    if days != sorted(set(days)):
+        raise ValueError(f"CAS_SCHEDULE must be in strictly increasing date order: {days}")
+    for entry in schedule:
+        if not SQUAREOFF_CAS_STOCKS < entry.continuous_end <= MARKET_CLOSE:
+            raise ValueError(
+                f"CAS schedule from {entry.effective}: continuous trading must end after the "
+                f"CAS square-off ({SQUAREOFF_CAS_STOCKS}) and by {MARKET_CLOSE}, "
+                f"not at {entry.continuous_end}"
+            )
+        if not entry.auction_end > entry.continuous_end:
+            raise ValueError(
+                f"CAS schedule from {entry.effective}: the auction ends before it starts"
+            )
+
+
+_check_cas_schedule(CAS_SCHEDULE)
 
 #: Weekly market holidays (Sat/Sun).  0 = Monday.
 WEEKEND = {5, 6}
@@ -244,18 +305,22 @@ class MarketCalendar:
     def is_market_open(self, moment: datetime) -> bool:
         """True during continuous trading (09:15–15:30).
 
-        Note this is the general session.  CAS-scope stocks stop continuous
-        trading at 15:15 — use :meth:`is_continuous_for` for a per-stock answer.
+        Note this is the general session.  CAS-scope stocks stopped continuous
+        trading at 15:15 from 3 Aug to 4 Dec 2026 — use :meth:`is_continuous_for`
+        for a per-stock answer on a given day (:data:`CAS_SCHEDULE`).
         """
         ist = self._ist(moment)
         return self.is_trading_day(ist.date()) and MARKET_OPEN <= ist.time() < MARKET_CLOSE
 
     def is_continuous_for(self, moment: datetime, *, is_cas_stock: bool) -> bool:
-        """Per-stock continuous-trading check."""
+        """Per-stock continuous-trading check, under the rules of ``moment``'s
+        own IST day (:func:`cas_session_on`) - so a replay of an earlier session
+        is judged as that session was traded."""
         ist = self._ist(moment)
         if not self.is_trading_day(ist.date()):
             return False
-        end = CAS_CONTINUOUS_END if is_cas_stock else MARKET_CLOSE
+        cas = cas_session_on(ist.date()) if is_cas_stock else None
+        end = cas.continuous_end if cas is not None else MARKET_CLOSE
         return MARKET_OPEN <= ist.time() < end
 
     # -- Square-off deadlines (constraint C5) -------------------------------
