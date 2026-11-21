@@ -141,16 +141,24 @@ required, and what is still open, is kept in
 - **Static, broker-whitelisted IP.** Rules out autoscaling deployments where the
   egress IP changes. Live mode refuses to load without `system.static_ip`;
   `make doctor` compares the actual egress IP with `EXPECTED_EGRESS_IP`.
+  Zerodha checks it on place, modify and cancel only, allows two IPs per
+  developer profile (shared by all apps) and one change a calendar week -
+  register the address family (IPv4/IPv6) the host really leaves on.
 - **Daily re-authentication** before pre-open; sessions must not persist overnight.
 - **Algo-ID tagging - OPEN (B1, audit LEG-001).** Below the registration
   threshold there is no registered Algo-ID, but the exchanges tag such orders
   with a generic one, and who sends it is unconfirmed. Live mode refuses to
   load until `broker.algo_tagging_confirmation` records Zerodha's written answer.
+  Research (21 Nov 2026) expects that answer to be "send nothing": NSE has the
+  broker put the generic ID on the order, and Zerodha staff say the client
+  passes none below 10 OPS.
 - **Hosting - OPEN (B10, audit HAL-001).** The India-region check
   (`deployment_region`) is this system's own rule; no cited regulation
   requires Indian servers. NSE's standard I(h) says retail algos "should be
   hosted on brokers' cloud servers", and whether that applies here needs a
-  written answer.
+  written answer. Research (21 Nov 2026) supports self-hosting: NSE's FAQ of
+  3 Nov 2025 has a tech-savvy client host the algo "at their end", and Zerodha
+  staff allow any cloud from the registered static IP.
 
 Two further boundaries matter:
 

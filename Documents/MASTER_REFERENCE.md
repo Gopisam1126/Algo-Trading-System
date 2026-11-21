@@ -1093,11 +1093,14 @@ asserting it is true.
   Algo-ID to obtain. **But its orders are still tagged** - **OPEN (B1, reopened
   16 Nov 2026, audit LEG-001).** The 9 Sep 2026 conclusion ("not applicable")
   read the SEBI circular alone. The exchanges' implementation standard
-  (NSE/INVG/67858, 5 May 2025, Annexure B.3, as read by the audit) requires
-  every API algo order below the threshold to carry an exchange-provided
-  **generic** algo ID, and whether Kite applies it server-side or expects the
-  client to send it is unconfirmed. Live mode refuses to load until
-  `broker.algo_tagging_confirmation` records Zerodha's written answer.
+  (NSE/INVG/67858, 5 May 2025, Annexure B.3) requires every API algo order
+  below the threshold to carry an exchange-provided **generic** algo ID.
+  **Researched 21 Nov 2026** ([RESEARCH_ALGO_TAGGING_AND_HOSTING.md](RESEARCH_ALGO_TAGGING_AND_HOSTING.md)):
+  the broker applies it - members send `"99999"` in the Algo ID field
+  (NSE/INVG/69255 para 8.2.4) - and Zerodha staff said on the Kite Connect
+  forum (23 Jul 2026) that below 10 OPS the client passes no Algo ID. What is
+  missing is Zerodha's answer in writing. Live mode refuses to load until
+  `broker.algo_tagging_confirmation` records it.
 - **Where the 10 comes from (audit HAL-002).** The SEBI circular sets no number:
   it speaks of "the specified order per second threshold" and leaves the figure
   to the Brokers' Industry Standards Forum. The 10 OPS (per exchange and
@@ -1111,9 +1114,14 @@ asserting it is true.
   exchange standards, as read, require *Indian* servers; the India-region check
   in `config.py` is this system's own rule (data and latency stay local).
   NSE's standard I(h) says instead that retail algorithms "should be hosted on
-  brokers' cloud servers", and whether that applies to a client's own
-  sub-threshold algo on its own static IP is a question for Zerodha and counsel
-  (B10). **OAuth + 2FA** and **daily session logout before pre-open** stand.
+  brokers' cloud servers" - a broker obligation. **Researched 21 Nov 2026
+  (B10):** NSE's FAQ of 3 Nov 2025 (Q5) says a tech-savvy client hosts the algo
+  "using a static IP at their end", and Zerodha staff (30 Jul 2026) allow AWS,
+  GCP, Azure or any infrastructure from the registered IP; no text requires a
+  client's server to be in India. The residual risk is that NSE's April 2026
+  consolidated circular (NSE/INVG/73992) restates I(h) without Q5. Zerodha's
+  written answer closes it. **OAuth + 2FA** and **daily session logout before
+  pre-open** stand.
 - Brokers retain API/algo logs for a minimum of 5 years.
 
 ### 15.3 The advisory boundary — easy to cross accidentally
@@ -1305,14 +1313,17 @@ research; B1 was too, and was reopened by the 16 Nov 2026 audit, because researc
 on the SEBI text alone was not enough:
 
 1. **Algo-ID tagging (B1, reopened, audit LEG-001)** — Zerodha's written answer
-   on what a client-developed, sub-threshold algo must send on an API order
-   under NSE/INVG/67858 B.3. Live mode will not load without it
-   (`broker.algo_tagging_confirmation`).
+   on what a client-developed, sub-threshold algo must send on an API order.
+   The research (21 Nov 2026) expects "nothing - the broker applies the
+   generic ID"; the support ticket to send is in
+   [RESEARCH_ALGO_TAGGING_AND_HOSTING.md](RESEARCH_ALGO_TAGGING_AND_HOSTING.md).
+   Live mode will not load without the answer (`broker.algo_tagging_confirmation`).
 2. **Static IP whitelisting** — process and lead time. A SEBI obligation at
-   every order rate.
-2a. **Hosting (B10, audit HAL-001)** — Zerodha's and counsel's written answer
-   on whether NSE standard I(h) ("hosted on brokers' cloud servers") applies to
-   this system.
+   every order rate. The research supports self-hosting, so procurement (B6)
+   need not wait for B10.
+2a. **Hosting (B10, audit HAL-001)** — the same ticket asks Zerodha to confirm
+   in writing that this system may run on its own VPS; counsel gets one narrow
+   question on the residual text risk.
 3. ~~**Historical data**~~ — ✅ closed: Connect ₹500/mo bundles WebSocket and
    historical.
 4. **Daily login** — what is permitted for an unattended personal algo. Worth
@@ -1360,8 +1371,8 @@ passing tests. Cheap now, annoying to retrofit.
 
 | # | Item | Status | Blocks |
 |---|---|---|---|
-| B1 | **Algo-ID tagging for a sub-threshold client algo** | ❌ **Reopened 16 Nov 2026 (audit LEG-001)** - closed 9 Sep 2026 on the SEBI text alone; the NSE standard tags such orders with a generic algo ID, and who sends it is unconfirmed. Needs Zerodha's written answer | Live mode (`broker.algo_tagging_confirmation`) |
-| B10 | **Hosting: does NSE standard I(h) apply?** | ❌ **Open (audit HAL-001, recorded 21 Nov 2026)** - I(h) says retail algos "should be hosted on brokers' cloud servers"; this system plans its own India-region VPS. Needs Zerodha's and counsel's written answer | Live trading; the choice of host (B6) |
+| B1 | **Algo-ID tagging for a sub-threshold client algo** | ⚠️ **Reopened 16 Nov 2026 (audit LEG-001); researched 21 Nov 2026** - the broker applies the generic ID ("99999", NSE/INVG/69255 8.2.4) and Zerodha staff say the client passes none. Needs Zerodha's answer in writing (the ticket is in RESEARCH_ALGO_TAGGING_AND_HOSTING.md) | Live mode (`broker.algo_tagging_confirmation`) |
+| B10 | **Hosting: does NSE standard I(h) apply?** | ⚠️ **Open (audit HAL-001); researched 21 Nov 2026** - NSE FAQ Q5 (3 Nov 2025): the tech-savvy client hosts "at their end"; Zerodha staff allow any cloud from the registered IP; no India-location rule for the client. Residual: NSE/INVG/73992 restates I(h) without Q5. Needs Zerodha's written answer; counsel on the residual | Live trading (no longer the choice of host: B6 may proceed) |
 | B2 | `kiteconnect` lacks `market_protection` | ✅ **Closed** — present in 5.2.1 | — |
 | B3 | NSE holiday list incomplete | ✅ **Closed 24 Aug 2026** | — |
 | B4 | Historical data pricing | ✅ **Closed** — Connect ₹500/mo bundles WebSocket + historical | — |
@@ -1403,7 +1414,7 @@ What NSE blocks is **overseas** access, not programmatic access as such. SEBI
 already requires the order path to originate from a single static,
 broker-whitelisted IP, and this system's own rule puts it in an India region —
 so one host answers both the compliance requirement and the data-reachability
-question (unless B10 moves the algo onto the broker's cloud). `scripts/check_data_reachability.py`
+question (B10's research, 21 Nov 2026, supports self-hosting). `scripts/check_data_reachability.py`
 makes that a one-command check on the day there is a host.
 
 Confirmed from Zerodha's developer forum, and it unblocks a great deal:
@@ -1453,6 +1464,7 @@ for SL-M; order slicing is capped at 10 slices.
 | 5 | STRATEGY_ENGINE.md | Anything touching strategies or AI generation |
 | 6 | VERIFICATION_REPORT.md | What was audited, what was wrong, what changed |
 | 7 | PRE_LIVE_CHECKLIST.md | **Before real capital. The gate.** |
+| 8 | RESEARCH_ALGO_TAGGING_AND_HOSTING.md | B1 and B10: the evidence (21 Nov 2026) and the Zerodha ticket to send |
 
 ### 24.1 Reading paths
 

@@ -188,9 +188,10 @@ this document** — everything else is automation that a direct push walks aroun
 
 ## 6. Running the QA environment
 
-There is **no QA server yet.** Blocker **B6** — a static IP — is open (and B10,
-whether the algo must be hosted on the broker's cloud, decides where it goes),
-and SEBI requires order endpoints to originate from a whitelisted address.
+There is **no QA server yet.** Blocker **B6** — a static IP — is open (B10,
+whether the algo must be hosted on the broker's cloud, was researched on 21 Nov
+2026 and supports a self-hosted VPS), and SEBI requires order endpoints to
+originate from a whitelisted address.
 So today "the QA environment" is the container stack, run wherever you are
 running it.
 

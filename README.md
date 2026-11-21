@@ -110,7 +110,10 @@ live order ([PRE_LIVE_CHECKLIST.md](Documents/PRE_LIVE_CHECKLIST.md)): how a
 sub-threshold algo's orders are tagged (B1, reopened by the 10 Nov 2026 audit,
 LEG-001), and whether NSE's standard that retail algos be hosted on the
 broker's cloud applies (B10, HAL-001). Running in an India region is this
-system's own rule, not a cited regulation.
+system's own rule, not a cited regulation. Research on 21 Nov 2026 found the
+expected answers - the broker tags the orders, and a client's own algo may run
+on its own server - so what remains is Zerodha's confirmation in writing
+([the evidence and the ticket to send](Documents/RESEARCH_ALGO_TAGGING_AND_HOSTING.md)).
 
 See [MVP_UI_AND_LEGAL.md §2](Documents/MVP_UI_AND_LEGAL.md) for the full
 treatment including taxation. Not legal or tax advice.

@@ -1464,7 +1464,11 @@ Not a coding task, but it gates all live trading, so here is the sequence:
    The SEBI requirement is that the IP is **static** and whitelisted. India
    hosting is this system's own rule (audit HAL-001, 21 Nov 2026), and NSE's
    standard I(h) - retail algos "should be hosted on brokers' cloud servers" -
-   may change the choice of host entirely: answer B10 before procuring.
+   was the open question (B10). Researched 21 Nov 2026: NSE's FAQ (3 Nov
+   2025, Q5) has a tech-savvy client host "at their end" and Zerodha staff
+   allow any cloud from the registered IP, so a self-hosted VPS fits; see
+   RESEARCH_ALGO_TAGGING_AND_HOSTING.md. Zerodha allows two IPs per developer
+   profile (primary + optional secondary), shared by all apps, one change a week.
 
 2. **Provision and note the IP.** After allocation, confirm the actual egress IP
    from the box itself — the assigned IP and the egress IP can differ behind

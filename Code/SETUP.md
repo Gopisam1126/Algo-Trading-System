@@ -367,6 +367,10 @@ API algo order BELOW the threshold to carry an exchange-provided generic algo
 ID, and whether Kite applies it server-side or expects the client to send it is
 unconfirmed. Live mode now refuses to load until `broker.algo_tagging_confirmation`
 records Zerodha's written answer; until then `doctor` warns (paper) or fails (live).
+Researched 21 Nov 2026 (`Documents/RESEARCH_ALGO_TAGGING_AND_HOSTING.md`): NSE's
+procedure has the broker send `"99999"` in the Algo ID field (NSE/INVG/69255 para
+8.2.4), and Zerodha staff say the client passes no Algo ID below 10 OPS - so the
+expected answer is "send nothing", which is what the adapter already does.
 
 *The 9 Sep 2026 reasoning:* `place_order()`
 takes an `algo_id` parameter documented as *"an **optional** algo ID to associate
