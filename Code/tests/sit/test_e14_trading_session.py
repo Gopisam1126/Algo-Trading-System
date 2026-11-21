@@ -35,8 +35,14 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from algotrader.broker.adapter import AmbiguousOrderError, BrokerPosition, OrderRejectedError
-from algotrader.broker.kite.mapping import broker_tag
+from algotrader.broker.adapter import (
+    AmbiguousOrderError,
+    BrokerPosition,
+    DuplicateBrokerOrderError,
+    OrderRejectedError,
+)
+from algotrader.broker.kite.mapping import broker_tag, order_type_out, product_out, side_out
+from algotrader.broker.kite.trading import KiteTradingAdapter
 from algotrader.common.calendar import IST, MarketCalendar, load_holidays_with_status
 from algotrader.common.enums import (
     AIVerdict,
@@ -2405,7 +2411,7 @@ class _RecordingBroker:
         return f"BROKER-{len(self.orders):06d}"
 
     async def find_by_client_order_id(self, client_order_id: str):
-        return self.orderbook.get(client_order_id)
+        return _as_kite_lists(self.orderbook, client_order_id)
 
 
 def _landed_order(request, broker_order_id: str, status: OrderStatus = OrderStatus.OPEN):
@@ -2425,6 +2431,56 @@ def _landed_order(request, broker_order_id: str, status: OrderStatus = OrderStat
         placed_at=_at(TRADING_DAY, 10, 0),
         last_update_at=_at(TRADING_DAY, 10, 0),
     )
+
+
+#: How Kite lists each of our statuses (the inverse of mapping.status_in for
+#: what a broker can say about an order it accepted).
+_KITE_STATUS = {
+    OrderStatus.SUBMITTED: "OPEN PENDING",
+    OrderStatus.OPEN: "OPEN",
+    OrderStatus.PARTIAL: "OPEN",
+    OrderStatus.FILLED: "COMPLETE",
+    OrderStatus.CANCELLED: "CANCELLED",
+    OrderStatus.REJECTED: "REJECTED",
+}
+
+
+def _kite_view(order):
+    """``order`` as KiteTradingAdapter would report it (audit ENG-008, E24-S08).
+
+    Built as a Kite order row and mapped by the adapter's own ``_to_order``:
+    the client id is the 20-character tag, the correlation id is derived from
+    it, and the intent is not known - exactly what the live path sees.
+    """
+    status = _KITE_STATUS[order.status]
+    if status == "OPEN" and order.order_type is OrderType.SLM and not order.filled_quantity:
+        status = "TRIGGER PENDING"
+    row = {
+        "order_id": order.broker_order_id,
+        "tag": broker_tag(order.client_order_id),
+        "tradingsymbol": order.symbol,
+        "transaction_type": side_out(order.side),
+        "order_type": order_type_out(order.order_type),
+        "product": product_out(order.product),
+        "quantity": order.quantity,
+        "price": str(order.limit_price) if order.limit_price is not None else 0,
+        "trigger_price": str(order.trigger_price) if order.trigger_price is not None else 0,
+        "status": status,
+        "filled_quantity": order.filled_quantity,
+        "average_price": str(order.average_price) if order.average_price is not None else 0,
+        "order_timestamp": order.placed_at.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "status_message": order.rejection_reason,
+    }
+    return KiteTradingAdapter._to_order(row)
+
+
+def _as_kite_lists(orders: dict, client_order_id: str):
+    """Look ``client_order_id`` up as Kite can: by its tag, refusing two matches."""
+    wanted = broker_tag(client_order_id)
+    found = [order for key, order in orders.items() if broker_tag(key) == wanted]
+    if len(found) > 1:
+        raise DuplicateBrokerOrderError(client_order_id, [o.broker_order_id for o in found])
+    return _kite_view(found[0]) if found else None
 
 
 class _SessionOrderStore:
@@ -3060,7 +3116,7 @@ class _OrderbookBroker:
         return broker_order_id
 
     async def find_by_client_order_id(self, client_order_id: str):
-        return self.orderbook.get(client_order_id)
+        return _as_kite_lists(self.orderbook, client_order_id)
 
     def intents(self, intent: OrderIntent) -> list:
         return [o for o in self.orders if o.intent is intent]
@@ -3984,8 +4040,15 @@ class _ReconciledBroker:
     MARKET orders fill on arrival; a stop stays working. The day's positions
     are cumulative bought and sold per symbol, and a symbol traded flat stays
     in the list at zero - Kite's own behaviour, and the reason the reconciler
-    judges activity rather than row presence. Keys are stored whole here; the
-    20-character truncation is the Kite adapter's and is proved in integration.
+    judges activity rather than row presence.
+
+    What the system READS is what Kite would tell it (audit ENG-008, E24-S08):
+    ``order_key`` is the 20-character tag, a lookup matches on the tag, and
+    every order comes back through the real adapter's mapping - our full id,
+    correlation id and intent are not on it, because Kite does not store them.
+    Until 20 Nov 2026 this keyed and returned orders whole, so a reconciler
+    that relied on the full id would have passed here and failed live.
+    The dict is still keyed by full id: that is the TEST's record, not Kite's.
     """
 
     def __init__(self) -> None:
@@ -4028,10 +4091,10 @@ class _ReconciledBroker:
         )
 
     async def find_by_client_order_id(self, client_order_id: str):
-        return self.orders.get(client_order_id)
+        return _as_kite_lists(self.orders, client_order_id)
 
     async def fetch_orderbook(self) -> list[Order]:
-        return list(self.orders.values())
+        return [_kite_view(order) for order in self.orders.values()]
 
     async def fetch_positions(self) -> list[BrokerPosition]:
         return [
@@ -4047,7 +4110,8 @@ class _ReconciledBroker:
         ]
 
     def order_key(self, client_order_id: str) -> str:
-        return client_order_id
+        # Kite's key, as KiteTradingAdapter.order_key gives it (E24-S08).
+        return broker_tag(client_order_id)
 
     def net(self) -> dict[str, int]:
         return {symbol: bought - sold for symbol, (bought, sold) in self.day.items()}

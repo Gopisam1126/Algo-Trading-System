@@ -38,6 +38,7 @@ from algotrader.execution.protective_stop import (
     stop_client_order_id,
 )
 from tests.doubles import CountingLimiter
+from tests.kite_account import check_place_order
 
 pytestmark = [pytest.mark.integration]
 
@@ -91,6 +92,7 @@ class _RecordingKite:
         self.book: list[dict[str, Any]] = []
 
     def place_order(self, **params: Any) -> str:
+        check_place_order(params)  # SDK keywords and tag shape (audit ENG-008, E24-S08)
         self.calls.append(params)
         self.book.append(
             {

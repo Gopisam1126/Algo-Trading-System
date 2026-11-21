@@ -54,6 +54,7 @@ from algotrader.execution.positions import (
 from algotrader.execution.protective_stop import ProtectiveStop, stop_client_order_id
 from algotrader.execution.reconciliation import Drift, Reconciler, ReconciliationReadError
 from tests.doubles import CountingLimiter
+from tests.kite_account import check_place_order
 
 pytestmark = [pytest.mark.integration]
 
@@ -138,6 +139,7 @@ class KiteAccount:
         self.cancels: list[str] = []
 
     def place_order(self, **params: Any) -> str:
+        check_place_order(params)  # SDK keywords and tag shape (audit ENG-008, E24-S08)
         self.placed.append(params)
         order_id = f"26082500{len(self.placed):04d}"
         self.book.append(
