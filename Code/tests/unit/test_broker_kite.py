@@ -28,6 +28,7 @@ from algotrader.common.models.market import Instrument
 from algotrader.common.models.trading import OrderRequest
 from algotrader.common.secrets import SecretString
 from tests.doubles import CountingLimiter
+from tests.kite_account import check_place_order
 
 
 def _auth() -> KiteAuthManager:
@@ -46,6 +47,7 @@ class FakeKite:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def place_order(self, **kwargs: Any) -> str:
+        check_place_order(kwargs)  # SDK keywords and tag shape (audit ENG-008, E24-S08)
         self.calls.append(("place_order", kwargs))
         if isinstance(self.canned.get("place_order"), Exception):
             raise self.canned["place_order"]

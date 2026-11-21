@@ -94,6 +94,7 @@ from tests.doubles import (
     nse_equity_tick,
     on_venue,
 )
+from tests.kite_account import StrictKiteAccount
 
 pytestmark = [pytest.mark.integration]
 
@@ -190,55 +191,35 @@ def calendar() -> MarketCalendar:
     return MarketCalendar(status.dates, covers_years=status.covers_years)
 
 
-class KiteAccount:
-    """Kite's payloads for orders, positions and margins (the fields we read)."""
+class KiteAccount(StrictKiteAccount):
+    """The shared strict account (audit ENG-008, E24-S08), driven by hand.
 
-    def __init__(self) -> None:
-        self.book: list[dict[str, Any]] = []
-        self.net: list[dict[str, Any]] = []
-        self.placed: list[dict[str, Any]] = []
+    These tests fill and hold explicitly - ``fill(tag, ...)`` and ``hold`` -
+    rather than settling each minute, and read ``net`` as Kite's list. Every
+    order still goes through the shared account's validation: tick, lot, tag,
+    market protection, SDK keywords and order type. Until 20 Nov 2026 this was
+    a second, permissive copy that accepted any of them.
+    """
+
+    def __init__(self, *, tick_size) -> None:
+        super().__init__(tick_size=tick_size)
+        self.held: list[dict[str, Any]] = []
         #: E15-S14: what one share of each symbol costs, and a way to fail.
         self.margin_per_share: dict[str, float] = {}
         self.margin_error: Exception | None = None
         self.margin_calls: list[list[dict[str, Any]]] = []
 
-    def place_order(self, **params: Any) -> str:
-        self.placed.append(params)
-        order_id = f"26082500{len(self.placed):04d}"
-        self.book.append(
-            {
-                "order_id": order_id,
-                "tag": params.get("tag"),
-                "status": "OPEN" if params["order_type"] == "MARKET" else "TRIGGER PENDING",
-                "tradingsymbol": params["tradingsymbol"],
-                "exchange": params.get("exchange", "NSE"),
-                "transaction_type": params["transaction_type"],
-                "order_type": params["order_type"],
-                "product": params["product"],
-                "quantity": params["quantity"],
-                "filled_quantity": 0,
-                "order_timestamp": "2026-08-25 10:00:00",
-            }
-        )
-        return order_id
+    @property
+    def net(self) -> list[dict[str, Any]]:  # type: ignore[override]
+        return self.held
 
-    def orders(self) -> list[dict[str, Any]]:
-        return [dict(r) for r in self.book]
-
-    def cancel_order(self, variety: str, order_id: str, **_kwargs: Any) -> str:
-        for row in self.book:
-            if row["order_id"] == order_id:
-                row["status"] = "CANCELLED"
-        return order_id
+    @net.setter
+    def net(self, _value: object) -> None:
+        # The base class's dict is replaced by the list these tests read.
+        pass
 
     def positions(self) -> dict[str, list[dict[str, Any]]]:
-        return {"net": [dict(r) for r in self.net], "day": []}
-
-    def margins(self, segment: str) -> dict[str, Any]:
-        return {
-            "available": {"cash": 400000.0, "live_balance": 400000.0},
-            "utilised": {"debits": 0.0},
-        }
+        return {"net": [dict(r) for r in self.held], "day": []}
 
     def order_margins(self, params: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """E15-S14: ``/margins/orders``, as Kite answers it."""
@@ -257,7 +238,7 @@ class KiteAccount:
         raise AssertionError(f"no order tagged {tag}")
 
     def hold(self, symbol: str, *, quantity: int) -> None:
-        self.net.append(
+        self.held.append(
             {
                 "tradingsymbol": symbol,
                 "exchange": "NSE",
@@ -299,7 +280,7 @@ class Stack:
     ) -> None:
         self.clock = clock or (lambda: NOW)
         self.redis = redis
-        self.account = account or KiteAccount()
+        self.account = account or KiteAccount(tick_size=instruments.tick_size)
         # Audit NR-002: the service runs in PAPER, so its account must say it is one.
         on_venue(Venue.PAPER, self.account)
         self.adapter = KiteTradingAdapter(

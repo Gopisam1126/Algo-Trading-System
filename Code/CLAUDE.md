@@ -954,7 +954,11 @@ E24) records each. The shapes worth remembering, because each passed QA:
   one price and accepted any grid, keyword and tag, so it proved a system more
   capable than the venue allows (ENG-008). The E15 SIT account now refuses
   what Kite and the exchange refuse, and SIT-26 shows a refused exit ends in a
-  NAKED_POSITION halt, not a closed book.
+  NAKED_POSITION halt, not a closed book. There is ONE Kite-client double for
+  system tests - `tests/kite_account.StrictKiteAccount` - and the E14 SIT's
+  adapter-level brokers report orders through `KiteTradingAdapter._to_order`
+  (tag as the id, no intent), because Kite stores nothing else (E24-S08). A
+  new double either reuses these or calls `check_place_order`.
 
 ### What the whole-system audit checked and did not break
 

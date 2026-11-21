@@ -47,6 +47,7 @@ from algotrader.common.db.repositories import InstrumentRepository
 from algotrader.common.enums import OrderIntent, OrderStatus, OrderType, Product, Side
 from algotrader.common.redis import keys
 from algotrader.common.secrets import SecretString
+from tests.kite_account import check_place_order
 
 pytestmark = [pytest.mark.integration]
 
@@ -102,6 +103,7 @@ class ScriptedKite:
         self._book: list[dict[str, Any]] = list(canned.get("orders", []))
 
     def place_order(self, **kwargs: Any) -> str:
+        check_place_order(kwargs)  # SDK keywords and tag shape (audit ENG-008, E24-S08)
         if self.fail_next is not None:
             failure, self.fail_next = self.fail_next, None
             # The order DID reach the exchange before the connection dropped —

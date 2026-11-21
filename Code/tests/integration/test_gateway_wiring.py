@@ -37,6 +37,7 @@ from algotrader.common.enums import OrderIntent, OrderType, Product, Side
 from algotrader.common.models.trading import OrderRequest
 from algotrader.execution.gateway import GatewayPolicy, OrderGateway
 from tests.doubles import CountingLimiter
+from tests.kite_account import check_place_order
 
 pytestmark = [pytest.mark.integration]
 
@@ -88,6 +89,7 @@ class _RecordingKite:
         self.calls: list[dict[str, Any]] = []
 
     def place_order(self, **params: Any) -> str:
+        check_place_order(params)  # SDK keywords and tag shape (audit ENG-008, E24-S08)
         self.calls.append(params)
         return "260825000999"
 
