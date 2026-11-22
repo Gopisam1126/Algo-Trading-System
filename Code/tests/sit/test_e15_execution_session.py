@@ -57,6 +57,8 @@ from algotrader.common.health import (
 from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import Recommendation
 from algotrader.common.redis import keys
+from algotrader.execution.day_ledger import day_ledger
+from algotrader.execution.end_of_day import LeftoverKind
 from algotrader.execution.gateway import GatewayPolicy, OrderGateway
 from algotrader.execution.halt import HaltController, HaltReason
 from algotrader.execution.live_inputs import (
@@ -643,6 +645,15 @@ class TestSit22NoPositionSurvivesItsDeadline:
         assert state.consecutive_loss
         assert state.records["consecutive_loss"].armed_by == "loss-latch"
 
+        # E15-S15: after the books close the same account is judged flat, and
+        # a flat verdict arms nothing - the losing-streak latch stays the only one.
+        day.clock.now = _ist(15, 40)
+        report = await day.service.end_of_day()
+        assert report.verdict.flat, report.verdict.describe()
+        assert report.statistics is not None and len(report.statistics.trades) == 3
+        assert report.statistics.losses == 3, "out at the entry price: a loss of the charges"
+        assert not (await day.halts.state()).kill_switch
+
     async def test_a_restart_after_the_deadline_still_squares_off_before_the_broker(
         self, session, instruments, redis, audit, calendar
     ) -> None:
@@ -765,6 +776,20 @@ class TestSit26AnExitTheBrokerRefuses:
         # INFY is the only position all day: TCS at 15:25 is in the closing blackout.
         status = (await session.execute(text("SELECT status FROM positions"))).scalar_one()
         assert status != "CLOSED", "the book closed a position the broker still holds"
+
+        # E15-S15: that evening the verdict names what was left, and the halt
+        # the morning will find keeps its FIRST reason.
+        day.clock.now = _ist(15, 40)
+        report = await day.service.end_of_day()
+        kinds = {(i.kind, i.symbol) for i in report.verdict.leftovers}
+        assert {
+            (LeftoverKind.BOOK_POSITION, "INFY"),
+            (LeftoverKind.OPEN_RECORD, "INFY"),
+            (LeftoverKind.BROKER_POSITION, "INFY"),
+        } <= kinds, report.verdict.describe()
+        after = await day.halts.state()
+        assert after.kill_switch
+        assert after.records["kill_switch"].reason is HaltReason.NAKED_POSITION
 
 
 # ---------------------------------------------------------------------------
@@ -1211,6 +1236,27 @@ class TestSit25ADayOnThePaperBroker:
         audited = await _audited(session)
         for rec in published:
             assert str(rec.correlation_id) in audited
+        assert not (await day.halts.state()).any_halted
+
+        # E15-S15: the end of the day, after the books close. Flat; three trades
+        # (TCS up, INFY stopped out, HDFCBANK out at about its entry - a loss of
+        # its charges); the net IS the loss limit's for the same orders, and
+        # against the paper account it is never above it and at most a paisa an
+        # executed order below it (day_ledger rounds charges up; E15-S16).
+        clock.now = _ist(15, 40)
+        report = await day.service.end_of_day()
+        assert report.verdict.flat, report.verdict.describe()
+        stats = report.statistics
+        assert stats is not None and stats.reconciles
+        assert (len(stats.trades), stats.booked, stats.unbooked) == (3, 3, ())
+        assert (stats.wins, stats.losses) == (1, 2)
+        orders = await OrderRepository(session, instruments).orders_placed_since(_ist(0, 0))
+        assert stats.net == day_ledger(orders, lambda _s: None).net
+        account = cash - PaperConfig().opening_cash
+        executed = sum(1 for o in orders if o["filled_quantity"])
+        assert stats.net is not None
+        assert stats.net <= account
+        assert account - stats.net <= Decimal("0.01") * executed
         assert not (await day.halts.state()).any_halted
 
     async def test_a_restart_from_the_paper_snapshot_keeps_the_book(
