@@ -146,7 +146,7 @@ refuses every entry at L0-L3 until the approval flow (E16-S03) and the envelope
 | `indicators/` | Components | incremental EMA/SMA/RSI/ATR/MACD/Bollinger/VWAP/VolumeRatio, warm-up, multi-timeframe snapshot, levels, state publishing |
 | `strategy/` | Components | the DSL, 27 primitives and their evaluators, the tri-state runtime, the approval-gated registry |
 | `signals/` | Components | the strategy loop and bar source (E13-S01); its LIVE/PAPER routes end at a port |
-| `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, exit timer (time and target exits), autonomy gate, day ledger, execution service |
+| `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, exit timer (time and target exits), autonomy gate, day ledger, end-of-day verdict and statistics, execution service |
 | `ai/` `macro/` `premarket/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
 
 "Components" means built and tested on their own and against each other in
@@ -480,7 +480,7 @@ responses — still cannot place an order.
 15:00 ┤ NO NEW ENTRIES     manage existing only
 15:05 ┤ OWN-TERMS EXIT     BEFORE broker square-off — PER STOCK:
       │                      15:10 CAS · 15:20 non-CAS · 15:25 F&O
-15:35 ┤ EOD                reconcile, journal, performance report
+15:35 ┤ EOD                reconcile, flat-book verdict, statistics (journal: E15-S11)
 16:00 ┤ BACKUP             DB dump + config + audit export, off-host
 ```
 
@@ -1279,7 +1279,7 @@ for Phase 0.
 | 07:00 | **Manual Zerodha login** (redirect flow) — alert on failure |
 | 09:13 | Pre-market briefing delivered — **review before the open** |
 | Intraday | Alerts are push; no polling needed |
-| 15:35 | EOD reconciliation, journal, report |
+| After the books close (15:35; 15:40 from 7 Dec 2026) | EOD: final reconciliation, flat-book verdict and the day's statistics (`execution/end_of_day.py`, E15-S15; a book not flat halts the next session until cleared); journal E15-S11 |
 | 16:00 | Backup off-host |
 
 ---

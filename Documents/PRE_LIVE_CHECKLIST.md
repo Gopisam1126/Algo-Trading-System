@@ -87,7 +87,7 @@ Full detail in LOW_LEVEL_ARCHITECTURE.md §10.12.
 - [ ] `make doctor` exits 0
 - [ ] Prometheus and Grafana reachable; alerts routed to Telegram
 - [ ] P0 alerts tested — kill switch, unknown position, auth failure
-- [ ] EOD reconciliation runs and reports cleanly
+- [ ] EOD reconciliation runs and reports cleanly - built (E15-S15: final cycle, flat-book verdict, statistics; LOW_LEVEL_ARCHITECTURE.md §8.4); tick when a paper session's verdict is FLAT and its net matches the paper account
 - [ ] Nightly backup verified off-host
 - [ ] Runbook written for: auth failure, feed loss, broker outage, unknown position
 

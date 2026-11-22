@@ -1428,6 +1428,46 @@ from a caller — and for an approval claims a slot, registers the `EntryPlan`
   paper cash. The account lives in memory; `on_change` hands each snapshot to
   the composition to persist (E23-S03), and `restore` revives it.
 
+### 8.4 The end of the day (E15-S15)
+
+`execution/end_of_day.py`. Once nothing can execute - `books_close(day)`, the
+close or the end of that day's closing auction from `CAS_SCHEDULE` (15:35;
+15:40 from 7 Dec 2026), never a fixed 15:35 - the execution service runs ONE
+final reconciliation cycle under its lock, then reads the account again and
+judges it. The day is **flat** only with nothing left: no position in the
+book, no `positions` row still open (what tomorrow's restore reads), no MIS
+quantity at the broker, no MIS order the broker lists as unfinished, and none
+of our order records unsettled (`SETTLED` is an allowlist: FILLED, CANCELLED,
+REJECTED, SUBMIT_FAILED). A cycle that failed or did not finish, or a read
+that failed, is a leftover of its own (`UNVERIFIED`) - a book nobody could see
+is not flat.
+
+**The fresh read is ORDERBOOK first**, the reverse of a cycle. A cycle asks
+"is anything unexplained?" and reads positions first so that an exit fill
+between the reads cannot cause a false halt. This asks "is anything left?",
+and positions-first is racy the other way: an order working at the first read
+fills before the second, and both reads look finished - a false FLAT. With
+the orderbook first, a false FLAT needs an order *placed* between the two reads.
+
+A verdict that is not flat arms the kill switch with `BOOK_NOT_FLAT`, naming
+up to eight leftovers; the latch has no TTL, so the next session refuses every
+signal until a named operator clears it. Every verdict is one `END_OF_DAY`
+audit row (FLAT or NOT_FLAT) carrying the day's statistics. A verdict is
+refused before the books close: at 14:00 every open position would be a
+leftover and tomorrow would halt on a book about to be squared off.
+
+**The statistics** (`execution/day_stats.py`) are built on `day_ledger`'s own
+`RoundTrip`, and their totals ARE the loss limit's `DayLedger` for the same
+orders - one definition, so the report cannot disagree with the number the
+limit acted on. A trade is a round trip, booked or not (a fill exited before
+it was booked has no `positions` row and is still counted, and named). WIN,
+LOSS and SCRATCH are the sign of the NET, the losing streak's definition: a
+trade out at its entry price is a loss of its charges. R is net over
+`|entry - stop| x quantity` from the closed row (the stop is anchored at the
+fill and never moved). A closed row no finished round trip explains is a
+discrepancy (`unexplained_closes`). The journal (setup, regime, outcome
+attribution) is E15-S11 and waits for a regime producer.
+
 ---
 
 ## 9. Concurrency & Process Model
@@ -1700,7 +1740,7 @@ All logs are JSON (`structlog`), always carrying `correlation_id`, `service`, `s
 | 09:13 | Pre-market briefing delivered; **operator reviews before the open** |
 | 09:15 | Session transitions to WATCHING; verify on dashboard |
 | Intraday | Alerts are push; no polling required |
-| 15:35 | EOD reconciliation, journal write, performance report |
+| After the books close | EOD: one final reconciliation cycle, the flat-book verdict and the day's statistics - `execution/end_of_day.py` (E15-S15), scheduled by the execution service itself at `books_close` (the close, or the end of that day's closing auction: 15:35, and 15:40 from 7 Dec 2026). The journal write is E15-S11 |
 | 16:00 | Backup: DB dump + config snapshot + audit export to off-host storage |
 
 ---

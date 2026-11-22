@@ -106,6 +106,7 @@ from algotrader.common.models.trading import OrderRequest, Recommendation, RiskD
 from algotrader.common.redis import keys
 from algotrader.common.text import one_safe_line
 from algotrader.execution.autonomy import entry_refusal
+from algotrader.execution.end_of_day import DayReport, EndOfDay
 from algotrader.execution.gateway import RateLimitedError, client_order_id
 from algotrader.execution.loss_latch import LossLatch
 from algotrader.execution.positions import EntryPlan
@@ -443,6 +444,20 @@ class ExecutionService:
             sleep=sleep,
         )
         self._timer_interval = squareoff_interval_seconds
+        #: E15-S15: built here, over the SAME reconciler, book and halts, so the
+        #: verdict judges the account this service traded - and a service
+        #: cannot run without its end of day.
+        self._eod = EndOfDay(
+            reconciler=reconciler,
+            records=store,
+            book=manager,
+            halter=halts,
+            calendar=calendar,
+            prices=facts,
+            audit=audit,
+        )
+        #: The trading day whose verdict has been reached in this process.
+        self._eod_done: dt.date | None = None
         self._stall_after = dt.timedelta(seconds=squareoff_stall_seconds)
         #: Beat by the dedicated one-second loop ONLY. The backstop sweeps after
         #: every cycle too, so the timer's own last_tick_at cannot tell a live
@@ -545,6 +560,35 @@ class ExecutionService:
         async with self._guard:
             return await self._timer.tick(self._clock())
 
+    async def end_of_day(self) -> DayReport:
+        """The final cycle and the flat-book verdict, under the lock (E15-S15).
+
+        Refused before the restore, for ``start``'s reason: a final cycle over
+        an empty book finds every held position unbooked and exits it. The
+        clock is read once the lock is held, as the loop does.
+        """
+        if not self._restored:
+            raise RuntimeError(
+                "the book has not been restored; a final cycle over an empty book "
+                "would exit every position it holds"
+            )
+        async with self._guard:
+            report = await self._eod.run(now=self._clock())
+        self._eod_done = report.verdict.trade_date
+        return report
+
+    async def end_of_day_if_due(self) -> DayReport | None:
+        """The verdict once per trading day, as soon as its books have closed.
+
+        Not reached is retried: ``end_of_day`` raises when the halt cannot be
+        armed, and the day is marked done only on a verdict. A restart after
+        the close judges the day again - one more cycle and one more audit row.
+        """
+        day = self._eod.due(self._clock())
+        if day is None or day == self._eod_done or not self._restored:
+            return None
+        return await self.end_of_day()
+
     def _check_timer_liveness(self) -> None:
         """The story's build concern 1: watch the timer loop independently.
 
@@ -582,6 +626,7 @@ class ExecutionService:
             group.create_task(self._reconcile_until(stop))
             group.create_task(self._squareoff_until(stop))
             group.create_task(self._heartbeat_until(stop))
+            group.create_task(self._end_of_day_until(stop))
             group.create_task(self._consume_until(source, stop))
 
     # Each loop below survives a transient failure (audit ENG-001). Inside the
@@ -607,6 +652,14 @@ class ExecutionService:
             except Exception:
                 log.exception("a square-off sweep raised; retrying")
             await self._sleep(self._timer_interval)
+
+    async def _end_of_day_until(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await self.end_of_day_if_due()
+            except Exception:
+                log.exception("the end-of-day verdict raised; retrying")
+            await self._sleep(self._interval)
 
     async def _heartbeat_until(self, stop: asyncio.Event) -> None:
         while not stop.is_set():

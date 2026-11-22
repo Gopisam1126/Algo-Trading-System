@@ -53,7 +53,7 @@ from uuid import UUID
 from algotrader.common.enums import Side
 from algotrader.execution.charges import order_charges
 
-__all__ = ["DayLedger", "day_ledger"]
+__all__ = ["DayLedger", "RoundTrip", "day_ledger", "round_trips"]
 
 
 @dataclass(frozen=True)
@@ -83,6 +83,35 @@ class DayLedger:
 UNKNOWN = DayLedger(realised=None, unrealised=None, charges=None, streak=None)
 
 
+@dataclass(frozen=True)
+class RoundTrip:
+    """One correlation id's fills today: an entry and whatever closed it.
+
+    The unit both the loss limit and the end-of-day statistics count in
+    (E15-S15). One definition, so the two cannot disagree about what a trade
+    made: the report's net is the loss limit's net by construction.
+    """
+
+    correlation_id: UUID | str
+    symbol: str
+    bought_qty: int
+    bought_value: Decimal
+    sold_qty: int
+    sold_value: Decimal
+    #: Charges on the executed orders only - not on any order still to close.
+    charges: Decimal
+    last_fill: dt.datetime | None
+
+    @property
+    def open_qty(self) -> int:
+        return self.bought_qty - self.sold_qty
+
+    @property
+    def cash(self) -> Decimal:
+        """Cash in minus cash out, gross: the realised P&L once ``open_qty`` is 0."""
+        return self.sold_value - self.bought_value
+
+
 @dataclass
 class _Trip:
     symbol: str
@@ -93,19 +122,12 @@ class _Trip:
     charges: Decimal = Decimal(0)
     last_fill: dt.datetime | None = None
 
-    @property
-    def open_qty(self) -> int:
-        return self.bought_qty - self.sold_qty
 
+def round_trips(orders: Iterable[Mapping[str, Any]]) -> tuple[RoundTrip, ...] | None:
+    """Every correlation id with fills in ``orders``, in the order first seen.
 
-def day_ledger(
-    orders: Iterable[Mapping[str, Any]],
-    last_price: Callable[[str], Decimal | None],
-) -> DayLedger:
-    """The ledger of ``orders`` (today's, any status), marking open quantity.
-
-    ``last_price(symbol)`` is the live price, or ``None`` when no fresh one
-    exists. It is asked only for symbols with open quantity.
+    ``None`` - not an empty tuple - when a filled order has no average price:
+    a fill we cannot price is a fill we cannot account for.
     """
     trips: dict[UUID | str, _Trip] = {}
     for order in orders:
@@ -114,8 +136,7 @@ def day_ledger(
             continue
         price = order.get("average_price")
         if price is None:
-            # A fill with no price is a fill we cannot account for.
-            return UNKNOWN
+            return None
         price = Decimal(price)
         side = Side(order["side"])
         trip = trips.setdefault(order["correlation_id"], _Trip(symbol=str(order["symbol"])))
@@ -131,13 +152,40 @@ def day_ledger(
             trip.last_fill is None or updated > trip.last_fill
         ):
             trip.last_fill = updated
+    return tuple(
+        RoundTrip(
+            correlation_id=cid,
+            symbol=t.symbol,
+            bought_qty=t.bought_qty,
+            bought_value=t.bought_value,
+            sold_qty=t.sold_qty,
+            sold_value=t.sold_value,
+            charges=t.charges,
+            last_fill=t.last_fill,
+        )
+        for cid, t in trips.items()
+    )
+
+
+def day_ledger(
+    orders: Iterable[Mapping[str, Any]],
+    last_price: Callable[[str], Decimal | None],
+) -> DayLedger:
+    """The ledger of ``orders`` (today's, any status), marking open quantity.
+
+    ``last_price(symbol)`` is the live price, or ``None`` when no fresh one
+    exists. It is asked only for symbols with open quantity.
+    """
+    trips = round_trips(orders)
+    if trips is None:
+        return UNKNOWN
 
     realised = Decimal(0)
     unrealised: Decimal | None = Decimal(0)
     charges = Decimal(0)
     finished: list[tuple[dt.datetime, Decimal]] = []
-    for trip in trips.values():
-        cash = trip.sold_value - trip.bought_value
+    for trip in trips:
+        cash = trip.cash
         charges += trip.charges
         if trip.open_qty == 0:
             realised += cash

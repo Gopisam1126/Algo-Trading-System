@@ -20,6 +20,7 @@ from kiteconnect import KiteConnect
 
 from algotrader.broker.adapter import (
     AmbiguousOrderError,
+    BrokerPosition,
     MarginSnapshot,
     OrderRejectedError,
     RateLimitError,
@@ -194,6 +195,10 @@ class Store:
     async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]:
         return []
 
+    async def open_position_rows(self) -> list[dict[str, Any]]:
+        """E15-S15: the rows tomorrow's restore would read."""
+        return [dict(r) for r in self.open_rows if r.get("status") != "CLOSED"]
+
     async def orders_since(self, since: dt.datetime) -> list[dict[str, Any]]:
         return [dict(o) for o in self.orders]
 
@@ -264,6 +269,23 @@ class Facts:
         return Decimal("1200.00")
 
 
+class Account:
+    """What the reconciler reads - here, for the end-of-day verdict (E15-S15)."""
+
+    def __init__(self) -> None:
+        self.positions: list[Any] = []
+        self.orderbook: list[Any] = []
+
+    async def fetch_orderbook(self) -> list[Any]:
+        return list(self.orderbook)
+
+    async def fetch_positions(self) -> list[Any]:
+        return list(self.positions)
+
+    def order_key(self, client_order_id: str) -> str:
+        return client_order_id[:20]
+
+
 class Reconciler:
     """Records what the book held, and whether a signal was mid-flight, per cycle."""
 
@@ -272,11 +294,15 @@ class Reconciler:
         self.cycles: list[dict[str, Any]] = []
         self.raises: Exception | None = None
         self.events: list[str] | None = None
+        self.broker = Account()
+        #: Whether the service's lock was held during each cycle.
+        self.locked: list[bool] = []
 
     async def run_cycle(self, *, now: dt.datetime) -> rec_mod.CycleReport:
         service: ExecutionService = self.ref["service"]
         if self.events is not None:
             self.events.append("cycle")
+        self.locked.append(service._guard.locked())
         self.cycles.append(
             {
                 "now": now,
@@ -1825,3 +1851,130 @@ class TestEachLayerReportsWhatItIsBuiltOver:
             ).venue
             is Venue.PAPER
         )
+
+
+# ===========================================================================
+# E15-S15 - the end of the day, from the service
+# ===========================================================================
+
+
+def _ist_at(day: dt.date, hh: int, mm: int) -> dt.datetime:
+    from algotrader.common.calendar import IST
+
+    return dt.datetime.combine(day, dt.time(hh, mm), tzinfo=IST).astimezone(dt.UTC)
+
+
+#: 25 Aug 2026's closing auction ends at 15:35 IST (CAS_SCHEDULE).
+AFTER_CLOSE = _ist_at(TRADE_DATE, 15, 40)
+
+
+def _mis(symbol: str, quantity: int) -> BrokerPosition:
+    return BrokerPosition(
+        symbol=symbol,
+        exchange="NSE",
+        product="MIS",
+        quantity=quantity,
+        day_buy_quantity=quantity,
+        day_sell_quantity=0,
+    )
+
+
+class TestE15S15EndOfDay:
+    async def test_refused_before_the_book_is_restored(self) -> None:
+        """A final cycle over an empty book exits what it holds (AC3's reason)."""
+        h = Harness()
+        h.clock.now = AFTER_CLOSE
+        with pytest.raises(RuntimeError, match="restored"):
+            await h.service.end_of_day()
+        assert h.reconciler.cycles == []
+        assert await h.service.end_of_day_if_due() is None
+
+    async def test_not_due_during_the_session(self) -> None:
+        h = await Harness().started()
+        cycles = len(h.reconciler.cycles)
+        assert await h.service.end_of_day_if_due() is None
+        assert len(h.reconciler.cycles) == cycles
+
+    async def test_once_per_day_after_the_books_close_under_the_lock(self) -> None:
+        h = await Harness().started()
+        h.clock.now = AFTER_CLOSE
+        cycles = len(h.reconciler.cycles)
+        report = await h.service.end_of_day_if_due()
+        assert report is not None and report.verdict.flat
+        assert report.verdict.trade_date == TRADE_DATE
+        assert len(h.reconciler.cycles) == cycles + 1
+        assert h.reconciler.locked[-1] is True, "the final cycle runs under the service's lock"
+        assert await h.service.end_of_day_if_due() is None, "once per day"
+        assert len(h.reconciler.cycles) == cycles + 1
+        assert [(e.stage, e.outcome) for e in h.audit if e.stage == "END_OF_DAY"] == [
+            ("END_OF_DAY", "FLAT")
+        ]
+
+    async def test_a_book_left_open_stops_the_next_session_until_cleared(self) -> None:
+        """The story's 'halts the next session until cleared': the verdict
+        arms the kill switch in the evening, and at 09:30 the next trading
+        day a signal is refused on it - with no one having touched the latch."""
+        h = await Harness().started()
+        h.clock.now = AFTER_CLOSE
+        h.reconciler.broker.positions = [_mis("TCS", 25)]
+        report = await h.service.end_of_day_if_due()
+        assert report is not None and not report.verdict.flat
+        state = await h.halts.state()
+        assert state.kill_switch and state.records["kill_switch"].reason is HaltReason.BOOK_NOT_FLAT
+
+        tomorrow = _calendar().next_trading_day(TRADE_DATE)
+        h.clock.now = _ist_at(tomorrow, 9, 30)
+        h.reconciler.broker.positions = []
+        result = await h.service.handle(_rec(emitted_at=h.clock.now))
+        assert result.outcome is Outcome.REJECTED
+        assert result.reason is RejectReason.KILL_SWITCH_ACTIVE
+
+    async def test_a_verdict_that_could_not_arm_is_tried_again(self) -> None:
+        h = await Harness().started()
+        h.clock.now = AFTER_CLOSE
+        h.reconciler.broker.positions = [_mis("TCS", 25)]
+        real_arm = h.halts.arm
+        calls = {"n": 0}
+
+        async def flaky(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("redis blip")
+            return await real_arm(*args, **kwargs)
+
+        h.halts.arm = flaky  # type: ignore[method-assign]
+        with pytest.raises(ConnectionError):
+            await h.service.end_of_day_if_due()
+        report = await h.service.end_of_day_if_due()
+        assert report is not None and (await h.halts.state()).kill_switch
+
+    async def test_run_reaches_the_verdict_on_its_own(self) -> None:
+        """The run loop schedules it: no caller has to remember to."""
+        h = Harness()
+        h.clock.now = AFTER_CLOSE
+        stop = asyncio.Event()
+
+        class Quiet:
+            async def start(self) -> None:
+                return None
+
+            async def next_batch(self) -> list[Any]:
+                await asyncio.sleep(0)
+                if h.service._eod_done == TRADE_DATE:
+                    stop.set()
+                return []
+
+            async def done(self, delivery: Any) -> None:
+                return None
+
+            async def poison(self, delivery: Any, reason: str) -> None:
+                return None
+
+        async def no_sleep(_seconds: float) -> None:
+            await asyncio.sleep(0)
+
+        h.service._sleep = no_sleep
+        await asyncio.wait_for(h.service.run(Quiet(), stop), timeout=5)
+        assert [(e.stage, e.outcome) for e in h.audit if e.stage == "END_OF_DAY"] == [
+            ("END_OF_DAY", "FLAT")
+        ]

@@ -77,6 +77,7 @@ UNKNOWN_POSITION       reconciliation
 DUPLICATE_ORDER        reconciliation
 NAKED_POSITION         the protective stop
 POSITION_NOT_HELD      reconciliation and the square-off timer
+BOOK_NOT_FLAT          the end-of-day verdict (``execution/end_of_day.py``)
 STALE_FEED             **nothing yet** - the feed composition (E23-S03)
 MARGIN_SHORTFALL       **nothing yet** - the margin monitor (E14-S12)
 ====================== =====================================================
@@ -143,6 +144,13 @@ class HaltReason(StrEnum):
     #: stop that filled unseen. Exiting it would SELL shares we do not own, so
     #: nothing is sent and the session halts for a human to close the record.
     POSITION_NOT_HELD = "POSITION_NOT_HELD"
+    #: The end-of-day verdict found the book not flat after the books closed
+    #: (E15-S15): a position, a working order or an unsettled record left, or
+    #: a book that could not be read. Armed in the evening so that the NEXT
+    #: session refuses until a human has looked - the latch has no TTL, so it
+    #: is still there at 09:15. Not POSITION_NOT_HELD or UNKNOWN_POSITION:
+    #: either may be among the leftovers, and the verdict names what it found.
+    BOOK_NOT_FLAT = "BOOK_NOT_FLAT"
 
 
 #: Which latch each reason writes to. Three latches rather than one flag,
