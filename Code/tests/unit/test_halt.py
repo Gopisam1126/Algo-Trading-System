@@ -596,6 +596,7 @@ class TestWhoArmsWhatIsTrue:
         HaltReason.DUPLICATE_ORDER: {"execution/reconciliation.py"},
         HaltReason.NAKED_POSITION: {"execution/protective_stop.py", "execution/reconciliation.py"},
         HaltReason.POSITION_NOT_HELD: {"execution/reconciliation.py", "execution/squareoff.py"},
+        HaltReason.BOOK_NOT_FLAT: {"execution/end_of_day.py"},
         HaltReason.STALE_FEED: set(),
         HaltReason.MARGIN_SHORTFALL: set(),
     }

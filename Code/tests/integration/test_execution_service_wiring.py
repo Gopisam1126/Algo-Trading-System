@@ -65,6 +65,8 @@ from algotrader.common.health import (
 from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import OrderRequest, Position, Recommendation
 from algotrader.common.redis import keys
+from algotrader.execution.day_ledger import day_ledger
+from algotrader.execution.end_of_day import LeftoverKind
 from algotrader.execution.gateway import GatewayPolicy, OrderGateway, client_order_id
 from algotrader.execution.halt import HaltController, HaltReason
 from algotrader.execution.live_inputs import (
@@ -1272,3 +1274,185 @@ class TestE15S10TheRealStackOverPaper:
         assert working_stops == [(10, "TRIGGER PENDING")]
         assert paper.positions()["net"][0]["quantity"] == 10
         assert not (await stack.halts.state()).any_halted
+
+
+# ===========================================================================
+# E15-S15 - the end-of-day verdict and statistics, against the real stack
+# ===========================================================================
+
+#: 25 Aug 2026's closing auction ends at 15:35 IST (CAS_SCHEDULE).
+AFTER_CLOSE = _at_ist(TRADE_DATE, 15, 40)
+
+
+async def _a_protected_position(stack: Stack) -> int:
+    """Enter INFY through the stream and book it with its stop. The quantity."""
+    await stack.service.start()
+    await stack.publish(_rec("INFY"))
+    await stack.consume_one()
+    (entry,) = stack.account.placed
+    stack.account.fill(entry["tag"], entry["quantity"], "1200.50")
+    stack.account.hold("INFY", quantity=entry["quantity"])
+    await stack.service.tick()
+    assert isinstance(stack.manager.tracked("INFY"), ProtectedPosition)
+    return int(entry["quantity"])
+
+
+async def _squared_off(stack: Stack, clock: dict[str, dt.datetime], quantity: int) -> None:
+    clock["now"] = _at_ist(TRADE_DATE, 15, 15)
+    await stack.service.sweep()
+    exit_ = stack.account.placed[-1]
+    stack.account.fill(exit_["tag"], exit_["quantity"], "1210.00")
+    stack.account.net[0]["quantity"] = 0
+    stack.account.net[0]["day_sell_quantity"] = quantity
+    clock["now"] = _at_ist(TRADE_DATE, 15, 15, 30)
+    await stack.service.on_reconnect()
+    assert stack.manager.open_positions() == []
+
+
+async def _eod_rows(session: AsyncSession) -> list[tuple[str, Any]]:
+    rows = (
+        await session.execute(
+            text("SELECT outcome, payload FROM decision_log WHERE stage = 'END_OF_DAY'")
+        )
+    ).all()
+    return [(r.outcome, r.payload) for r in rows]
+
+
+class TestE15S15Ac1TheVerdictFromTheRealReconciler:
+    async def test_a_squared_off_day_is_flat(self, session, instruments, redis, audit, calendar):
+        clock = {"now": NOW}
+        stack = Stack(session, instruments, redis, audit, calendar, clock=lambda: clock["now"])
+        quantity = await _a_protected_position(stack)
+        await _squared_off(stack, clock, quantity)
+
+        clock["now"] = AFTER_CLOSE
+        report = await stack.service.end_of_day()
+
+        assert report.verdict.flat, report.verdict.describe()
+        assert report.cycle is not None
+        assert not (await stack.halts.state()).any_halted
+        ((outcome, payload),) = await _eod_rows(session)
+        assert outcome == "FLAT" and payload["flat"] is True
+        assert payload["statistics"]["trades"] == 1
+
+    async def test_a_position_left_open_is_named_and_halts(
+        self, session, instruments, redis, audit, calendar
+    ):
+        """The square-off never ran: the book, the row, the broker's holding,
+        the working stop at the broker and its unsettled record are each named."""
+        clock = {"now": NOW}
+        stack = Stack(session, instruments, redis, audit, calendar, clock=lambda: clock["now"])
+        await _a_protected_position(stack)
+
+        clock["now"] = AFTER_CLOSE
+        report = await stack.service.end_of_day()
+
+        kinds = {(item.kind, item.symbol) for item in report.verdict.leftovers}
+        assert kinds == {
+            (LeftoverKind.BOOK_POSITION, "INFY"),
+            (LeftoverKind.OPEN_RECORD, "INFY"),
+            (LeftoverKind.BROKER_POSITION, "INFY"),
+            (LeftoverKind.WORKING_ORDER, "INFY"),
+            (LeftoverKind.UNSETTLED_ORDER, "INFY"),
+        }, report.verdict.describe()
+        state = await stack.halts.state()
+        assert state.kill_switch
+        assert state.records["kill_switch"].reason is HaltReason.BOOK_NOT_FLAT
+        ((outcome, payload),) = await _eod_rows(session)
+        assert outcome == "NOT_FLAT" and payload["leftover_count"] == 5
+
+    async def test_a_stop_left_working_after_the_exit_is_named(
+        self, session, instruments, redis, audit, calendar
+    ):
+        """AC1's 'a working stop': the position closed, and its stop - which
+        our record says was cancelled - is working at the broker again."""
+        clock = {"now": NOW}
+        stack = Stack(session, instruments, redis, audit, calendar, clock=lambda: clock["now"])
+        quantity = await _a_protected_position(stack)
+        await _squared_off(stack, clock, quantity)
+        stop = next(p for p in stack.account.placed if p["order_type"] == "SL-M")
+        row = next(r for r in stack.account.book if r["tag"] == stop["tag"])
+        row["status"] = "TRIGGER PENDING"
+
+        clock["now"] = AFTER_CLOSE
+        report = await stack.service.end_of_day()
+
+        assert [i.kind for i in report.verdict.leftovers] == [LeftoverKind.WORKING_ORDER]
+        assert (await stack.halts.state()).kill_switch
+
+    async def test_before_the_books_close_it_is_refused(
+        self, session, instruments, redis, audit, calendar
+    ):
+        clock = {"now": NOW}
+        stack = Stack(session, instruments, redis, audit, calendar, clock=lambda: clock["now"])
+        await _a_protected_position(stack)
+        clock["now"] = _at_ist(TRADE_DATE, 15, 34)
+        with pytest.raises(ValueError, match="books closed"):
+            await stack.service.end_of_day()
+        assert not (await stack.halts.state()).any_halted
+        assert await _eod_rows(session) == []
+
+
+class TestE15S15Ac2TheStatisticsOnPaper:
+    async def test_the_net_is_the_loss_limits_and_within_paise_of_the_account(
+        self, session, instruments, redis, audit, calendar
+    ):
+        """One stop-out and one time exit on the paper broker, whose account
+        charges every executed order. The report's net IS day_ledger's for the
+        same orders (AC2). Against the paper account's own change it may differ
+        by the rounding of the two charge schedules - day_ledger rounds each
+        order's charges UP, the paper account to the nearest paisa - so it is
+        never ABOVE the account, and never more than a paisa an order below."""
+        stack, paper, tape, clock = _paper_stack(session, instruments, redis, audit, calendar)
+        tape.quote("INFY", "1200.00")
+        tape.quote("TCS", "1200.00")
+        await stack.service.start()
+        await stack.publish(_rec("INFY"))
+        await stack.consume_one()
+        await stack.service.tick()
+        clock["now"] += dt.timedelta(minutes=1)
+        tape.quote("INFY", "1170.00")  # through INFY's stop
+        await stack.service.tick()
+        await stack.service.tick()
+
+        tape.quote("TCS", "1200.00")
+        await stack.publish(_rec("TCS"))
+        await stack.consume_one()
+        await stack.service.tick()
+        clock["now"] = _at_ist(TRADE_DATE, 15, 5)  # TCS is CAS: 15:10 minus the buffer
+        tape.quote("TCS", "1215.00")
+        await stack.service.sweep()
+        clock["now"] += dt.timedelta(seconds=30)
+        tape.quote("TCS", "1215.00")
+        await stack.service.on_reconnect()
+        assert stack.manager.open_positions() == []
+
+        clock["now"] = AFTER_CLOSE
+        report = await stack.service.end_of_day()
+        assert report.verdict.flat, report.verdict.describe()
+        stats = report.statistics
+        assert stats is not None
+
+        orders = await stack.orders.orders_placed_since(_at_ist(TRADE_DATE, 0, 0))
+        assert stats.net == day_ledger(orders, lambda _s: None).net
+        assert (len(stats.trades), stats.wins, stats.losses, stats.booked) == (2, 1, 1, 2)
+        assert stats.reconciles and stats.unbooked == ()
+        closed = await stack.positions.closed_since(_at_ist(TRADE_DATE, 0, 0))
+        assert {str(r["correlation_id"]) for r in closed} == {
+            str(t.correlation_id) for t in stats.trades
+        }
+
+        account = (
+            sum((Decimal(str(h["pnl"])) for h in paper.positions()["net"]), Decimal(0))
+            - paper.charges_total
+        )
+        executed = sum(1 for o in orders if o["filled_quantity"])
+        assert stats.net is not None
+        assert stats.net <= account
+        assert account - stats.net <= Decimal("0.01") * executed
+
+        loser, winner = stats.trades
+        assert loser.symbol == "INFY" and loser.r_multiple is not None
+        assert loser.r_multiple < Decimal("-1"), "a full stop-out, plus charges"
+        assert winner.symbol == "TCS" and winner.r_multiple is not None
+        assert winner.r_multiple > 0

@@ -634,6 +634,13 @@ class Reconciler:
         """
         return venue_of_all(self._broker, self._protector, self._canceller)
 
+    @property
+    def broker(self) -> BrokerView:
+        """What this reconciler reads (E15-S15). The end-of-day verdict reads
+        through it, so the account it judges is - structurally - the account
+        the final cycle reconciled, never a second one passed beside it."""
+        return self._broker
+
     async def run_cycle(self, *, now: dt.datetime) -> CycleReport:
         """Read, then act. Raises :class:`ReconciliationReadError` having done
         nothing if any read fails."""

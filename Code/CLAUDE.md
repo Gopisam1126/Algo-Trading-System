@@ -297,7 +297,7 @@ Built and tested as components (counts: the latest CI run; it must say
 `notifier/`, `ai/`, `macro/` - six of thirteen packages. `execution/` holds the
 whole order path: risk engine, sizer, slots, halt and loss latches, gateway and
 state machine, protective stop, position book, reconciliation, square-off,
-autonomy gate, day ledger and the service that drives them. **Nothing composes
+autonomy gate, day ledger, end-of-day verdict and the service that drives them. **Nothing composes
 it into a process yet** (no entrypoint, E23-S03).
 
 ### The architectural fact to keep in mind
@@ -592,6 +592,29 @@ Recorded because each was believed, written down, and wrong.
   it terminal, then sends a protected MARKET exit and marks the position
   `ExitingPosition(reason=TIME)`. No Redis sorted set: that would be a second
   copy of the deadline, and a missed add is a position with no time exit.
+- **E15-S15 end of day** — `execution/end_of_day.py` and `execution/day_stats.py`.
+  After `books_close(day)` (the close, or the CAS auction's end - 15:40 from
+  7 Dec 2026) the service runs one final cycle under its lock, reads again
+  ORDERBOOK FIRST, and judges: anything left in the book, an open positions
+  row, MIS quantity at the broker, a working MIS order, an unsettled record,
+  or a read that failed is NOT FLAT and arms `BOOK_NOT_FLAT` (no TTL: the next
+  session refuses until cleared). `run()` schedules it once per trading day.
+  The statistics are built on `day_ledger.round_trips` and their totals ARE
+  the loss limit's `DayLedger`; WIN/LOSS/SCRATCH is the sign of the net, R is
+  net over the closed row's `|entry - stop| x qty`.
+
+- **"The read order that makes a check race-free makes every check on those
+  reads race-free."** Reconciliation reads positions first so an exit filling
+  between the reads cannot fake an unknown position. The end-of-day verdict
+  asks the opposite question - is anything LEFT - and positions-first makes
+  it racy the other way: a stop working at the first read fills before the
+  second, and both reads look finished. The race depends on the question, not
+  on the reads (E15-S15).
+- **"Paper charges are the day ledger's charges."** Same rates, two copies:
+  `execution/charges.py` rounds each order UP (the loss limit errs early),
+  `broker/paper.py` to the nearest paisa. A paper day's report is never above
+  the account and at most a paisa an order below it (E15-S16 raised).
+
 - **E15-S14 live risk inputs** — `execution/live_inputs.py`. ATR is the
   `atr_14` the strategy side publishes to `state:indicator` (an
   `IndicatorSnapshot` with `as_of` and `ready`, written by

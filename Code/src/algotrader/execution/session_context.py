@@ -245,6 +245,15 @@ class ContextStore(Protocol):
         """The registered strategy's lifecycle state, or None if it has none."""
         ...
 
+    async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]:
+        """Positions closed at or after ``since`` (the end-of-day statistics)."""
+        ...
+
+    async def open_position_rows(self) -> list[dict[str, Any]]:
+        """Every positions row not CLOSED - what tomorrow's restore would read
+        (the end-of-day verdict, E15-S15)."""
+        ...
+
 
 class RepositoryContextStore:
     """:class:`ContextStore` over the repositories that hold the answers."""
@@ -273,6 +282,12 @@ class RepositoryContextStore:
 
     async def occupied_slots(self) -> set[int]:
         return set(await self._positions.occupied_slots())
+
+    async def closed_since(self, since: dt.datetime) -> list[dict[str, Any]]:
+        return list(await self._positions.closed_since(since))
+
+    async def open_position_rows(self) -> list[dict[str, Any]]:
+        return list(await self._positions.open_positions())
 
     async def profile(self, symbol: str) -> dict[str, Any] | None:
         result: dict[str, Any] | None = await self._instruments.profile(symbol)
