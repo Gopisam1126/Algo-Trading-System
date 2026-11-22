@@ -99,7 +99,7 @@ src/algotrader/
   ingest/                WebSocket ingestion, cleaning, bar construction
   indicators/            Incremental TI engine
   macro/                 News + macro context (slow loop)      [empty - planned]
-  premarket/             The daily preparation pipeline        [empty - planned]
+  premarket/             The daily preparation pipeline        [base universe only - E07-S01]
   signals/               Strategy evaluation loop (AI review: planned)
   strategy/              DSL, primitives, registry (gauntlet: planned)
   ai/                    Anthropic client, prompts, budget     [empty - planned]

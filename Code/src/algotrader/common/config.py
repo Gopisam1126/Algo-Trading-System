@@ -414,7 +414,11 @@ class ScoringWeights(_Model):
 
 
 class UniverseConfig(_Model):
-    base: str = "nifty200"
+    #: The bases ``premarket/universe.py`` builds (E07-S01). A string field
+    #: accepted any word and nothing read it; a Literal makes "configured" and
+    #: "implemented" the same set, as ``sizing_method`` does (ENG-003).
+    base: Literal["nifty50", "nifty100", "nifty200", "nifty500", "fno", "custom"] = "nifty200"
+    #: The universe when ``base`` is ``custom``, and only then.
     custom_symbols: list[str] = Field(default_factory=list)
     hard_filters: HardFilters = Field(default_factory=HardFilters)
     scoring_weights: ScoringWeights = Field(default_factory=ScoringWeights)
@@ -425,6 +429,27 @@ class UniverseConfig(_Model):
     def _watchlist_fits_shortlist(self) -> Self:
         if self.final_watchlist_size > self.shortlist_size:
             raise ValueError("final_watchlist_size cannot exceed shortlist_size")
+        return self
+
+    @model_validator(mode="after")
+    def _custom_symbols_belong_to_custom(self) -> Self:
+        """A custom base needs its symbols, and symbols under another base
+        would be read by nothing - a configured list that changes nothing."""
+        if self.base == "custom" and not self.custom_symbols:
+            raise ValueError("universe.base custom needs universe.custom_symbols")
+        if self.base != "custom" and self.custom_symbols:
+            raise ValueError(
+                f"universe.custom_symbols is read only when universe.base is custom, "
+                f"not {self.base}; remove it or set base: custom"
+            )
+        # The one symbol rule (common/models/trading.py), imported here rather
+        # than at module level to keep config free of model imports at load.
+        from algotrader.common.models.trading import _validate_symbol
+
+        for symbol in self.custom_symbols:
+            _validate_symbol(symbol)
+        if len(set(self.custom_symbols)) != len(self.custom_symbols):
+            raise ValueError("universe.custom_symbols lists a symbol twice")
         return self
 
 

@@ -285,6 +285,17 @@ class InstrumentRepository:
         result = await self._session.execute(stmt)
         return int(cast("CursorResult[Any]", result).rowcount or 0)
 
+    async def active_symbols(self) -> frozenset[str]:
+        """Every symbol the master marks active - what a base universe resolves
+        against (E07-S01). A delisted symbol is kept as a row (E02-S06) but is
+        not active, so an index file still naming it reads as unresolved."""
+        rows = (
+            await self._session.execute(
+                select(Instrument.tradingsymbol).where(Instrument.is_active.is_(True))
+            )
+        ).all()
+        return frozenset(str(r[0]) for r in rows)
+
     async def eligible_today(self) -> list[str]:
         """Today's tradable universe with hazard flags applied.
 
