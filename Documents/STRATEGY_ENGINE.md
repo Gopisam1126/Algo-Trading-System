@@ -329,6 +329,14 @@ CREATE INDEX ON strategy_trial (trial_ts DESC);
 - The `strategy_hash` deduplicates genuinely identical re-runs while still counting distinct variants.
 - The **effective trial count** for DSR is the count of distinct hashes within the relevant search family.
 
+**As built (E12-S04, 22 Nov 2026).** `common.db.repositories.TrialRepository` records a run (`record(TrialRecord)`, which refuses at construction what the columns or the rules would refuse: a non-hash, a rejection without its G1-G12 check, a pass naming one, a PBO outside [0, 1], an empty report) and counts (`effective_trial_count()`): distinct `strategy_hash` over **all** trials, plus `PRE_REGISTRY_TRIALS`. Three decisions, recorded where the code is:
+
+- **The family is global.** This section names "the relevant search family" and defines none; a larger denominator is the conservative direction for DSR. A narrower family is G6's (E12-S07) to define - with a definition, not by filtering.
+- **The starting count is zero, deliberately.** No backtest has ever run in this system (the gauntlet, E12-S05..S08, does not exist). If strategies were backtested *outside* it, those runs are trials and must be recorded before the first DSR - an owner question on the story.
+- **The hash is the caller's.** The repository sits below the strategy layer and cannot compute `content_hash()` itself; the gauntlet passes it.
+
+Every gauntlet run writing its row is the gauntlet's job (E12-S05..S08); the registry is the store it writes to.
+
 The registry is also the honest answer to "how much searching have we done?" — a number that should be visible in the admin UI and that should make you uncomfortable when it grows fast.
 
 ---
@@ -699,7 +707,7 @@ MVP ships a **YAML editor with live validation**: primitive autocomplete, inline
 | **AI-generated code execution** | Structurally impossible — DSL only, no code path (P1) |
 | **Prompt injection steering strategy generation** | Generation input is structured statistics from our own database, not free text. News content reaches it only as bounded `NewsSignal` fields. A successful injection could at most produce a bad-but-valid strategy, which still faces the full gauntlet |
 | **Strategy DSL as an injection vector** | Strict schema validation; no string interpolation into queries or prompts; primitive names validated against an allowlist |
-| **Trial registry tampering** (to inflate DSR) | Append-only; DB role has INSERT but not UPDATE/DELETE; hash-chained like the decision log |
+| **Trial registry tampering** (to inflate DSR) | Append-only; DB role has INSERT but not UPDATE/DELETE (built, tested as the service login). Hash-chaining like the decision log - which would also catch the table OWNER deleting rows - is **not built** (E12-S13) |
 | **Holdout contamination** | Holdout data is physically excluded from the generation context; access is logged; a second read of the same holdout for the same strategy is rejected |
 | **Approval bypass** | Human approval enforced in the state machine, not in config; requires re-authentication |
 | **Resource exhaustion via validation** | Gauntlet runs in a resource-limited worker with timeouts; queued, never inline with trading |

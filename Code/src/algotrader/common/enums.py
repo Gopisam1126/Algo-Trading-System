@@ -224,6 +224,14 @@ class StrategyOrigin(StrEnum):
     BUILTIN_SEED = "BUILTIN_SEED"
 
 
+class TrialOutcome(StrEnum):
+    """A gauntlet run's verdict (STRATEGY_ENGINE.md §6). Both are trials: a
+    rejection is counted exactly as a pass is, or the DSR denominator lies."""
+
+    PASSED = "PASSED"
+    REJECTED = "REJECTED"
+
+
 class StrategyState(StrEnum):
     """See STRATEGY_ENGINE.md §4."""
 
