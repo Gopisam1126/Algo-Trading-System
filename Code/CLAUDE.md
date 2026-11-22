@@ -293,8 +293,9 @@ Built and tested as components (counts: the latest CI run; it must say
   reconciliation can find a stop it never saw placed. Mutation: 17 injected,
   17 killed.
 
-**Empty (`__init__.py` only):** `orchestrator/`, `premarket/`, `api/`,
-`notifier/`, `ai/`, `macro/` - six of thirteen packages. `execution/` holds the
+**Empty (`__init__.py` only):** `orchestrator/`, `api/`, `notifier/`, `ai/`,
+`macro/` - five of thirteen packages. `premarket/` holds the base universe
+loader (E07-S01) and no pipeline yet. `execution/` holds the
 whole order path: risk engine, sizer, slots, halt and loss latches, gateway and
 state machine, protective stop, position book, reconciliation, square-off,
 autonomy gate, day ledger, end-of-day verdict and the service that drives them. **Nothing composes
@@ -592,6 +593,25 @@ Recorded because each was believed, written down, and wrong.
   it terminal, then sends a protected MARKET exit and marks the position
   `ExitingPosition(reason=TIME)`. No Redis sorted set: that would be a second
   copy of the deadline, and a missed add is a position with no time exit.
+- **E07-S01 base universe** — `premarket/universe.py`. `universe.base` (now a
+  Literal) is a Nifty 50/100/200/500 constituent file from niftyindices.com
+  (or NSE's archive, which serves the same bytes, when it answers HTML - SIT-010),
+  the F&O stock universe (unexpired NFO futures whose underlying is an NSE
+  equity in the master - the indices drop out with no hand-kept list), or
+  `custom_symbols` (custom only; a typo refuses). Resolved against
+  `InstrumentRepository.active_symbols()`; what does not resolve is named,
+  and a wrong-shaped file, an implausible count or a stale master refuses.
+
+- **"An index file's symbol is Kite's symbol."** Not outside the EQ series:
+  `HFCL` (BE, trade-to-trade) is `HFCL-BE` at Kite and `EMBASSY` (a REIT) is
+  `EMBASSY-RR` (22 Nov 2026). And not every row is a stock: on a demerger NSE
+  Indices adds a placeholder (`DUMMYHEG`, ISIN `DUM545A01024`) until the
+  demerged company lists - which is why the Nifty 500 listed 501.
+- **"The sync leaves the columns it does not send alone."** It writes `sector`
+  and `name` from `EXCLUDED` while its rows carry neither, so every morning it
+  nulls both. Latent - nothing else writes them yet - and the first sector
+  producer would be erased daily (E07-S07).
+
 - **E15-S15 end of day** — `execution/end_of_day.py` and `execution/day_stats.py`.
   After `books_close(day)` (the close, or the CAS auction's end - 15:40 from
   7 Dec 2026) the service runs one final cycle under its lock, reads again

@@ -38,6 +38,8 @@ CODE = Path(__file__).resolve().parents[2]
 #: leaf -> the file that reads it. The test checks the file names the leaf.
 WIRED: dict[str, str] = {
     "system.mode": "src/algotrader/execution/service.py",
+    "universe.base": "src/algotrader/premarket/universe.py",
+    "universe.custom_symbols": "src/algotrader/premarket/universe.py",
     "system.timezone": "src/algotrader/common/config.py",  # fixed: Literal
     "system.deployment_region": "scripts/doctor.py",
     "system.static_ip": "scripts/doctor.py",

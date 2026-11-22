@@ -147,7 +147,8 @@ refuses every entry at L0-L3 until the approval flow (E16-S03) and the envelope
 | `strategy/` | Components | the DSL, 27 primitives and their evaluators, the tri-state runtime, the approval-gated registry |
 | `signals/` | Components | the strategy loop and bar source (E13-S01); its LIVE/PAPER routes end at a port |
 | `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, exit timer (time and target exits), autonomy gate, day ledger, end-of-day verdict and statistics, execution service |
-| `ai/` `macro/` `premarket/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
+| `premarket/` | Component | the base universe (E07-S01): a Nifty 50/100/200/500 constituent file, the F&O stock universe or a custom list, resolved against the instrument master; no pipeline yet |
+| `ai/` `macro/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
 
 "Components" means built and tested on their own and against each other in
 integration tests; none of them runs as a process yet.

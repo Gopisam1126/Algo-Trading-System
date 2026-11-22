@@ -184,6 +184,8 @@ This is exactly how a professional discretionary trader works: the hard thinking
 - **F&O universe (~180–200 stocks)** — all have derivatives, hence institutional interest and good liquidity.
 - **Custom watchlist** — user-supplied symbol list.
 
+*Built (E07-S01, 22 Nov 2026):* `premarket/universe.py`. The index lists are NSE Indices' constituent files (niftyindices.com, falling back to the same file on nsearchives.nseindia.com, because the publisher answers a busy client with an HTML page - SIT-010); the F&O universe is the unexpired NFO stock futures (218 names on 22 Nov 2026 - the six index underlyings drop out because they are not equities in the instrument master); every list is resolved against the instrument master and what does not resolve is named. Two facts of the files: a constituent outside the EQ series is `SYMBOL-SERIES` at Kite (`HFCL-BE`, `EMBASSY-RR`), and on a demerger NSE Indices adds a placeholder (`DUMMYHEG`, ISIN `DUM...`) until the new company lists - the Nifty 500 listed 501. Hard filters are E07-S02; sectors from the files' Industry column, E07-S07.
+
 ### 5.2 Hard filters (binary exclusions — applied before any scoring)
 
 A stock failing *any* of these is removed from the day's universe entirely:

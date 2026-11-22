@@ -151,5 +151,5 @@ def test_the_empty_packages_named_are_the_empty_packages(doc: Path) -> None:
     """ENG-009/ENG-038: the package states are checked against the tree, both ways
     - a built package called empty, and an empty one presented as built."""
     actual = empty_packages()
-    assert actual, "control: six packages are still empty (E23-S03, E10, ...)"
+    assert actual, "control: five packages are still empty (E23-S03, E10, ...)"
     assert named_empty(doc) == actual
