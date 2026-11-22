@@ -28,6 +28,7 @@ import re
 import uuid
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -49,8 +50,9 @@ from algotrader.common.db.models import (
     ShadowSignal,
     Strategy,
     StrategyApproval,
+    StrategyTrial,
 )
-from algotrader.common.enums import PositionStatus, Timeframe
+from algotrader.common.enums import PositionStatus, StrategyOrigin, Timeframe, TrialOutcome
 
 log = logging.getLogger(__name__)
 
@@ -1516,3 +1518,117 @@ class ShadowSignalRepository:
             pg_insert(ShadowSignal).values(**values).returning(ShadowSignal.id)
         )
         return int(result.scalar_one())
+
+
+# ---------------------------------------------------------------------------
+# The trial registry (E12-S04, STRATEGY_ENGINE.md §6)
+# ---------------------------------------------------------------------------
+
+#: Trials run before the registry existed, counted into the DSR denominator.
+#: **Zero, deliberately (E12-S04 build concern, 21 Nov 2026):** this system has
+#: never run a backtest - the gauntlet (E12-S05..S08) does not exist, and the
+#: one shipped strategy was written, not searched for. If the owner has
+#: backtested strategies OUTSIDE this system, those runs are trials too and
+#: must be recorded before the first DSR is computed (an owner question, on
+#: the story). A count that starts at zero when searching already happened
+#: makes DSR optimistic exactly when it matters most.
+PRE_REGISTRY_TRIALS = 0
+
+_TRIAL_HASH = re.compile(r"^[0-9a-f]{64}$")
+_GAUNTLET_CHECK = re.compile(r"^G(?:[1-9]|1[0-2])$")
+#: strategy_trial's NUMERIC(8,4) and NUMERIC(5,4) - refused at construction,
+#: not at the INSERT, which is the moment the record is wanted.
+_STAT_LIMIT = Decimal("10000")
+
+
+@dataclass(frozen=True, slots=True)
+class TrialRecord:
+    """One gauntlet run, as the registry stores it. Construction validates:
+    holding one proves it fits the table and says something coherent."""
+
+    strategy_id: str
+    strategy_hash: str  # StrategyDocument.content_hash(): a hash of behaviour
+    origin: StrategyOrigin
+    outcome: TrialOutcome
+    report: dict[str, Any]
+    failed_check: str | None = None
+    observed_sharpe: Decimal | None = None
+    deflated_sharpe: Decimal | None = None
+    pbo: Decimal | None = None
+    trade_count: int | None = None
+    generation_batch_id: uuid.UUID | None = None
+
+    def __post_init__(self) -> None:
+        if not 0 < len(self.strategy_id) <= 64:
+            raise ValueError(f"strategy_id must be 1-64 characters, got {len(self.strategy_id)}")
+        if not _TRIAL_HASH.match(self.strategy_hash):
+            raise ValueError("strategy_hash must be a content hash: 64 lowercase hex characters")
+        origin, outcome = StrategyOrigin(self.origin), TrialOutcome(self.outcome)
+        if outcome is TrialOutcome.REJECTED:
+            if self.failed_check is None or not _GAUNTLET_CHECK.match(self.failed_check):
+                raise ValueError(
+                    f"a REJECTED trial names the check it failed (G1-G12), "
+                    f"not {self.failed_check!r}"
+                )
+        elif self.failed_check is not None:
+            raise ValueError(f"a PASSED trial failed no check, but names {self.failed_check!r}")
+        for name in ("observed_sharpe", "deflated_sharpe"):
+            value = getattr(self, name)
+            if value is not None and not (value.is_finite() and abs(value) < _STAT_LIMIT):
+                raise ValueError(f"{name} is {value}: a finite number under {_STAT_LIMIT} in size")
+        if self.pbo is not None and not (self.pbo.is_finite() and 0 <= self.pbo <= 1):
+            raise ValueError(f"pbo is a probability, not {self.pbo}")
+        if self.trade_count is not None and self.trade_count < 0:
+            raise ValueError(f"trade_count is {self.trade_count}")
+        if not isinstance(self.report, dict) or not self.report:
+            raise ValueError("a trial carries its validation report - an empty one records nothing")
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "outcome", outcome)
+
+
+class TrialRepository:
+    """``strategy_trial``: every gauntlet run, pass or fail, forever (BR-4).
+
+    **Insert and count, nothing else** - the application role has INSERT but no
+    UPDATE or DELETE (``tests/integration/test_service_login.py`` connects AS the
+    service login and is refused both), because deleting a failed trial deflates
+    the DSR denominator and inflates every later validation.
+
+    **Every run is a row; the count is of distinct hashes** (STRATEGY_ENGINE.md
+    §6). A parameter sweep's settings hash apart, so 20 settings are 20 trials;
+    a genuinely identical re-run hashes the same and adds a row but not a
+    trial. The count is GLOBAL: §6 speaks of "the relevant search family" and
+    defines none, and a larger denominator is the conservative direction for
+    DSR. Narrowing it is E12-S07's decision, with a definition.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def record(self, trial: TrialRecord) -> int:
+        """Write one run; its row id. The caller commits."""
+        values = {
+            "strategy_id": trial.strategy_id,
+            "strategy_hash": trial.strategy_hash,
+            "origin": str(trial.origin),
+            "generation_batch_id": trial.generation_batch_id,
+            "observed_sharpe": trial.observed_sharpe,
+            "deflated_sharpe": trial.deflated_sharpe,
+            "pbo": trial.pbo,
+            "trade_count": trial.trade_count,
+            "outcome": str(trial.outcome),
+            "failed_check": trial.failed_check,
+            "report": trial.report,
+        }
+        result = await self._session.execute(
+            pg_insert(StrategyTrial).values(**values).returning(StrategyTrial.id)
+        )
+        return int(result.scalar_one())
+
+    async def effective_trial_count(self) -> int:
+        """The DSR denominator: distinct strategy hashes ever trialled, plus
+        :data:`PRE_REGISTRY_TRIALS`. Rejections count; deletions cannot happen."""
+        result = await self._session.execute(
+            select(func.count(func.distinct(StrategyTrial.strategy_hash)))
+        )
+        return int(result.scalar_one()) + PRE_REGISTRY_TRIALS  # COUNT always returns a row
