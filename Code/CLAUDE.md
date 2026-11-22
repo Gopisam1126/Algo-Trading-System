@@ -974,6 +974,14 @@ E24) records each. The shapes worth remembering, because each passed QA:
   adapter-level brokers report orders through `KiteTradingAdapter._to_order`
   (tag as the id, no intent), because Kite stores nothing else (E24-S08). A
   new double either reuses these or calls `check_place_order`.
+- **"The sizer's quantity is monotonic in its inputs."** In margin, volatility,
+  per-share margin and the size factor, yes. In capital and in entry price, no -
+  and correctly: the minimum position (RSK-012) and a stop that would cross zero
+  are price FLOORS that refuse, so more capital can turn a margin-bound position
+  into a token one (refused), and a cheaper entry can fall under the minimum
+  where a dearer one does not. Hypothesis found the entry case on its first run
+  (10.00 sized 0, 10.02 sized 999). `tests/property/test_risk_engine_properties.py`
+  states each exception exactly, so any OTHER non-monotonicity fails (E22-S01).
 - **"The code is corrected, so the record is."** Batch A made live mode refuse
   to load without the broker's written answer on Algo-ID tagging (LEG-001) -
   and left `PRE_LIVE_CHECKLIST.md`, the gate before capital, showing B1 - which
