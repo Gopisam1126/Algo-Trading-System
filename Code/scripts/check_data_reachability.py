@@ -1,20 +1,17 @@
 #!/usr/bin/env python
 """Prove — or disprove — that this host can reach the public data sources.
 
-Blocker B8 says NSE blocks programmatic access to its public data. Research
-narrows that considerably: what NSE blocks is **overseas** access. Its robots
-policy excludes crawlers and its edge refuses non-Indian IPs outright, but a
-polite client on an Indian host, carrying the session cookie its site issues,
-is a normal visitor.
+Blocker B8 says NSE blocks programmatic access to its public data. What is
+known: NSE's edge refuses non-Indian addresses, and its home page can refuse an
+automated client even from an Indian one - on 23 Nov 2026 it answered 403 to an
+Indian ISP's address while every API and archive endpoint this probe and the
+data stories use answered the same client, given browser headers and no cookie.
+So a 403 from the home page alone is not a verdict on the host.
 
-That matters because it collapses B8 into B6. SEBI already requires the order
-path to originate from a single static, broker-whitelisted, India-hosted IP.
-The same host answers both: one India VPS resolves the static-IP requirement
-AND the data-reachability question. There is no second problem to solve.
-
-What this script cannot do is procure that host. So it exists to make the
-answer a single command on the day there is one, rather than a fetcher written
-on a laptop and discovered to be useless in production.
+The production host is planned in an India region - this system's own rule,
+not a regulation (audit HAL-001) - and the order path needs a static,
+broker-whitelisted IP. Re-run this probe there, because what NSE accepts from
+one address says little about another.
 
     python scripts/check_data_reachability.py
 
@@ -88,7 +85,13 @@ PROBES = [
     Probe(
         name="NSE home (session cookie)",
         url="https://www.nseindia.com/",
-        blocks="every other NSE probe — its API needs the cookie this issues",
+        # Informational, not required (corrected 23 Nov 2026). This said every
+        # other NSE probe needed the cookie this page issues; that day the page
+        # answered 403 to an Indian host while the ASM and market-status APIs
+        # answered it without any cookie. A required probe that is not needed
+        # turns a working host into a failing exit code.
+        blocks="nothing on its own - the NSE APIs answered without its cookie on 23 Nov 2026",
+        required=False,
     ),
     Probe(
         name="NSE all-reports page",
@@ -199,7 +202,8 @@ def _probe(probe: Probe, opener: urllib.request.OpenerDirector) -> Result:
         elapsed = time.monotonic() - started
         hint = {
             401: "authentication required",
-            403: "FORBIDDEN — the classic signature of a non-Indian egress IP",
+            403: "FORBIDDEN — NSE refused this client: a non-Indian address, or bot "
+            "protection (an Indian host got this from NSE's home page on 23 Nov 2026)",
             429: "rate limited — slow down and retry",
             503: "service unavailable, possibly a temporary block",
         }.get(exc.code, "")
@@ -240,11 +244,12 @@ def main(argv: list[str] | None = None) -> int:
     ip = _egress_ip()
     print(f"  egress IP: {ip}")
     print("  This is the address a broker whitelists and the one NSE geolocates.")
-    print("  NSE is expected to refuse non-Indian addresses.\n")
+    print("  NSE refuses non-Indian addresses, and can refuse an automated client")
+    print("  from an Indian one.\n")
 
-    # A cookie jar, because NSE's API endpoints require the session its home
-    # page issues. Probing them without it reports a block that is really a
-    # missing handshake.
+    # A cookie jar. NSE's APIs once wanted the session its home page issues; on
+    # 23 Nov 2026 they answered without it, but the jar costs nothing and keeps
+    # a return of that requirement from reading as a block.
     import http.cookiejar
 
     opener = urllib.request.build_opener(
@@ -289,9 +294,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    blocks: {result.probe.blocks}")
     print(
         "\nIf these are 403s and the egress IP above is outside India, that is the\n"
-        "expected result and not a bug. SEBI already requires the order path to\n"
-        "originate from a single static, broker-whitelisted, India-hosted IP, so\n"
-        "the same host resolves both requirements. Re-run this there."
+        "expected result: re-run this on the India-region production host (an\n"
+        "India region is this system's own rule, not a regulation - HAL-001).\n"
+        "From an Indian address a 403 means NSE refused the client, not the\n"
+        "country: check the request headers before blaming the host."
     )
     return 1
 
