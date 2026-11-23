@@ -695,10 +695,10 @@ Runs on every push and pull request to DEV, QA, PROD and main:
 - **QA → PROD:** the owner's route, `.github/workflows/promote.yml`. Its PROD
   path exits with an error until the pre-live checklist is signed off.
 - **Branch protection on PROD** is the owner's switch and is recommended - it is
-  the only gate that also stops a hand-typed `git push`. One point to settle
-  first: `DEPLOYMENT.md §5` suggests requiring the CI-gate status on QA as well,
-  but `promote.py` pushes a fresh promotion commit that has no status yet, so
-  that rule would refuse every promotion.
+  the only gate that also stops a hand-typed `git push`. `DEPLOYMENT.md §5` gives
+  the rules. It deliberately does **not** require the CI-gate status on QA:
+  `promote.py` pushes a fresh promotion commit with no status yet, so that rule
+  would refuse every promotion (corrected 23 Nov 2026).
 - **Rollback:** `DEPLOYMENT.md §8`.
 
 ---
@@ -720,15 +720,20 @@ Today's key settings: paper mode; ₹5,00,000 capital; 5 slots; 1% risk per trad
 
 ## 14. What is left, in numbers
 
-From the tracker on 23 Nov 2026, each open story classified by what it needs:
+From the tracker on 23 Nov 2026 (after that day's story review), each open
+story classified by what it needs:
 
 | | Stories | Est. days |
 |---|---|---|
-| Done (QA-Success or Closed) | 81 of 216 | - |
-| Can be **completed now**, with nothing from the owner | 86 | ~113 |
+| Done (QA-Success or Closed) | 81 of 217 | - |
+| Removed (E21-S01, cancelled - the broker applies the generic algo ID) | 1 | - |
+| Can be **completed now**, with nothing from the owner | 87 | ~115 |
 | Can be **built now**; one real-world check needs an owner item | 28 | ~42 |
 | **Needs an owner item to start** (12 of them wait only on decisions about news sources) | 20 | ~26 |
-| Cancelled but still marked New (E21-S01) | 1 | - |
+
+The review also split E23-S03: its new first half, **E23-S08 (process
+entrypoints and a first local run of the stack)**, needs no VPS and is the step
+that turns the components into a running system.
 
 From this host the NSE files the data stories need are reachable (bhavcopy,
 surveillance lists, price bands, index closes, the F&O ban list, corporate

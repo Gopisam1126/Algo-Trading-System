@@ -172,17 +172,31 @@ paper trading has a record across more than one market regime.
 
 ## 5. Branch protection — set this once, in the GitHub UI
 
-CI cannot enforce itself. Under **Settings → Branches**, add a rule for `QA`
-and `PROD`:
+CI cannot enforce itself, and a direct push walks around every workflow. Under
+**Settings → Rules → Rulesets → New branch ruleset** (rulesets are free on a
+public repository), with enforcement **Active**:
 
-- ☑ Require status checks to pass — select **`CI gate`**
-- ☑ Require branches to be up to date before merging
-- ☑ Do not allow bypassing the above settings
-- ☑ Restrict who can push (the promotion workflow uses `GITHUB_TOKEN`)
+| Branch | Rules |
+|---|---|
+| `PROD` | ☑ Restrict updates - bypass list: the repository admin (the owner) only · ☑ Restrict deletions · ☑ Block force pushes |
+| `QA` | ☑ Restrict deletions · ☑ Block force pushes |
+| `DEV` | ☑ Restrict deletions · ☑ Block force pushes |
 
-Without this, the promotion workflow is advisory: someone can still push
-directly to `QA`. **This is the single highest-value five minutes of setup in
-this document** — everything else is automation that a direct push walks around.
+**Do not require the `CI gate` status check on a branch `scripts/promote.py`
+pushes to.** A required status check refuses a push of any commit that has not
+already passed it on another ref, and every promotion is a fresh commit (QA's
+tree is DEV's minus the stripped paths), so QA would refuse every promotion. CI
+is enforced where it can be instead: `promote.py` refuses unless CI passed DEV's
+exact head commit, and QA's own CI run follows every promotion. When PROD
+promotion is enabled, add the workflow's actor to PROD's bypass list.
+
+(Corrected 23 Nov 2026. This section asked for the status check, "up to date
+before merging" and "no bypass" on QA and PROD - rules written for pull-request
+merges, which this pipeline does not use.)
+
+Without this, someone can still push directly to `PROD`. **This is the single
+highest-value five minutes of setup in this document** — everything else is
+automation that a direct push walks around.
 
 ---
 

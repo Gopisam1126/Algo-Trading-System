@@ -1079,7 +1079,7 @@ else was examined. Verified sound, with probes rather than by reading:
 | B10 hosting | ⚠️ **Open (HAL-001); researched 21 Nov 2026 - self-hosting supported.** NSE standard I(h) ("hosted on brokers' cloud servers") is a broker obligation; NSE's FAQ (3 Nov 2025, Q5) has a tech-savvy client host "at their end", Zerodha staff allow any cloud from the registered IP, and no text puts a client's server in India. Residual: NSE/INVG/73992 restates I(h) without Q5. India-region hosting is this system's own rule. Needs Zerodha in writing; B6 need not wait |
 | B5 daily login | ⚠️ Needs real credentials |
 | B6 static IP | 🔍 **Order endpoints only** — does not block development |
-| B8 NSE data access | 🔍 Same fix as B6; `scripts/check_data_reachability.py` answers it in one command |
+| B8 NSE data access | 🔍 **Not a VPS question for development** (23 Nov 2026): from the dev host, an Indian ISP, NSE's home page answers 403 but every endpoint the data stories need answers with browser headers and no cookie - bhavcopy (UDiFF), ASM/GSM, F&O ban, price bands, equity master, index closes, corporate actions, event calendar, FII/DII. `scripts/check_data_reachability.py` re-checks it on the production host |
 
 `make doctor` reports all of this at runtime.
 

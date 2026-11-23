@@ -412,27 +412,36 @@ Thirteen containers on one India-region host.
            │                  │                   │
 ┌──────────▼──────────────────▼───────────────────▼───────────────────┐
 │                    MESSAGE / STATE FABRIC                            │
-│  Redis 7 — Streams (durable events) · Hashes (state) · ZSets (timers)│
-└──────────┬──────────┬──────────┬──────────┬─────────────────────────┘
-           │          │          │          │
-   ┌───────▼──┐ ┌─────▼────┐ ┌───▼──────┐ ┌─▼──────────────┐
-   │ market-  │ │ ti-      │ │ signal-  │ │ execution-svc  │
-   │ ingest   │ │ engine   │ │ engine   │ │                │
-   │          │ │          │ │          │ │ RiskEngine     │
-   │ read-only│ │ no net   │ │ AI calls │ │ PositionMgr    │
-   │ creds    │ │ access   │ │ read-only│ │ OrderGateway   │
-   └──────────┘ └──────────┘ └──────────┘ │ ◄── ONLY service│
-                                          │  with trading   │
-   ┌──────────┐ ┌──────────┐ ┌──────────┐ │  credentials    │
-   │ macro-svc│ │ premarket│ │ strategy-│ └────────┬────────┘
-   │ slow loop│ │ -job     │ │ svc      │          │
-   └──────────┘ └──────────┘ └──────────┘   ┌──────▼──────┐
-                                            │   BROKER    │
-   ┌───────────────────────────────────┐    └─────────────┘
+│  Redis 7 — Streams (durable events) · Hashes (state) · halt latches  │
+└──────────┬──────────┬───────────┬───────────────────────────────────┘
+           │          │           │
+   ┌───────▼──┐ ┌─────▼───────┐ ┌─▼──────────────┐
+   │ market-  │ │ signal-     │ │ execution-svc  │
+   │ ingest   │ │ engine      │ │                │
+   │          │ │ indicators, │ │ RiskEngine     │
+   │ read-only│ │ strategies, │ │ PositionMgr    │
+   │ creds    │ │ AI calls    │ │ OrderGateway   │
+   └──────────┘ └─────────────┘ │ ◄── ONLY service│
+                                │  with trading   │
+   ┌──────────┐ ┌──────────┐    │  credentials    │
+   │ macro-svc│ │ premarket│    └────────┬────────┘
+   │ slow loop│ │ -job     │             │
+   └──────────┘ └──────────┘      ┌──────▼──────┐
+   ┌──────────┐                   │   BROKER    │
+   │ strategy-│                   └─────────────┘
+   │ svc      │
+   └──────────┘
+   ┌───────────────────────────────────┐
    │  TimescaleDB — OHLCV, orders,     │
    │  positions, audit log, journal    │
    └───────────────────────────────────┘
 ```
+
+There is no `ti-engine`: the indicator engine runs inside `signal-engine`, in
+the strategy loop (E13-S01), and the service is gone from compose and from the
+health roster. The square-off timer keeps no sorted set either; it sweeps the
+position book each second (E15-S06). Both corrected 23 Nov 2026 - this diagram
+and the table below showed the earlier design.
 
 ### 6.1 Service responsibilities
 
@@ -440,8 +449,7 @@ Thirteen containers on one India-region host.
 |---|---|---|---|---|
 | `orchestrator` | Always | Lifecycle, scheduling, kill switch, health | No | No |
 | `market-ingest` | Market hours | WebSocket, tick cleaning, bar construction | No | No |
-| `ti-engine` | Market hours | Incremental indicators per symbol per timeframe | No | No |
-| `signal-engine` | Trading window | Strategy evaluation, AI confirmation | No | Sonnet |
+| `signal-engine` | Trading window | Incremental indicators per symbol per timeframe, strategy evaluation, AI confirmation | No | Sonnet |
 | `execution-svc` | Market hours | Risk checks, sizing, orders, positions, reconciliation | **Yes (only)** | No |
 | `macro-svc` | 06:00–16:00 | News, sentiment, macro → Market Context | No | Haiku |
 | `premarket-job` | 05:30–09:15 | Historical analysis, scoring, daily plan | No | Opus |
@@ -529,7 +537,8 @@ Recommendation  ← NO quantity, NO stop price, NO rupees
                        ↓
    Stop placement failed? → CLOSE AT MARKET (naked position never acceptable)
                        ↓
-   Register square-off deadline in timer ZSET
+   Square-off deadline stored on the position; the exit timer sweeps the book
+   every second and exits each position at its own deadline (E15-S06)
 ```
 
 **On ambiguous failure (timeout, 5xx): QUERY, never retry.** The deterministic
@@ -751,7 +760,9 @@ control:killswitch              STR    ACTIVE | INACTIVE
 control:health:{service}        STR    heartbeat, TTL 30s
 lock:slot:{i} · lock:symbol:{s} STR    SET NX PX — all with TTL
 ratelimit:orders                STR    token bucket
-timer:squareoff                 ZSET   symbol → deadline epoch
+timer:squareoff                 ZSET   defined in keys.py and UNUSED - the exit
+                                       timer reads each position's own deadline
+                                       (E15-S06; corrected 23 Nov 2026)
 ```
 
 **Streams, not Pub/Sub, for anything that must not be lost.** Pub/Sub is
@@ -972,8 +983,8 @@ India-only deployment region.
    mounted ONLY into execution-svc
               │
    market-ingest ─┐            │
-   ti-engine     ─┤ read-only  │ full trading
-   signal-engine ─┤ data creds │ credentials
+   signal-engine ─┤ read-only  │ full trading
+                  │ data creds │ credentials
    macro-svc     ─┤            │
    premarket-job ─┘            ▼
                         execution-svc ──→ Broker
@@ -1241,8 +1252,9 @@ notify-egress                   egress-filtered to Telegram/SMTP
 ### 18.2 Startup order
 
 `redis` + `timescaledb` → `orchestrator` (migrations, config validation) →
-`execution-svc` (auth, reconcile) → `ti-engine` (warm-up) → `market-ingest` →
-`signal-engine` → `api-server`, `notifier`.
+`execution-svc` (auth, reconcile) → `market-ingest` → `signal-engine`
+(indicator warm-up, then the strategy loop - there is no `ti-engine`) →
+`api-server`, `notifier`.
 
 The orchestrator will not transition to `TRADING` until every service reports
 ready.
