@@ -612,6 +612,20 @@ Recorded because each was believed, written down, and wrong.
 - **"A backfill can reach back as far as the exchange's archive."** Only as far
   as the holiday calendar covers: it refuses an uncovered year rather than guess
   its holidays, and a guessed holiday is a permanent gap. 2026 today.
+- **"A command's test runs the command."** Not when it calls `main()` in the
+  test process: `tests/conftest.py` sets the Windows event-loop policy for the
+  whole session, so the bhavcopy command passed its test while, run as an
+  operator runs it, it crashed at its first query - it never set the policy
+  itself (SIT-011, found by a dry run of the SIT harness). Its test now runs it
+  as a process of its own, and `tests/security/test_service_entrypoints.py`
+  holds every database entrypoint to setting the policy before its loop. *A
+  test process is not a neutral host: what its conftest configures, every
+  in-process test inherits.*
+- **"The sync reports what it wrote."** It logged `upserted=-1` for the real
+  10,338-row dump, all of which landed: the driver's rowcount was unknown. And
+  the upsert is ONE statement - 51,690 bound parameters today against
+  PostgreSQL's 65,535, so the two columns E07-S07 plans to add would fail every
+  morning's sync. Chunk it as `bulk_upsert` does (SIT-012, in E07-S07).
 
 - **E07-S01 base universe** — `premarket/universe.py`. `universe.base` (now a
   Literal) is a Nifty 50/100/200/500 constituent file from niftyindices.com

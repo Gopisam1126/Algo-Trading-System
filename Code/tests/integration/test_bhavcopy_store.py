@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import os
+import subprocess
+import sys
 import zipfile
 from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
 
 import psycopg
 import pytest
@@ -207,18 +209,6 @@ async def test_the_master_is_read_from_the_table(factory) -> None:
     assert {"INFY", "HFCL-BE", "EMBASSY-RR"} <= master
 
 
-@pytest.fixture(scope="module")
-def backfill() -> Any:
-    import importlib.util
-
-    path = Path(__file__).resolve().parents[2] / "scripts" / "backfill_bhavcopy.py"
-    spec = importlib.util.spec_from_file_location("backfill_bhavcopy", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.fixture
 def deployed_seeded(deployed_database: dict[str, str]) -> Iterator[dict[str, str]]:
     before = _seed(deployed_database["owner"])
@@ -227,33 +217,45 @@ def deployed_seeded(deployed_database: dict[str, str]) -> Iterator[dict[str, str
 
 
 class TestTheCommand:
-    """``scripts/backfill_bhavcopy.py`` end to end, under the login production
-    runs it as - the services' login, created by the real first-init script -
-    not ``SET ROLE`` on the owner's connection, which proves grants and not
-    what a login gets (audit SEC-002)."""
+    """``scripts/backfill_bhavcopy.py`` end to end, as an operator runs it: a
+    process of its own, under the login production runs it as - the services'
+    login, created by the real first-init script - not ``SET ROLE`` on the
+    owner's connection, which proves grants and not what a login gets (audit
+    SEC-002).
+
+    A process of its own because this one is not neutral: ``tests/conftest.py``
+    sets the Windows event-loop policy for the whole session. Run in-process,
+    the command passed here while, run on its own, it crashed at its first
+    query - it had never set the policy itself (SIT-011)."""
 
     @staticmethod
-    def _run(backfill: Any, monkeypatch: pytest.MonkeyPatch, url: str, archive: Path) -> int:
-        monkeypatch.setenv("DATABASE_URL", url)
+    def _run(url: str, archive: Path) -> subprocess.CompletedProcess[str]:
+        script = Path(__file__).resolve().parents[2] / "scripts" / "backfill_bhavcopy.py"
         argv = ["--start", "2026-11-20", "--end", "2026-11-20", "--archive", str(archive)]
-        return int(backfill.main([*argv, "--offline"]))
+        return subprocess.run(  # a fixed command: this interpreter, this repository's script
+            [sys.executable, str(script), *argv, "--offline"],
+            env={**os.environ, "DATABASE_URL": url},
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
 
-    def test_the_services_login_stores_the_day(
-        self, backfill, deployed_seeded, tmp_path, monkeypatch, capsys
-    ) -> None:
+    def test_the_services_login_stores_the_day(self, deployed_seeded, tmp_path) -> None:
         BhavcopyArchive(tmp_path).write(DAY, ZIP)
-        assert self._run(backfill, monkeypatch, deployed_seeded["svc"], tmp_path) == 0
+        done = self._run(deployed_seeded["svc"], tmp_path)
+        assert done.returncode == 0, done.stderr[-2000:]
         assert _count(deployed_seeded["owner"]) == 3722
-        assert "1 stored, 0 missing, 0 refused; 3722 bar(s) written" in capsys.readouterr().out
+        assert "1 stored, 0 missing, 0 refused; 3722 bar(s) written" in done.stdout
 
     def test_a_login_that_could_rewrite_the_record_is_refused(
-        self, backfill, deployed_seeded, tmp_path, monkeypatch, capsys
+        self, deployed_seeded, tmp_path
     ) -> None:
         """The owner runs the migrations and may UPDATE the audit trail; a
         command that writes what it reads from the internet does not run as it."""
         BhavcopyArchive(tmp_path).write(DAY, ZIP)
-        assert self._run(backfill, monkeypatch, deployed_seeded["owner"], tmp_path) == 2
+        done = self._run(deployed_seeded["owner"], tmp_path)
+        assert done.returncode == 2, done.stderr[-2000:]
         assert _count(deployed_seeded["owner"]) == 0
-        err = capsys.readouterr().err
-        assert "refused:" in err and "algotrader_svc" in err
-        assert "test_only_not_a_real_secret" not in err  # the refusal names no secret
+        assert "refused:" in done.stderr and "algotrader_svc" in done.stderr
+        assert "test_only_not_a_real_secret" not in done.stderr  # it names no secret

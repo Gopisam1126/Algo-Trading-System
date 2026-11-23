@@ -517,17 +517,58 @@ class TestTheLoader:
 
 
 class TestTheBackfill:
-    def test_only_sessions_are_asked_for_and_gaps_are_named(self, calendar, tmp_path) -> None:
+    def test_only_sessions_are_asked_for_and_gaps_are_named(
+        self, calendar, tmp_path, caplog
+    ) -> None:
         """16-23 Nov 2026: five sessions (the 21st and 22nd are a weekend); the
-        19th has no file."""
+        19th has no file - and the gap is logged, not only returned.
+
+        coverage.py reports the warning's line as unexecuted in this module while
+        the record below proves it ran (23 Nov 2026; a minimal coroutine does not
+        reproduce it) - hence an assertion on the behaviour, not on coverage."""
         sessions = [dt.date(2026, 11, d) for d in (16, 17, 18, 20, 23)]
         network = Network({d: _file(d) for d in sessions})
         loader = _loader(calendar, tmp_path, network, store=Store(frozenset(FILLER)))
-        report = asyncio.run(loader.backfill(dt.date(2026, 11, 16), dt.date(2026, 11, 23)))
+        with caplog.at_level("WARNING", logger="algotrader.premarket.bhavcopy"):
+            report = asyncio.run(loader.backfill(dt.date(2026, 11, 16), dt.date(2026, 11, 23)))
         assert network.asked == sorted([*sessions, dt.date(2026, 11, 19)])
         assert [r.day for r in report.of(DayOutcome.MISSING)] == [dt.date(2026, 11, 19)]
         assert len(report.of(DayOutcome.STORED)) == 5
         assert not report.ok
+        gaps = [r.getMessage() for r in caplog.records if "MISSING" in r.getMessage()]
+        assert gaps == ["bhavcopy 2026-11-19: MISSING - no file for 2026-11-19"]
+
+    def test_progress_hears_every_session_once_in_order_gaps_included(
+        self, calendar, tmp_path
+    ) -> None:
+        """What the command prints its per-day lines from. Covered until SIT-011
+        only by the command's in-process test - now a process of its own."""
+        sessions = [dt.date(2026, 11, d) for d in (16, 17, 18, 20)]
+        network = Network({d: _file(d) for d in sessions})
+        loader = _loader(calendar, tmp_path, network, store=Store(frozenset(FILLER)))
+        heard: list[Any] = []
+        report = asyncio.run(
+            loader.backfill(dt.date(2026, 11, 16), dt.date(2026, 11, 20), progress=heard.append)
+        )
+        assert heard == report.results
+        assert [(r.day.day, r.outcome) for r in heard] == [
+            (16, DayOutcome.STORED),
+            (17, DayOutcome.STORED),
+            (18, DayOutcome.STORED),
+            (19, DayOutcome.MISSING),
+            (20, DayOutcome.STORED),
+        ]
+
+    def test_the_report_counts_the_bars_the_store_wrote_and_no_others(
+        self, calendar, tmp_path
+    ) -> None:
+        """The command's summary line - 'N bar(s) written' - is this number."""
+        sessions = [dt.date(2026, 11, d) for d in (16, 17, 18, 20)]
+        store = Store(frozenset(FILLER))
+        loader = _loader(calendar, tmp_path, Network({d: _file(d) for d in sessions}), store=store)
+        report = asyncio.run(loader.backfill(dt.date(2026, 11, 16), dt.date(2026, 11, 20)))
+        assert store.stored == [len(FILLER)] * 4  # the 19th, MISSING, wrote nothing
+        assert report.bars == 4 * len(FILLER)
 
     def test_a_rerun_reads_the_archive_and_fetches_nothing(self, calendar, tmp_path) -> None:
         sessions = [dt.date(2026, 11, d) for d in (16, 17, 18)]

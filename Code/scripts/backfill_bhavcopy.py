@@ -130,6 +130,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("no database: pass --database-url or set DATABASE_URL")
     if args.end < args.start:
         parser.error(f"--end {args.end} is before --start {args.start}")
+    from algotrader.common.db.eventloop import configure_event_loop_policy
+
+    # Before the loop exists, not inside it: on Windows asyncio.run builds a
+    # ProactorEventLoop, which async psycopg refuses at the first query. The
+    # test process sets this for itself (tests/conftest.py), so only a run in a
+    # process of its own shows whether the command does (SIT-011).
+    configure_event_loop_policy()
     return asyncio.run(_run(args))
 
 
