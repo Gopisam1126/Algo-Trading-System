@@ -129,7 +129,7 @@ package has a `__main__`, so no service runs as a process yet (E23-S03).
 | `strategy/` | Components | the strategy language, 27 primitives and their evaluators, the approval-gated registry, the trial registry |
 | `signals/` | Components | the strategy loop and bar source; its LIVE/PAPER routes end at a port the AI review will fill |
 | `execution/` | Components, composed in one service object | 14-check risk engine, sizer, slots, halts and loss latch, order gateway and state machine, protective stops, position book, reconciliation, exit timer, autonomy gate, day ledger, end-of-day verdict and statistics, execution service |
-| `premarket/` | Component | the base universe (Nifty 50/100/200/500, F&O stocks or a custom list, resolved against the instrument master); no pipeline yet |
+| `premarket/` | Components | the base universe (Nifty 50/100/200/500, F&O stocks or a custom list, resolved against the instrument master); NSE's daily bhavcopy stored as daily bars, with an archive and a backfill command; no pipeline yet |
 | `ai/` `macro/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
 
 **What stands between this and a paper session:** the AI review and the
@@ -147,7 +147,7 @@ All times IST. The right-hand column is today's state.
 
 | Time | Step | What happens | State |
 |---|---|---|---|
-| 05:30 | Data sync | Instrument master; bhavcopy (end-of-day prices); corporate actions; hazard lists - ASM/GSM surveillance, T2T, F&O ban, circuit bands, CAS scope | instrument sync ✅ · rest ⬜ (E03, E04) |
+| 05:30 | Data sync | Instrument master; bhavcopy (end-of-day prices); corporate actions; hazard lists - ASM/GSM surveillance, T2T, F&O ban, circuit bands, CAS scope | instrument sync ✅ · bhavcopy ✅ (E03-S01; the 05:30 schedule is E11-S02) · rest ⬜ (E03, E04) |
 | 06:30 | Universe | The base universe (Nifty 200 by default), then hard filters (T2T, surveillance, bans, bands, price, volume, market cap, range, spread) | base universe ✅ (E07-S01) · filters ⬜ (E07-S02) |
 | 07:00 | Broker login | The owner logs in to Zerodha once a day, by hand - an exchange rule; the system cannot do it unattended | auth code 🟡 · login helper ⬜ |
 | 07:30 | Multi-timeframe analysis | Weekly, daily and hourly indicators for the eligible universe | ⬜ (E11-S04) |
@@ -249,7 +249,7 @@ Code/
                  protective_stop, positions, reconciliation, squareoff,
                  day_ledger, day_stats, end_of_day, charges, live_inputs,
                  session_context, autonomy, loss_latch, service
-    premarket/   universe (base universe)
+    premarket/   universe (base universe), bhavcopy (daily bars from NSE's file)
     ai/ macro/ orchestrator/ api/ notifier/     (empty)
   config/        system.yaml, strategies/*.yaml, nse_holidays.yaml
   migrations/    Alembic migrations (the schema's history)

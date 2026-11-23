@@ -18,6 +18,13 @@ safety-critical task unimplementable as written.
 > `gsm_stage` and `asm_category`, wired through the repository in both
 > directions.
 >
+> **Built 23 Nov 2026: `E03-S01`** - `premarket/bhavcopy.py` reads the UDiFF
+> bhavcopy (the legacy path is retired) strictly, per §5.1: the exact header,
+> every row's own trade date, a row floor and the master's resolution share;
+> one bad row refuses the file. `scripts/backfill_bhavcopy.py` back-fills a
+> range from an on-disk archive, politely. The backfill reaches only years the
+> holiday file covers (2026 today); 2024-2025 need their holiday lists first.
+>
 > **What is still Sprint 2 work:** the corporate action *feed* (`E03-S02`
 > task 1). The deferral reasoning in §9 still applies to it unchanged — it
 > should inherit `E04-S06`'s fetcher rather than build one under time

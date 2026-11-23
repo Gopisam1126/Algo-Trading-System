@@ -147,7 +147,7 @@ refuses every entry at L0-L3 until the approval flow (E16-S03) and the envelope
 | `strategy/` | Components | the DSL, 27 primitives and their evaluators, the tri-state runtime, the approval-gated registry |
 | `signals/` | Components | the strategy loop and bar source (E13-S01); its LIVE/PAPER routes end at a port |
 | `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, exit timer (time and target exits), autonomy gate, day ledger, end-of-day verdict and statistics, execution service |
-| `premarket/` | Component | the base universe (E07-S01): a Nifty 50/100/200/500 constituent file, the F&O stock universe or a custom list, resolved against the instrument master; no pipeline yet |
+| `premarket/` | Components | the base universe (E07-S01): a Nifty 50/100/200/500 constituent file, the F&O stock universe or a custom list, resolved against the instrument master; the NSE bhavcopy as daily bars, archived and back-filled (E03-S01); no pipeline yet |
 | `ai/` `macro/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
 
 "Components" means built and tested on their own and against each other in
@@ -159,8 +159,9 @@ The AI review and the Recommendation emitter (E13-S03/S04, which need the
 Anthropic client, E10-S01); a market context with a regime (E09); the day's
 locked plan (E11-S08); a news source (the shipped `orb_classic`, which now
 asks only for 15m/1h agreement - audit TRD-014 - enters only when no material
-news landed, and nothing reports news yet); daily and intraday bars (E03 -
-E03-S01 is blocked by B8); and the entrypoints (E23-S03). The backlog tracker is the authority on each item's state.
+news landed, and nothing reports news yet); the morning run that keeps daily
+bars current (E11-S02 - E03-S01 loads them from NSE's bhavcopy) and intraday
+history (E03-S03); and the entrypoints (E23-S03). The backlog tracker is the authority on each item's state.
 
 ### 2.4 The gap that had been invisible
 
@@ -1392,7 +1393,7 @@ passing tests. Cheap now, annoying to retrofit.
 | B5 | Daily login procedure | ⚠️ Needs your credentials | Unattended operation |
 | B6 | Static IP not procured | 🔍 Research done, procurement needs you | **Order endpoints only** |
 | B7 | `kiteconnect` pins a vulnerable `autobahn` | ✅ **Closed 24 Aug 2026** | — |
-| B8 | NSE blocks programmatic access | 🔍 Same fix as B6 | E03-S01, all of E04 |
+| B8 | NSE data access from the host | 🔍 **Not a VPS question for development** (23 Nov 2026) - every endpoint the data stories need answers from the development host (§22.2); `scripts/check_data_reachability.py` re-checks the production host | The production host's pre-market data only |
 | D1 | Secrets backend (SOPS → Vault) | Deferred | — |
 | D2 | Equity only, or F&O? | **Recommend equity first** | Scope |
 | D3 | Capital amount | ₹5L assumed | Slot sizing |
@@ -1421,14 +1422,19 @@ elections, not part of the annual circular. Both are real. **When sources
 disagree, the disagreement usually encodes something; resolve it rather than
 picking a side.**
 
-### 22.2 B6 and B8 are one problem
+### 22.2 B6 and B8 meet at the production host
 
-What NSE blocks is **overseas** access, not programmatic access as such. SEBI
-already requires the order path to originate from a single static,
-broker-whitelisted IP, and this system's own rule puts it in an India region —
-so one host answers both the compliance requirement and the data-reachability
-question (B10's research, 21 Nov 2026, supports self-hosting). `scripts/check_data_reachability.py`
-makes that a one-command check on the day there is a host.
+Measured 23 Nov 2026 from the development host (an Indian ISP): NSE's home page
+answers 403, and every endpoint the data stories need - the UDiFF bhavcopy,
+ASM/GSM, the F&O ban list, price bands, the equity master, index closes,
+corporate actions, the event calendar, FII/DII - answers with browser headers
+and no cookie. So B8 does not hold up development: E03-S01 was built and
+verified against NSE's live archive. What remains is the production host. SEBI
+requires the order path to originate from a static, broker-whitelisted IP, and
+this system's own rule puts that host in an India region (B10's research,
+21 Nov 2026, supports self-hosting). Whether NSE treats a datacentre address as
+it treats this ISP is unmeasured; `scripts/check_data_reachability.py` answers
+it in one command on the day there is a host.
 
 Confirmed from Zerodha's developer forum, and it unblocks a great deal:
 **the static IP applies to ORDER ENDPOINTS ONLY.** WebSocket market data, the

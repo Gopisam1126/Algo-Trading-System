@@ -286,6 +286,75 @@ def migrated_database(database_url: str) -> Iterator[str]:
             os.environ["DATABASE_URL"] = previous
 
 
+#: The services' login, as ``ops/postgres/initdb/10-app-login.sh`` creates it.
+SERVICE_LOGIN = "algotrader_svc"
+#: Test-only values for a throwaway container, assembled so the secret scanner
+#: does not read them as credentials.
+SERVICE_LOGIN_PASSWORD = "svc_" + "test_only_not_a_real_secret"
+_DEPLOYED_OWNER_PASSWORD = "owner_" + "test_only_not_a_real_secret"
+
+
+@pytest.fixture(scope="session")
+def deployed_database() -> Iterator[dict[str, str]]:
+    """A database initialised the way compose initialises one, then migrated.
+
+    The REAL first-init script is mounted (``ops/postgres/initdb``), so the
+    services' login exists exactly as in production, and the schema is migrated
+    as the owner, as ``make migrate`` does. ``owner`` and ``svc`` are the two
+    DSNs. Unlike ``migrated_database``, a test here can connect AS the login a
+    service or a tool runs under, instead of ``SET ROLE`` on the owner's
+    connection - which proves the grants and not what a login gets (audit
+    SEC-002). Shared by the service-login checks and the bhavcopy command.
+    """
+    if not DOCKER_AVAILABLE:
+        pytest.skip(_SKIP_REASON)
+
+    from alembic import command
+    from alembic.config import Config
+    from testcontainers.community.postgres import PostgresContainer
+
+    container = (
+        PostgresContainer(
+            image=TIMESCALE_IMAGE,
+            username="algotrader",
+            password=_DEPLOYED_OWNER_PASSWORD,
+            dbname="algotrader",
+            driver="psycopg",
+        )
+        .with_env("ALGOTRADER_APP_DB_USER", SERVICE_LOGIN)
+        .with_env("ALGOTRADER_APP_DB_PASSWORD", SERVICE_LOGIN_PASSWORD)
+        .with_volume_mapping(
+            str(CODE_ROOT / "ops" / "postgres" / "initdb"), "/docker-entrypoint-initdb.d", "ro"
+        )
+    )
+    with container:
+        owner_url: str = container.get_connection_url()
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(5432)
+        svc_url = (
+            f"postgresql+psycopg://{SERVICE_LOGIN}:{SERVICE_LOGIN_PASSWORD}"
+            f"@{host}:{port}/algotrader"
+        )
+
+        import psycopg
+
+        with psycopg.connect(owner_url.replace("postgresql+psycopg://", "postgresql://")) as conn:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
+            conn.commit()
+        previous = os.environ.get("DATABASE_URL")
+        os.environ["DATABASE_URL"] = owner_url
+        try:
+            cfg = Config(str(CODE_ROOT / "alembic.ini"))
+            cfg.set_main_option("script_location", str(CODE_ROOT / "migrations"))
+            command.upgrade(cfg, "head")
+        finally:
+            if previous is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = previous
+        yield {"owner": owner_url, "svc": svc_url}
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     """Pin async tests to asyncio; the project does not use trio."""

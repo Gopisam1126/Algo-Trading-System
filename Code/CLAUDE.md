@@ -166,7 +166,8 @@ the gateway are unbuilt: no process entrypoint
 `__main__` - no service does yet). Every live risk input now has a producer -
 health from heartbeats (E20-S05), ATR, margin and correlations (E15-S14) - but
 each reads a source nothing fills in production yet: heartbeats from seven
-services that have no process, and daily bars (E03). So the production engine
+services that have no process, and daily bars, which E03-S01 loads from NSE's
+bhavcopy but nothing yet runs each morning (E11-S02). So the production engine
 still rejects every signal, now for reasons it names. Paper mode exists
 (E15-S10): a simulated Kite client behind the real adapter, so a paper session
 runs the code that trades. Strategies persist (E12-S01): an immutable document
@@ -593,6 +594,25 @@ Recorded because each was believed, written down, and wrong.
   it terminal, then sends a protected MARKET exit and marks the position
   `ExitingPosition(reason=TIME)`. No Redis sorted set: that would be a second
   copy of the deadline, and a missed add is a position with no time exit.
+- **E03-S01 bhavcopy** — `premarket/bhavcopy.py`: NSE's UDiFF capital-market
+  file per session (`nsearchives.nseindia.com/content/cm/...`), parsed strictly
+  (exact header, every row's own `TradDt`, at least 1,000 rows, 80% of EQ rows
+  in the master; one bad row refuses the file) into `1d` bars at the 09:15 IST
+  open, stored through `bulk_upsert`; the raw zip archived on disk once it has
+  parsed. `scripts/backfill_bhavcopy.py` back-fills a range, at most one request
+  a second, `--offline` from the archive only, and only as the services' login:
+  it makes `require_least_privilege` first, as every service entrypoint does,
+  because it writes what it reads from the internet. The calendar decides what
+  is a session: a 404 on a session is MISSING, reported - never read as a holiday.
+
+- **"A file the exchange publishes is a session's file."** Not on Muhurat:
+  NSE publishes a bhavcopy for the Diwali special session (8 Nov 2026), and the
+  calendar stands the system down that day - so the backfill skips it, or an
+  hour-long session would sit in the daily ranges ATR is built from.
+- **"A backfill can reach back as far as the exchange's archive."** Only as far
+  as the holiday calendar covers: it refuses an uncovered year rather than guess
+  its holidays, and a guessed holiday is a permanent gap. 2026 today.
+
 - **E07-S01 base universe** — `premarket/universe.py`. `universe.base` (now a
   Literal) is a Nifty 50/100/200/500 constituent file from niftyindices.com
   (or NSE's archive, which serves the same bytes, when it answers HTML - SIT-010),
@@ -1094,8 +1114,8 @@ a Recommendation on `stream:signals` (E13-S03 AI review - which needs the
 Anthropic client, E10-S01 - and E13-S04 emission), a market context with a
 regime (E09), the day's locked plan (E11-S08), a news source (the shipped
 `orb_classic` enters only when no material news landed, so it never fires until
-one reports), daily and intraday bars (E03 -
-E03-S01 is blocked by B8, NSE refusing this host), and the process
+one reports), the morning run that keeps daily bars current (E11-S02 -
+E03-S01 loads them) and intraday history (E03-S03), and the process
 entrypoints (E23-S03). That vertical slice is the first thing that would be
 evidence about the system rather than its parts.
 

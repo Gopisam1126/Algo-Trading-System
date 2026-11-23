@@ -39,9 +39,13 @@ CONTAINER_FIXTURES = (
     "redis_container",
     "redis_url",
     "redis_client",
-    # A module may start its OWN container rather than share the session's -
-    # test_service_login.py does, because it needs the first-init script
-    # mounted (18 Nov 2026). Constructing one needs Docker just the same.
+    # The database with the first-init script mounted, so the services' login
+    # exists (tests/conftest.py). test_service_login.py started its own from
+    # 18 Nov 2026; shared since 23 Nov 2026, when the bhavcopy command's test
+    # needed to run AS that login too.
+    "deployed_database",
+    # A module may still start its OWN container rather than share one.
+    # Constructing one needs Docker just the same.
     "PostgresContainer(",
     "RedisContainer(",
 )
