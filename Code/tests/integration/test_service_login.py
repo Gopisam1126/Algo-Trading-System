@@ -6,18 +6,15 @@ service gets, because the services did not connect as algotrader_app at all:
 they connected as the bootstrap user that owns the tables, for whom every one
 of those grants was irrelevant.
 
-So this module starts its own TimescaleDB with the REAL first-init script
-mounted (``ops/postgres/initdb``), migrates it as the owner exactly as
-``make migrate`` does, and then connects with the DSN the services use -
+So it runs against ``deployed_database`` (``tests/conftest.py``): a TimescaleDB with the
+REAL first-init script mounted (``ops/postgres/initdb``), migrated as the owner
+exactly as ``make migrate`` does. It connects with the DSN the services use -
 a fresh login, no SET ROLE - and asks it to rewrite history.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
-from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -29,59 +26,10 @@ from algotrader.common.db import privilege
 from algotrader.common.db.engine import create_engine_from_url, open_service_engine
 from algotrader.common.db.models import APPEND_ONLY_TABLES
 from algotrader.common.db.privilege import LeastPrivilegeError, require_least_privilege
+from tests.conftest import SERVICE_LOGIN as SVC
+from tests.conftest import SERVICE_LOGIN_PASSWORD as SVC_PASSWORD
 
 pytestmark = [pytest.mark.integration]
-
-CODE = Path(__file__).resolve().parents[2]
-INITDB = CODE / "ops" / "postgres" / "initdb"
-SVC = "algotrader_svc"
-#: Test-only values for a throwaway container, assembled so the secret scanner
-#: does not read them as credentials.
-SVC_PASSWORD = "svc_" + "test_only_not_a_real_secret"
-OWNER_PASSWORD = "owner_" + "test_only_not_a_real_secret"
-
-
-@pytest.fixture(scope="module")
-def deployed() -> Iterator[dict[str, str]]:
-    """A database initialised the way compose initialises one, then migrated."""
-    from alembic import command
-    from alembic.config import Config
-    from testcontainers.community.postgres import PostgresContainer
-
-    from tests.conftest import TIMESCALE_IMAGE
-
-    container = (
-        PostgresContainer(
-            image=TIMESCALE_IMAGE,
-            username="algotrader",
-            password=OWNER_PASSWORD,
-            dbname="algotrader",
-            driver="psycopg",
-        )
-        .with_env("ALGOTRADER_APP_DB_USER", SVC)
-        .with_env("ALGOTRADER_APP_DB_PASSWORD", SVC_PASSWORD)
-        .with_volume_mapping(str(INITDB), "/docker-entrypoint-initdb.d", "ro")
-    )
-    with container:
-        owner_url: str = container.get_connection_url()
-        host = container.get_container_host_ip()
-        port = container.get_exposed_port(5432)
-        svc_url = f"postgresql+psycopg://{SVC}:{SVC_PASSWORD}@{host}:{port}/algotrader"
-        with psycopg.connect(_plain(owner_url)) as conn:
-            conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
-            conn.commit()
-        previous = os.environ.get("DATABASE_URL")
-        os.environ["DATABASE_URL"] = owner_url
-        try:
-            cfg = Config(str(CODE / "alembic.ini"))
-            cfg.set_main_option("script_location", str(CODE / "migrations"))
-            command.upgrade(cfg, "head")
-        finally:
-            if previous is None:
-                os.environ.pop("DATABASE_URL", None)
-            else:
-                os.environ["DATABASE_URL"] = previous
-        yield {"owner": owner_url, "svc": svc_url}
 
 
 def _plain(url: str) -> str:
@@ -102,9 +50,9 @@ def _check(url: str) -> None:
 
 class TestTheFirstInitCreatesTheServicesLogin:
     def test_it_is_a_login_member_of_the_app_role_that_owns_nothing(
-        self, deployed: dict[str, str]
+        self, deployed_database: dict[str, str]
     ) -> None:
-        with psycopg.connect(_plain(deployed["owner"])) as conn:
+        with psycopg.connect(_plain(deployed_database["owner"])) as conn:
             row = conn.execute(
                 "SELECT r.rolcanlogin, r.rolsuper, r.rolinherit, "
                 "pg_has_role(r.rolname, 'algotrader_app', 'MEMBER'), "
@@ -134,14 +82,14 @@ class TestConnectedAsTheServicesNothingRewritesTheRecord:
             "VALUES ('x', repeat('0', 64), 'mallory')",
         ],
     )
-    def test_it_is_refused(self, deployed: dict[str, str], statement: str) -> None:
-        with psycopg.connect(_plain(deployed["svc"]), autocommit=True) as conn:
+    def test_it_is_refused(self, deployed_database: dict[str, str], statement: str) -> None:
+        with psycopg.connect(_plain(deployed_database["svc"]), autocommit=True) as conn:
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute(statement)
 
-    def test_the_control_it_can_do_its_job(self, deployed: dict[str, str]) -> None:
+    def test_the_control_it_can_do_its_job(self, deployed_database: dict[str, str]) -> None:
         """A login that could do nothing would pass every refusal above."""
-        with psycopg.connect(_plain(deployed["svc"]), autocommit=True) as conn:
+        with psycopg.connect(_plain(deployed_database["svc"]), autocommit=True) as conn:
             conn.execute("SELECT count(*) FROM decision_log").fetchone()
             row = conn.execute(
                 "SELECT has_table_privilege('decision_log', 'INSERT'), "
@@ -152,19 +100,19 @@ class TestConnectedAsTheServicesNothingRewritesTheRecord:
 
 
 class TestTheServicesRefuseALoginThatCould:
-    def test_the_services_login_passes(self, deployed: dict[str, str]) -> None:
-        _check(deployed["svc"])
+    def test_the_services_login_passes(self, deployed_database: dict[str, str]) -> None:
+        _check(deployed_database["svc"])
 
-    def test_the_owner_is_refused_and_told_why(self, deployed: dict[str, str]) -> None:
+    def test_the_owner_is_refused_and_told_why(self, deployed_database: dict[str, str]) -> None:
         with pytest.raises(LeastPrivilegeError) as refused:
-            _check(deployed["owner"])
+            _check(deployed_database["owner"])
         message = str(refused.value)
         assert "owns tables in the schema" in message
         assert "can DELETE from decision_log" in message
 
-    def test_a_member_of_the_owner_is_refused_too(self, deployed: dict[str, str]) -> None:
+    def test_a_member_of_the_owner_is_refused_too(self, deployed_database: dict[str, str]) -> None:
         """Owning nothing is not enough: membership in the owner inherits its rights."""
-        with psycopg.connect(_plain(deployed["owner"]), autocommit=True) as conn:
+        with psycopg.connect(_plain(deployed_database["owner"]), autocommit=True) as conn:
             conn.execute("DROP ROLE IF EXISTS qa_owner_member")
             # A utility statement takes no bind parameters; psycopg quotes the literal.
             conn.execute(
@@ -173,24 +121,24 @@ class TestTheServicesRefuseALoginThatCould:
                 )
             )
         try:
-            member = deployed["svc"].replace(f"{SVC}:", "qa_owner_member:")
+            member = deployed_database["svc"].replace(f"{SVC}:", "qa_owner_member:")
             with pytest.raises(LeastPrivilegeError, match="can UPDATE decision_log"):
                 _check(member)
         finally:
-            with psycopg.connect(_plain(deployed["owner"]), autocommit=True) as conn:
+            with psycopg.connect(_plain(deployed_database["owner"]), autocommit=True) as conn:
                 conn.execute("DROP ROLE qa_owner_member")
 
     def test_open_service_engine_refuses_the_owners_dsn(
-        self, deployed: dict[str, str], monkeypatch: pytest.MonkeyPatch
+        self, deployed_database: dict[str, str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("DATABASE_URL", deployed["owner"])
+        monkeypatch.setenv("DATABASE_URL", deployed_database["owner"])
         with pytest.raises(LeastPrivilegeError):
             asyncio.run(open_service_engine(DatabaseConfig()))
 
     def test_open_service_engine_returns_an_engine_for_the_services_login(
-        self, deployed: dict[str, str], monkeypatch: pytest.MonkeyPatch
+        self, deployed_database: dict[str, str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("DATABASE_URL", deployed["svc"])
+        monkeypatch.setenv("DATABASE_URL", deployed_database["svc"])
 
         async def run() -> Any:
             engine = await open_service_engine(DatabaseConfig())

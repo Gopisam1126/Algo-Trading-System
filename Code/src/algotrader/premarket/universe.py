@@ -81,6 +81,7 @@ __all__ = [
     "build_base_universe",
     "fetch_index_file",
     "fno_underlyings",
+    "kite_tradingsymbol",
     "load_base_universe",
     "parse_constituents",
     "reconstitution",
@@ -141,6 +142,16 @@ _ISIN = re.compile(r"IN[A-Z0-9]{9}[0-9]")
 _PLACEHOLDER_ISIN = re.compile(r"DUM[A-Z0-9]{9}")
 
 
+def kite_tradingsymbol(symbol: str, series: str) -> str:
+    """NSE's (symbol, series) as Kite names it: ``INFY`` for EQ, ``HFCL-BE`` otherwise.
+
+    One definition for every NSE file this system reads - the index lists here,
+    the bhavcopy (``premarket/bhavcopy.py``) - so two readers cannot disagree on
+    which instrument a row is (verified against Kite's NSE list, 22 Nov 2026).
+    """
+    return symbol if series == "EQ" else f"{symbol}-{series}"
+
+
 class UniverseSourceError(ValueError):
     """The input to the universe is not one that can be trusted. Never partial."""
 
@@ -156,7 +167,7 @@ class Constituent:
     @property
     def tradingsymbol(self) -> str:
         """Kite's symbol: the bare symbol for EQ, ``SYMBOL-SERIES`` otherwise."""
-        return self.symbol if self.series == "EQ" else f"{self.symbol}-{self.series}"
+        return kite_tradingsymbol(self.symbol, self.series)
 
     @property
     def is_placeholder(self) -> bool:
