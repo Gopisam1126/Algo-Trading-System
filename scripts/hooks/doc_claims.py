@@ -40,6 +40,9 @@ DOCUMENTS = [
         "VERIFICATION_REPORT",
         "PRE_LIVE_CHECKLIST",
         "DEPLOYMENT",
+        # The one-document overview (23 Nov 2026). It restates status, so it is
+        # held to the same claims - an overview is where a stale claim is READ.
+        "PROJECT_GUIDE",
     )
 ]
 
