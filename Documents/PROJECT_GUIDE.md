@@ -727,7 +727,7 @@ From the tracker on 23 Nov 2026, each open story classified by what it needs:
 | Done (QA-Success or Closed) | 81 of 216 | - |
 | Can be **completed now**, with nothing from the owner | 86 | ~113 |
 | Can be **built now**; one real-world check needs an owner item | 28 | ~42 |
-| **Needs an owner item to start** (13 of them only a decision on news sources) | 20 | ~26 |
+| **Needs an owner item to start** (12 of them wait only on decisions about news sources) | 20 | ~26 |
 | Cancelled but still marked New (E21-S01) | 1 | - |
 
 From this host the NSE files the data stories need are reachable (bhavcopy,
