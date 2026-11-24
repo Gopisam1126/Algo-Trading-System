@@ -155,26 +155,31 @@ class InstrumentDailyStatus(_Frozen):
     carries punitive margins, and ``is_cas_stock`` determines the square-off
     deadline.  Refreshed every morning by the pre-market job.
 
+    A flag is ``None`` until its source has reported for the day - the table's
+    own rule since E04-S01 - and ``None`` is never clean: a default of ``False``
+    here would be the "unknown reads as fine" defect the table had.
+
     See INDIA_FEATURES_AND_CONFIG.md §2.2.
     """
 
     symbol: str
     trade_date: datetime
-    is_t2t: bool = False
-    is_asm: bool = False
-    is_gsm: bool = False
-    is_fno_ban: bool = False
-    is_cas_stock: bool = False  # drives the square-off deadline
+    is_t2t: bool | None = None
+    is_asm: bool | None = None
+    is_gsm: bool | None = None
+    is_fno_ban: bool | None = None
+    is_cas_stock: bool | None = None  # drives the square-off deadline
     circuit_band_pct: Decimal | None = None
     upper_circuit: Price | None = None
     lower_circuit: Price | None = None
-    has_earnings_today: bool = False
+    has_earnings_today: bool | None = None
 
     @property
     def intraday_permitted(self) -> bool:
         """Hard gate.  A False here removes the symbol from the universe
-        entirely, before any scoring happens."""
-        return not (self.is_t2t or self.is_asm or self.is_gsm)
+        entirely, before any scoring happens. Only a flag a source reported
+        as ``False`` permits; an unreported one does not."""
+        return self.is_t2t is False and self.is_asm is False and self.is_gsm is False
 
 
 class IndicatorSnapshot(_Frozen):

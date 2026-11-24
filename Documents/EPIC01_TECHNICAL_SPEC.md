@@ -437,31 +437,42 @@ CREATE INDEX ix_instruments_sector ON instruments (sector) WHERE is_active;
 -- instrument_daily_status: the India hazard flags, per symbol PER DAY (BR-8).
 -- History matters: a backtest must know whether a symbol was in ASM on the
 -- day being simulated, not whether it is today.
+--
+-- Every flag is NULL until ITS source has reported for that day (E04-S01,
+-- migration 9c2f4e6a1b70, 24 Nov 2026). The lists come from separate sources
+-- (surveillance roster, T2T, F&O ban, CAS scope, earnings); with NOT NULL
+-- DEFAULT FALSE - this table's first design - the first source to write a
+-- day's row also wrote "checked and clean" for every flag nobody checked.
+-- Every reader treats NULL as restricted; each source writes only its columns.
 -- ---------------------------------------------------------------------------
 CREATE TABLE instrument_daily_status (
     symbol_id           INTEGER      NOT NULL REFERENCES instruments(id),
     trade_date          DATE         NOT NULL,
-    is_t2t              BOOLEAN      NOT NULL DEFAULT FALSE,
-    is_asm              BOOLEAN      NOT NULL DEFAULT FALSE,
-    is_gsm              BOOLEAN      NOT NULL DEFAULT FALSE,
-    is_fno_ban          BOOLEAN      NOT NULL DEFAULT FALSE,
-    is_cas_stock        BOOLEAN      NOT NULL DEFAULT FALSE,   -- drives deadline
+    is_t2t              BOOLEAN,     -- NULL = not reported = restricted
+    is_asm              BOOLEAN,
+    is_gsm              BOOLEAN,
+    gsm_stage           SMALLINT,    -- 0 (shortlisted) .. ; NULL when not in GSM
+    asm_category        VARCHAR,     -- LONG_TERM / SHORT_TERM
+    is_fno_ban          BOOLEAN,
+    is_cas_stock        BOOLEAN,     -- drives deadline; NULL takes the earlier one
     circuit_band_pct    NUMERIC(5,2),
     upper_circuit       NUMERIC(14,4),
     lower_circuit       NUMERIC(14,4),
-    has_earnings_today  BOOLEAN      NOT NULL DEFAULT FALSE,
+    has_earnings_today  BOOLEAN,
     prev_close          NUMERIC(14,4),
     fetched_at          TIMESTAMPTZ  NOT NULL DEFAULT now(),
     PRIMARY KEY (symbol_id, trade_date)
 );
 CREATE INDEX ix_ids_date ON instrument_daily_status (trade_date);
 
--- Convenience view: today's eligible universe, hazards applied.
+-- Convenience view: today's eligible universe, hazards applied. NOT NULL is
+-- NULL, not true, so a row with any of the three flags unreported drops out.
+-- (As built, the date is the IST date - CURRENT_DATE is the server's.)
 CREATE VIEW v_eligible_today AS
 SELECT i.*
 FROM instruments i
 JOIN instrument_daily_status s
-  ON s.symbol_id = i.id AND s.trade_date = CURRENT_DATE
+  ON s.symbol_id = i.id AND s.trade_date = (now() AT TIME ZONE 'Asia/Kolkata')::date
 WHERE i.is_active
   AND NOT s.is_t2t AND NOT s.is_asm AND NOT s.is_gsm;
 ```

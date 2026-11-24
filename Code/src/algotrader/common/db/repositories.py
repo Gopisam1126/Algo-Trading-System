@@ -776,40 +776,89 @@ def _row_to_bar_dict(mapping: Any, symbol: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+#: The columns of ``instrument_daily_status`` a hazard source may write. The
+#: key (``symbol_id``, ``trade_date``) identifies the row; ``fetched_at`` is the
+#: database's own clock, never the caller's.
+STATUS_COLUMNS = frozenset(
+    {
+        "is_t2t",
+        "is_asm",
+        "is_gsm",
+        "gsm_stage",
+        "asm_category",
+        "is_fno_ban",
+        "is_cas_stock",
+        "circuit_band_pct",
+        "upper_circuit",
+        "lower_circuit",
+        "has_earnings_today",
+        "prev_close",
+    }
+)
+_STATUS_KEY = frozenset({"symbol_id", "trade_date"})
+
+
 class DailyStatusRepository:
-    """Per-symbol per-day hazard flags (BR-8)."""
+    """Per-symbol per-day hazard flags (BR-8).
+
+    Each hazard source owns some columns and writes **only those**: the
+    surveillance roster writes ``is_asm``/``asm_category``/``is_gsm``/
+    ``gsm_stage``, the T2T list ``is_t2t``, and so on. A row's other columns keep
+    what their own sources wrote, or stay NULL - unknown, which every reader
+    refuses. Until E04-S01 an upsert rewrote every column from its own row, so a
+    T2T write would have reset the surveillance flags it followed to the
+    defaults (then ``false``: checked and clean).
+    """
 
     def __init__(self, session: AsyncSession, instruments: InstrumentRepository) -> None:
         self._session = session
         self._instruments = instruments
 
     async def upsert(self, rows: Sequence[dict[str, Any]]) -> int:
+        """Write the columns ``rows`` carry for each (symbol, day), and only those.
+
+        Every row must carry the same columns - the key plus the source's own
+        - so one call cannot set a flag for some rows and leave it to the
+        default for others. Chunked under PostgreSQL's bound-parameter limit,
+        like ``bulk_upsert``: a day's roster is ~3,600 rows today and one
+        statement does not stay under the limit as columns are added (SIT-012).
+
+        Returns the rows inserted or updated, COUNTED from ``RETURNING``: the
+        driver's ``rowcount`` for a multi-row ``INSERT ... ON CONFLICT`` is -1
+        under async psycopg, which is how the instrument sync came to report
+        ``-1`` rows written (SIT-012) - and how this did, until its test ran.
+        """
         if not rows:
             return 0
-        stmt = pg_insert(InstrumentDailyStatus).values(list(rows))
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["symbol_id", "trade_date"],
-            set_={
-                c: getattr(stmt.excluded, c)
-                for c in (
-                    "is_t2t",
-                    "is_asm",
-                    "is_gsm",
-                    "gsm_stage",
-                    "asm_category",
-                    "is_fno_ban",
-                    "is_cas_stock",
-                    "circuit_band_pct",
-                    "upper_circuit",
-                    "lower_circuit",
-                    "has_earnings_today",
-                    "prev_close",
-                    "fetched_at",
-                )
-            },
-        )
-        result = await self._session.execute(stmt)
-        return int(cast("CursorResult[Any]", result).rowcount or 0)
+        keys = frozenset(rows[0])
+        if any(frozenset(row) != keys for row in rows):
+            raise ValueError(
+                "every row in one daily-status upsert must carry the same columns, so a "
+                "flag is never written for some rows and left unknown for others"
+            )
+        if not _STATUS_KEY <= keys:
+            raise ValueError("a daily-status row needs symbol_id and trade_date")
+        columns = sorted(keys - _STATUS_KEY)
+        unknown = set(columns) - STATUS_COLUMNS
+        if unknown or not columns:
+            raise ValueError(
+                f"a daily-status upsert writes status columns only; got {sorted(unknown) or 'none'}"
+            )
+        per_statement = max(1, _PG_MAX_BIND_PARAMS // len(keys))
+        written = 0
+        for start in range(0, len(rows), per_statement):
+            insert = pg_insert(InstrumentDailyStatus).values(
+                list(rows[start : start + per_statement])
+            )
+            upsert = insert.on_conflict_do_update(
+                index_elements=["symbol_id", "trade_date"],
+                set_={
+                    **{c: getattr(insert.excluded, c) for c in columns},
+                    "fetched_at": func.now(),
+                },
+            ).returning(InstrumentDailyStatus.symbol_id)
+            written += len((await self._session.execute(upsert)).all())
+        return written
 
     async def for_symbol(self, symbol: str, trade_date: dt.date) -> dict[str, Any] | None:
         sid = await self._instruments.symbol_id(symbol)

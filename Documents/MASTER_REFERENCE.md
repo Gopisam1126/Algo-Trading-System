@@ -147,7 +147,7 @@ refuses every entry at L0-L3 until the approval flow (E16-S03) and the envelope
 | `strategy/` | Components | the DSL, 27 primitives and their evaluators, the tri-state runtime, the approval-gated registry |
 | `signals/` | Components | the strategy loop and bar source (E13-S01); its LIVE/PAPER routes end at a port |
 | `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, exit timer (time and target exits), autonomy gate, day ledger, end-of-day verdict and statistics, execution service |
-| `premarket/` | Components | the base universe (E07-S01): a Nifty 50/100/200/500 constituent file, the F&O stock universe or a custom list, resolved against the instrument master; the NSE bhavcopy as daily bars, archived and back-filled (E03-S01); no pipeline yet |
+| `premarket/` | Components | the base universe (E07-S01): a Nifty 50/100/200/500 constituent file, the F&O stock universe or a custom list, resolved against the instrument master; the NSE bhavcopy as daily bars, archived and back-filled (E03-S01); the ASM and GSM flags per trade date from NSE's surveillance roster (E04-S01); no pipeline yet |
 | `ai/` `macro/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
 
 "Components" means built and tested on their own and against each other in
@@ -735,7 +735,7 @@ Algo-Trading-System/
 |---|---|---|
 | `ohlcv` | Bar history | Hypertable, compressed after 90d |
 | `instruments` | Symbol master | Broker tokens, lot size, tick size |
-| `instrument_daily_status` | **Daily hazard flags** | T2T, ASM, GSM, F&O ban, CAS, circuit bands |
+| `instrument_daily_status` | **Daily hazard flags** | T2T, ASM, GSM, F&O ban, CAS, circuit bands - each NULL (unknown, refused) until its own source reports, and each source writes only its columns (E04-S01) |
 | `daily_plan` | Pre-market output | Market thesis, macro snapshot, token usage |
 | `plan_candidate` | Ranked candidates | Score breakdown, AI rationale, playbook, gap status |
 | `decision_log` | **Immutable audit** | Hypertable, hash-chained, INSERT-only role |
@@ -1355,6 +1355,14 @@ The data layer is broker-agnostic and everything downstream needs it:
 The hazard lists deserve early attention — they are the easiest thing to get
 wrong and the hardest to notice. Build them, run daily, eyeball for a week or two
 before anything depends on them.
+
+E04-S01 (24 Nov 2026) found the shape of "wrong and hard to notice" before any
+list existed: the flags defaulted to `false`, so the first list written made
+every other list read clean. A flag is now unknown until its own source reports.
+And the source matters: NSE's surveillance *roster* (`REG1_IND<DDMMYY>.csv`,
+written the evening of each session with the measures in force from the next)
+carries its own effective date; the website's ASM/GSM API does not - its date is
+the date of the request.
 
 ### 21.3 Build sequence
 

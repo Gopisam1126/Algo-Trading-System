@@ -57,10 +57,8 @@ returned per symbol (``industries``) because nothing yet fills
 
 from __future__ import annotations
 
-import csv
 import dataclasses
 import datetime as dt
-import io
 import re
 import urllib.error
 import urllib.request
@@ -70,7 +68,7 @@ from typing import Any, Final, Literal
 
 from algotrader.common.config import UniverseConfig
 from algotrader.common.models.trading import _validate_symbol
-from algotrader.common.text import one_safe_line
+from algotrader.common.text import MalformedCsvError, csv_rows, one_safe_line
 
 __all__ = [
     "INDEX_BASES",
@@ -188,7 +186,10 @@ def parse_constituents(raw: bytes, *, base: str) -> tuple[Constituent, ...]:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise _refuse(f"the {base} file is not UTF-8 text") from None
-    rows = list(csv.reader(io.StringIO(text)))
+    try:
+        rows = csv_rows(text)
+    except MalformedCsvError as exc:
+        raise _refuse(f"the {base} file is {exc}") from None
     if not rows or tuple(cell.strip() for cell in rows[0]) != HEADER:
         # The first few cells, each cut short: an HTML page's first "row" is
         # its whole head, and the reason only needs to show it is not a CSV.

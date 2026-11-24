@@ -66,7 +66,6 @@ refuses on rather than guessing through).
 from __future__ import annotations
 
 import asyncio
-import csv
 import datetime as dt
 import io
 import logging
@@ -89,7 +88,7 @@ from algotrader.common.calendar import MarketCalendar
 from algotrader.common.enums import Timeframe
 from algotrader.common.models.market import Bar
 from algotrader.common.models.trading import _validate_symbol
-from algotrader.common.text import one_safe_line
+from algotrader.common.text import MalformedCsvError, csv_rows, one_safe_line
 from algotrader.premarket.universe import kite_tradingsymbol
 
 log = logging.getLogger(__name__)
@@ -239,7 +238,10 @@ def parse_bhavcopy(raw: bytes, *, day: dt.date) -> tuple[BhavcopyRow, ...]:
     mirror serving yesterday's file under today's name is a plausible, silent
     failure. A row that is not well-formed refuses the whole file.
     """
-    rows = list(csv.reader(io.StringIO(_the_csv(raw, day))))
+    try:
+        rows = csv_rows(_the_csv(raw, day))
+    except MalformedCsvError as exc:
+        raise _refuse(f"the bhavcopy for {day} is {exc}") from None
     if not rows or tuple(cell.strip() for cell in rows[0]) != HEADER:
         shown = [cell.strip()[:16] for cell in rows[0][:4]] if rows else []
         raise _refuse(f"the header begins {shown!r}, not the UDiFF bhavcopy's {list(HEADER[:4])!r}")

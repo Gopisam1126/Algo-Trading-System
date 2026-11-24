@@ -180,6 +180,15 @@ class InstrumentDailyStatus(Base):
     must know whether a symbol was in ASM on the day being simulated, not
     whether it is today. Getting this wrong makes every historical result
     optimistic, because today's clean symbols were not always clean.
+
+    **Every flag is NULL until its source has reported for the day** (migration
+    ``9c2f4e6a1b70``, E04-S01). The lists arrive from separate sources - the
+    surveillance roster, the T2T list, the F&O ban, CAS scope, earnings - and a
+    ``false`` default meant the first source to write a day's row also wrote
+    "checked and clean" for every flag nobody had checked. ``False`` is
+    written only by a source that read a complete list and did not find the
+    symbol on it; every reader treats anything else as restricted
+    (``execution.session_context.restrictions_from``, ``v_eligible_today``).
     """
 
     __tablename__ = "instrument_daily_status"
@@ -187,14 +196,15 @@ class InstrumentDailyStatus(Base):
     symbol_id: Mapped[int] = mapped_column(Integer, ForeignKey("instruments.id"), primary_key=True)
     trade_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
 
-    is_t2t: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    is_asm: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    is_gsm: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    is_t2t: Mapped[bool | None] = mapped_column(Boolean)
+    is_asm: Mapped[bool | None] = mapped_column(Boolean)
+    is_gsm: Mapped[bool | None] = mapped_column(Boolean)
 
     #: GSM stages escalate: the lower ones mean a reduced band and 100% margin,
     #: the higher ones move the stock to periodic call auction and permit no
     #: upward price movement at all. A boolean cannot distinguish "restricted"
-    #: from "structurally untradeable". NULL when not in GSM.
+    #: from "structurally untradeable". 0 is a stage - "shortlisted" - so NULL
+    #: means not in GSM (or not yet reported), never stage 0.
     gsm_stage: Mapped[int | None] = mapped_column(SmallInteger)
 
     #: Which ASM list. Both are hard exclusions, so this changes no filtering —
@@ -202,16 +212,15 @@ class InstrumentDailyStatus(Base):
     asm_category: Mapped[str | None] = mapped_column(
         _enum(SurveillanceCategory, "asm_category_enum")
     )
-    is_fno_ban: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    is_fno_ban: Mapped[bool | None] = mapped_column(Boolean)
     #: Drives the per-stock square-off deadline (15:10 CAS vs 15:20 non-CAS).
-    is_cas_stock: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    #: Unknown (NULL) takes the earlier deadline, or is refused at entry.
+    is_cas_stock: Mapped[bool | None] = mapped_column(Boolean)
 
     circuit_band_pct: Mapped[Decimal | None] = mapped_column(Pct5)
     upper_circuit: Mapped[Decimal | None] = mapped_column(Money)
     lower_circuit: Mapped[Decimal | None] = mapped_column(Money)
-    has_earnings_today: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default="false"
-    )
+    has_earnings_today: Mapped[bool | None] = mapped_column(Boolean)
     prev_close: Mapped[Decimal | None] = mapped_column(Money)
     fetched_at: Mapped[dt.datetime] = mapped_column(Ts, nullable=False, server_default=func.now())
 

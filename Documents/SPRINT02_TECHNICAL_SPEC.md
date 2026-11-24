@@ -429,6 +429,16 @@ currently held"* — is the interesting one: a stock going into ASM overnight
 while you hold it is a real scenario, and the correct response is to flag for
 exit, not to silently keep the position.
 
+*Built 24 Nov 2026.* The source is NSE's dated surveillance roster
+(`REG1_IND<DDMMYY>.csv`), written the evening of each session with the measures
+in force from the next - verified against that week's circulars - not the
+website's ASM/GSM API, which carries no effective date (its date is the
+request's). §5.1's floor is two floors: the roster must list at least 2,000
+securities, and each of its three lists (long-term ASM, short-term ASM, GSM)
+must name at least five. Building it found that §6's columns defaulted to
+`false` - the most permissive answer - for every flag a source had not yet
+written; they are NULL (unknown, refused) until reported.
+
 ### E04-S04 · Circuit bands (1 d)
 Computes upper/lower circuit from the previous close, which means it depends on
 bhavcopy (`E03-S01`) for `prev_close` — **a dependency the tracker does not
