@@ -58,7 +58,8 @@ def test_every_database_entrypoint_sets_the_loop_policy_before_its_loop() -> Non
     so a command's in-process test cannot see the omission (SIT-011)."""
     entrypoints = [*SRC.rglob("__main__.py"), *SCRIPTS.glob("*.py")]
     judged = [p for p in entrypoints if "asyncio.run(" in p.read_text(encoding="utf-8")]
-    assert any(p.name == "backfill_bhavcopy.py" for p in judged), "the scan found no command"
+    found = {p.name for p in judged}
+    assert {"backfill_bhavcopy.py", "sync_surveillance.py"} <= found, "the scan missed a command"
     offenders = [p.name for p in judged if _policy_missing_or_late(p.read_text(encoding="utf-8"))]
     assert not offenders, f"call configure_event_loop_policy() before asyncio.run: {offenders}"
 

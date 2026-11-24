@@ -112,9 +112,20 @@ class TestE01FullTradeLifecycle:
         ist_today = (
             await db.execute(text("SELECT (now() AT TIME ZONE 'Asia/Kolkata')::date"))
         ).scalar_one()
-        await DailyStatusRepository(db, instruments).upsert(
+        daily = DailyStatusRepository(db, instruments)
+        await daily.upsert(
             [{"symbol_id": symbol_id, "trade_date": ist_today, "is_cas_stock": True}]
         )
+        await db.flush()
+        # Until 24 Nov 2026 this row was eligible: the flags it did not carry
+        # defaulted to false - "checked and clean" - for checks nobody made.
+        # An unreported flag is unknown now, and unknown is not eligible
+        # (E04-S01); the symbol becomes eligible once its sources report.
+        assert symbol not in await instruments.eligible_today()
+        await daily.upsert(
+            [{"symbol_id": symbol_id, "trade_date": ist_today, "is_asm": False, "is_gsm": False}]
+        )
+        await daily.upsert([{"symbol_id": symbol_id, "trade_date": ist_today, "is_t2t": False}])
         await db.flush()
         assert symbol in await instruments.eligible_today()
 

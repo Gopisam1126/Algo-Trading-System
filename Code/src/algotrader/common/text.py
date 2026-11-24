@@ -20,6 +20,33 @@ because the other constructor looks equally reasonable.
 
 from __future__ import annotations
 
+import csv
+import io
+
+
+class MalformedCsvError(ValueError):
+    """Text that the ``csv`` module cannot read as CSV at all."""
+
+
+def csv_rows(text: str) -> list[list[str]]:
+    """Every row of ``text`` read as CSV, or :class:`MalformedCsvError`.
+
+    ``csv`` raises ``csv.Error`` - not a ``ValueError`` - for an unterminated
+    quote or a field over its 128 KiB limit, so a parser that catches only its
+    own refusal type let a damaged or hostile file escape as a crash: the
+    bhavcopy, the index constituents and the surveillance roster all did, each
+    documented as refusing a bad file (QA-SEC-45, found in E04-S01's STRIDE
+    pass). Every CSV in ``src`` is read through here
+    (``tests/security/test_csv_parsing.py``), and each caller turns this into
+    its own refusal.
+    """
+    try:
+        return list(csv.reader(io.StringIO(text, newline="")))
+    except csv.Error as exc:
+        # csv's message names the limit or the quote, never the content.
+        raise MalformedCsvError(f"not well-formed CSV ({exc})") from None
+
+
 #: A detail is one line, and no longer than this.
 #:
 #: Enforced where the value is BUILT rather than at the log call, because the

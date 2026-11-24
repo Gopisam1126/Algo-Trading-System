@@ -296,7 +296,8 @@ Built and tested as components (counts: the latest CI run; it must say
 
 **Empty (`__init__.py` only):** `orchestrator/`, `api/`, `notifier/`, `ai/`,
 `macro/` - five of thirteen packages. `premarket/` holds the base universe
-loader (E07-S01) and no pipeline yet. `execution/` holds the
+loader (E07-S01), the bhavcopy (E03-S01) and the surveillance roster (E04-S01),
+and no pipeline yet. `execution/` holds the
 whole order path: risk engine, sizer, slots, halt and loss latches, gateway and
 state machine, protective stop, position book, reconciliation, square-off,
 autonomy gate, day ledger, end-of-day verdict and the service that drives them. **Nothing composes
@@ -626,6 +627,43 @@ Recorded because each was believed, written down, and wrong.
   the upsert is ONE statement - 51,690 bound parameters today against
   PostgreSQL's 65,535, so the two columns E07-S07 plans to add would fail every
   morning's sync. Chunk it as `bulk_upsert` does (SIT-012, in E07-S07).
+
+- **E04-S01 surveillance** — `premarket/surveillance.py`: trade date T's ASM
+  and GSM flags from NSE's surveillance roster of the session before T
+  (`REG1_IND<DDMMYY>.csv` under `nsearchives.nseindia.com/content/cm/`), which
+  NSE writes the evening of each session with the measures in force from the
+  next (checked against that week's circulars, 24 Nov 2026). Its
+  `Last-Modified` must fall between that session's close and T's open; it is
+  parsed strictly by column NAME (NSE repurposes its `Filler` columns),
+  refused if any of its three lists names fewer than five (an empty deny list
+  is a failed fetch), and written for every instrument it names and nothing
+  else.
+  `scripts/sync_surveillance.py --date T` (or `--start/--end`, `--offline`),
+  as `algotrader_svc` only. **A flag in `instrument_daily_status` is NULL until
+  its own source reports** (migration `9c2f4e6a1b70`), and
+  `DailyStatusRepository.upsert` writes only the columns its rows carry. Every
+  CSV in `src` is read through `common.text.csv_rows`.
+
+- **"`false` is a safe default for a hazard flag."** It is the CLEAN answer.
+  The six flags were `NOT NULL DEFAULT false` and the upsert rewrote every
+  column, so the first hazard list to write a day's row - any of five -
+  reported the other four as checked and clean, and each later list reset the
+  earlier ones. Latent only because no list existed yet; found by reading the
+  schema before writing the first (E04-S01). Unknown is NULL now - and every
+  reader already refused NULL: `restrictions_from` had been written expecting
+  exactly this column change.
+- **"The list's date is in the list."** NSE's ASM API stamps every row with
+  the date of the REQUEST (`asmTime 24-Nov-2026`, on a holiday), and its
+  `gsmStage` is the roman numeral of a surveillance code, not a stage (`LXII`
+  is code 62). The roster is dated by its name and by when NSE wrote it, and
+  the circulars say what it means.
+- **"`rowcount` counts the rows."** Twice now: the instrument sync logged -1
+  (SIT-012), and the new daily-status upsert reported -1 rows for 3,582 written
+  until its integration test ran. Count what `RETURNING` returns.
+- **"A parser that refuses bad input refuses all bad input."** Three parsers
+  caught only their own refusal type, and `csv.Error` is not a `ValueError`: an
+  unterminated quote crashed the bhavcopy backfill, the universe load and the
+  roster sync instead of refusing (QA-SEC-45). One helper now, held by a test.
 
 - **E07-S01 base universe** — `premarket/universe.py`. `universe.base` (now a
   Literal) is a Nifty 50/100/200/500 constituent file from niftyindices.com
