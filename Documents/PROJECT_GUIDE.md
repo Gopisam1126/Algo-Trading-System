@@ -720,12 +720,13 @@ Today's key settings: paper mode; ₹5,00,000 capital; 5 slots; 1% risk per trad
 
 ## 14. What is left, in numbers
 
-From the tracker on 23 Nov 2026 (after that day's story review and E03-S01,
-which raised E04-S09), each open story classified by what it needs:
+From the tracker on 24 Nov 2026 (after the 23 Nov story review, E03-S01 -
+which raised E04-S09 - and E04-S01, which raised E04-S10), each open story
+classified by what it needs:
 
 | | Stories | Est. days |
 |---|---|---|
-| Done (QA-Success or Closed) | 82 of 218 | - |
+| Done (QA-Success or Closed) | 83 of 219 | - |
 | Removed (E21-S01, cancelled - the broker applies the generic algo ID) | 1 | - |
 | Can be **completed now**, with nothing from the owner | 87 | ~115 |
 | Can be **built now**; one real-world check needs an owner item | 28 | ~42 |
