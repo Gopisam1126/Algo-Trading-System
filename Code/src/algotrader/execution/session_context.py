@@ -213,8 +213,9 @@ def restrictions_from(status: Mapping[str, Any] | None) -> tuple[str, ...] | Non
     if status.get("is_fno_ban") is not False:
         blocked.append("FNO_BAN")
     # `is not False` rather than truthiness: a flag that is missing or NULL is
-    # not a clean flag. The columns are NOT NULL today; this keeps a future
-    # nullable column, or a row built by hand, from reading as "not restricted".
+    # not a clean flag. Every flag is NULL until its own source reports
+    # (E04-S01, migration 9c2f4e6a1b70), so this is the check that refuses a
+    # day whose sources have not all reported - a truthiness test would pass it.
     return tuple(blocked)
 
 

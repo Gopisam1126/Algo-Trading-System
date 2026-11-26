@@ -1,13 +1,13 @@
-"""E04-S01 against the real schema: NSE's surveillance rosters into
-``instrument_daily_status``, read back by the reader execution uses.
+"""E04-S01 and S02 against the real schema: NSE's surveillance rosters into
+``instrument_daily_status``, read back by the readers execution uses.
 
 The unit tests prove the parse and the sync's decisions. This proves the seams:
 the migration that makes an unreported flag NULL (unknown) instead of false
 (clean); the repository writing only a source's own columns, so a second
 source cannot reset the first's flags; the real roster's names landing on the
-right trade date; and ``restrictions_from`` - what the execution service
-consults before every entry - refusing what the roster flags and what nobody
-has reported.
+right trade date, T2T among them; and ``restrictions_from`` - what the
+execution service consults before every entry - and ``v_eligible_today``
+refusing what the roster flags and what nobody has reported.
 
 The instruments and rows this writes are committed (the store opens its own
 transaction, as production does), so the fixture removes exactly what it added,
@@ -50,7 +50,11 @@ pytestmark = [pytest.mark.integration]
 
 CODE = Path(__file__).resolve().parents[2]
 FIXTURES = CODE / "tests" / "fixtures"
-NOV20, NOV23, NOV25, NOV26 = (dt.date(2026, 11, d) for d in (20, 23, 25, 26))
+NOV20, NOV23, NOV24, NOV25, NOV26 = (dt.date(2026, 11, d) for d in (20, 23, 24, 25, 26))
+#: A wall clock after every day synced here: each closed day is over.
+AFTER = dt.datetime(2026, 12, 1, tzinfo=dt.UTC)
+#: Trade-for-trade on 25 Nov 2026 (BE, BZ, ST, SZ) and under no other measure.
+T2T_ONLY = ("ABAN-BE", "ANSALAPI-BZ", "AARADHYA-ST", "GLOBAL-BE")
 ROSTER_20 = gzip.decompress((FIXTURES / "surveillance" / "REG1_IND201126.csv.gz").read_bytes())
 ROSTER_23 = gzip.decompress((FIXTURES / "surveillance" / "REG1_IND231126.csv.gz").read_bytes())
 WRITTEN = {
@@ -74,6 +78,12 @@ SYMBOLS = sorted(
 )
 #: 23 Nov's roster as the master knows it - what a 25 Nov sync writes.
 WRITTEN_25 = len({r.tradingsymbol for r in parse_roster(ROSTER_23, session=NOV23)} & MASTER)
+#: ... and how many of those trade for trade on 25 Nov.
+T2T_25 = len({r.tradingsymbol for r in parse_roster(ROSTER_23, session=NOV23) if r.is_t2t} & MASTER)
+#: Named by the 20 Nov roster and not the 23 Nov one: nothing reports their 25 Nov series.
+UNNAMED_25 = sorted(
+    set(SYMBOLS) - {r.tradingsymbol for r in parse_roster(ROSTER_23, session=NOV23)}
+)
 
 
 def _owner(url: str) -> str:
@@ -184,6 +194,7 @@ def _sync(
         archive=RosterArchive(archive),
         store=RepositoryStatusStore(factory),
         fetch=_fetch,
+        now=lambda: AFTER,
     )
 
 
@@ -354,8 +365,15 @@ class TestTheRealRosters:
         assert aspire and (aspire["is_asm"], aspire["asm_category"]) == (True, "SHORT_TERM")
         assert stage0 and (stage0["is_gsm"], stage0["gsm_stage"]) == (True, 0)
         assert infy and (infy["is_asm"], infy["is_gsm"], infy["gsm_stage"]) == (False, False, None)
+        assert infy["is_t2t"] is False  # EQ: rolling (E04-S02)
+        aban = await _status(factory, "ABAN-BE", NOV25)
+        assert aban and (aban["is_t2t"], aban["is_asm"], aban["is_gsm"]) == (True, False, False)
         # Only the roster's columns: what no source has reported stays unknown.
-        assert (infy["is_t2t"], infy["is_fno_ban"], infy["is_cas_stock"]) == (None, None, None)
+        assert (infy["is_fno_ban"], infy["is_cas_stock"], infy["has_earnings_today"]) == (
+            None,
+            None,
+            None,
+        )
 
     async def test_a_stock_added_overnight_is_refused_on_the_day_it_applies(
         self, calendar, factory, tmp_path
@@ -367,7 +385,7 @@ class TestTheRealRosters:
         sync = _sync(calendar, factory, tmp_path)
         for day in (NOV23, NOV25):
             assert (await sync.sync_day(day)).outcome is SyncOutcome.STORED
-            await _report(factory, day, {"is_t2t": False, "is_fno_ban": False})
+            await _report(factory, day, {"is_fno_ban": False})
         assert restrictions_from(await _status(factory, "EMPOWER", NOV23)) == ()
         assert restrictions_from(await _status(factory, "EMPOWER", NOV25)) == ("ASM:LONG_TERM",)
         assert restrictions_from(await _status(factory, "INFY", NOV25)) == ()
@@ -377,7 +395,7 @@ class TestTheRealRosters:
         self, calendar, factory, tmp_path
     ) -> None:
         await _sync(calendar, factory, tmp_path).sync_day(NOV25)
-        assert restrictions_from(await _status(factory, "INFY", NOV25)) == ("T2T", "FNO_BAN")
+        assert restrictions_from(await _status(factory, "INFY", NOV25)) == ("FNO_BAN",)
 
     async def test_a_day_whose_roster_is_missing_leaves_every_symbol_refused(
         self, calendar, factory, tmp_path, seeded
@@ -398,6 +416,65 @@ class TestTheRealRosters:
         again = await _sync(calendar, factory, tmp_path).sync_day(NOV25)
         assert again.source == "archive" and again.written == before == WRITTEN_25
         assert _rows_on(seeded, NOV25) == before
+
+
+class TestTradeForTrade:
+    """E04-S02: the roster's series as ``is_t2t``, through the real store and
+    both readers - ``restrictions_from`` and the eligibility view."""
+
+    async def test_a_t2t_stock_is_refused_by_the_reader_execution_consults(
+        self, calendar, factory, tmp_path, seeded
+    ) -> None:
+        """AC1 as far as it is built (the watchlist's hard filter is E07-S02):
+        with the F&O ban reported clean, a trade-for-trade stock under no
+        other measure is refused for T2T alone, and a rolling one is not. A
+        security the governing roster does not name stays unknown - refused -
+        however clean the other sources say it is."""
+        result = await _sync(calendar, factory, tmp_path).sync_day(NOV25)
+        await _report(factory, NOV25, {"is_fno_ban": False})
+        for symbol in T2T_ONLY:
+            assert restrictions_from(await _status(factory, symbol, NOV25)) == ("T2T",), symbol
+        assert restrictions_from(await _status(factory, "INFY", NOV25)) == ()
+        hfcl = restrictions_from(await _status(factory, "HFCL-BE", NOV25))  # Nifty 500, BE
+        assert hfcl is not None and hfcl[0] == "T2T" and len(hfcl) > 1  # and under ASM
+        assert UNNAMED_25, "the two rosters name the same securities: the control proves nothing"
+        for symbol in UNNAMED_25:
+            restricted = restrictions_from(await _status(factory, symbol, NOV25))
+            assert restricted == ("T2T", "ASM", "GSM"), symbol
+        with psycopg.connect(_owner(seeded)) as conn:
+            counts = conn.execute(
+                "SELECT count(*) FILTER (WHERE is_t2t), count(*) FILTER (WHERE is_t2t IS NULL) "
+                "FROM instrument_daily_status WHERE trade_date = %s",
+                (NOV25,),
+            ).fetchone()
+        assert counts == (result.t2t, len(UNNAMED_25)) and result.t2t == T2T_25
+
+    async def test_no_t2t_stock_is_eligible_even_with_every_other_flag_reported_clean(
+        self, factory, seeded
+    ) -> None:
+        """SPRINT02 8: no T2T symbol may reach the eligible list, even if every
+        other source downstream of the roster says it is clean. The control:
+        rolling stocks are listed once they are."""
+        today = _ist_today(seeded)
+        rows = [r for r in parse_roster(ROSTER_23, session=NOV23) if r.tradingsymbol in MASTER]
+        await RepositoryStatusStore(factory).write(today, rows)
+        with psycopg.connect(_owner(seeded), autocommit=True) as conn:
+            conn.execute(
+                "UPDATE instrument_daily_status SET is_asm = false, is_gsm = false, "
+                "is_fno_ban = false, is_cas_stock = false WHERE trade_date = %s AND symbol_id IN "
+                "(SELECT id FROM instruments WHERE tradingsymbol = ANY(%s))",
+                (today, SYMBOLS),
+            )
+            listed = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT tradingsymbol FROM v_eligible_today WHERE tradingsymbol = ANY(%s)",
+                    (SYMBOLS,),
+                ).fetchall()
+            }
+        t2t = {r.tradingsymbol for r in rows if r.is_t2t}
+        assert len(t2t) == T2T_25 and not t2t & listed
+        assert {"INFY", "EMPOWER", "ASPIRE-SM"} <= listed
 
 
 # ---------------------------------------------------------------------------
@@ -431,12 +508,25 @@ class TestTheCommand:
         )
 
     def test_the_services_login_writes_the_day(self, deployed_seeded, tmp_path) -> None:
-        RosterArchive(tmp_path).write(NOV23, ROSTER_23)
+        archive = RosterArchive(tmp_path)
+        archive.write(NOV23, ROSTER_23)
+        archive.mark_absent(NOV24, at=AFTER)  # as the online run that filled it recorded
         done = self._run(deployed_seeded["svc"], tmp_path)
         assert done.returncode == 0, done.stderr[-2000:]
         assert _rows_on(deployed_seeded["owner"], NOV25) == WRITTEN_25
         assert f"1 stored, 0 missing, 0 refused; {WRITTEN_25} status row(s) written" in done.stdout
-        assert "roster=2026-11-23" in done.stdout
+        assert "roster=2026-11-23" in done.stdout and f" t2t={T2T_25} " in done.stdout
+
+    def test_an_archive_silent_about_a_closed_day_exits_1_offline(
+        self, deployed_seeded, tmp_path
+    ) -> None:
+        """The 23rd's roster alone cannot govern the 25th offline: nothing says
+        NSE held no session on the 24th."""
+        RosterArchive(tmp_path).write(NOV23, ROSTER_23)
+        done = self._run(deployed_seeded["svc"], tmp_path)
+        assert done.returncode == 1, done.stderr[-2000:]
+        assert "0 stored, 1 missing" in done.stdout and "2026-11-24" in done.stdout
+        assert _rows_on(deployed_seeded["owner"], NOV25) == 0
 
     def test_a_login_that_could_rewrite_the_record_is_refused(
         self, deployed_seeded, tmp_path

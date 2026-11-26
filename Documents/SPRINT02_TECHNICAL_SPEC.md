@@ -423,6 +423,28 @@ atypical liquidity, and no strategy has been validated on it.
 The simplest stories in the sprint and the highest consequence-per-line. Both
 are pure deny lists. §5.1's rule is the whole story: an empty list must raise.
 
+*E04-S02 built 26 Nov 2026.* There is no separate T2T file to fetch. E04-S01's
+roster has a `Series` column giving the series each security trades in from the
+next session. BE, BZ, ST and SZ are trade-for-trade; EQ and SM roll (NSE's
+legend of series). Any other series is unknown, and so refused. Checked against
+every 2026 bhavcopy, the roster's series agreed with the traded series on all
+606,785 unchanged pairs and on 1,781 of 1,783 changes. The other two were in the
+8 Nov Muhurat roster, which E04-S01 never read. §5.1's floor: BE, BZ and ST must
+each list at least five. SZ lists one or two, so it has no floor.
+
+**Building it found QA-E04-07 (CRITICAL), in E04-S01 code already on QA.** E04-S01
+read the roster of the calendar's previous trading day. On Sunday 1 Feb 2026 NSE
+held a full live session for the Union Budget (NSE/CMTR/72349). The calendar does
+not know that session, and its roster put COOLCAPS, ESSENTIA, MANORAMA, RCDL and
+SYSTMTXC into short-term ASM from 2 Feb. E04-S01 read 30 Jan's roster for 2 Feb
+and wrote all five clean. Trade date T now reads the last roster NSE wrote before
+T opened. It checks each closed day since the previous trading day, newest first.
+A 404 on a closed day counts as "no session" only once that day is over (IST), and
+the archive records each absence, so an offline re-run answers the same way.
+
+*E04-S03:* the ban is not in the roster (NSE's REG_IND file structure). Its file
+is `fo_secban_<DDMMYYYY>.csv`.
+
 ### E04-S01 · ASM / GSM (1 d, 🔴)
 Needs the schema change from §6 first. Task 4 — *"alert on newly-added names
 currently held"* — is the interesting one: a stock going into ASM overnight
