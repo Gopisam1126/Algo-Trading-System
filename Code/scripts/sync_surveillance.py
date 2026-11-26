@@ -1,19 +1,22 @@
 #!/usr/bin/env python
-"""Write a trade date's ASM and GSM flags from NSE's surveillance roster (E04-S01).
+"""Write a trade date's ASM, GSM and T2T flags from NSE's surveillance roster
+(E04-S01, E04-S02).
 
     python scripts/sync_surveillance.py --date 2026-11-25
     python scripts/sync_surveillance.py --start 2026-01-02 --end 2026-11-25
     python scripts/sync_surveillance.py --date 2026-11-25 --offline
 
-Each trade date T (the holiday calendar decides which days are sessions) reads
-the roster NSE wrote the evening of the session before T - the indicators in
-force from T - from the archive if it is there, otherwise from NSE's archive at
-most once a second; checks when NSE wrote it, parses it strictly, archives it,
-and writes ``is_asm``, ``asm_category``, ``is_gsm`` and ``gsm_stage`` for every
-instrument it names, and nothing else. A day that is MISSING or REFUSED writes
-nothing, so its flags stay unknown and no symbol can be traded on it.
-Re-running is safe: the same roster writes the same values, and ``--offline``
-reads only the archive and never touches the network.
+Each trade date T (the holiday calendar decides which days are traded) reads
+the last roster NSE wrote before T - the evening file of the last session NSE
+held, which may be one the calendar does not trade (the Budget session of
+1 Feb 2026, Muhurat on 8 Nov) - from the archive if it is there, otherwise
+from NSE's archive at most once a second; checks when NSE wrote it, parses it
+strictly, archives it, and writes ``is_asm``, ``asm_category``, ``is_gsm``,
+``gsm_stage`` and ``is_t2t`` for every instrument it names, and nothing else.
+A day that is MISSING or REFUSED writes nothing, so its flags stay unknown and
+no symbol can be traded on it. Re-running is safe: the same roster writes the
+same values, and ``--offline`` reads only the archive and never touches the
+network.
 
 The database URL comes from ``--database-url`` or ``DATABASE_URL``, and must be
 the services' login (``algotrader_svc``). A login that could rewrite the audit
@@ -93,7 +96,8 @@ async def _run(args: argparse.Namespace) -> int:
             roster = r.roster_session.isoformat() if r.roster_session else "-"
             line = (
                 f"  {r.trade_date}  {r.outcome.value:<17} roster={roster} {r.source or '-':<8} "
-                f"written={r.written} asm={r.asm} gsm={r.gsm} unresolved={r.unresolved}"
+                f"written={r.written} asm={r.asm} gsm={r.gsm} t2t={r.t2t} "
+                f"unresolved={r.unresolved}"
             )
             if r.held_flagged:
                 line += f"  HELD AND FLAGGED: {', '.join(r.held_flagged)}"

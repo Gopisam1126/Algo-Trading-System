@@ -296,7 +296,7 @@ Built and tested as components (counts: the latest CI run; it must say
 
 **Empty (`__init__.py` only):** `orchestrator/`, `api/`, `notifier/`, `ai/`,
 `macro/` - five of thirteen packages. `premarket/` holds the base universe
-loader (E07-S01), the bhavcopy (E03-S01) and the surveillance roster (E04-S01),
+loader (E07-S01), the bhavcopy (E03-S01) and the surveillance roster (E04-S01, S02),
 and no pipeline yet. `execution/` holds the
 whole order path: risk engine, sizer, slots, halt and loss latches, gateway and
 state machine, protective stop, position book, reconciliation, square-off,
@@ -629,7 +629,8 @@ Recorded because each was believed, written down, and wrong.
   morning's sync. Chunk it as `bulk_upsert` does (SIT-012, in E07-S07).
 
 - **E04-S01 surveillance** — `premarket/surveillance.py`: trade date T's ASM
-  and GSM flags from NSE's surveillance roster of the session before T
+  and GSM flags from the last surveillance roster NSE wrote before T opened
+  (E04-S02 - not the calendar's previous session; see below)
   (`REG1_IND<DDMMYY>.csv` under `nsearchives.nseindia.com/content/cm/`), which
   NSE writes the evening of each session with the measures in force from the
   next (checked against that week's circulars, 24 Nov 2026). Its
@@ -664,6 +665,33 @@ Recorded because each was believed, written down, and wrong.
   caught only their own refusal type, and `csv.Error` is not a `ValueError`: an
   unterminated quote crashed the bhavcopy backfill, the universe load and the
   roster sync instead of refusing (QA-SEC-45). One helper now, held by a test.
+
+- **E04-S02 T2T** — `is_t2t` comes from the same roster's `Series` column, which
+  gives the series each security trades in from the next session. BE, BZ, ST and
+  SZ are trade-for-trade; EQ and SM roll (NSE's legend of series). Any other
+  series is `None`, which is unknown and refused. BE, BZ and ST must each name at
+  least five securities. **T reads the LAST roster NSE wrote before T opened.**
+  `_find` probes each closed day between `previous_trading_day(T)` and T, newest
+  first, before falling back to the previous trading day. A 404 on a closed day
+  counts as an absence only after that day has ended (IST). The absence is then
+  recorded in the archive as `REG1_IND<DDMMYY>.absent`, and `--offline` needs a
+  roster or an absence for every closed day.
+
+- **"The calendar's previous session is the exchange's previous session."** NSE
+  held a full live session on Sunday 1 Feb 2026 (Union Budget, NSE/CMTR/72349),
+  which `nse_holidays.yaml` does not list. The roster NSE wrote after it put five
+  stocks into short-term ASM from 2 Feb. E04-S01 read 30 Jan's roster for 2 Feb
+  and wrote all five clean on their first day under the measure (QA-E04-07,
+  CRITICAL, on QA). It was found by checking the roster's series against a year
+  of bhavcopies: two series changes for 9 Nov were in the Muhurat roster, which
+  nothing read. A calendar lists the sessions the system trades. Which roster
+  governs a day is decided by the exchange's own files.
+- **"A design decision recorded with its reasoning has been checked."** E04-S01's
+  docstring said: *"Around Muhurat the calendar's previous session is the last
+  regular one, and that is the roster read."* That decision was written down,
+  reasoned and reviewed, and it was the defect. Being on record made it look
+  settled. Probe the fact a decision rests on (here: is there a roster for the
+  Muhurat day?), not just the code that carries it out.
 
 - **E07-S01 base universe** — `premarket/universe.py`. `universe.base` (now a
   Literal) is a Nifty 50/100/200/500 constituent file from niftyindices.com

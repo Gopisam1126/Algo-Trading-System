@@ -1,9 +1,12 @@
-"""E04-S01: NSE's surveillance roster, parsed strictly and synced per trade date.
+"""E04-S01 and S02: NSE's surveillance roster, parsed strictly and synced per
+trade date - ASM, GSM and T2T.
 
 Every refusal is tested against the REAL roster with one thing changed, so the
 check under test is the only thing that can refuse (the real file passing is
 each test's control). The circular-backed facts - which stocks NSE put under
-ASM w.e.f. 23 and 25 Nov 2026 - are asserted against the real files.
+ASM w.e.f. 23 and 25 Nov 2026, and w.e.f. 2 Feb after the Budget session - are
+asserted against the real files, as are the two series moves NSE made for
+9 Nov in the roster it wrote after Muhurat.
 """
 
 from __future__ import annotations
@@ -39,11 +42,41 @@ from algotrader.premarket.surveillance import (
 CODE = Path(__file__).resolve().parents[2]
 FIXTURES = CODE / "tests" / "fixtures"
 NOV20, NOV23, NOV25 = dt.date(2026, 11, 20), dt.date(2026, 11, 23), dt.date(2026, 11, 25)
-ROSTER_20 = gzip.decompress((FIXTURES / "surveillance" / "REG1_IND201126.csv.gz").read_bytes())
-ROSTER_23 = gzip.decompress((FIXTURES / "surveillance" / "REG1_IND231126.csv.gz").read_bytes())
-#: When NSE wrote them (their Last-Modified headers, read 24 Nov 2026).
+NOV24 = dt.date(2026, 11, 24)  # Guru Nanak Jayanti: no session
+#: Fri 30 Jan, the Budget session on Sun 1 Feb (NSE/CMTR/72349), Mon 2 Feb.
+JAN30, FEB01, FEB02 = dt.date(2026, 1, 30), dt.date(2026, 2, 1), dt.date(2026, 2, 2)
+#: Fri 6 Nov, Muhurat on Sun 8 Nov, Mon 9 Nov.
+NOV06, NOV08, NOV09 = dt.date(2026, 11, 6), dt.date(2026, 11, 8), dt.date(2026, 11, 9)
+
+
+def _real(name: str) -> bytes:
+    return gzip.decompress((FIXTURES / "surveillance" / name).read_bytes())
+
+
+ROSTER_20 = _real("REG1_IND201126.csv.gz")
+ROSTER_23 = _real("REG1_IND231126.csv.gz")
+ROSTER_JAN30 = _real("REG1_IND300126.csv.gz")
+ROSTER_FEB01 = _real("REG1_IND010226.csv.gz")
+ROSTER_NOV06 = _real("REG1_IND061126.csv.gz")
+ROSTER_NOV08 = _real("REG1_IND081126.csv.gz")
+#: When NSE wrote them (their Last-Modified headers, read 24 and 25 Nov 2026).
 WRITTEN_20 = dt.datetime(2026, 11, 20, 13, 54, 4, tzinfo=dt.UTC)
 WRITTEN_23 = dt.datetime(2026, 11, 23, 14, 40, 33, tzinfo=dt.UTC)
+WRITTEN_JAN30 = dt.datetime(2026, 1, 30, 14, 55, 4, tzinfo=dt.UTC)
+WRITTEN_FEB01 = dt.datetime(2026, 2, 1, 13, 20, 33, tzinfo=dt.UTC)  # 18:50 IST, a Sunday
+WRITTEN_NOV06 = dt.datetime(2026, 11, 6, 14, 35, 5, tzinfo=dt.UTC)
+WRITTEN_NOV08 = dt.datetime(2026, 11, 8, 13, 39, 3, tzinfo=dt.UTC)  # 19:09 IST, a Sunday
+#: Every roster NSE wrote around those days, as its archive serves them.
+NSE_2026 = {
+    JAN30: Fetched(ROSTER_JAN30, WRITTEN_JAN30),
+    FEB01: Fetched(ROSTER_FEB01, WRITTEN_FEB01),
+    NOV06: Fetched(ROSTER_NOV06, WRITTEN_NOV06),
+    NOV08: Fetched(ROSTER_NOV08, WRITTEN_NOV08),
+    NOV20: Fetched(ROSTER_20, WRITTEN_20),
+    NOV23: Fetched(ROSTER_23, WRITTEN_23),
+}
+#: A wall clock after every day these tests sync: each closed day is over.
+AFTER = dt.datetime(2026, 12, 1, tzinfo=dt.UTC)
 MASTER = frozenset(
     line
     for line in (FIXTURES / "universe" / "nse_eq_symbols_20261122.txt")
@@ -202,6 +235,12 @@ class TestTheRows:
     def test_a_suspended_security_parses(self) -> None:
         assert _by_symbol(parse_roster(ROSTER_23, session=NOV23))["AURIGROW"].status == "S"
 
+    def test_an_inactive_security_parses(self) -> None:
+        """NSE's file structure lists A, S and I; refusing I would refuse a file
+        the publisher calls well-formed - and stop every trade that day."""
+        raw = _edit(ROSTER_23, row=_set(sv.STATUS, "I"))
+        assert _by_symbol(parse_roster(raw, session=NOV23))["INFY"].status == "I"
+
     def test_a_bad_series_refuses(self) -> None:
         with pytest.raises(RosterError, match="not a series code"):
             parse_roster(_edit(ROSTER_23, row=_set(sv.SERIES, "eq")), session=NOV23)
@@ -267,6 +306,86 @@ class TestAnEmptyDenyList:
     @pytest.mark.parametrize("column", [sv.LT_ASM, sv.ST_ASM, sv.GSM])
     def test_exactly_a_handful_is_accepted(self, column: str) -> None:
         assert parse_roster(_keep_only(ROSTER_23, column, sv.MIN_FLAGGED), session=NOV23)
+
+
+# ---------------------------------------------------------------------------
+# T2T (E04-S02): the series a security trades in from the next session
+# ---------------------------------------------------------------------------
+
+
+def _relabel(raw: bytes, series: str, keep: int, to: str) -> bytes:
+    """The real roster with all but ``keep`` of ``series``'s rows moved to ``to``."""
+    lines = raw.decode("utf-8").split("\n")
+    at = lines[0].split(",").index(sv.SERIES)
+    kept = 0
+    for i, line in enumerate(lines[1:], start=1):
+        cells = line.split(",")
+        if len(cells) > at and cells[at] == series:
+            if kept < keep:
+                kept += 1
+            else:
+                cells[at] = to
+                lines[i] = ",".join(cells)
+    return "\n".join(lines).encode("utf-8")
+
+
+class TestTradeForTrade:
+    def test_every_series_the_real_roster_carries_is_classified(self) -> None:
+        """NSE's legend of series: EQ and SM settle rolling; BE, BZ, ST and SZ
+        trade for trade. The 23 Nov roster carries those six and nothing else."""
+        rows = parse_roster(ROSTER_23, session=NOV23)
+        assert {r.series for r in rows if r.is_t2t is True} == {"BE", "BZ", "ST", "SZ"}
+        assert {r.series for r in rows if r.is_t2t is False} == {"EQ", "SM"}
+        assert all(r.is_t2t is not None for r in rows)
+        assert sum(r.is_t2t is True for r in rows) == 184 + 41 + 102 + 2
+
+    @pytest.mark.parametrize(
+        ("symbol", "series", "kite"),
+        [
+            ("ABAN", "BE", "ABAN-BE"),
+            ("ANSALAPI", "BZ", "ANSALAPI-BZ"),
+            ("AARADHYA", "ST", "AARADHYA-ST"),
+            ("SECL", "SZ", "SECL-SZ"),  # suspended - and still trade-for-trade
+        ],
+    )
+    def test_a_trade_for_trade_stock_is_t2t_under_its_kite_name(
+        self, symbol: str, series: str, kite: str
+    ) -> None:
+        row = _by_symbol(parse_roster(ROSTER_23, session=NOV23))[symbol]
+        assert (row.series, row.tradingsymbol, row.is_t2t) == (series, kite, True)
+
+    @pytest.mark.parametrize(("symbol", "kite"), [("INFY", "INFY"), ("ASPIRE", "ASPIRE-SM")])
+    def test_a_rolling_stock_is_not_t2t(self, symbol: str, kite: str) -> None:
+        row = _by_symbol(parse_roster(ROSTER_23, session=NOV23))[symbol]
+        assert (row.tradingsymbol, row.is_t2t) == (kite, False)
+
+    def test_a_series_this_code_does_not_know_is_unknown_not_clean(self) -> None:
+        """RR (a REIT's series) never appears in the roster; if it did, the
+        flag would be NULL - refused by every reader - not written False."""
+        rows = _by_symbol(parse_roster(_edit(ROSTER_23, row=_set(sv.SERIES, "RR")), session=NOV23))
+        assert rows["INFY"].is_t2t is None
+
+    @pytest.mark.parametrize(("series", "to"), [("BE", "EQ"), ("BZ", "EQ"), ("ST", "SM")])
+    def test_a_trade_for_trade_list_that_names_fewer_than_a_handful_refuses(
+        self, series: str, to: str
+    ) -> None:
+        """SPRINT02 5.1 again: a roster whose BE list has (all but) vanished into
+        EQ would write every one of those stocks clean."""
+        raw = _relabel(ROSTER_23, series, sv.MIN_FLAGGED - 1, to)
+        with pytest.raises(RosterError, match=f"the trade-for-trade series {series}, under"):
+            parse_roster(raw, session=NOV23)
+
+    @pytest.mark.parametrize(("series", "to"), [("BE", "EQ"), ("BZ", "EQ"), ("ST", "SM")])
+    def test_exactly_a_handful_is_accepted(self, series: str, to: str) -> None:
+        raw = _relabel(ROSTER_23, series, sv.MIN_FLAGGED, to)
+        rows = parse_roster(raw, session=NOV23)
+        assert sum(r.series == series for r in rows) == sv.MIN_FLAGGED
+
+    def test_sz_carries_no_floor(self) -> None:
+        """SZ named one or two securities all through 2026: a floor would
+        refuse real files."""
+        rows = parse_roster(_relabel(ROSTER_23, "SZ", 0, "SM"), session=NOV23)
+        assert not any(r.series == "SZ" for r in rows)
 
 
 class TestTheFileItself:
@@ -469,6 +588,7 @@ def _sync(calendar: MarketCalendar, tmp_path: Path, **kw: Any) -> SurveillanceSy
     kw.setdefault("store", _Store())
     kw.setdefault("fetch", _Fetch())
     kw.setdefault("sleep", _no_sleep)
+    kw.setdefault("now", lambda: AFTER)
     return SurveillanceSync(calendar=calendar, archive=RosterArchive(tmp_path), **kw)
 
 
@@ -476,10 +596,12 @@ class TestOneTradeDate:
     async def test_a_trade_date_reads_the_roster_of_the_session_before_it(
         self, calendar: MarketCalendar, tmp_path: Path
     ) -> None:
-        """25 Nov 2026 follows a holiday: its roster is 23 Nov's, not 24 Nov's."""
+        """25 Nov 2026 follows a holiday. NSE could have held a session on the
+        24th (it did on two Sundays this year), so the 24th is asked first; it
+        has no roster, so the 23rd's governs."""
         fetch, store = _Fetch(), _Store()
         result = await _sync(calendar, tmp_path, fetch=fetch, store=store).sync_day(NOV25)
-        assert fetch.asked == [NOV23]
+        assert fetch.asked == [NOV24, NOV23]
         assert result.outcome is SyncOutcome.STORED and result.roster_session == NOV23
         written = {r.tradingsymbol: r for r in store.writes[0][1]}
         assert store.writes[0][0] == NOV25
@@ -584,6 +706,149 @@ class TestOneTradeDate:
         assert result.held_flagged == () and caplog.records == []
 
 
+def _everything(raw: bytes, session: dt.date) -> _Store:
+    """A store whose master knows every name the roster lists - so a fact is
+    asserted about the roster, not about how far today's master reaches back."""
+    return _Store(master=frozenset(r.tradingsymbol for r in parse_roster(raw, session=session)))
+
+
+class TestTheGoverningRoster:
+    """E04-S02, QA-E04-07: T reads the LAST roster NSE wrote before T opened.
+    NSE held sessions on Sun 1 Feb (the Budget) and Sun 8 Nov 2026 (Muhurat)
+    that the calendar does not trade, and wrote a roster after each."""
+
+    async def test_2_feb_reads_the_roster_of_the_budget_session(
+        self, calendar: MarketCalendar, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """NSE's notice of 1 Feb 2026 put COOLCAPS, ESSENTIA, MANORAMA, RCDL and
+        SYSTMTXC into ST-ASM for 2 Feb and VIVIMEDLAB into stage II. Read the
+        calendar's way, 2 Feb took 30 Jan's roster and wrote all five clean."""
+        caplog.set_level(logging.WARNING, logger="algotrader.premarket.surveillance")
+        fetch, store = _Fetch(NSE_2026), _everything(ROSTER_FEB01, FEB01)
+        result = await _sync(calendar, tmp_path, fetch=fetch, store=store).sync_day(FEB02)
+        assert result.outcome is SyncOutcome.STORED and result.roster_session == FEB01
+        assert fetch.asked == [FEB01]  # the latest closed day first, and it answered
+        written = _by_symbol(store.writes[0][1])
+        for added in ("COOLCAPS", "ESSENTIA", "MANORAMA", "RCDL", "SYSTMTXC"):
+            assert written[added].st_asm_stage == 1, added
+        assert written["VIVIMEDLAB"].st_asm_stage == 2
+        for gone in ("BAWEJA", "GANESHIN", "MIRCELECTR", "ORIENTTECH"):
+            assert not written[gone].is_asm, gone
+        assert [r.getMessage() for r in caplog.records] == [
+            "NSE wrote a roster for 2026-02-01, a day the calendar has no session on; "
+            "it governs 2026-02-02"
+        ]
+
+    def test_the_roster_before_it_had_them_clean(self) -> None:
+        """The control: what E04-S01 wrote for 2 Feb."""
+        before = _by_symbol(parse_roster(ROSTER_JAN30, session=JAN30))
+        for added in ("COOLCAPS", "ESSENTIA", "MANORAMA", "RCDL", "SYSTMTXC"):
+            assert before[added].st_asm_stage is None, added
+
+    async def test_9_nov_reads_the_muhurat_roster_and_its_series(
+        self, calendar: MarketCalendar, tmp_path: Path
+    ) -> None:
+        """GLOBAL and OPTIFIN traded EQ on 6 Nov and BE on 9 Nov: the 6 Nov
+        roster says EQ (for Muhurat), the 8 Nov roster BE."""
+        fetch, store = _Fetch(NSE_2026), _everything(ROSTER_NOV08, NOV08)
+        result = await _sync(calendar, tmp_path, fetch=fetch, store=store).sync_day(NOV09)
+        assert result.roster_session == NOV08 and fetch.asked == [NOV08]
+        written = _by_symbol(store.writes[0][1])
+        before = _by_symbol(parse_roster(ROSTER_NOV06, session=NOV06))
+        for moved in ("GLOBAL", "OPTIFIN"):
+            assert (written[moved].tradingsymbol, written[moved].is_t2t) == (f"{moved}-BE", True)
+            assert (before[moved].tradingsymbol, before[moved].is_t2t) == (moved, False)
+        assert result.t2t == sum(1 for r in written.values() if r.is_t2t)
+
+    async def test_a_plain_weekend_is_asked_about_and_recorded_absent(
+        self, calendar: MarketCalendar, tmp_path: Path
+    ) -> None:
+        fetch = _Fetch()
+        result = await _sync(calendar, tmp_path, fetch=fetch).sync_day(NOV23)
+        sat, sun = dt.date(2026, 11, 21), dt.date(2026, 11, 22)
+        assert fetch.asked == [sun, sat, NOV20] and result.roster_session == NOV20
+        archive = RosterArchive(tmp_path)
+        assert archive.is_absent(sun) and archive.is_absent(sat)
+        assert not archive.is_absent(NOV20) and archive.read(NOV20) == ROSTER_20
+
+    async def test_a_recorded_absence_is_not_asked_again(
+        self, calendar: MarketCalendar, tmp_path: Path
+    ) -> None:
+        await _sync(calendar, tmp_path).sync_day(NOV25)
+        again = _Fetch()
+        result = await _sync(calendar, tmp_path, fetch=again).sync_day(NOV25)
+        assert again.asked == [] and result.outcome is SyncOutcome.STORED
+
+    @pytest.mark.parametrize(
+        ("asked_at", "outcome"),
+        [
+            # 23:59:59.999999 IST on the 24th: NSE may still write the 24th's roster.
+            (dt.datetime(2026, 11, 24, 18, 29, 59, 999999, tzinfo=dt.UTC), SyncOutcome.MISSING),
+            # 00:00 IST on the 25th: the 24th is over, and had none.
+            (dt.datetime(2026, 11, 24, 18, 30, tzinfo=dt.UTC), SyncOutcome.STORED),
+        ],
+    )
+    async def test_a_closed_days_404_is_absence_only_once_the_day_is_over(
+        self, calendar: MarketCalendar, tmp_path: Path, asked_at: dt.datetime, outcome: SyncOutcome
+    ) -> None:
+        fetch, store = _Fetch(), _Store()
+        sync = _sync(calendar, tmp_path, fetch=fetch, store=store, now=lambda: asked_at)
+        result = await sync.sync_day(NOV25)
+        assert result.outcome is outcome
+        if outcome is SyncOutcome.MISSING:
+            assert "that day is not over" in result.detail and result.roster_session == NOV24
+            assert fetch.asked == [NOV24] and store.writes == []
+            assert not RosterArchive(tmp_path).is_absent(NOV24)
+        else:
+            assert fetch.asked == [NOV24, NOV23] and RosterArchive(tmp_path).is_absent(NOV24)
+
+    async def test_a_closed_day_that_cannot_be_asked_about_refuses(
+        self, calendar: MarketCalendar, tmp_path: Path
+    ) -> None:
+        """A failure that is not a 404 says nothing about whether NSE held a
+        session - so the older roster is not read in its place."""
+
+        def unreachable(session: dt.date) -> Fetched:
+            fetch.asked.append(session)
+            raise RosterError("surveillance roster refused: could not be fetched (URLError)")
+
+        fetch, store = _Fetch(), _Store()
+        result = await _sync(calendar, tmp_path, fetch=unreachable, store=store).sync_day(NOV25)
+        assert result.outcome is SyncOutcome.REFUSED and "could not be fetched" in result.detail
+        assert fetch.asked == [NOV24] and store.writes == []
+        assert not RosterArchive(tmp_path).is_absent(NOV24)
+
+    async def test_a_closed_days_roster_written_at_the_wrong_time_refuses(
+        self, calendar: MarketCalendar, tmp_path: Path
+    ) -> None:
+        morning = dt.datetime(2026, 11, 24, 4, 0, tzinfo=dt.UTC)  # 09:30 IST on the 24th
+        fetch = _Fetch({NOV24: Fetched(ROSTER_23, morning), NOV23: Fetched(ROSTER_23, WRITTEN_23)})
+        store = _Store()
+        result = await _sync(calendar, tmp_path, fetch=fetch, store=store).sync_day(NOV25)
+        assert result.outcome is SyncOutcome.REFUSED and "not the evening file" in result.detail
+        assert fetch.asked == [NOV24] and store.writes == []
+        assert RosterArchive(tmp_path).read(NOV24) is None
+
+    async def test_offline_must_know_every_closed_day(
+        self, calendar: MarketCalendar, tmp_path: Path
+    ) -> None:
+        """An archive that holds the 23rd's roster but says nothing about the
+        24th cannot tell "no session" from "never asked" - so it refuses. Its
+        controls: the absence recorded, and a roster recorded."""
+        archive = RosterArchive(tmp_path)
+        archive.write(NOV23, ROSTER_23)
+        offline = _sync(calendar, tmp_path, offline=True)
+        result = await offline.sync_day(NOV25)
+        assert result.outcome is SyncOutcome.MISSING
+        assert "does not record whether NSE wrote a roster for 2026-11-24" in result.detail
+        archive.mark_absent(NOV24, at=AFTER)
+        result = await offline.sync_day(NOV25)
+        assert result.outcome is SyncOutcome.STORED and result.roster_session == NOV23
+        archive.write(NOV24, ROSTER_23)
+        result = await offline.sync_day(NOV25)
+        assert result.outcome is SyncOutcome.STORED and result.roster_session == NOV24
+
+
 class TestPoliteness:
     def test_an_interval_under_a_second_is_refused(
         self, calendar: MarketCalendar, tmp_path: Path
@@ -599,10 +864,13 @@ class TestPoliteness:
         async def sleep(seconds: float) -> None:
             slept.append(seconds)
 
-        sync = _sync(calendar, tmp_path, sleep=sleep, clock=lambda: 100.0)
-        await sync.sync_day(NOV23)
-        await sync.sync_day(NOV25)
-        assert slept == [sv.FETCH_INTERVAL_SECONDS]
+        fetch = _Fetch()
+        sync = _sync(calendar, tmp_path, fetch=fetch, sleep=sleep, clock=lambda: 100.0)
+        await sync.sync_day(NOV23)  # asks 22, 21 (a weekend), then 20 Nov
+        await sync.sync_day(NOV25)  # asks 24 (the holiday), then 23 Nov
+        assert fetch.asked == [dt.date(2026, 11, 22), dt.date(2026, 11, 21), NOV20, NOV24, NOV23]
+        # Every request after the first waited out the interval - probes too.
+        assert slept == [sv.FETCH_INTERVAL_SECONDS] * (len(fetch.asked) - 1)
 
 
 class TestARange:
@@ -640,6 +908,15 @@ class TestTheArchive:
         path = RosterArchive(tmp_path).write(NOV23, ROSTER_23)
         assert path == tmp_path / "2026" / "REG1_IND231126.csv"
         assert RosterArchive(tmp_path).read(NOV23) == ROSTER_23
+        assert not list((tmp_path / "2026").glob("*.partial"))
+
+    def test_an_absence_is_filed_beside_the_rosters_and_says_when(self, tmp_path: Path) -> None:
+        archive = RosterArchive(tmp_path)
+        path = archive.mark_absent(NOV24, at=AFTER)
+        assert path == tmp_path / "2026" / "REG1_IND241126.absent"
+        assert path.read_text("utf-8") == "HTTP 404 at 2026-12-01T00:00:00+00:00\n"
+        assert archive.is_absent(NOV24) and archive.read(NOV24) is None
+        assert not archive.is_absent(NOV23)
         assert not list((tmp_path / "2026").glob("*.partial"))
 
 
