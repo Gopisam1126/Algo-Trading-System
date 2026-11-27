@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import http.client
 import re
 import urllib.error
 import urllib.request
@@ -437,7 +438,10 @@ def fetch_index_file(
             if status != 200:
                 raise _refuse(f"the {base} file answered HTTP {status}")
             body: bytes = response.read(MAX_FILE_BYTES + 1)
-    except urllib.error.URLError as exc:
+    except (OSError, http.client.HTTPException) as exc:
+        # URLError (and HTTPError) is an OSError, raised by the open. A failure
+        # while READING the body - a timeout, a reset, a short read - is a bare
+        # OSError or HTTPException that urllib does not wrap (QA-E04-12).
         raise _refuse(f"the {base} file could not be fetched ({type(exc).__name__})") from exc
     if len(body) > MAX_FILE_BYTES:
         raise _refuse(f"the {base} file exceeds {MAX_FILE_BYTES} bytes")
