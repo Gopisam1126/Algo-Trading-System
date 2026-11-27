@@ -126,6 +126,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import email.utils
+import http.client
 import logging
 import os
 import re
@@ -450,7 +451,10 @@ def fetch_roster(session: dt.date, *, opener: Opener = _open, timeout: float = 3
                 f"NSE has no surveillance roster for {session} (HTTP 404)"
             ) from None
         raise _refuse(f"NSE answered HTTP {exc.code} for {session}") from None
-    except urllib.error.URLError as exc:
+    except (OSError, http.client.HTTPException) as exc:
+        # URLError is an OSError, raised by the open. A failure while READING
+        # the body - a timeout, a reset, a short read - is a bare OSError or
+        # HTTPException that urllib does not wrap, and escaped (QA-E04-12).
         raise _refuse(
             f"the roster for {session} could not be fetched ({type(exc).__name__})"
         ) from exc
@@ -517,9 +521,10 @@ class SyncOutcome(StrEnum):
     STORED = "STORED"
     #: The calendar says T has no session; nothing was requested.
     NOT_A_TRADING_DAY = "NOT_A_TRADING_DAY"
-    #: A session, and no roster for it: T's flags stay unknown.
+    #: A session, and no file for it (a roster, or the F&O ban list of
+    #: ``fno_ban.py``, which reports in these terms too): T's flags stay unknown.
     MISSING = "MISSING"
-    #: A roster this system will not use: T's flags stay unknown.
+    #: A file this system will not use: T's flags stay unknown.
     REFUSED = "REFUSED"
 
 

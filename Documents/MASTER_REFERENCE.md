@@ -147,7 +147,7 @@ refuses every entry at L0-L3 until the approval flow (E16-S03) and the envelope
 | `strategy/` | Components | the DSL, 27 primitives and their evaluators, the tri-state runtime, the approval-gated registry |
 | `signals/` | Components | the strategy loop and bar source (E13-S01); its LIVE/PAPER routes end at a port |
 | `execution/` | Components, composed in one service object | the 14-check risk engine, sizer, slots, halt latches and loss latch, order gateway and state machine, protective stops, position book, reconciliation, exit timer (time and target exits), autonomy gate, day ledger, end-of-day verdict and statistics, execution service |
-| `premarket/` | Components | the base universe (E07-S01): a Nifty 50/100/200/500 constituent file, the F&O stock universe or a custom list, resolved against the instrument master; the NSE bhavcopy as daily bars, archived and back-filled (E03-S01); the ASM, GSM and T2T flags per trade date from the last surveillance roster NSE wrote before that day (E04-S01, E04-S02); no pipeline yet |
+| `premarket/` | Components | the base universe (E07-S01): a Nifty 50/100/200/500 constituent file, the F&O stock universe or a custom list, resolved against the instrument master; the NSE bhavcopy as daily bars, archived and back-filled (E03-S01); the ASM, GSM and T2T flags per trade date from the last surveillance roster NSE wrote before that day (E04-S01, E04-S02); the F&O ban flag per trade date, for every active instrument, from NSE's ban list for that day (E04-S03); no pipeline yet |
 | `ai/` `macro/` `orchestrator/` `api/` `notifier/` | **Empty** | `__init__.py` only |
 
 "Components" means built and tested on their own and against each other in
@@ -735,7 +735,7 @@ Algo-Trading-System/
 |---|---|---|
 | `ohlcv` | Bar history | Hypertable, compressed after 90d |
 | `instruments` | Symbol master | Broker tokens, lot size, tick size |
-| `instrument_daily_status` | **Daily hazard flags** | T2T, ASM, GSM, F&O ban, CAS, circuit bands - each NULL (unknown, refused) until its own source reports, and each source writes only its columns (E04-S01); ASM, GSM and T2T from NSE's surveillance roster (E04-S01, E04-S02) |
+| `instrument_daily_status` | **Daily hazard flags** | T2T, ASM, GSM, F&O ban, CAS, circuit bands - each NULL (unknown, refused) until its own source reports, and each source writes only its columns (E04-S01); ASM, GSM and T2T from NSE's surveillance roster (E04-S01, E04-S02); the F&O ban from NSE's ban list, for every active instrument (E04-S03) |
 | `daily_plan` | Pre-market output | Market thesis, macro snapshot, token usage |
 | `plan_candidate` | Ranked candidates | Score breakdown, AI rationale, playbook, gap status |
 | `decision_log` | **Immutable audit** | Hypertable, hash-chained, INSERT-only role |
@@ -1373,6 +1373,18 @@ their first day under it (QA-E04-07, CRITICAL). Trade date T now reads the last
 roster NSE wrote before T opened. It checks each closed day since the previous
 trading day, newest first. A missing file on a closed day counts as "no session"
 only once that day has ended. T2T comes from the same roster's `Series` column.
+
+E04-S03 (27 Nov 2026) asked the same question of the F&O ban list, and the list
+answers it itself: `fo_secban_<DDMMYYYY>.csv` is named for the trade date it
+governs and says so in its first line. NSE writes it the evening before, and it
+did so after both Sunday sessions. Every 2026 list (221 trade dates) names
+exactly the stocks that NSE Clearing's combined open-interest file for the
+session before marks "No Fresh Positions". What the ban list raised instead is
+the shape of a deny list. A row missing from the roster leaves an instrument
+unknown, but a row missing from the ban list reads as clean. So a download cut
+off at a line boundary is a shorter, valid list, and the fetch now checks the
+body against `Content-Length`. The list is also the one deny list that is often
+truly empty, and NSE says so: `NIL`.
 
 ### 21.3 Build sequence
 

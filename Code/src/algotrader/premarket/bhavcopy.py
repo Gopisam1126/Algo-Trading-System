@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import http.client
 import io
 import logging
 import os
@@ -424,7 +425,10 @@ def fetch_bhavcopy(day: dt.date, *, opener: Opener = _open, timeout: float = 30.
         if exc.code == 404:
             raise BhavcopyMissingError(f"NSE has no bhavcopy for {day} (HTTP 404)") from None
         raise _refuse(f"NSE answered HTTP {exc.code} for {day}") from None
-    except urllib.error.URLError as exc:
+    except (OSError, http.client.HTTPException) as exc:
+        # URLError is an OSError, raised by the open. A failure while READING
+        # the body - a timeout, a reset, a short read - is a bare OSError or
+        # HTTPException that urllib does not wrap, and escaped (QA-E04-12).
         raise _refuse(
             f"the bhavcopy for {day} could not be fetched ({type(exc).__name__})"
         ) from exc

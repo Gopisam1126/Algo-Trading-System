@@ -147,7 +147,7 @@ All times IST. The right-hand column is today's state.
 
 | Time | Step | What happens | State |
 |---|---|---|---|
-| 05:30 | Data sync | Instrument master; bhavcopy (end-of-day prices); corporate actions; hazard lists - ASM/GSM surveillance, T2T, F&O ban, circuit bands, CAS scope | instrument sync ✅ · bhavcopy ✅ (E03-S01; the 05:30 schedule is E11-S02) · rest ⬜ (E03, E04) |
+| 05:30 | Data sync | Instrument master; bhavcopy (end-of-day prices); corporate actions; hazard lists - ASM/GSM surveillance, T2T, F&O ban, circuit bands, CAS scope | instrument sync ✅ · bhavcopy ✅ (E03-S01) · ASM/GSM and T2T ✅ (E04-S01, E04-S02) · F&O ban ✅ (E04-S03) · circuit bands, CAS scope, corporate actions ⬜ (E03, E04) · the 05:30 schedule ⬜ (E11-S02) |
 | 06:30 | Universe | The base universe (Nifty 200 by default), then hard filters (T2T, surveillance, bans, bands, price, volume, market cap, range, spread) | base universe ✅ (E07-S01) · filters ⬜ (E07-S02) |
 | 07:00 | Broker login | The owner logs in to Zerodha once a day, by hand - an exchange rule; the system cannot do it unattended | auth code 🟡 · login helper ⬜ |
 | 07:30 | Multi-timeframe analysis | Weekly, daily and hourly indicators for the eligible universe | ⬜ (E11-S04) |

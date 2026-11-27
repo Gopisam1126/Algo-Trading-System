@@ -440,8 +440,8 @@ CREATE INDEX ix_instruments_sector ON instruments (sector) WHERE is_active;
 --
 -- Every flag is NULL until ITS source has reported for that day (E04-S01,
 -- migration 9c2f4e6a1b70, 24 Nov 2026). The lists come from separate sources
--- (the surveillance roster - ASM, GSM and T2T, E04-S01/S02 - then the F&O ban,
--- CAS scope and earnings); with NOT NULL
+-- (the surveillance roster - ASM, GSM and T2T, E04-S01/S02 - NSE's F&O ban list,
+-- E04-S03, then CAS scope and earnings); with NOT NULL
 -- DEFAULT FALSE - this table's first design - the first source to write a
 -- day's row also wrote "checked and clean" for every flag nobody checked.
 -- Every reader treats NULL as restricted; each source writes only its columns.

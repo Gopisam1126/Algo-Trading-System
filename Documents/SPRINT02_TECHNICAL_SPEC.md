@@ -362,6 +362,12 @@ anything: if the ASM list has fewer than a handful of names, or the bhavcopy has
 fewer rows than the known universe, treat it as a failed fetch. A structurally
 valid file with no rows is still a failure.
 
+The F&O ban list is the one list that is often truly empty, and NSE says so
+explicitly: on such a day the first line ends `: NIL`. Only that explicit NIL reads
+as "nothing banned". A list with no rows and no NIL is still a failed fetch
+(E04-S03). The same inversion makes truncation dangerous. A deny list cut off at a
+line boundary parses as a shorter list, so its body must match `Content-Length`.
+
 ---
 
 ## 6. SCHEMA CHANGES REQUIRED
@@ -442,8 +448,30 @@ T opened. It checks each closed day since the previous trading day, newest first
 A 404 on a closed day counts as "no session" only once that day is over (IST), and
 the archive records each absence, so an offline re-run answers the same way.
 
-*E04-S03:* the ban is not in the roster (NSE's REG_IND file structure). Its file
-is `fo_secban_<DDMMYYYY>.csv`.
+*E04-S03 built 27 Nov 2026.* The ban is not in the roster (NSE's REG_IND file
+structure). Its file, `fo_secban_<DDMMYYYY>.csv`, is named for the trade date it
+GOVERNS and says so in its first line ("Securities in Ban For Trade Date
+27-NOV-2026:"). NSE writes it the evening of the session before, from that
+session's closing open interest. NSE Clearing's SOP (NCL/CMPT/70085, in force
+from 1 Oct 2025) bans a stock whose Future-Equivalent open interest exceeds 95% of
+its market-wide position limit at the end of a day "from next day onwards", and
+lifts the ban at 80%. Intraday monitoring (NSE/SURV/71090) only broadcasts alerts;
+it bans nothing. So QA-E04-07's question has a plain answer here: T reads its own
+file. NSE wrote the 2 Feb list on 1 Feb, after the Budget session, and the 9 Nov
+list on 8 Nov, after Muhurat. This is the one deny list that is legitimately
+empty: NSE writes `NIL` on the first line, and a list with neither rows nor NIL is
+refused. The list is exhaustive, so every active instrument gets an answer: true
+for the Kite names of a banned security, false for every other. A banned name the
+master does not know refuses the day. **A row missing from this list reads as
+clean**, the opposite of the roster, so a download cut off at a line boundary is a
+shorter, valid list. The fetch checks the body against `Content-Length`.
+Execution refuses a banned stock (a recorded, conservative assumption). Whether to
+trade the stock itself is the owner's call, with E07-S02's `exclude_fno_ban`.
+Checked on 27 Nov 2026 for every 2026 session (221 trade dates). Each list names
+exactly the stocks NSE Clearing's combined open-interest file for the session before
+marks "No Fresh Positions". No stock over 95% of its limit went unbanned, and no
+banned stock was under 80%. 39 days were NIL, no day banned more than six, and the
+year banned eleven distinct stocks.
 
 ### E04-S01 · ASM / GSM (1 d, 🔴)
 Needs the schema change from §6 first. Task 4 — *"alert on newly-added names

@@ -234,18 +234,24 @@ CREATE TABLE instruments (
 );
 
 -- Refreshed every morning by premarket-job. This is the SEBI/NSE hazard table.
+-- Every flag is NULL - unknown, which every reader refuses - until ITS source
+-- reports for the day, and each source writes only its own columns (E04-S01,
+-- migration 9c2f4e6a1b70). This block said NOT NULL DEFAULT FALSE until
+-- 27 Nov 2026: the first design, under which the first list to write a day's
+-- row reported every other flag checked and clean. EPIC01_TECHNICAL_SPEC.md
+-- has the full table.
 CREATE TABLE instrument_daily_status (
     symbol_id           INTEGER     NOT NULL REFERENCES instruments(id),
     trade_date          DATE        NOT NULL,
-    is_t2t              BOOLEAN     NOT NULL DEFAULT FALSE,  -- intraday impossible
-    is_asm              BOOLEAN     NOT NULL DEFAULT FALSE,
-    is_gsm              BOOLEAN     NOT NULL DEFAULT FALSE,
-    is_fno_ban          BOOLEAN     NOT NULL DEFAULT FALSE,
-    is_cas_stock        BOOLEAN     NOT NULL DEFAULT FALSE,  -- drives square-off deadline
+    is_t2t              BOOLEAN,    -- intraday impossible (E04-S02, the roster's series)
+    is_asm              BOOLEAN,    -- E04-S01, the surveillance roster
+    is_gsm              BOOLEAN,    -- E04-S01
+    is_fno_ban          BOOLEAN,    -- E04-S03, NSE's F&O ban list
+    is_cas_stock        BOOLEAN,    -- drives square-off deadline; NULL takes the earlier
     circuit_band_pct    NUMERIC(5,2),
     upper_circuit       NUMERIC(14,4),
     lower_circuit       NUMERIC(14,4),
-    has_earnings_today  BOOLEAN     NOT NULL DEFAULT FALSE,
+    has_earnings_today  BOOLEAN,
     PRIMARY KEY (symbol_id, trade_date)
 );
 

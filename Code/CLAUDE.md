@@ -296,8 +296,8 @@ Built and tested as components (counts: the latest CI run; it must say
 
 **Empty (`__init__.py` only):** `orchestrator/`, `api/`, `notifier/`, `ai/`,
 `macro/` - five of thirteen packages. `premarket/` holds the base universe
-loader (E07-S01), the bhavcopy (E03-S01) and the surveillance roster (E04-S01, S02),
-and no pipeline yet. `execution/` holds the
+loader (E07-S01), the bhavcopy (E03-S01), the surveillance roster (E04-S01, S02) and
+the F&O ban list (E04-S03), and no pipeline yet. `execution/` holds the
 whole order path: risk engine, sizer, slots, halt and loss latches, gateway and
 state machine, protective stop, position book, reconciliation, square-off,
 autonomy gate, day ledger, end-of-day verdict and the service that drives them. **Nothing composes
@@ -692,6 +692,31 @@ Recorded because each was believed, written down, and wrong.
   reasoned and reviewed, and it was the defect. Being on record made it look
   settled. Probe the fact a decision rests on (here: is there a roster for the
   Muhurat day?), not just the code that carries it out.
+
+- **E04-S03 F&O ban** — `premarket/fno_ban.py`: `is_fno_ban` for trade date T from
+  NSE's `fo_secban_<DDMMYYYY>.csv` (`nsearchives.nseindia.com/archives/fo/sec_ban/`).
+  The file is named for the trade date it GOVERNS, says so in its first line, and is
+  written the evening of the session before, after the 2026 Budget and Muhurat
+  sessions too. So T reads its own file and nothing is probed. A day with no ban is
+  NSE's explicit `NIL`; no rows and no NIL is refused. The list is exhaustive, so
+  EVERY active instrument is written: true for a banned security's Kite names (`S`,
+  `S-BE`, `S-BZ`), false for the rest. A banned name the master does not know
+  refuses the day. The body must match `Content-Length`. `Last-Modified` must fall
+  after the calendar's previous session ENDED (its closing auction, dated) and before
+  T opens. `scripts/sync_fno_ban.py --date T` (or `--start/--end`, `--offline`), as
+  `algotrader_svc` only. Execution already refused `FNO_BAN` and still does.
+  `v_eligible_today` only flags it.
+
+- **"A missing row is an unknown row."** In the roster, yes: an instrument it does not
+  name stays NULL and is refused. In a deny list a missing row is the CLEAN answer, so
+  a download cut off at a line boundary is a valid, shorter list.
+  `HTTPResponse.read(n)` returns a short body without raising. The ban fetch compares
+  the body with `Content-Length` (E04-S03).
+- **"`except URLError` catches a failed download."** It catches a failure to CONNECT.
+  A timeout, a reset or a short chunk while READING the body arrives as a bare
+  `OSError` or `http.client.HTTPException`. All three premarket fetchers let it escape
+  as a crash (QA-E04-12). They catch both now, and
+  `tests/security/test_fetch_failures.py` holds every fetcher to it.
 
 - **E07-S01 base universe** — `premarket/universe.py`. `universe.base` (now a
   Literal) is a Nifty 50/100/200/500 constituent file from niftyindices.com

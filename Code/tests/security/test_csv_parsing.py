@@ -71,6 +71,16 @@ def test_the_index_constituents_refuse_it() -> None:
         parse_constituents(raw, base="nifty50")
 
 
+def test_the_fno_ban_list_refuses_it() -> None:
+    """Its 64 KiB cap refuses a field this size before csv sees it - a
+    refusal either way, never a crash."""
+    from algotrader.premarket.fno_ban import BanListError, parse_ban_list
+
+    raw = gzip.decompress((FIXTURES / "fno_ban" / "fo_secban_27112026.csv.gz").read_bytes())
+    with pytest.raises(BanListError, match="refused"):
+        parse_ban_list(raw + OVERSIZED + b"\n", trade_date=dt.date(2026, 11, 27))
+
+
 def test_the_surveillance_roster_refuses_it() -> None:
     raw = gzip.decompress((FIXTURES / "surveillance" / "REG1_IND231126.csv.gz").read_bytes())
     with pytest.raises(RosterError, match="not well-formed CSV"):
